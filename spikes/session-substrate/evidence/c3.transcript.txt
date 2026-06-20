@@ -1,47 +1,75 @@
 # criterion: c3
-# verdict: PARTIAL
-# observed_reason: C3 ACHIEVABLE but NOT natively. Allowing AskUserQuestion returns 'The user did not answer'; no native answer API exists. The session CAN be driven on a code-chosen answer (no TTY) via a deny-with-answer-message workaround: across two trials the model echoed exactly the option the CODE selected (pick[0]='Alpha', pick[1]='Bravo', differing -> proves code-driven, not model cooperation/prompt-following). Caveat: the answer rides the permission-deny channel (tool_result is_error), relies on the model interpreting the message, and is not a structured native selection — relevant to ADR-001 Option C / hybrid.
-# timestamp: 2026-06-20T20:30:47.909243+00:00
+# verdict: PASS
+# observed_reason: C3 ACHIEVED NATIVELY on substrate A. AskUserQuestion is answered programmatically (no TTY) by returning a PermissionResultAllow whose updated_input carries the documented AskUserQuestionOutput `answers` map keyed by the question text -> the code-chosen label. The tool_result is NOT an error (is_error in {None,False}) and reads 'Your questions have been answered: ...You can now continue with these answers in mind.', and the session continues on the code-selected option. Proven code-driven: two trials under a neutral prompt that never names the pick each echoed exactly the option the CODE chose (pick[0]='Alpha', pick[1]='Bravo'; differing -> not model cooperation/prompt-following). Native multi-select via the answers-map (comma-separated labels) also works (multi_native=True). This CORRECTS the earlier PARTIAL verdict, which injected the WRONG answer shape (e.g. a `selected`/`selectedOption` flag or extra top-level fields instead of the documented `answers` map keyed by question text) and so wrongly claimed 'no native structured answer field exists'. Caveats: the native answer is delivered by injecting the tool's documented output `answers` map through the permission-allow updated_input channel; free-text 'Other' (the `response` field) is a separate path not exercised here; multi-select robustness on complex/multi-question asks beyond this 3-option probe is unproven. The deny-with-answer-message workaround ALSO works (non-native, rides the error channel; w0_match=True) but is not the basis of this verdict.
+# timestamp: 2026-06-20T23:22:09.274728+00:00
 ------------------------------------------------------------
 === T8 / C3 — AskUserQuestion answered programmatically (substrate A) ===
 sdk: claude-agent-sdk==0.2.105
 ANTHROPIC_API_KEY set: False (must be False)
-Mechanism note: SDK has no native AskUserQuestion answer API; can_use_tool only allows(+updatedInput)/denies(+message). Probing native vs workaround.
+Mechanism note: AskUserQuestion flows through the can_use_tool callback (allow(+updated_input) / deny(+message)). The NATIVE answer is delivered by returning an ALLOW whose updated_input carries the documented AskUserQuestionOutput `answers` map keyed by question text -> selected label. CORRECTION: the earlier PARTIAL verdict injected the WRONG shape (e.g. a `selected`/`selectedOption` flag, or extra top-level fields) and so wrongly concluded 'no native structured answer field exists'. The accurate finding is below.
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t8-c3-iowlkh83']
 
---- TRIAL native_allow (expect: NOT answered) ---
-  session_id: be9653bc-45e7-4233-be83-6419eb1e19c9
-  AskUserQuestion fired: 1  options_presented: ['Alpha', 'Bravo']
-  tool_result is_error=None: 'The user did not answer the questions.'
-  model final: "You didn't make a selection (the question was dismissed), so there's no label to report. If you'd like, run it again and pick Alpha or Bravo, and I'll reply wit"
+--- TRIAL native_allow pick[0] (PRIMARY) ---
+  session_id: [REDACTED]
+  AskUserQuestion fired: 1  question: 'Pick one option'  options_presented: ['Alpha', 'Bravo']  multiSelect: False
+  code-chosen label(s): 'Alpha'
+  tool_result is_error=None: 'Your questions have been answered: "Pick one option"="Alpha". You can now continue with these answers in mind.'
+  model final: 'FINAL_PICK=Alpha'
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t8-c3-ssyc6puf']
 
---- TRIAL workaround_deny pick[0] ---
-  session_id: bc7b9eba-05c1-4ae3-b1d0-56caeeb82749
-  AskUserQuestion fired: 1  options_presented: ['Alpha', 'Bravo']
-  code-chosen label (via deny message): 'Alpha'
+--- TRIAL native_allow pick[1] (PRIMARY) ---
+  session_id: [REDACTED]
+  AskUserQuestion fired: 1  question: 'Pick one option'  options_presented: ['Alpha', 'Bravo']  multiSelect: False
+  code-chosen label(s): 'Bravo'
+  tool_result is_error=None: 'Your questions have been answered: "Pick one option"="Bravo". You can now continue with these answers in mind.'
+  model final: 'FINAL_PICK=Bravo'
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t8-c3--yjp5crw']
+
+--- TRIAL native_allow multiselect (informational) ---
+  session_id: [REDACTED]
+  AskUserQuestion fired: 1  question: 'Pick colors'  options_presented: ['Red', 'Green', 'Blue']  multiSelect: True
+  code-chosen label(s): 'Red, Blue'
+  tool_result is_error=None: 'Your questions have been answered: "Pick colors"="Red, Blue". You can now continue with these answers in mind.'
+  model final: 'FINAL_PICKS=Red,Blue'
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t8-c3-ywc9d3y5']
+
+--- TRIAL workaround_deny pick[0] (SECONDARY, non-native) ---
+  session_id: [REDACTED]
+  AskUserQuestion fired: 1  question: 'Pick one option'  options_presented: ['Alpha', 'Bravo']  multiSelect: False
+  code-chosen label(s): 'Alpha'
   tool_result is_error=True: 'The user selected: Alpha'
   model final: 'FINAL_PICK=Alpha'
 
---- TRIAL workaround_deny pick[1] ---
-  session_id: 7d9caa3a-26e5-4cc2-9cff-70e1665b68cd
-  AskUserQuestion fired: 1  options_presented: ['Alpha', 'Bravo']
-  code-chosen label (via deny message): 'Bravo'
-  tool_result is_error=True: 'The user selected: Bravo'
-  model final: 'FINAL_PICK=Bravo'
-
 === C3 evaluation ===
-native_answered (allow path returns a selection): False
-workaround pick[0] echoed code choice 'Alpha': True
-workaround pick[1] echoed code choice 'Bravo': True
-code-driven (both matched AND choices differ -> not model cooperation/prompt): True
+native pick[0] answered over allow channel (no error, 'answered', echoed 'Alpha'): True
+native pick[1] answered over allow channel (no error, 'answered', echoed 'Bravo'): True
+code picks differ across native trials (Alpha vs Bravo): True
+NATIVE code-driven (both native trials answered + choices differ -> NOT model guess/prompt-following): True
+native multi-select answered via answers-map (informational, not gating): True (multiSelect=True, final='FINAL_PICKS=Red,Blue')
+SECONDARY deny-with-answer-message workaround echoed code choice 'Alpha' (informational, NON-native, rides error channel): True (tool_result is_error=[True])
 
-Distinguishers / limitations:
-- AskUserQuestion genuinely fired as a real tool_use each trial (can_use_tool intercepted it),
-  so this is not model refusal or the model declining to call the tool.
-- The neutral prompt never says which option to pick; the CODE chose it. Two trials with
-  DIFFERENT code picks both echoed correctly -> the answer is code-driven, not prompt/coincidence.
-- Native answering is unsupported on this SDK version; the working path is a deny-message
-  workaround (permission-channel), not a structured native answer. This is the make-or-break
-  nuance for ADR-001 (substrate A may need a hybrid/workaround for C3).
+Distinguishers / limitations (substrate A C3):
+- NATIVE answer mechanism: return PermissionResultAllow(updated_input={**input,
+  'answers': {<question text>: <chosen label>}}). The documented AskUserQuestionOutput
+  `answers` map is keyed by QUESTION TEXT -> selected label (multi-select: comma-separated
+  labels in the one string; optional `response` carries freeform 'Other' text).
+- RESULT (verified live): tool_result is NOT an error (is_error in {None,False}) and reads
+  'Your questions have been answered: "<q>"="<label>". You can now continue with these
+  answers in mind.' -> a GENUINE structured native answer over the ALLOW channel.
+- CORRECTION: the earlier PARTIAL verdict injected the WRONG shape (a `selected`/
+  `selectedOption` flag, or extra top-level decision fields) instead of the documented
+  `answers` map keyed by question text, and so wrongly concluded 'no native structured
+  answer field exists on this SDK / over the wire'. That claim is REMOVED.
+- AskUserQuestion genuinely fired as a real tool_use each trial (can_use_tool intercepted
+  it) -> not model refusal or the model declining to call the tool.
+- The neutral prompt never says which option to pick; the CODE chose it. Two NATIVE trials
+  with DIFFERENT code picks both echoed correctly -> code-driven, not prompt/coincidence.
+- SECONDARY (non-native): the deny-with-answer-message workaround ALSO drives the session,
+  but rides the permission-DENY/error channel (tool_result is_error) and relies on the
+  model interpreting natural-language text. Retained as an alternative mechanism only.
+- Caveats: native answer is injected via the permission-allow updated_input channel;
+  free-text 'Other' (`response` field) is a separate path, NOT tested here; multi-select
+  robustness on complex/multi-question asks beyond the 3-option probe is unproven.
 - C3 only; no claim about C1/C2/C4-C6.
-VERDICT: PARTIAL
-REASON: C3 ACHIEVABLE but NOT natively. Allowing AskUserQuestion returns 'The user did not answer'; no native answer API exists. The session CAN be driven on a code-chosen answer (no TTY) via a deny-with-answer-message workaround: across two trials the model echoed exactly the option the CODE selected (pick[0]='Alpha', pick[1]='Bravo', differing -> proves code-driven, not model cooperation/prompt-following). Caveat: the answer rides the permission-deny channel (tool_result is_error), relies on the model interpreting the message, and is not a structured native selection — relevant to ADR-001 Option C / hybrid.
+VERDICT: PASS
+REASON: C3 ACHIEVED NATIVELY on substrate A. AskUserQuestion is answered programmatically (no TTY) by returning a PermissionResultAllow whose updated_input carries the documented AskUserQuestionOutput `answers` map keyed by the question text -> the code-chosen label. The tool_result is NOT an error (is_error in {None,False}) and reads 'Your questions have been answered: ...You can now continue with these answers in mind.', and the session continues on the code-selected option. Proven code-driven: two trials under a neutral prompt that never names the pick each echoed exactly the option the CODE chose (pick[0]='Alpha', pick[1]='Bravo'; differing -> not model cooperation/prompt-following). Native multi-select via the answers-map (comma-separated labels) also works (multi_native=True). This CORRECTS the earlier PARTIAL verdict, which injected the WRONG answer shape (e.g. a `selected`/`selectedOption` flag or extra top-level fields instead of the documented `answers` map keyed by question text) and so wrongly claimed 'no native structured answer field exists'. Caveats: the native answer is delivered by injecting the tool's documented output `answers` map through the permission-allow updated_input channel; free-text 'Other' (the `response` field) is a separate path not exercised here; multi-select robustness on complex/multi-question asks beyond this 3-option probe is unproven. The deny-with-answer-message workaround ALSO works (non-native, rides the error channel; w0_match=True) but is not the basis of this verdict.
