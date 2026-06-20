@@ -45,7 +45,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe (587334d)
 - [x] T5 — A-harness: persistent session lifecycle (start/resume/send/stop) (053ca9b)
 - [x] T6 — A · C1 bidirectional streaming check (fb4247e)
-- [ ] T7 — A · C2 per-tool permission decision check (sandboxed)
+- [x] T7 — A · C2 per-tool permission decision check (sandboxed) (c8d9f3c)
 - [ ] T8 — A · C3 AskUserQuestion answered programmatically
 - [ ] T9 — A · C4 ExitPlanMode approve/reject + feedback
 - [ ] T10 — C5 test skill fixture (emits permission + AskUserQuestion/ExitPlanMode)
@@ -138,7 +138,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
     enforce resolved-target containment through the permission callback where supported, and record
     repository status before/after. Any inability to enforce containment SHALL be documented in the verdict.
 - **Tests:** none — verdict + transcript + recorded containment checks are the artifact.
-- **Status:** todo
+- **Status:** done (c8d9f3c) — **C2 PASS**. A real SDK permission callback (`can_use_tool`, `permission_mode=default`, no bypass) **denied one Write before execution** → the denied marker **remained absent**; a second Write was **allowed** and produced the expected sentinel (`ALLOWED_OK`). The **same tool (Write) received opposite per-request decisions** (deny then allow), proving a genuine per-request gate, not global tool config; callback fired both times (not refusal/no-call), denied not executed (not post-exec failure). Resolved-path containment is **deny-by-default** (outside-fixture + traversal denied, unit-checked); **containment is policy-level, not OS/kernel sandboxing**. Disposable `/tmp` fixture cleaned up; no new repo changes during the run; evidence `evidence/c2.*` scrubbed (X3). **Both independent reviewers returned ALL PASS** (19/19 each). C2 only — no C1/C3–C6 claim.
 
 ### T8 — A · C3 AskUserQuestion answered programmatically ⭐
 - **Goal:** Prove a multiple-choice question raised mid-session is intercepted and answered programmatically (no TTY), and the session proceeds on that answer.
