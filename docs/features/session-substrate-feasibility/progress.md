@@ -51,7 +51,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T10 — C5 test skill fixture (emits permission + AskUserQuestion/ExitPlanMode) (e54507a)
 - [x] T11 — A · C5 skill invocation through the same channels (95362da — PASS)
 - [x] T12 — A · C6 session resume by id across process runs (a5c3452 — PASS)
-- [ ] T13 — B-harness: CLI `stream-json` driver + permission-mechanism discovery
+- [x] T13 — B-harness: CLI `stream-json` driver + permission-mechanism discovery (fee27d8 — PASS)
 - [ ] T14 — B · C2 permission decision over the wire (sandboxed)
 - [ ] T15 — B · C3 AskUserQuestion over `stream-json`
 - [ ] T16 — B · C4 ExitPlanMode over `stream-json`
@@ -269,7 +269,30 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the harness runs, it SHALL parse the `stream-json` event stream and record the observed event/message shapes.
   - It SHALL record the actual on-the-wire permission mechanism on the installed CLI version (flag, hook, MCP permission tool, or none) as evidence. **(X3)**
 - **Tests:** none — harness; exercised by T14–T16.
-- **Status:** todo
+- **Status:** done (fee27d8) — **PASS**. `harness_cli.py` drives the **raw** `claude` CLI (2.1.185) over
+  `stream-json` **directly** (stdlib `subprocess` + manual NDJSON + reader threads; **no claude-agent-sdk
+  import** — substrate B is a genuinely independent fallback). Parses the event stream and records the
+  observed message/event shapes: `system`/init (session_id, tools, mcp_servers, permissionMode, model),
+  `assistant` (content blocks: thinking/text/tool_use), `user` (tool_result), `result` (subtype/usage/
+  session_id), plus the control plane `control_request`/`control_response`. **Permission mechanism on
+  2.1.185 (the discovery):** the bidirectional **stream-json control protocol** — the driver sends an
+  `initialize` control_request, the CLI sends `can_use_tool` control_requests, the driver answers with a
+  `control_response` (`{behavior:"allow", updatedInput:<input>}` or `{behavior:"deny", message:…}`). It is
+  **activated by the undocumented `--permission-prompt-tool stdio` spawn flag** (still **ABSENT from
+  `--help`** on 2.1.185 — updates ADR-001's stale v2.1.183 note): **verified live in both directions** —
+  WITHOUT the flag, **no `can_use_tool` reaches the driver** (CLI auto-decides via `--allowedTools`,
+  default-mode auto-DENY); WITH it, the round-trip works (allow → sentinel created; light deny → file
+  absent). Wire gotcha recorded: an **allow** `control_response` MUST carry `updatedInput` (else ZodError);
+  a wire **deny** still rides `subtype:success`. NOT `--permission-prompt-tool <mcp>` and NOT "none".
+  Host CLI auth, no API key; session_id scrubbed; evidence `evidence/cli_permission_mechanism.*` secret-scan
+  clean (X3); contained (temp cwd, sentinel-only allow, project-dir cleanup, no process leak). **Two fresh
+  independent reviewers (acceptance + live-reproduction, adversarial + evidence-audit) both AGREE PASS**,
+  each independently reproducing the round-trip AND the negative control (flag off → 0 `can_use_tool`).
+  Light mechanism demo only — **rigorous C2 allow/deny+containment is T14**. **ADR/P1 caveats to carry:**
+  (1) **undocumented-flag risk** — B couples directly to `--permission-prompt-tool stdio` on the host CLI
+  binary (pin/monitor the CLI version; treat a missing/changed flag as fail-clean); (2) harness gaps for
+  T15/T16 — add a `control_cancel_request` branch; (3) A-vs-B is the **same** control protocol but B
+  hand-rolls NDJSON/threads/timeouts the SDK provides → more maintenance surface + sharper version coupling.
 
 ### T14 — B · C2 permission decision over the wire (sandboxed)
 - **Goal:** Prove (or disprove) that the CLI `stream-json` path can answer a per-tool permission decision — denied tool does not execute, allowed tool does.
