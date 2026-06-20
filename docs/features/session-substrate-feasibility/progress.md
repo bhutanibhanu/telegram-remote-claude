@@ -41,7 +41,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 ## Task list
 - [x] T1 — Spike scaffold + isolated, ignored venv + recorded deps (9792e15)
 - [x] T2 — Secret scrubber utility + unit test (bc9facf)
-- [ ] T3 — Evidence recorder + transcript-capture helper
+- [x] T3 — Evidence recorder + transcript-capture helper (dc2a0c3)
 - [ ] T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe
 - [ ] T5 — A-harness: persistent session lifecycle (start/resume/send/stop)
 - [ ] T6 — A · C1 bidirectional streaming check
@@ -95,7 +95,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN a transcript is written, it SHALL pass through `scrub()` first; no raw, unscrubbed transcript is ever persisted. **(X3 precondition)**
   - WHEN a check produces no verdict (hang/crash), the recorder SHALL still write a `FAIL` with the observed reason (fail-clean), never leave an empty/silent artifact.
 - **Tests:** none — throwaway helper; correctness rides on T2's test + manual inspection of `evidence/`.
-- **Status:** todo
+- **Status:** done (dc2a0c3) — 4 independent reviewers across 3 rounds; final 2 (incl. adversarial): ALL PASS. Two real defects caught & fixed: (1) criterion id was written unscrubbed into JSON/header/filenames → now scrubbed (contents) + whitelist-sanitized (filename) + path-traversal containment; (2) fail-clean robustness — recorder-side flush failures no longer mask the original check exception, and the authoritative result JSON is written first so a failed transcript write never leaves a lone half-artifact.
 
 ### T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe
 - **Goal:** Record Python and `claude` CLI versions and empirically probe whether the Agent SDK package exists/installs (prior research got this wrong) — the first evidence artifact.
