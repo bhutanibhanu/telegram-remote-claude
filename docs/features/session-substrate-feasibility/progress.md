@@ -39,9 +39,9 @@ each task to them where relevant; they are also bound inline to the tasks they m
   evidence-producing task T4, T6–T17; consolidated final gate at T18.)
 
 ## Task list
-- [ ] T1 — Spike scaffold + isolated, ignored venv + recorded deps
-- [ ] T2 — Secret scrubber utility + unit test
-- [ ] T3 — Evidence recorder + transcript-capture helper
+- [x] T1 — Spike scaffold + isolated, ignored venv + recorded deps (9792e15)
+- [x] T2 — Secret scrubber utility + unit test (bc9facf)
+- [x] T3 — Evidence recorder + transcript-capture helper (dc2a0c3)
 - [ ] T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe
 - [ ] T5 — A-harness: persistent session lifecycle (start/resume/send/stop)
 - [ ] T6 — A · C1 bidirectional streaming check
@@ -73,7 +73,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - The production files `requirements.txt` and `requirements-dev.txt` SHALL remain byte-for-byte unchanged (verify with `git diff`). **(X2)**
   - No file under `engine/`, `bot.py`, `claude_runner.py`, `session_manager.py`, `permissions.py`, or `render.py` is created or modified (design anti-goal).
 - **Tests:** none — scaffold; verified by `git status`/`git diff` per acceptance.
-- **Status:** todo
+- **Status:** done (9792e15) — 2 independent reviewers: ALL PASS.
 
 ### T2 — Secret scrubber utility + unit test
 - **Goal:** A reusable `scrub()` that redacts tokens/keys/secrets from text before any transcript is written, with a real unit test — the one tested unit in the spike (SB3).
@@ -84,7 +84,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN `scrub()` receives text with no secrets, it SHALL return it unchanged.
   - The scrubber SHALL be the single chokepoint every transcript write passes through (see T3).
 - **Tests:** **Real pytest unit test** (`test_scrub.py`) asserting: known token shapes are redacted; benign text is preserved; idempotent on already-scrubbed text. This is the only required automated test in the spike.
-- **Status:** todo
+- **Status:** done (bc9facf) — 16 tests pass under spike-local pytest.ini; 2 independent reviewers (incl. adversarial leak/over-redaction probes): ALL PASS.
 
 ### T3 — Evidence recorder + transcript-capture helper
 - **Goal:** Shared helper that records a per-criterion `PASS/FAIL/PARTIAL` result with its captured session transcript, routing every write through the T2 scrubber.
@@ -95,7 +95,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN a transcript is written, it SHALL pass through `scrub()` first; no raw, unscrubbed transcript is ever persisted. **(X3 precondition)**
   - WHEN a check produces no verdict (hang/crash), the recorder SHALL still write a `FAIL` with the observed reason (fail-clean), never leave an empty/silent artifact.
 - **Tests:** none — throwaway helper; correctness rides on T2's test + manual inspection of `evidence/`.
-- **Status:** todo
+- **Status:** done (dc2a0c3) — 4 independent reviewers across 3 rounds; final 2 (incl. adversarial): ALL PASS. Two real defects caught & fixed: (1) criterion id was written unscrubbed into JSON/header/filenames → now scrubbed (contents) + whitelist-sanitized (filename) + path-traversal containment; (2) fail-clean robustness — recorder-side flush failures no longer mask the original check exception, and the authoritative result JSON is written first so a failed transcript write never leaves a lone half-artifact.
 
 ### T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe
 - **Goal:** Record Python and `claude` CLI versions and empirically probe whether the Agent SDK package exists/installs (prior research got this wrong) — the first evidence artifact.
