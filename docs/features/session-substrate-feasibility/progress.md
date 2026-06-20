@@ -46,14 +46,14 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T5 — A-harness: persistent session lifecycle (start/resume/send/stop) (053ca9b)
 - [x] T6 — A · C1 bidirectional streaming check (fb4247e)
 - [x] T7 — A · C2 per-tool permission decision check (sandboxed) (c8d9f3c)
-- [x] T8 — A · C3 AskUserQuestion answered programmatically (4eeaa9f — PARTIAL)
+- [x] T8 — A · C3 AskUserQuestion answered programmatically (4eeaa9f impl; b9a7360 correction — PASS native, was PARTIAL)
 - [x] T9 — A · C4 ExitPlanMode approve/reject + feedback (275a9b1 — PASS)
 - [x] T10 — C5 test skill fixture (emits permission + AskUserQuestion/ExitPlanMode) (e54507a)
 - [x] T11 — A · C5 skill invocation through the same channels (95362da — PASS)
 - [x] T12 — A · C6 session resume by id across process runs (a5c3452 — PASS)
 - [x] T13 — B-harness: CLI `stream-json` driver + permission-mechanism discovery (fee27d8 — PASS)
 - [x] T14 — B · C2 permission decision over the wire (sandboxed) (dba7d5f — PASS)
-- [ ] T15 — B · C3 AskUserQuestion over `stream-json`
+- [x] T15 — B · C3 AskUserQuestion over `stream-json` (90cdc1d — PASS native)
 - [ ] T16 — B · C4 ExitPlanMode over `stream-json`
 - [ ] T17 — `run_all.py`: C1–C6 PASS/FAIL/PARTIAL matrix (+ B contingency)
 - [ ] T18 — Draft normalized engine interface + final evidence secret-scan gate
@@ -147,7 +147,25 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Acceptance:**
   - WHEN AskUserQuestion fires mid-session, the check SHALL answer it from code with no TTY and confirm the session continued on that answer — verdict + transcript. **(X3)** *(make-or-break)*
 - **Tests:** none — verdict + transcript is the artifact.
-- **Status:** done (4eeaa9f) — **PARTIAL (not a native PASS)**. A real AskUserQuestion request was intercepted programmatically via `can_use_tool` with **no TTY**. **Native `allow` and `updated_input` injection did NOT provide a structured answer** (both return "The user did not answer the questions"). A **deny-with-answer-message workaround** caused the session to continue on the **code-selected** answer; differing **Alpha/Bravo** trials (code picked each) both echoed correctly → the selection is **code-driven**, not model prompt-following/guess. The workaround rides an **error/denial channel** (`tool_result is_error=True`) and **depends on the model interpreting natural-language text**. **No native structured AskUserQuestion answer API exists in `claude-agent-sdk==0.2.105`** (zero special-casing; callback only allows/denies). **Multi-select & complex-question robustness remain unproven.** **Substrate B must still be tested for C3 in T15** before the substrate is locked (design S1). Both independent reviewers confirmed **PARTIAL** (23/23). Feeds ADR-001 Option C / hybrid. C3 only — no C1/C2/C4–C6 claim.
+- **Status:** done (4eeaa9f impl; **corrected b9a7360**) — **C3 (A) PASS — NATIVE**. _(Original verdict was
+  PARTIAL; CORRECTED to native PASS after T15 adversarial review discovered the native answer shape — the
+  original probe injected the WRONG shape and so wrongly concluded "no native answer API exists".)_ A real
+  AskUserQuestion request is intercepted programmatically via `can_use_tool` with **no TTY** and **answered
+  NATIVELY** by returning `PermissionResultAllow(updated_input={**input, "answers": {question_text:
+  chosen_label}})` — the documented `AskUserQuestionOutput.answers` map keyed by question text → label. The
+  tool_result is **NOT an error** ("Your questions have been answered: …You can now continue with these answers
+  in mind.") and the session continues on the **code-selected** option. **Code-driven:** differing Alpha/Bravo
+  trials each continued on the code pick under a neutral prompt; adversarial review confirmed an **off-menu
+  injected answer ("Zucchini") is honored verbatim** → the SDK genuinely uses the injected map. Multi-select
+  works (comma-separated labels). The earlier wrong shapes (`selected`/`selectedOption` flags / extra top-level
+  fields) silently no-op ("The user did not answer the questions") — that was the PARTIAL root cause, a probe
+  defect, NOT a substrate limitation. The deny-with-answer-message workaround also still works and is retained
+  as a documented non-native FALLBACK (`is_error=True`). No API key; evidence `evidence/c3.*` regenerated,
+  scrubbed + secret-scan clean (X3). **Three fresh independent reviewers (acceptance + live-reproduction,
+  adversarial incl. off-menu injection, make-or-break/ADR specialist) all AGREE PASS** (and independently
+  reproduced it). **UNPROVEN / P1-must-validate:** free-text "Other" (`response` field), `annotations`, and
+  **multi-question asks (1–4 questions; only single question tested)** — build the `answers` map per-question on
+  verbatim question text. **C3 is substrate-NEUTRAL** (native PASS on A and B). C3 only — no C1/C2/C4–C6 claim.
 
 ### T9 — A · C4 ExitPlanMode approve/reject + feedback ⭐
 - **Goal:** Prove a proposed plan is surfaced and can be approved **or** rejected with feedback programmatically, and the session honors the verdict.
@@ -198,8 +216,9 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   No production files; no repo-root `.claude/`; no secrets. **Two independent reviewers (acceptance +
   adversarial) both ACCEPT** the fixture. Behavioral emission proof is deferred to T11; reviewers
   flagged for T11: **allow** the sentinel Write so the skill proceeds, and run **differing-option
-  trials** to prove the `C5_DONE` value is code-driven (C5 completion inherits C3's PARTIAL
-  deny-channel / model-interpretation caveat).
+  trials** to prove the `C5_DONE` value is code-driven. _(Update: the earlier note that "C5 completion
+  inherits C3's PARTIAL deny-channel caveat" is WITHDRAWN — C3 was subsequently corrected to a native
+  PASS on both substrates (T8/T15); C5's capability is unaffected/strengthened.)_
 
 ### T11 — A · C5 skill invocation through the same channels
 - **Goal:** Prove the C5 test skill is invoked in-session and its interactive prompts flow through the **same** permission/question/plan channels proven in C2–C4, driven to completion.
@@ -223,11 +242,13 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   options. Containment (X1): repo git status unchanged by the run (only the in-fixture sentinel
   changed); out-of-fixture/traversal Writes + Bash/Edit/ExitPlanMode denied; fixtures (incl. `.claude`
   tree) rmtree'd; policy-level, not OS sandbox. Host CLI auth, no API key; evidence `evidence/c5.*`
-  scrubbed + secret-scan clean (X3). **INHERITED CAVEAT:** the AskUserQuestion answer rides **C3's
-  PARTIAL deny-with-answer-message workaround** (`PermissionResultDeny(message=…)`, non-native — no
-  native answer API on claude-agent-sdk==0.2.105) and depends on the model interpreting the message;
-  this is C3's limitation, not a new one — C5's acceptance is channel-routing + drive-to-completion,
-  not channel nativeness. **Two fresh independent reviewers (acceptance + live-reproduction, and
+  scrubbed + secret-scan clean (X3). **C3-PATH NOTE (updated — supersedes the earlier "inherited PARTIAL
+  caveat"):** C3 is now a **native PASS** on both substrates (T8/T15) — the AskUserQuestion answer is
+  delivered natively via the documented `AskUserQuestionOutput.answers` map on the permission-**allow**
+  channel. This C5 run happened to exercise the (still-valid) deny-with-answer-message FALLBACK; **C5's
+  capability is unaffected and strengthened** — the native answer channel is available to C5's prompts too,
+  and C5's acceptance was always channel-routing + drive-to-completion (proven code-driven via differing
+  Alpha/Bravo picks), which is unchanged. **Two fresh independent reviewers (acceptance + live-reproduction, and
   adversarial + evidence-audit) both AGREE PASS**, each independently reproducing PASS; no objective
   defect (one optional regex-hardening nit that can only ever cause a false FAIL, never inflate).
   C5 only — no C1/C2/C3/C4/C6 claim beyond reusing their proven code paths.
@@ -330,7 +351,27 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Acceptance:**
   - WHEN AskUserQuestion appears in the stream, the check SHALL answer it over the wire and confirm continuation — verdict + transcript. **(X3)** *(make-or-break; tested on B unconditionally)*
 - **Tests:** none — verdict + transcript is the artifact.
-- **Status:** todo
+- **Status:** done (90cdc1d) — **C3 (B) PASS — NATIVE, over the wire**. Via the T13 `CLISessionHarness` (raw CLI
+  stream-json, no claude-agent-sdk): AskUserQuestion arrives as an **ordinary `can_use_tool` control_request**
+  (no special subtype) and is **answered programmatically (no TTY) NATIVELY** by returning an **ALLOW**
+  `control_response` whose `updatedInput` carries the **documented `AskUserQuestionOutput.answers` map keyed by
+  the question text → the code-chosen label**. The tool_result is **NOT an error** (`is_error in {None,False}`)
+  and reads "Your questions have been answered: …You can now continue with these answers in mind."; the turn
+  completes (`result subtype=success`) and the session continues on the code-selected option. **Code-driven:**
+  two trials under a neutral prompt that never names the pick each continued on the CODE-chosen label
+  (pick[0]=Alpha→Alpha, pick[1]=Bravo→Bravo); an adversarial reviewer further confirmed an **off-menu injected
+  answer ("Zucchini", not in the options) was honored verbatim** → the CLI genuinely USES the injected map,
+  not coincidental model agreement. Multi-select works via the native answers-map (comma-separated labels).
+  **This CORRECTS the earlier PARTIAL** (the prior probe injected the wrong shape — `selected`/`selectedOption`
+  flags / extra top-level fields — and so wrongly concluded "no native answer exists"). The deny-with-answer
+  workaround also still works and is retained as a documented non-native FALLBACK (rides `is_error=True`).
+  Containment (temp cwd, risky tools denied, repo unchanged); host CLI auth, no API key; evidence
+  `evidence/c3_cli.*` scrubbed + secret-scan clean (X3); harness gained an additive `control_cancel_request`
+  branch (0 observed). **Three fresh independent reviewers (acceptance + live-reproduction, adversarial incl.
+  off-menu injection, make-or-break/ADR specialist) all AGREE PASS.** **UNPROVEN / P1-must-validate:** free-text
+  "Other" (`response` field), `annotations`, and **multi-question asks (schema allows 1–4 questions; only single
+  question tested)** — P1 must build the `answers` map per-question keyed on verbatim question text and spread
+  the full original input. **C3 is substrate-NEUTRAL** (native PASS on A and B alike → does not decide A vs B).
 
 ### T16 — B · C4 ExitPlanMode over `stream-json` ⭐
 - **Goal:** Prove (or disprove) that a plan can be approved/rejected-with-feedback programmatically over the CLI `stream-json` protocol.
