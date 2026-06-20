@@ -20,7 +20,7 @@ These four shape spike effort and deliverables. Defaults applied; revise here be
 |---|---|---|
 | S1 | **Substrate coverage** | **A-first.** Test Agent SDK (A) fully against C1–C6. Always test CLI `stream-json` (B) on the make-or-break **C2/C3/C4** so the fallback is credible; test B on the remaining criteria only where A fails or is partial. |
 | S2 | **Evidence bar** | Each criterion gets a **runnable check** printing `PASS / FAIL / PARTIAL` **plus a captured session transcript/log** saved as evidence. Reproducible over hand-waving. |
-| S3 | **Spike code location + disposition** | Lives in `spikes/session-substrate/`, committed on this branch as reference, **never imported by production**, deleted before P1. Durable deliverables are the evidence log + filled ADR-001. |
+| S3 | **Spike code location + disposition** | Lives in `spikes/session-substrate/`, committed on this branch and **retained after P0** as a reproducible, non-production reference (harnesses + scrubbed evidence). **Never imported by production** (and prod never imported by it). **Not deleted at the P1 boundary**: P1 may remove it only via a **separately reviewed task, after equivalent integration evidence exists**. Durable deliverables are the evidence log + filled ADR-001; the retained tree backs them with a re-runnable reproduction. |
 | S4 | **ADR acceptance boundary** | Spike **fills** ADR-001 (Decision, Normalized engine interface, Consequences) as status **Proposed**. Owner accepts separately at **G-ADR** — matches the design doc's hard gate. Acceptance is **not** in this pipeline's scope. |
 
 ---
@@ -55,7 +55,8 @@ contract the streaming engine will be built against.
   no `session_manager.py`/`permissions.py`/`render.py`. The spike imports nothing into prod and
   prod imports nothing from the spike.
 - **No P1+ work.** No streaming engine, no live rendering, no multi-project, no real approval UI.
-- **Not a polished tool.** Throwaway harnesses; readability over robustness; deleted before P1.
+- **Not a polished tool.** Throwaway-quality harnesses (readability over robustness), but **retained
+  after P0 as a non-production reference** (S3) — not deleted at the P1 boundary.
 - **Not a substrate *implementation*.** It tests candidates and writes the decision; it does not
   build the chosen one.
 
@@ -106,8 +107,11 @@ Each criterion is proven by a runnable check (`PASS/FAIL/PARTIAL`) + a saved tra
 
 ### Future
 
-The spike's lasting output is the **Normalized engine interface** (below), which P1's streaming
-engine is built against. Nothing else from the spike survives.
+The spike's lasting *functional* output is the **Normalized engine interface** (below), which P1's
+streaming engine is built against. The spike tree itself (harnesses + scrubbed evidence) is **retained
+after P0 as a reproducible, non-production reference** (S3) — not a build input, never imported by
+production, and removable in P1 only via a separately reviewed task once equivalent integration
+evidence exists.
 
 ---
 
@@ -165,10 +169,13 @@ This is a *draft contract for P1*, not an implementation. No engine is built in 
 - **Testing strategy.** No unit-test suite for throwaway harnesses; the *evidence* (runnable
   checks + transcripts) is the verification artifact. The repo's existing 53-test snapshot is **not
   touched** and not used as a gate here.
-- **CI.** None for the spike (CI is stood up in P1). The merge artifact is docs + ADR, not code.
+- **CI.** None for the spike (CI is stood up in P1). The production deliverable is docs + ADR, not
+  code; the retained spike tree (S3) lands as reference only, behind no CI gate.
 - **Docs / merge artifact.** What lands on `main` via this pipeline: this `design.md`, the evidence
-  log, and the filled **ADR-001 (Proposed)**. The `spikes/` tree is reference-only and removed
-  before P1.
+  log, the filled **ADR-001 (Proposed)**, and the `spikes/session-substrate/` tree itself —
+  **retained as a reproducible, non-production reference** (S3), never imported by production. It is
+  **not removed at the P1 boundary**; P1 may remove it only through a separately reviewed task after
+  equivalent integration evidence exists.
 
 ---
 
@@ -201,10 +208,17 @@ This is a *draft contract for P1*, not an implementation. No engine is built in 
 
 **In scope (P0 / this pipeline):** preflight + two throwaway harnesses + test skill; runnable
 C1–C6 checks with captured transcripts; the C1–C6 evidence matrix; the drafted normalized engine
-interface; ADR-001 filled to *Proposed*; a go/no-go writeup.
+interface; ADR-001 filled to *Proposed*; a go/no-go writeup. The `spikes/session-substrate/` tree
+(harnesses + scrubbed evidence) **lands on `main` and is retained** as a reproducible, non-production
+reference (S3).
 
 **Out of scope (deferred to P1+):** the streaming engine, live rendering, permission UI,
 multi-project, restart recovery, concurrency, CI — none begin until ADR-001 is accepted.
+
+**Spike retention & removal.** The `spikes/session-substrate/` tree stays after P0 as a non-production
+reference and **must never be imported by production**. Removing it is **not** part of P0 and **not**
+an automatic P1 step: P1 may delete it only through a **separately reviewed task, after equivalent
+integration evidence exists**.
 
 **Expected build order (input to `/plan` — do not execute yet):**
 1. **Step 0 — Preflight:** record Python + `claude` CLI versions; probe Agent SDK existence/version.
