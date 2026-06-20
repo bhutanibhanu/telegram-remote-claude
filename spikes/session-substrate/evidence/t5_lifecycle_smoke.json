@@ -1,0 +1,8 @@
+{
+  "criterion": "t5_lifecycle_smoke",
+  "verdict": "PASS",
+  "observed_reason": "start / send x2 (multi-turn) / stop OK; stable session_id=7f00613d-5bbd-4f57-8cd2-a9ad75009b39; events streamed both turns; clean disconnect, no leaked CLI process.",
+  "timestamp": "2026-06-20T19:37:12.406779+00:00",
+  "transcript_path": "t5_lifecycle_smoke.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

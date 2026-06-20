@@ -1,0 +1,18 @@
+# criterion: t5_lifecycle_smoke
+# verdict: PASS
+# observed_reason: start / send x2 (multi-turn) / stop OK; stable session_id=7f00613d-5bbd-4f57-8cd2-a9ad75009b39; events streamed both turns; clean disconnect, no leaked CLI process.
+# timestamp: 2026-06-20T19:37:12.406779+00:00
+------------------------------------------------------------
+=== T5 SELF-CHECK — substrate A persistent session lifecycle ===
+sdk: claude-agent-sdk==0.2.105
+ANTHROPIC_API_KEY set: False (must be False — no API key)
+cwd (temp, isolated from repo): /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t5_sdk_1oii6o4v
+start(): connected; child claude pids now: [64565]
+turn1: msgs=4 session_id=7f00613d-5bbd-4f57-8cd2-a9ad75009b39 text~='TURN1_OK'
+turn2: msgs=3 session_id=7f00613d-5bbd-4f57-8cd2-a9ad75009b39 text~='TURN2_OK'
+stop(): disconnected
+leak-check: before=[] after=[] leaked=[]
+checks: turns_ok=True session_stable=True streamed=True no_leak=True
+
+VERDICT: PASS
+REASON: start / send x2 (multi-turn) / stop OK; stable session_id=7f00613d-5bbd-4f57-8cd2-a9ad75009b39; events streamed both turns; clean disconnect, no leaked CLI process.
