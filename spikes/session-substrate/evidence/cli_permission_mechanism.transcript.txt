@@ -1,0 +1,47 @@
+# criterion: cli_permission_mechanism
+# verdict: PASS
+# observed_reason: Raw `claude` CLI driven bidirectionally over stream-json: initialize handshake succeeded, NDJSON event stream parsed (system/init, assistant, user, result), and the programmatic permission mechanism WORKS — with `--permission-prompt-tool stdio` set, a can_use_tool control_request arrived over the wire and our allow control_response was honored (sentinel created with HELLO). Mechanism = stream-json control protocol, ACTIVATED by the undocumented `--permission-prompt-tool stdio` spawn flag (absent from --help: present_in_help=False). Light deny demo over the same channel: deny_honored=True (denied Write produced no file). Rigorous allow+deny+containment proof is T14.
+# timestamp: 2026-06-20T22:41:32.103584+00:00
+------------------------------------------------------------
+=== T13 DISCOVERY — substrate B: raw `claude` CLI stream-json driver ===
+claude --version: 2.1.185 (Claude Code)
+ANTHROPIC_API_KEY set: False (must be False — no API key)
+`--permission-prompt-tool` present in --help: False (ABSENT from --help, but the flag IS accepted and functional — it is the undocumented switch whose value `stdio` routes can_use_tool over the wire)
+cwd (temp, isolated from repo): /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t13_cli_xtoil20y
+spawn command: claude --output-format stream-json --verbose -p --input-format stream-json --permission-mode default --permission-prompt-tool stdio --allowedTools Read,LS,Glob,Grep --disallowedTools Bash,Edit,NotebookEdit,WebFetch,WebSearch
+start(): subprocess spawned; reader thread running
+initialize(): control_response received; reply keys=['account', 'agents', 'available_output_styles', 'commands', 'feedback_survey_config', 'models', 'output_style', 'pid']
+send prompt: 'Create a file named t13_probe.txt in the current directory containing exactly the text HELLO using the Write tool. Do not use any other tool.'
+  assistant content blocks: ['thinking']
+  assistant content blocks: ["tool_use(name='Write', input_keys=['content', 'file_path'])"]
+  user(tool_result) blocks: ['tool_result(is_error=None)']
+    tool_result content: 'File created successfully at: /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t13_cli_xtoil20y/t13_probe.txt (file state is current in your context — no need to Read it back)'
+  assistant content blocks: ['text(len=76)']
+  result: subtype='success' is_error=False num_turns=2 session_id=[REDACTED]
+
+observed event types (count): {'system': 1, 'rate_limit_event': 1, 'assistant': 3, 'user': 1, 'result': 1}
+can_use_tool control_request observed: True
+can_use_tool request shape: {'tool_name': 'Write', 'input_keys': ['content', 'file_path'], 'meta_keys': ['description', 'display_name', 'permission_suggestions', 'tool_use_id']}
+permission decisions taken: ['ALLOW Write -> /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t13_cli_xtoil20y/t13_probe.txt']
+assistant tool_use observed: True
+sentinel t13_probe.txt: exists=True content='HELLO'
+
+send prompt (deny demo): 'Now create a file named t13_should_not_exist.txt in the current directory containing the text NOPE using the Write tool.'
+  deny result: subtype='success' is_error=False
+deny demo: denied-target exists=False (expected False); deny_honored=True; can_use_tool seen for denied write=False
+stop(): stdin closed, subprocess terminated, threads joined
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t13-cli-xtoil20y']
+
+=== PERMISSION MECHANISM (T13 finding, CLI on this host) ===
+Mechanism: the bidirectional stream-json CONTROL PROTOCOL, ACTIVATED by the
+undocumented `--permission-prompt-tool stdio` spawn flag.
+  * Spawn `claude --output-format stream-json --verbose -p --input-format stream-json --permission-prompt-tool stdio [--permission-mode default]`.
+  * The driver sends an `initialize` control_request on stdin (control handshake) and then user messages as {type:user,message:{role,content},...}.
+  * With `--permission-prompt-tool stdio` set, the CLI routes per-tool permission checks BACK to the driver as `can_use_tool` control_request frames; the driver answers each with a `control_response` (`{behavior:allow,updatedInput}` or `{behavior:deny,message}`).
+  * THE SWITCH (T13 key finding): `--permission-prompt-tool stdio` is what enables the round-trip. WITHOUT the flag, the CLI auto-decides tools itself from --allowedTools / --permission-mode and NEVER emits can_use_tool — verified live (a run with the flag absent: Write was auto-handled by the CLI, NO can_use_tool reached the driver). The SDK sets this flag to `stdio` automatically whenever a can_use_tool callback is provided (claude_agent_sdk/_internal/client.py: permission_prompt_tool_name='stdio').
+  * ALLOW WIRE SHAPE GOTCHA (T13 key finding): an allow control_response MUST carry `updatedInput` as a record; omitting it returns 'Tool permission request failed: ZodError ... expected record' and the tool fails. The harness defaults `updatedInput` to the original tool input on allow (mirrors the SDK).
+  * `initialize` handshake completed: True (sent matching the SDK; the activating switch is the spawn flag, not the initialize frame).
+  * `--permission-prompt-tool` present in --help: False. UPDATES ADR-001's stale note (was: 'absent on v2.1.183'): on THIS version (2.1.185) the flag is STILL ABSENT FROM --help, but it IS accepted and functional — the real programmatic permission mechanism is `--permission-prompt-tool stdio` + the stream-json control protocol, NOT a separate MCP permission tool and NOT 'none'.
+
+VERDICT: PASS
+REASON: Raw `claude` CLI driven bidirectionally over stream-json: initialize handshake succeeded, NDJSON event stream parsed (system/init, assistant, user, result), and the programmatic permission mechanism WORKS — with `--permission-prompt-tool stdio` set, a can_use_tool control_request arrived over the wire and our allow control_response was honored (sentinel created with HELLO). Mechanism = stream-json control protocol, ACTIVATED by the undocumented `--permission-prompt-tool stdio` spawn flag (absent from --help: present_in_help=False). Light deny demo over the same channel: deny_honored=True (denied Write produced no file). Rigorous allow+deny+containment proof is T14.

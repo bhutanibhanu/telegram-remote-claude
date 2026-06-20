@@ -1,0 +1,8 @@
+{
+  "criterion": "cli_permission_mechanism",
+  "verdict": "PASS",
+  "observed_reason": "Raw `claude` CLI driven bidirectionally over stream-json: initialize handshake succeeded, NDJSON event stream parsed (system/init, assistant, user, result), and the programmatic permission mechanism WORKS — with `--permission-prompt-tool stdio` set, a can_use_tool control_request arrived over the wire and our allow control_response was honored (sentinel created with HELLO). Mechanism = stream-json control protocol, ACTIVATED by the undocumented `--permission-prompt-tool stdio` spawn flag (absent from --help: present_in_help=False). Light deny demo over the same channel: deny_honored=True (denied Write produced no file). Rigorous allow+deny+containment proof is T14.",
+  "timestamp": "2026-06-20T22:41:32.103584+00:00",
+  "transcript_path": "cli_permission_mechanism.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}
