@@ -1,0 +1,61 @@
+# criterion: c2
+# verdict: PASS
+# observed_reason: Genuine per-tool SDK permission decision honored: Write to denied-marker was DENIED via can_use_tool and did NOT execute (file absent); Write to allowed-marker was ALLOWED and executed (file present with sentinel). Same tool, opposite outcomes via the callback (not global disabling); callback fired both times (not refusal/no-call); repo untouched; containment enforced.
+# timestamp: 2026-06-20T20:10:03.642666+00:00
+------------------------------------------------------------
+=== T7 / C2 — per-tool permission decision check (substrate A, sandboxed) ===
+sdk: claude-agent-sdk==0.2.105
+ANTHROPIC_API_KEY set: False (must be False)
+permission_mode=default; Write is NOT in allowed/ disallowed lists (callback is the sole decision point; no bypass/skip).
+disposable fixture (outside repo): /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0
+
+# containment policy unit-check (pure decide()):
+  inside/allowed   -> allow (policy: allowed-marker.txt permitted inside fixture)
+  inside/denied    -> deny  (policy: deny-by-default (only allowed-marker.txt permitted))
+  outside fixture  -> deny  (containment: target resolves OUTSIDE fixture)
+  traversal        -> deny  (containment: target resolves OUTSIDE fixture)
+
+start(): session connected
+
+--- turn 1 ---
+  [tool_use]    Write {'file_path': '/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0/denied-marker.txt', 'content': '<14 chars>'}
+  [tool_result] is_error=True policy: deny-by-default (only allowed-marker.txt permitted)
+  [tool_use_result] Error: policy: deny-by-default (only allowed-marker.txt permitted)
+  turn 1: tool_use=1 tool_results=2 text_msgs=1 result_is_error=False
+
+--- turn 2 ---
+  [tool_use]    Write {'file_path': '/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0/allowed-marker.txt', 'content': '<10 chars>'}
+  [tool_result] is_error=None File created successfully at: /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0/allowed-marker.txt (file state is curr
+  [tool_use_result] {'type': 'create', 'filePath': '/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0/allowed-marker.txt', 'content': 'ALL
+  turn 2: tool_use=1 tool_results=2 text_msgs=2 result_is_error=False
+
+stop(): disconnected
+
+# recorded permission decisions (callback log, in order):
+    8378.0ms  Write   deny   target=/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0/denied-marker.txt  reason=policy: deny-by-default (only allowed-marker.txt permitted)  input={'file_path': '/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0/denied-marker.txt', 'content': '<14 chars>'}
+   17056.3ms  Write   allow  target=/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0/allowed-marker.txt  reason=policy: allowed-marker.txt permitted inside fixture  input={'file_path': '/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0/allowed-marker.txt', 'content': '<10 chars>'}
+
+# filesystem proof:
+  denied-marker exists?  False   (expected: False -> not executed)
+  allowed-marker exists? True  content_has_sentinel=True (expected: True / True)
+  repo NEW changes during run: NONE (expected NONE -> tool activity did not touch the repo)
+  (pre-existing uncommitted entries, ignored as not run-induced: ['?? spikes/session-substrate/checks/c2_permission.py', '?? spikes/session-substrate/evidence/c2.json', '?? spikes/session-substrate/evidence/c2.transcript.txt'])
+
+# distinguishers:
+  denied callback fired (model DID attempt Write -> not refusal/no-call): True
+  allowed callback fired: True
+  denied NOT executed (blocked before exec, not post-exec failure): True
+  allowed executed with expected content: True
+  same tool (Write) denied once + allowed once -> NOT global disabling: True
+  repository untouched by run (no new changes): True
+
+cleanup: removed fixture /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t7_c2_njkhxkv0 (exists now: False)
+
+Limitations / scope:
+- Proves C2 (per-tool permission decision) ONLY; no claim about C1/C3-C6.
+- Containment is enforced by the callback resolving the target path; the SDK still
+  runs the tool in-process, so containment is policy-level (callback denies out-of-
+  fixture targets), not an OS sandbox. Effects were confined to a temp dir; repo untouched.
+- Single host/run; verdict reproducible, session_id/paths are not.
+VERDICT: PASS
+REASON: Genuine per-tool SDK permission decision honored: Write to denied-marker was DENIED via can_use_tool and did NOT execute (file absent); Write to allowed-marker was ALLOWED and executed (file present with sentinel). Same tool, opposite outcomes via the callback (not global disabling); callback fired both times (not refusal/no-call); repo untouched; containment enforced.
