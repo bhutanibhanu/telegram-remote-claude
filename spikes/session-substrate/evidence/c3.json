@@ -1,0 +1,8 @@
+{
+  "criterion": "c3",
+  "verdict": "PARTIAL",
+  "observed_reason": "C3 ACHIEVABLE but NOT natively. Allowing AskUserQuestion returns 'The user did not answer'; no native answer API exists. The session CAN be driven on a code-chosen answer (no TTY) via a deny-with-answer-message workaround: across two trials the model echoed exactly the option the CODE selected (pick[0]='Alpha', pick[1]='Bravo', differing -> proves code-driven, not model cooperation/prompt-following). Caveat: the answer rides the permission-deny channel (tool_result is_error), relies on the model interpreting the message, and is not a structured native selection — relevant to ADR-001 Option C / hybrid.",
+  "timestamp": "2026-06-20T20:30:47.909243+00:00",
+  "transcript_path": "c3.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

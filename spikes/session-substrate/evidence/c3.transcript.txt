@@ -1,0 +1,47 @@
+# criterion: c3
+# verdict: PARTIAL
+# observed_reason: C3 ACHIEVABLE but NOT natively. Allowing AskUserQuestion returns 'The user did not answer'; no native answer API exists. The session CAN be driven on a code-chosen answer (no TTY) via a deny-with-answer-message workaround: across two trials the model echoed exactly the option the CODE selected (pick[0]='Alpha', pick[1]='Bravo', differing -> proves code-driven, not model cooperation/prompt-following). Caveat: the answer rides the permission-deny channel (tool_result is_error), relies on the model interpreting the message, and is not a structured native selection — relevant to ADR-001 Option C / hybrid.
+# timestamp: 2026-06-20T20:30:47.909243+00:00
+------------------------------------------------------------
+=== T8 / C3 — AskUserQuestion answered programmatically (substrate A) ===
+sdk: claude-agent-sdk==0.2.105
+ANTHROPIC_API_KEY set: False (must be False)
+Mechanism note: SDK has no native AskUserQuestion answer API; can_use_tool only allows(+updatedInput)/denies(+message). Probing native vs workaround.
+
+--- TRIAL native_allow (expect: NOT answered) ---
+  session_id: be9653bc-45e7-4233-be83-6419eb1e19c9
+  AskUserQuestion fired: 1  options_presented: ['Alpha', 'Bravo']
+  tool_result is_error=None: 'The user did not answer the questions.'
+  model final: "You didn't make a selection (the question was dismissed), so there's no label to report. If you'd like, run it again and pick Alpha or Bravo, and I'll reply wit"
+
+--- TRIAL workaround_deny pick[0] ---
+  session_id: bc7b9eba-05c1-4ae3-b1d0-56caeeb82749
+  AskUserQuestion fired: 1  options_presented: ['Alpha', 'Bravo']
+  code-chosen label (via deny message): 'Alpha'
+  tool_result is_error=True: 'The user selected: Alpha'
+  model final: 'FINAL_PICK=Alpha'
+
+--- TRIAL workaround_deny pick[1] ---
+  session_id: 7d9caa3a-26e5-4cc2-9cff-70e1665b68cd
+  AskUserQuestion fired: 1  options_presented: ['Alpha', 'Bravo']
+  code-chosen label (via deny message): 'Bravo'
+  tool_result is_error=True: 'The user selected: Bravo'
+  model final: 'FINAL_PICK=Bravo'
+
+=== C3 evaluation ===
+native_answered (allow path returns a selection): False
+workaround pick[0] echoed code choice 'Alpha': True
+workaround pick[1] echoed code choice 'Bravo': True
+code-driven (both matched AND choices differ -> not model cooperation/prompt): True
+
+Distinguishers / limitations:
+- AskUserQuestion genuinely fired as a real tool_use each trial (can_use_tool intercepted it),
+  so this is not model refusal or the model declining to call the tool.
+- The neutral prompt never says which option to pick; the CODE chose it. Two trials with
+  DIFFERENT code picks both echoed correctly -> the answer is code-driven, not prompt/coincidence.
+- Native answering is unsupported on this SDK version; the working path is a deny-message
+  workaround (permission-channel), not a structured native answer. This is the make-or-break
+  nuance for ADR-001 (substrate A may need a hybrid/workaround for C3).
+- C3 only; no claim about C1/C2/C4-C6.
+VERDICT: PARTIAL
+REASON: C3 ACHIEVABLE but NOT natively. Allowing AskUserQuestion returns 'The user did not answer'; no native answer API exists. The session CAN be driven on a code-chosen answer (no TTY) via a deny-with-answer-message workaround: across two trials the model echoed exactly the option the CODE selected (pick[0]='Alpha', pick[1]='Bravo', differing -> proves code-driven, not model cooperation/prompt-following). Caveat: the answer rides the permission-deny channel (tool_result is_error), relies on the model interpreting the message, and is not a structured native selection — relevant to ADR-001 Option C / hybrid.
