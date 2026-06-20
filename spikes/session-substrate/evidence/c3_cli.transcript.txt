@@ -1,0 +1,98 @@
+# criterion: c3_cli
+# verdict: PASS
+# observed_reason: C3 ACHIEVED NATIVELY on substrate B (over the wire). AskUserQuestion arrives as an ordinary can_use_tool control_request (no special subtype) and is answered programmatically (no TTY) by returning an ALLOW control_response whose updatedInput carries the documented AskUserQuestionOutput `answers` map keyed by the question text -> the code-chosen label. The tool_result is NOT an error (is_error in {None,False}) and reads 'Your questions have been answered: ...You can now continue with these answers in mind.', the turn completes (result subtype=success), and the session continues on the code-selected option. Proven code-driven: two trials under a neutral prompt that never names the pick each echoed exactly the option the CODE chose (pick[0]='Alpha', pick[1]='Bravo'; differing -> not model guess/prompt-following). Native multi-select via the answers-map also works (multi_native=True). This CORRECTS the earlier PARTIAL verdict, which injected the WRONG answer shape (options[i].selected / selectedOption flags, or extra top-level answer/answers decision fields instead of the documented `answers` map keyed by question text) and so wrongly claimed 'no native structured-answer field over the wire'. Caveats: the native answer is delivered by injecting the tool's documented output `answers` map through the permission-allow updatedInput channel; free-text 'Other' (the `response` field) is a separate path not exercised here; multi-select robustness on complex/multi-question asks beyond this 3-option probe is unproven. The deny-with-answer-message workaround ALSO works (non-native, rides the error channel; w0_match=True) but is not the basis of this verdict. Substrate A's C3 (T8) reaches the SAME native PASS via the same answers-map mechanism.
+# timestamp: 2026-06-20T23:24:17.896656+00:00
+------------------------------------------------------------
+=== T15 / C3 — AskUserQuestion answered programmatically OVER THE WIRE (substrate B) ===
+substrate B: raw `claude` CLI over stream-json control protocol (NO claude-agent-sdk).
+claude --version: 2.1.185 (Claude Code)
+ANTHROPIC_API_KEY set: False (must be False)
+Mechanism note: AskUserQuestion arrives as an ORDINARY can_use_tool control_request (no special subtype). The NATIVE answer is delivered by returning an ALLOW whose updatedInput carries the documented AskUserQuestionOutput `answers` map keyed by the question text -> selected label. CORRECTION: the earlier PARTIAL verdict injected the WRONG shape (options[i].selected / selectedOption flags, or extra top-level answer/answers decision fields) and so wrongly concluded 'no native structured-answer field over the wire'. The accurate finding is below.
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t15-c3-cli-vjkwj0rz']
+
+--- TRIAL native_allow pick[0] (PRIMARY) ---
+  session_id: [REDACTED]
+  AskUserQuestion fired: 1  question: 'Pick one option'  options_presented: ['Alpha', 'Bravo']  multiSelect: False  meta_keys: ['display_name', 'tool_use_id']
+  code-chosen label(s): 'Alpha'
+  tool_result is_error=None: 'Your questions have been answered: "Pick one option"="Alpha". You can now continue with these answers in mind.'
+  result: subtype='success' is_error=False
+  control_cancel_request frames seen: 0
+  model final: 'FINAL_PICK=Alpha'
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t15-c3-cli-wux-4wyl']
+
+--- TRIAL native_allow pick[1] (PRIMARY) ---
+  session_id: [REDACTED]
+  AskUserQuestion fired: 1  question: 'Pick one option'  options_presented: ['Alpha', 'Bravo']  multiSelect: False  meta_keys: ['display_name', 'tool_use_id']
+  code-chosen label(s): 'Bravo'
+  tool_result is_error=None: 'Your questions have been answered: "Pick one option"="Bravo". You can now continue with these answers in mind.'
+  result: subtype='success' is_error=False
+  control_cancel_request frames seen: 0
+  model final: 'FINAL_PICK=Bravo'
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t15-c3-cli-0yaasbpn']
+
+--- TRIAL native_allow multiselect (informational) ---
+  session_id: [REDACTED]
+  AskUserQuestion fired: 1  question: 'Pick colors'  options_presented: ['Red', 'Green', 'Blue']  multiSelect: True  meta_keys: ['display_name', 'tool_use_id']
+  code-chosen label(s): 'Red, Blue'
+  tool_result is_error=None: 'Your questions have been answered: "Pick colors"="Red, Blue". You can now continue with these answers in mind.'
+  result: subtype='success' is_error=False
+  control_cancel_request frames seen: 0
+  model final: 'FINAL_PICKS=Red, Blue'
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t15-c3-cli-6swokw3p']
+
+--- TRIAL workaround_deny pick[0] (SECONDARY, non-native) ---
+  session_id: [REDACTED]
+  AskUserQuestion fired: 1  question: 'Pick one option'  options_presented: ['Alpha', 'Bravo']  multiSelect: False  meta_keys: ['display_name', 'tool_use_id']
+  code-chosen label(s): 'Alpha'
+  tool_result is_error=True: 'The user selected: Alpha'
+  result: subtype='success' is_error=False
+  control_cancel_request frames seen: 0
+  model final: 'FINAL_PICK=Alpha'
+
+=== C3 (substrate B) evaluation ===
+native pick[0] answered over allow channel (no error, 'answered', echoed 'Alpha', turn success=True): True
+  -> native pick[0] tool_result(s): [(None, 'Your questions have been answered: "Pick one option"="Alpha". You can now continue with these answers in mind.')]
+native pick[1] answered over allow channel (no error, 'answered', echoed 'Bravo', turn success=True): True
+code picks differ across native trials (Alpha vs Bravo): True
+NATIVE code-driven (both native trials answered + choices differ -> NOT model guess/prompt-following): True
+session continued on the code answer both native trials (result subtype=success): True
+native multi-select answered via answers-map (informational, not gating): True (multiSelect=True, final='FINAL_PICKS=Red, Blue')
+SECONDARY deny-with-answer-message workaround echoed code choice 'Alpha' (informational, NON-native, rides error channel): True (tool_result is_error=[True])
+repository untouched by run (no new git changes): True (new changes: NONE)
+control_cancel_request frames seen across trials: 0 (0 expected -> the additive harness branch was defensive, not exercised)
+
+Distinguishers / limitations (substrate B C3):
+- HOW AskUserQuestion appears over the wire: an ORDINARY can_use_tool control_request
+  (request.input.questions[].options[].label + multiSelect; meta has display_name+tool_use_id).
+  NOT a distinct message/control subtype -- it is not special-cased on the wire.
+- NATIVE answer mechanism: return an ALLOW control_response whose updatedInput is
+  {**input, 'answers': {<question text>: <chosen label>}}. The documented
+  AskUserQuestionOutput `answers` map is keyed by QUESTION TEXT -> selected label
+  (multi-select: comma-separated labels in the one string; optional `response` = 'Other').
+- RESULT (verified live): tool_result is NOT an error (is_error in {None,False}) and reads
+  'Your questions have been answered: "<q>"="<label>". You can now continue with these
+  answers in mind.'; the turn result subtype is success -> a GENUINE structured native
+  answer over the ALLOW channel.
+- CORRECTION: the earlier PARTIAL verdict injected the WRONG shape (options[i].selected /
+  selectedOption flags, or extra top-level answer/answers decision fields) instead of the
+  documented `answers` map keyed by question text, and so wrongly concluded 'no native
+  structured-answer field over the wire'. That claim is REMOVED.
+- AskUserQuestion genuinely fired as a real can_use_tool over the wire each trial (callback
+  intercepted it) -> not model refusal / not the model declining to call the tool.
+- The neutral prompt never says which option to pick; the CODE chose it. Two NATIVE trials
+  with DIFFERENT code picks (Alpha vs Bravo) both echoed correctly -> code-driven, no TTY.
+- Native multi-select: works via the SAME answers-map (multiSelect=true input, two labels
+  comma-separated in the one answer string, both echoed). Robustness on complex questions unproven.
+- SECONDARY (non-native): the deny-with-answer-message workaround ALSO drives the session,
+  but rides the permission-DENY/error channel (tool_result is_error=True) and relies on the
+  model interpreting natural-language text. Retained as an alternative mechanism only.
+- Containment (X1): text-only Q&A, every risky tool denied, disposable temp cwd, repo untouched;
+  policy-level, not OS sandbox.
+- Harness: an ADDITIVE control_cancel_request branch was added to harness_cli.py (T13 reviewer
+  flag) so a cancel frame is dropped rather than mis-delivered as a turn event; it was 0 in
+  every AskUserQuestion flow observed -> defensive, not required for this verdict.
+- This is SUBSTRATE B's INDEPENDENT C3 result. It matches A's C3 = native PASS: BOTH
+  substrates answer AskUserQuestion natively via the documented answers-map on the allow channel.
+- C3 only; no claim about C1/C2/C4-C6.
+VERDICT: PASS
+REASON: C3 ACHIEVED NATIVELY on substrate B (over the wire). AskUserQuestion arrives as an ordinary can_use_tool control_request (no special subtype) and is answered programmatically (no TTY) by returning an ALLOW control_response whose updatedInput carries the documented AskUserQuestionOutput `answers` map keyed by the question text -> the code-chosen label. The tool_result is NOT an error (is_error in {None,False}) and reads 'Your questions have been answered: ...You can now continue with these answers in mind.', the turn completes (result subtype=success), and the session continues on the code-selected option. Proven code-driven: two trials under a neutral prompt that never names the pick each echoed exactly the option the CODE chose (pick[0]='Alpha', pick[1]='Bravo'; differing -> not model guess/prompt-following). Native multi-select via the answers-map also works (multi_native=True). This CORRECTS the earlier PARTIAL verdict, which injected the WRONG answer shape (options[i].selected / selectedOption flags, or extra top-level answer/answers decision fields instead of the documented `answers` map keyed by question text) and so wrongly claimed 'no native structured-answer field over the wire'. Caveats: the native answer is delivered by injecting the tool's documented output `answers` map through the permission-allow updatedInput channel; free-text 'Other' (the `response` field) is a separate path not exercised here; multi-select robustness on complex/multi-question asks beyond this 3-option probe is unproven. The deny-with-answer-message workaround ALSO works (non-native, rides the error channel; w0_match=True) but is not the basis of this verdict. Substrate A's C3 (T8) reaches the SAME native PASS via the same answers-map mechanism.

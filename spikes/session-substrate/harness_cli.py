@@ -228,6 +228,9 @@ class CLISessionHarness:
         self.init_frame: Optional[Dict[str, Any]] = None
         #: Every can_use_tool request the CLI sent us (shape evidence for T13).
         self.permission_requests: List[Dict[str, Any]] = []
+        #: Count of control_cancel_request frames seen (T15 additive fix; 0 in
+        #: every observed AskUserQuestion flow -- exposed so checks can assert it).
+        self._cancel_requests_seen = 0
 
     # -- command building (mirrors the SDK's _build_command, by hand) ----------
 
@@ -474,6 +477,21 @@ class CLISessionHarness:
             return
         if mtype == "control_request":
             self._handle_control_request(msg)
+            return
+        if mtype == "control_cancel_request":
+            # T15 additive fix: the CLI can abandon an in-flight control_request
+            # (e.g. a can_use_tool permission prompt) and tell us via a
+            # control_cancel_request carrying the original request_id. This driver
+            # answers can_use_tool *synchronously* inside the reader thread, so by
+            # the time such a cancel could be processed the response is already
+            # sent (no stale-response hazard for the synchronous path). The frame
+            # is handled here purely so it is NOT mis-delivered into the caller's
+            # turn event queue as a spurious event. We mirror the SDK
+            # (_internal/query.py: control_cancel_request -> cancel, no response)
+            # by simply dropping it -- a cancelled request must NOT be answered.
+            # NOTE (T15 empirical): across every AskUserQuestion session in T15,
+            # NO control_cancel_request was observed; this branch is defensive.
+            self._cancel_requests_seen += 1
             return
         # system/init: capture the init frame eagerly (even before send() runs).
         if mtype == "system" and msg.get("subtype") == "init":
