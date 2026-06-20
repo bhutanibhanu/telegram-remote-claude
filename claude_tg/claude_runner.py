@@ -129,68 +129,102 @@ class ClaudeRunner:
             raise ClaudeBusy()
 
         async with lock:
-            cmd = self._build_cmd(chat_id)
             cwd = self.get_cwd(chat_id)
-            try:
-                code, out, err = await self._invoke(cmd, prompt, cwd)
-            except asyncio.TimeoutError:
-                return ClaudeResult(
-                    ok=False, text="",
-                    error=f"Claude timed out after {self.config.timeout_seconds}s.",
-                )
-            except FileNotFoundError:
-                return ClaudeResult(
-                    ok=False, text="",
-                    error=f"Claude binary not found: {self.config.claude_bin!r}. Set CLAUDE_BIN.",
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                log.exception("claude invocation failed")
-                return ClaudeResult(ok=False, text="", error=f"Failed to run Claude: {exc}")
-
-            data = self._parse(out)
-            if data is None:
-                fallback = (out.strip() or err.strip())
-                if fallback and code == 0:
-                    return ClaudeResult(ok=True, text=fallback)
-                return ClaudeResult(
-                    ok=False, text="",
-                    error=(err.strip() or f"Claude exited with code {code} and no parseable output.")[:1500],
-                )
-
-            session_id = data.get("session_id")
-            if session_id:
-                self._sessions[chat_id] = session_id
+            had_session = chat_id in self._sessions
+            result = await self._run_once(chat_id, prompt, cwd)
+            # If resuming an expired/missing session failed, drop the dead session
+            # id and retry once fresh — otherwise the chat would stay stuck failing
+            # every message until the user manually ran /reset.
+            if had_session and not result.ok and self._is_resume_failure(result):
+                log.info("resume failed for chat %s; clearing session and retrying fresh", chat_id)
+                self._sessions.pop(chat_id, None)
                 self._persist(chat_id)
+                result = await self._run_once(chat_id, prompt, cwd)
+            return result
 
-            result_text = data.get("result")
-            if not isinstance(result_text, str):
-                result_text = ""
+    async def _run_once(self, chat_id: int, prompt: str, cwd: str) -> ClaudeResult:
+        cmd = self._build_cmd(chat_id)
+        try:
+            code, out, err = await self._invoke(cmd, prompt, cwd)
+        except asyncio.TimeoutError:
+            return ClaudeResult(
+                ok=False, text="",
+                error=f"Claude timed out after {self.config.timeout_seconds}s.",
+            )
+        except FileNotFoundError:
+            return ClaudeResult(
+                ok=False, text="",
+                error=f"Claude binary not found: {self.config.claude_bin!r}. Set CLAUDE_BIN.",
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("claude invocation failed")
+            return ClaudeResult(ok=False, text="", error=f"Failed to run Claude: {exc}")
 
-            subtype = data.get("subtype")
-            is_error = bool(data.get("is_error")) or (subtype is not None and subtype != "success")
-            if is_error or code != 0:
-                msg = result_text or err.strip() or f"Claude reported an error (subtype={subtype})."
-                return ClaudeResult(ok=False, text=result_text, session_id=session_id, error=msg[:1500])
+        data = self._parse(out)
+        if data is None:
+            fallback = (out.strip() or err.strip())
+            if fallback and code == 0:
+                return ClaudeResult(ok=True, text=fallback)
+            return ClaudeResult(
+                ok=False, text="",
+                error=(err.strip() or f"Claude exited with code {code} and no parseable output.")[:1500],
+            )
 
-            return ClaudeResult(ok=True, text=result_text, session_id=session_id)
+        session_id = data.get("session_id")
+        if session_id:
+            self._sessions[chat_id] = session_id
+            self._persist(chat_id)
+
+        result_text = data.get("result")
+        if not isinstance(result_text, str):
+            result_text = ""
+
+        subtype = data.get("subtype")
+        is_error = bool(data.get("is_error")) or (subtype is not None and subtype != "success")
+        if is_error or code != 0:
+            msg = result_text or err.strip() or f"Claude reported an error (subtype={subtype})."
+            return ClaudeResult(ok=False, text=result_text, session_id=session_id, error=msg[:1500])
+
+        return ClaudeResult(ok=True, text=result_text, session_id=session_id)
+
+    @staticmethod
+    def _is_resume_failure(result: ClaudeResult) -> bool:
+        """Heuristic: did a --resume turn fail because the session is gone?"""
+        err = (result.error or "").lower()
+        if "timed out" in err or "binary not found" in err:
+            return False
+        return (
+            "no conversation found" in err
+            or "no parseable output" in err
+            or ("session" in err and ("not found" in err or "invalid" in err or "expired" in err))
+        )
 
     @staticmethod
     def _parse(out: str) -> dict | None:
         out = (out or "").strip()
         if not out:
             return None
+        # Normal case: the whole stdout is one JSON object.
         try:
             data = json.loads(out)
-            return data if isinstance(data, dict) else None
+            if isinstance(data, dict):
+                return data
         except json.JSONDecodeError:
-            # tolerate stray log lines around the JSON: try the last {...} line
-            for line in reversed(out.splitlines()):
-                line = line.strip()
-                if line.startswith("{") and line.endswith("}"):
-                    try:
-                        data = json.loads(line)
-                        if isinstance(data, dict):
-                            return data
-                    except json.JSONDecodeError:
-                        continue
-            return None
+            pass
+        # Fallback: stray single-line log JSON around the result. Collect every
+        # single-line JSON object and prefer the one that looks like a Claude
+        # result, so a trailing diagnostic line is never mistaken for the answer.
+        candidates: list[dict] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    candidates.append(parsed)
+        for parsed in reversed(candidates):
+            if parsed.get("type") == "result" or "result" in parsed or "session_id" in parsed:
+                return parsed
+        return candidates[-1] if candidates else None

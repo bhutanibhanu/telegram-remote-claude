@@ -105,7 +105,8 @@ class TelegramClaudeBot:
             await asyncio.gather(typing, return_exceptions=True)
 
         if result.ok:
-            await self._reply_chunked(update, result.text or "✅ (Claude returned no text.)")
+            text = result.text if (result.text and result.text.strip()) else "✅ (Claude returned no text.)"
+            await self._reply_chunked(update, text)
         else:
             await self._reply_chunked(update, f"⚠️ {result.error or 'Something went wrong.'}")
 

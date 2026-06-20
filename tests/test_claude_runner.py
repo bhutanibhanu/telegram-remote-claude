@@ -206,3 +206,86 @@ async def test_persistence_roundtrip(tmp_path, monkeypatch):
 
     runner2 = ClaudeRunner(make_config(), session_store=store)
     assert runner2._sessions[5] == "PERSIST"
+
+
+async def test_stale_session_retries_fresh(monkeypatch):
+    runner = ClaudeRunner(make_config())
+    runner._sessions[1] = "OLD"
+    calls = []
+
+    async def fake(cmd, stdin, cwd):
+        calls.append(cmd)
+        if "--resume" in cmd:
+            return 1, "", "No conversation found with session ID: OLD"
+        return 0, ok_json(result="recovered", session_id="NEW"), ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    res = await runner.run(1, "hi")
+    assert res.ok and res.text == "recovered"
+    assert runner._sessions[1] == "NEW"
+    assert len(calls) == 2
+    assert "--resume" in calls[0] and "--resume" not in calls[1]
+
+
+async def test_genuine_error_does_not_retry(monkeypatch):
+    runner = ClaudeRunner(make_config())
+    runner._sessions[1] = "S"
+    calls = []
+
+    async def fake(cmd, stdin, cwd):
+        calls.append(cmd)
+        return 0, json.dumps(
+            {"type": "result", "subtype": "error_during_execution",
+             "is_error": True, "result": "model said no", "session_id": "S"}
+        ), ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    res = await runner.run(1, "hi")
+    assert not res.ok
+    assert len(calls) == 1  # a real content error must NOT trigger a fresh retry
+
+
+async def test_parse_prefers_result_over_trailing_log(monkeypatch):
+    runner = ClaudeRunner(make_config())
+    combined = ok_json(result="real answer", session_id="S") + "\n" + json.dumps(
+        {"level": "warn", "msg": "stray log line"}
+    )
+
+    async def fake(cmd, stdin, cwd):
+        return 0, combined, ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    res = await runner.run(1, "x")
+    assert res.ok and res.text == "real answer"
+    assert runner._sessions[1] == "S"
+
+
+async def test_different_chats_not_blocked(monkeypatch):
+    runner = ClaudeRunner(make_config())
+    started = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def fake(cmd, stdin, cwd):
+        if stdin == "block":
+            started.set()
+            await gate.wait()
+        return 0, ok_json(), ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    t1 = asyncio.create_task(runner.run(1, "block"))
+    await started.wait()
+    res2 = await runner.run(2, "go")  # different chat must not be blocked by chat 1
+    assert res2.ok
+    gate.set()
+    await t1
+
+
+async def test_empty_result_is_ok(monkeypatch):
+    runner = ClaudeRunner(make_config())
+
+    async def fake(cmd, stdin, cwd):
+        return 0, ok_json(result="", session_id="S"), ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    res = await runner.run(1, "x")
+    assert res.ok and res.text == ""
