@@ -1,0 +1,78 @@
+# criterion: c5
+# verdict: PASS
+# observed_reason: C5 honored: the spike-c5-probe SKILL was invoked in-session (Skill tool fired) and its interactive prompts flowed through the SAME can_use_tool channels as C2/C3. Its per-tool permission request (Write c5_skill_sentinel.txt) was answered over the C2 code path and honored (sentinel present with C5_SKILL_RAN in both trials); its AskUserQuestion was answered over the C3 code path; the skill was driven to its C5_DONE completion in both trials; and the completion option was CODE-DRIVEN (trial1 C5_DONE=Alpha when code picked Alpha, trial2 C5_DONE=Bravo when code picked Bravo -- differing picks, each echoed -> not a model guess). Containment (X1): repo untouched (no new git changes); the only filesystem effect was the in-fixture sentinel; out-of-fixture/traversal Writes and Bash/Edit/ExitPlanMode denied; fixtures (incl. their .claude tree) rmtree'd. INHERITED CAVEAT: the AskUserQuestion answer rides C3's PARTIAL deny-with-answer-message workaround (PermissionResultDeny message=<selected option>, tool_result is_error=True) -- NOT a native structured answer API (none exists on claude-agent-sdk==0.2.105) -- and depends on the model interpreting the message. Containment is policy-level (callback resolves/denies targets), not an OS sandbox. C5 only; no claim about C1/C2/C3/C4/C6 beyond reusing their proven code paths here. Host CLI auth, no API key. claude CLI 2.1.185 (Claude Code); skill loaded/invoked on this CLI version.
+# timestamp: 2026-06-20T22:01:45.998292+00:00
+------------------------------------------------------------
+=== T11 / C5 — skill invocation through the same channels (substrate A, sandboxed) ===
+sdk: claude-agent-sdk==0.2.105
+claude CLI: 2.1.185 (Claude Code)
+ANTHROPIC_API_KEY set: False (must be False)
+skill source: /Users/ray/dev/claude-telegram-bot-session-substrate-feasibility/spikes/session-substrate/test_skill/spike-c5-probe/SKILL.md (exists=True)
+Mechanism: skills=['spike-c5-probe'] injects Skill(spike-c5-probe) into allowed_tools and (with setting_sources=['project']) loads the cwd .claude/skills tree. The skill's Write (C2 channel) + AskUserQuestion (C3 channel) flow through the SAME can_use_tool callback as C2/C3. AskUserQuestion is answered via C3's PARTIAL deny-with-answer-message workaround (no native answer API on this SDK). No bypass; permission_mode=default.
+Two trials pick DIFFERENT options (trial1 Alpha, trial2 Bravo) to prove the C5_DONE option is CODE-DRIVEN, not a model guess.
+
+--- TRIAL 1 — code picks option[0] (expect Alpha) ---
+  fixture (temp, outside repo): /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t11_c5_qfwtt0ba
+  session_id: 5c43f405-dd37-4cd4-9d83-803f9e50e897
+  Skill invoked? True (tool_use_streamed=1, callback_seen=0)
+  Write callback fired: 1  allowed_in_fixture=True
+  out-of-fixture Write denials: NONE
+  sentinel present in fixture: True  content_ok=True
+  AskUserQuestion fired: 1  options_presented=['Alpha', 'Bravo']
+  code-chosen label (via C3 deny-message path): 'Alpha'
+  other tools denied (containment): NONE
+  tool_result is_error=None: 'Launching skill: spike-c5-probe'
+  tool_result is_error=None: 'File created successfully at: c5_skill_sentinel.txt (file state is current in your context — no need to Read it back)'
+  tool_result is_error=True: 'The user selected: Alpha'
+  completion line seen: True  C5_DONE label='Alpha'  matches code choice=True
+  model final (first 200): '**Step 1 — Writing sentinel file.**\n**Step 2 — Interactive question.**\nC5_DONE:Alpha'
+
+--- TRIAL 2 — code picks option[1] (expect Bravo) ---
+  fixture (temp, outside repo): /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t11_c5_nrejsbw6
+  session_id: 53d510b3-7c62-41a7-bdfe-97ebaadfdc26
+  Skill invoked? True (tool_use_streamed=1, callback_seen=0)
+  Write callback fired: 1  allowed_in_fixture=True
+  out-of-fixture Write denials: NONE
+  sentinel present in fixture: True  content_ok=True
+  AskUserQuestion fired: 1  options_presented=['Alpha', 'Bravo']
+  code-chosen label (via C3 deny-message path): 'Bravo'
+  other tools denied (containment): NONE
+  tool_result is_error=None: 'Launching skill: spike-c5-probe'
+  tool_result is_error=None: 'File created successfully at: c5_skill_sentinel.txt (file state is current in your context — no need to Read it back)'
+  tool_result is_error=True: 'The user selected: Bravo'
+  completion line seen: True  C5_DONE label='Bravo'  matches code choice=True
+  model final (first 200): '**Step 1 — C2 permission channel:** Writing the sentinel file.\n**Step 2 — C3 interactive-question channel:** Asking the operator.\nC5_DONE:Bravo'
+
+=== C5 evaluation (per channel, across both trials) ===
+skill_invoked (Skill tool fired / callback saw it, both trials): True
+permission_channel (in-fixture sentinel Write allowed + present, both trials): True
+question_channel (AskUserQuestion fired + answered via C3 path, both trials): True
+completion (C5_DONE line seen, both trials): True
+  trial1 C5_DONE='Alpha' (code chose 'Alpha') matches=True
+  trial2 C5_DONE='Bravo' (code chose 'Bravo') matches=True
+code_driven (both echo their code pick AND picks differ -> not model guess): True
+out-of-fixture Write attempts denied: t1=NONE t2=NONE
+repo NEW changes during run: NONE (expected NONE -> X1)
+  (pre-existing uncommitted entries ignored: ['?? spikes/session-substrate/checks/c5_skill.py', '?? spikes/session-substrate/evidence/c5.json', '?? spikes/session-substrate/evidence/c5.transcript.txt'])
+
+cleanup: removed 0 plan-scratch file(s) created in /Users/ray/.claude/plans (expected 0)
+
+Distinguishers / limitations (explicit disclosures):
+- The skill is loaded as a PROJECT skill from the disposable temp cwd's .claude/skills tree
+  (setting_sources=['project']); the repo-root .claude/ and user .claude/ are NOT used.
+- skills=['spike-c5-probe'] injects Skill(spike-c5-probe) into allowed_tools, so the CLI may
+  auto-approve the Skill tool itself; we detect invocation from the Skill tool_use in the
+  stream AND record if the callback was consulted. The skill's Write + AskUserQuestion are NOT
+  in allowed_tools, so they route through the SAME can_use_tool callback as C2/C3.
+- Permission (C2 channel): the in-fixture sentinel Write is ALLOWED (so the skill proceeds);
+  out-of-fixture/traversal Writes are DENIED (containment). Same callback as c2_permission.py.
+- Question (C3 channel): answered via C3's PARTIAL deny-with-answer-message workaround
+  (PermissionResultDeny message=<selected option>); native allow/updated_input does NOT answer
+  on claude-agent-sdk==0.2.105. This PARTIAL caveat is INHERITED by C5's completion path.
+- Code-driven proof: the neutral invocation prompt never names Alpha/Bravo; the CODE picks per
+  trial. Two trials with DIFFERENT picks each echoed their pick in C5_DONE -> code-driven.
+- Containment (X1): repo git status snapshotted before/after (only in-fixture sentinel changes);
+  fixtures rmtree'd; containment is policy-level (callback denies out-of-fixture), not an OS sandbox.
+- C5 only; no claim about C1/C2/C3/C4/C6 beyond reusing their code paths. Substrate B is out of scope here.
+VERDICT: PASS
+REASON: C5 honored: the spike-c5-probe SKILL was invoked in-session (Skill tool fired) and its interactive prompts flowed through the SAME can_use_tool channels as C2/C3. Its per-tool permission request (Write c5_skill_sentinel.txt) was answered over the C2 code path and honored (sentinel present with C5_SKILL_RAN in both trials); its AskUserQuestion was answered over the C3 code path; the skill was driven to its C5_DONE completion in both trials; and the completion option was CODE-DRIVEN (trial1 C5_DONE=Alpha when code picked Alpha, trial2 C5_DONE=Bravo when code picked Bravo -- differing picks, each echoed -> not a model guess). Containment (X1): repo untouched (no new git changes); the only filesystem effect was the in-fixture sentinel; out-of-fixture/traversal Writes and Bash/Edit/ExitPlanMode denied; fixtures (incl. their .claude tree) rmtree'd. INHERITED CAVEAT: the AskUserQuestion answer rides C3's PARTIAL deny-with-answer-message workaround (PermissionResultDeny message=<selected option>, tool_result is_error=True) -- NOT a native structured answer API (none exists on claude-agent-sdk==0.2.105) -- and depends on the model interpreting the message. Containment is policy-level (callback resolves/denies targets), not an OS sandbox. C5 only; no claim about C1/C2/C3/C4/C6 beyond reusing their proven code paths here. Host CLI auth, no API key. claude CLI 2.1.185 (Claude Code); skill loaded/invoked on this CLI version.
