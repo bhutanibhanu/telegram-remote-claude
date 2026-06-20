@@ -36,3 +36,13 @@ def test_hard_cut_when_no_boundary():
 def test_invalid_limit():
     with pytest.raises(ValueError):
         split_message("x", limit=0)
+
+
+def test_utf16_aware_chunking():
+    text = "😀" * 3000  # astral chars: 2 UTF-16 units each -> 6000 units total
+    chunks = split_message(text, limit=4096)
+    assert "".join(chunks) == text
+    for c in chunks:
+        assert len(c.encode("utf-16-le")) // 2 <= 4096  # Telegram's real limit
+    assert len(chunks) >= 2
+
