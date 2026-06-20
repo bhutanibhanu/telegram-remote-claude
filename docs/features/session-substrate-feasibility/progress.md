@@ -47,7 +47,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T6 — A · C1 bidirectional streaming check (fb4247e)
 - [x] T7 — A · C2 per-tool permission decision check (sandboxed) (c8d9f3c)
 - [x] T8 — A · C3 AskUserQuestion answered programmatically (4eeaa9f — PARTIAL)
-- [ ] T9 — A · C4 ExitPlanMode approve/reject + feedback
+- [x] T9 — A · C4 ExitPlanMode approve/reject + feedback (275a9b1 — PASS)
 - [ ] T10 — C5 test skill fixture (emits permission + AskUserQuestion/ExitPlanMode)
 - [ ] T11 — A · C5 skill invocation through the same channels
 - [ ] T12 — A · C6 session resume by id across process runs
@@ -156,7 +156,29 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Acceptance:**
   - WHEN ExitPlanMode surfaces a plan, the check SHALL approve it in one path and reject-with-feedback in another, confirming the session honored each — verdict + transcript. **(X3)** *(make-or-break)*
 - **Tests:** none — verdict + transcript is the artifact.
-- **Status:** todo
+- **Status:** done (275a9b1) — **C4 PASS**. ExitPlanMode fired as a real tool request through the
+  real SDK permission callback (`can_use_tool`, `permission_mode=plan`, no bypass) in two isolated
+  trials. **APPROVE** (`PermissionResultAllow`) → native CLI "User has approved your plan". **REJECT**
+  (`PermissionResultDeny(message=…)`) → "Plan rejected …"; the model stayed in plan mode and the plan
+  was **never approved → no execution greenlit**. The reject feedback injects a **code-only marker**
+  (`ADD_LOGGING_STEP`) the neutral prompt never mentions; `feedback_honored` asserts against the
+  **FULL** revised structured plan **OR** the model's revision reply (either suffices — both prove
+  the code-supplied feedback influenced the post-rejection session). **T9-repair (Reviewer-B defect
+  fixed):** the prior probe asserted the marker against a `[:400]`-truncated plan; it now uses the
+  full plan text, keeps the `[:200]` preview for readability only, records both signals separately
+  + which one supported the run. On the committed run `marker_in_full_revised_plan=False`,
+  `marker_in_revision_response=True` → PASS via the reply signal. **Caveats:** whether the marker
+  lands in the structured-plan FIELD is **model-variant** (a reviewer reproduced both False and True
+  across runs, and even an empty revised-plan field — the combined gate held PASS each time); reject
+  feedback rides the **`PermissionResultDeny(message=...)` channel** (the natural rejection channel,
+  not a dedicated plan-feedback API, and depends on the model reading it); **post-approval ARBITRARY
+  execution is NOT tested** (contained: Bash/Edit/out-of-fixture-Write/AskUserQuestion denied; cwd is
+  a disposable temp fixture; plan-scratch cleaned). Host CLI auth, no API key; evidence `evidence/c4.*`
+  scrubbed + secret-scan clean (X3); spike-only, no production files. **Two fresh independent
+  reviewers — acceptance + live-reproduction, and adversarial-reproducibility + evidence-audit — both
+  AGREE PASS** with no objective defect; reviewer 2 observed the structured-plan signal flip False→True
+  across runs while the combined gate stayed PASS, confirming the repair removed the prior fragility.
+  C4 only — no C1/C2/C3/C5/C6 claim. **Substrate B still requires its own C4 probe at T16** (design S1).
 
 ### T10 — C5 test skill fixture
 - **Goal:** A minimal custom slash-command skill that deliberately emits a permission request **and** an AskUserQuestion (and/or ExitPlanMode), to drive C5 through the same channels as C2–C4.
