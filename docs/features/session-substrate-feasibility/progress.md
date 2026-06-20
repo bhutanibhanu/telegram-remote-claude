@@ -54,7 +54,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T13 — B-harness: CLI `stream-json` driver + permission-mechanism discovery (fee27d8 — PASS)
 - [x] T14 — B · C2 permission decision over the wire (sandboxed) (dba7d5f — PASS)
 - [x] T15 — B · C3 AskUserQuestion over `stream-json` (90cdc1d — PASS native)
-- [ ] T16 — B · C4 ExitPlanMode over `stream-json`
+- [x] T16 — B · C4 ExitPlanMode over `stream-json` (acc586f — PASS)
 - [ ] T17 — `run_all.py`: C1–C6 PASS/FAIL/PARTIAL matrix (+ B contingency)
 - [ ] T18 — Draft normalized engine interface + final evidence secret-scan gate
 - [ ] T19 — Fill ADR-001 (Proposed) + go/no-go writeup
@@ -380,7 +380,29 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Acceptance:**
   - WHEN ExitPlanMode appears in the stream, the check SHALL approve in one path and reject-with-feedback in another, confirming honored behavior — verdict + transcript. **(X3)** *(make-or-break; tested on B unconditionally)*
 - **Tests:** none — verdict + transcript is the artifact.
-- **Status:** todo
+- **Status:** done (acc586f) — **C4 (B) PASS**, over the wire, mirroring the repaired substrate-A C4 (T9) standard.
+  Via the T13 `CLISessionHarness` (raw CLI stream-json, no claude-agent-sdk; `permission_mode=plan`, no bypass):
+  ExitPlanMode arrives as an ordinary `can_use_tool` control_request (plan in `input.plan`). **APPROVE** (ALLOW
+  control_response) → native "User has approved your plan"; **REJECT** (DENY control_response `message`=feedback
+  with code marker `ADD_LOGGING_STEP`) → "Plan rejected …", the model stayed in plan mode and the plan was
+  **never approved → no execution greenlit**. **feedback_honored** asserts against the **FULL** revised structured
+  plan **OR** the model's revision reply (the T9-repair semantics; NOT a truncated value); both signals recorded +
+  which supported the run (committed run: structured-plan field False, reply True → honored via reply; an
+  independent reviewer reproduced BOTH True — structured-plan placement is **model-variant**, gate held PASS).
+  Code-driven (marker absent from the neutral prompt). **Schema-confirmed native mechanism (C3 lesson applied):**
+  the adversarial reviewer inspected `ExitPlanModeOutput` (no `feedback`/`rejectionReason`/decision field — binary
+  allow/deny), found a `plan_approval_request`+feedback path in the CLI binary but proved it is the **multi-agent
+  teammate subsystem** (NOT reachable via single-agent `can_use_tool`), and **live-tested that enriched deny fields
+  are ignored** (only `message` passes through) → the deny-`message` channel **IS** the genuine native
+  reject-with-feedback mechanism; **no missed native shape** (unlike C3). Containment (X1): temp cwd; Bash/Edit/
+  out-of-fixture-Write/AskUserQuestion denied; repo unchanged; plan-scratch cleaned; `control_cancel_request`
+  counter = 0 observed. **POST-APPROVAL ARBITRARY EXECUTION NOT TESTED** (contained). Host CLI auth, no API key;
+  evidence `evidence/c4_cli.*` scrubbed + secret-scan clean (X3); harness_cli.py unchanged. **Three fresh
+  independent reviewers (acceptance + live-reproduction, adversarial + schema/binary deep-dive, make-or-break/ADR
+  specialist) all AGREE PASS**, each independently reproducing approve+reject+feedback. **GATE-1 NOTE:** with C3
+  (native, both substrates) and C4 (both substrates) now PASS, **both make-or-break criteria are GREEN on A and B
+  → the design's "constrained mode" re-plan risk is retired.** **C4 is substrate-NEUTRAL** (same allow/deny +
+  deny-message mechanism on both → does not decide A vs B). C4 only — no C1/C2/C3/C5/C6 claim.
 
 ### T17 — `run_all.py`: C1–C6 PASS/FAIL/PARTIAL matrix (+ B contingency)
 - **Goal:** Aggregate all checks into one runnable entry point that prints the C1–C6 matrix across substrate A and B, and runs B on the **remaining** criteria only where A came back FAIL/PARTIAL (design S1).
