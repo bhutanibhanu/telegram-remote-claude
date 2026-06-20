@@ -52,7 +52,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T11 — A · C5 skill invocation through the same channels (95362da — PASS)
 - [x] T12 — A · C6 session resume by id across process runs (a5c3452 — PASS)
 - [x] T13 — B-harness: CLI `stream-json` driver + permission-mechanism discovery (fee27d8 — PASS)
-- [ ] T14 — B · C2 permission decision over the wire (sandboxed)
+- [x] T14 — B · C2 permission decision over the wire (sandboxed) (dba7d5f — PASS)
 - [ ] T15 — B · C3 AskUserQuestion over `stream-json`
 - [ ] T16 — B · C4 ExitPlanMode over `stream-json`
 - [ ] T17 — `run_all.py`: C1–C6 PASS/FAIL/PARTIAL matrix (+ B contingency)
@@ -304,7 +304,24 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
     enforce resolved-target containment where the CLI mechanism permits it, and record repository
     status before/after. Any inability to enforce containment SHALL be documented in the verdict.
 - **Tests:** none — verdict + transcript is the artifact.
-- **Status:** todo
+- **Status:** done (dba7d5f) — **C2 (B) PASS**, held to the same standard as substrate-A C2 (T7) and over the
+  real wire. Via the T13 `CLISessionHarness` (raw CLI stream-json, **no claude-agent-sdk**): a `can_use_tool`
+  control_request for **`Write` → denied marker arrived over the wire**, the deny `control_response` was
+  honored and the tool **did NOT execute** (file absent; `tool_result is_error=True` is the denial itself,
+  not a post-exec failure; the model genuinely issued the tool_use, so not a no-call); a second `Write` →
+  in-fixture allowed sentinel was **answered allow and executed** (`ALLOWED_OK` present). The **SAME tool
+  (Write) received opposite per-request decisions** by resolved target path (Write in neither allowedTools
+  nor disallowedTools) → a genuine **per-request gate over the wire**, not static `--allowedTools`. Resolved-path
+  **containment** deny-by-default unit-checked (outside-fixture + abs/rel traversal denied) and an adversarial
+  reviewer additionally confirmed a live model-issued out-of-fixture Write was denied end-to-end. Repo git
+  status unchanged by the run; disposable temp fixture; containment is **policy-level, not OS sandbox**. Host
+  CLI auth, no API key; evidence `evidence/c2_cli.*` scrubbed + secret-scan clean (X3); harness_cli.py
+  unchanged. **Two fresh independent reviewers (acceptance + live-reproduction, adversarial) both AGREE PASS**,
+  each independently reproducing deny-blocks + allow-executes + same-tool-opposite + callback-fired-both-times.
+  **A-vs-B note (for ADR):** functionally equivalent (B's evidence is arguably stronger — it requires an
+  independent on-the-wire `can_use_tool` frame, not just an in-process callback log); asymmetries: B couples to
+  the undocumented `--permission-prompt-tool stdio` flag and needs the `updatedInput`-on-allow workaround +
+  hand-rolled NDJSON/threads/timeouts. C2 only — no C1/C3–C6 claim.
 
 ### T15 — B · C3 AskUserQuestion over `stream-json` ⭐
 - **Goal:** Prove (or disprove) that an AskUserQuestion can be answered programmatically over the CLI `stream-json` protocol.
