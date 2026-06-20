@@ -1,0 +1,8 @@
+{
+  "criterion": "preflight",
+  "verdict": "PASS",
+  "observed_reason": "Python 3.14.5 + claude CLI 2.1.183 (Claude Code) captured; Agent SDK claude-agent-sdk==0.2.105 exists, installs into the spike venv, and imports.",
+  "timestamp": "2026-06-20T19:17:39.710920+00:00",
+  "transcript_path": "preflight.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}
