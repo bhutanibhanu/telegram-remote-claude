@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from claude_tg.bot import TelegramClaudeBot
@@ -17,6 +18,9 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # HTTPX logs Telegram request URLs, which contain the bot token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     config = Config.from_env()
     store = JsonSessionStore(config.state_file) if config.state_file else None
     runner = ClaudeRunner(config, session_store=store)
@@ -30,7 +34,15 @@ def main() -> None:
         config.model or "(default)",
         config.skip_permissions,
     )
-    app.run_polling(allowed_updates=["message"])
+    # Python 3.14 no longer creates a default event loop for synchronous callers.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        app.run_polling(allowed_updates=["message"])
+    finally:
+        asyncio.set_event_loop(None)
+        if not loop.is_closed():
+            loop.close()
 
 
 if __name__ == "__main__":
