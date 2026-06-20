@@ -49,7 +49,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T8 — A · C3 AskUserQuestion answered programmatically (4eeaa9f — PARTIAL)
 - [x] T9 — A · C4 ExitPlanMode approve/reject + feedback (275a9b1 — PASS)
 - [x] T10 — C5 test skill fixture (emits permission + AskUserQuestion/ExitPlanMode) (e54507a)
-- [ ] T11 — A · C5 skill invocation through the same channels
+- [x] T11 — A · C5 skill invocation through the same channels (95362da — PASS)
 - [ ] T12 — A · C6 session resume by id across process runs
 - [ ] T13 — B-harness: CLI `stream-json` driver + permission-mechanism discovery
 - [ ] T14 — B · C2 permission decision over the wire (sandboxed)
@@ -209,7 +209,28 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the test skill runs, its permission + interactive prompts SHALL be answered over the same code paths as C2–C4 and the skill driven to completion — verdict + transcript. **(X3)**
   - Any tool the skill runs SHALL stay within the temp fixture sandbox. **(X1)**
 - **Tests:** none — verdict + transcript is the artifact.
-- **Status:** todo
+- **Status:** done (95362da) — **C5 PASS**. The throwaway `spike-c5-probe` skill (T10) was **invoked
+  in-session** on CLI 2.1.185 (real `Skill` tool_use → CLI tool_result `Launching skill:
+  spike-c5-probe`), loaded as a project skill from a disposable temp cwd's `.claude/skills/` tree
+  (`skills=["spike-c5-probe"]`, `setting_sources=["project"]`). Its interactive prompts flowed through
+  the **same `can_use_tool` channels** as C2/C3 (the Skill tool is auto-approved via allowed_tools, but
+  Write and AskUserQuestion are NOT in allowed_tools so they route through the callback): the per-tool
+  **permission** request (`Write c5_skill_sentinel.txt`) was answered over the **C2** code path and
+  honored (sentinel present with `C5_SKILL_RAN`); the **AskUserQuestion** was answered over the **C3**
+  code path; the skill was driven to its `C5_DONE` completion in both trials. The completion option is
+  **code-driven**: trial 1 (code picks Alpha) → `C5_DONE:Alpha`, trial 2 (code picks Bravo) →
+  `C5_DONE:Bravo` — differing picks each echoed under a neutral invocation prompt that never names the
+  options. Containment (X1): repo git status unchanged by the run (only the in-fixture sentinel
+  changed); out-of-fixture/traversal Writes + Bash/Edit/ExitPlanMode denied; fixtures (incl. `.claude`
+  tree) rmtree'd; policy-level, not OS sandbox. Host CLI auth, no API key; evidence `evidence/c5.*`
+  scrubbed + secret-scan clean (X3). **INHERITED CAVEAT:** the AskUserQuestion answer rides **C3's
+  PARTIAL deny-with-answer-message workaround** (`PermissionResultDeny(message=…)`, non-native — no
+  native answer API on claude-agent-sdk==0.2.105) and depends on the model interpreting the message;
+  this is C3's limitation, not a new one — C5's acceptance is channel-routing + drive-to-completion,
+  not channel nativeness. **Two fresh independent reviewers (acceptance + live-reproduction, and
+  adversarial + evidence-audit) both AGREE PASS**, each independently reproducing PASS; no objective
+  defect (one optional regex-hardening nit that can only ever cause a false FAIL, never inflate).
+  C5 only — no C1/C2/C3/C4/C6 claim beyond reusing their proven code paths.
 
 ### T12 — A · C6 session resume by id across process runs
 - **Goal:** Prove a session can be resumed by id from a **fresh process** with history intact.
