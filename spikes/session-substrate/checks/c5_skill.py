@@ -29,11 +29,13 @@ The can_use_tool callback (the SAME levers as C2/C3 -- allow / deny+message):
   * Write: resolve the target; ALLOW iff it is `c5_skill_sentinel.txt` INSIDE the
     fixture (the C2 channel -- we must allow it so the skill can proceed to the
     question); DENY anything outside-fixture / traversal (containment X1).
-  * AskUserQuestion: answer via the C3 deny-with-answer-message WORKAROUND,
-    conveying the trial's CODE-SELECTED option. (C3 is PARTIAL: native allow /
-    updated_input does NOT answer on this SDK version; the only working path is
-    PermissionResultDeny(message=<the selected option>) which the model interprets.
-    C5 inherits that caveat.)
+  * AskUserQuestion: answer via the deny-with-answer-message path, conveying the
+    trial's CODE-SELECTED option (PermissionResultDeny(message=<selected option>),
+    which the model interprets). NOTE: C3 is a NATIVE PASS (T8/T15) — the native
+    answer is the documented AskUserQuestionOutput `answers` map injected via an
+    ALLOW's updated_input; this C5 run happens to exercise the deny-with-answer
+    FALLBACK, which still works. C5's claim is channel-routing + drive-to-completion,
+    not the answer mechanism's nativeness, so either path satisfies C5.
   * Bash, Edit, ExitPlanMode, everything else: DENY (containment X1).
 
 Two trials select DIFFERENT options (trial 1 -> Alpha, trial 2 -> Bravo) under a
@@ -53,8 +55,9 @@ Honest verdict policy (PASS/PARTIAL/FAIL all valid; not manufactured):
             AskUserQuestion is answered via the SAME C3 code path; the skill is
             driven to completion (C5_DONE seen); and BOTH trials' option is
             code-driven (C5_DONE echoes the code-selected option, Alpha vs Bravo).
-            DISCLOSE that the AskUserQuestion answer rides C3's PARTIAL
-            deny-with-answer-message workaround (non-native), inherited here.
+            DISCLOSE that this run answers AskUserQuestion via the deny-with-answer
+            FALLBACK; C3 itself is a native PASS (T8/T15) and the native answers-map
+            path is also available to C5 — C5's capability is unaffected.
   PARTIAL : channels are exercised but e.g. completion/option-echo is unreliable,
             or the skill loads but native answering is still required, etc. --
             record exactly what held and what did not.
@@ -326,8 +329,9 @@ async def _run() -> int:
     log("Mechanism: skills=['spike-c5-probe'] injects Skill(spike-c5-probe) into allowed_tools "
         "and (with setting_sources=['project']) loads the cwd .claude/skills tree. The skill's "
         "Write (C2 channel) + AskUserQuestion (C3 channel) flow through the SAME can_use_tool "
-        "callback as C2/C3. AskUserQuestion is answered via C3's PARTIAL deny-with-answer-message "
-        "workaround (no native answer API on this SDK). No bypass; permission_mode=default.")
+        "callback as C2/C3. AskUserQuestion is answered via the deny-with-answer-message FALLBACK "
+        "(C3 is a native PASS per T8/T15; the native answers-map path is also available). "
+        "No bypass; permission_mode=default.")
     log("Two trials pick DIFFERENT options (trial1 Alpha, trial2 Bravo) to prove the C5_DONE "
         "option is CODE-DRIVEN, not a model guess.")
 
@@ -398,13 +402,16 @@ async def _run() -> int:
                 "Alpha, trial2 C5_DONE=Bravo when code picked Bravo -- differing picks, each echoed -> not a "
                 "model guess). Containment (X1): repo untouched (no new git changes); the only filesystem "
                 "effect was the in-fixture sentinel; out-of-fixture/traversal Writes and Bash/Edit/ExitPlanMode "
-                "denied; fixtures (incl. their .claude tree) rmtree'd. INHERITED CAVEAT: the AskUserQuestion "
-                "answer rides C3's PARTIAL deny-with-answer-message workaround (PermissionResultDeny "
-                "message=<selected option>, tool_result is_error=True) -- NOT a native structured answer API "
-                "(none exists on claude-agent-sdk==0.2.105) -- and depends on the model interpreting the "
-                "message. Containment is policy-level (callback resolves/denies targets), not an OS sandbox. "
-                "C5 only; no claim about C1/C2/C3/C4/C6 beyond reusing their proven code paths here. Host CLI "
-                f"auth, no API key. claude CLI {cli_ver}; skill loaded/invoked on this CLI version."
+                "denied; fixtures (incl. their .claude tree) rmtree'd. C3-PATH NOTE: this run answered the "
+                "AskUserQuestion via the deny-with-answer-message FALLBACK (PermissionResultDeny "
+                "message=<selected option>, tool_result is_error=True), which depends on the model interpreting "
+                "the message. C3 itself is a NATIVE PASS (T8/T15) -- the native answer is the documented "
+                "AskUserQuestionOutput `answers` map injected via an ALLOW's updated_input -- and that native "
+                "path is equally available to C5's prompts; C5's claim is channel-routing + drive-to-completion, "
+                "so the verdict is unaffected by which answer path is used. Containment is policy-level "
+                "(callback resolves/denies targets), not an OS sandbox. C5 only; no claim about C1/C2/C3/C4/C6 "
+                f"beyond reusing their proven code paths here. Host CLI auth, no API key. claude CLI {cli_ver}; "
+                "skill loaded/invoked on this CLI version."
             )
         elif skill_invoked and (permission_channel or question_channel):
             verdict = "PARTIAL"
@@ -412,8 +419,9 @@ async def _run() -> int:
                 "C5 partially demonstrated: skill_invoked={si}, permission_channel={pc}, question_channel={qc}, "
                 "completion={comp}, code_driven={cd}, repo_untouched={ru}. The skill loaded/invoked and at least "
                 "one interactive prompt flowed through the C2/C3 code path, but not every C5 condition held "
-                "(see per-channel lines above). The AskUserQuestion answer, where exercised, rides C3's PARTIAL "
-                "deny-with-answer-message workaround (non-native), inherited here.".format(
+                "(see per-channel lines above). The AskUserQuestion answer, where exercised, used the "
+                "deny-with-answer-message FALLBACK (C3 is a native PASS per T8/T15; native answers-map also "
+                "available).".format(
                     si=skill_invoked, pc=permission_channel, qc=question_channel,
                     comp=completion, cd=code_driven, ru=repo_untouched,
                 )
@@ -455,9 +463,11 @@ async def _run() -> int:
     log("  in allowed_tools, so they route through the SAME can_use_tool callback as C2/C3.")
     log("- Permission (C2 channel): the in-fixture sentinel Write is ALLOWED (so the skill proceeds);")
     log("  out-of-fixture/traversal Writes are DENIED (containment). Same callback as c2_permission.py.")
-    log("- Question (C3 channel): answered via C3's PARTIAL deny-with-answer-message workaround")
-    log("  (PermissionResultDeny message=<selected option>); native allow/updated_input does NOT answer")
-    log("  on claude-agent-sdk==0.2.105. This PARTIAL caveat is INHERITED by C5's completion path.")
+    log("- Question (C3 channel): answered via the deny-with-answer-message FALLBACK")
+    log("  (PermissionResultDeny message=<selected option>). C3 is a NATIVE PASS (T8/T15) -- the native")
+    log("  answer is the documented AskUserQuestionOutput `answers` map via an ALLOW's updated_input, which")
+    log("  is equally available to C5; this run used the fallback, and C5's routing/completion claim is")
+    log("  unaffected by which answer path is exercised.")
     log("- Code-driven proof: the neutral invocation prompt never names Alpha/Bravo; the CODE picks per")
     log("  trial. Two trials with DIFFERENT picks each echoed their pick in C5_DONE -> code-driven.")
     log("- Containment (X1): repo git status snapshotted before/after (only in-fixture sentinel changes);")
