@@ -43,7 +43,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T2 — Secret scrubber utility + unit test (bc9facf)
 - [x] T3 — Evidence recorder + transcript-capture helper (dc2a0c3)
 - [x] T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe (587334d)
-- [ ] T5 — A-harness: persistent session lifecycle (start/resume/send/stop)
+- [x] T5 — A-harness: persistent session lifecycle (start/resume/send/stop) (053ca9b)
 - [ ] T6 — A · C1 bidirectional streaming check
 - [ ] T7 — A · C2 per-tool permission decision check (sandboxed)
 - [ ] T8 — A · C3 AskUserQuestion answered programmatically
@@ -117,7 +117,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN `stop()` is called, the session SHALL terminate cleanly without leaking processes.
   - The lifecycle SHALL expose the seams (`send`, event stream out) the criterion checks need.
 - **Tests:** none — throwaway harness; exercised by T6–T12.
-- **Status:** todo
+- **Status:** done (053ca9b) — `SDKSessionHarness` over claude-agent-sdk==0.2.105: start/resume/send/stop with session-id capture + SDK-message passthrough (event stream out) and a bounded per-message timeout. Live self-check PASS (start → 2 multi-turn sends over one stable session_id → clean stop, no leaked CLI process; host CLI auth, no API key). Two independent reviewers returned ALL PASS; evidence `evidence/t5_lifecycle_smoke.*` (scrubbed, X3); spike-only, no production files touched. Note: cross-process resume is the seam only — proven later in C6/T12; leak check is a descendant-pid heuristic (can't see reparented orphans).
 
 ### T6 — A · C1 bidirectional streaming check
 - **Goal:** Prove a persistent session can take a new operator message in mid-session and emit a continuous event stream out.
