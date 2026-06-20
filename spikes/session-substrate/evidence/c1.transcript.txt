@@ -1,0 +1,65 @@
+# criterion: c1
+# verdict: PASS
+# observed_reason: 2 turns over one stable session_id=8685b77c-60a7-447d-a950-2e202c3d55c9; each emitted a clean terminal result; genuinely incremental StreamEvent deltas streamed OUT before completion in BOTH turns (turn1 incr=3, turn2 incr=3). Bidirectional 'message in mid-session -> event stream out' demonstrated.
+# timestamp: 2026-06-20T19:52:54.130735+00:00
+------------------------------------------------------------
+=== T6 / C1 — bidirectional streaming check (substrate A) ===
+sdk: claude-agent-sdk==0.2.105
+ANTHROPIC_API_KEY set: False (must be False)
+cwd (temp, isolated): /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t6_c1_blf1fs2x
+start(): persistent session connected
+
+--- turn 1: operator message IN -> event stream OUT ---
+session_id: 8685b77c-60a7-447d-a950-2e202c3d55c9
+event sequence (12 events) [ms, kind, type]:
+      15.2  control      System/init
+      15.3  control      System/status
+    1075.9  other        RateLimitEvent
+    1920.5  control      StreamEvent/message_start
+    1920.6  control      StreamEvent/content_block_start
+    1920.7  incremental  StreamEvent/content_block_delta:text_delta
+    1920.7  incremental  StreamEvent/content_block_delta:text_delta
+    1973.2  completed    AssistantMessage
+    1973.2  control      StreamEvent/content_block_stop
+    2097.9  incremental  StreamEvent/message_delta
+    2098.3  control      StreamEvent/message_stop
+    2176.2  terminal     Result/success(is_error=False)
+counts: {'incremental': 3, 'completed': 1, 'control': 6, 'terminal': 1, 'other': 1}
+timing: first_incremental=1920.7ms  completed=1973.2ms  result=2176.2ms
+terminal result is_error=False
+answer preview (86 chars): "I'm not going to use any tools for this — it's a simple requ"
+genuinely_incremental=True  buffered_at_completion=False
+
+--- turn 2: operator message IN -> event stream OUT ---
+session_id: 8685b77c-60a7-447d-a950-2e202c3d55c9
+event sequence (11 events) [ms, kind, type]:
+       4.2  control      System/init
+       4.2  control      System/status
+    1605.5  control      StreamEvent/message_start
+    1605.8  control      StreamEvent/content_block_start
+    1605.9  incremental  StreamEvent/content_block_delta:text_delta
+    1891.9  incremental  StreamEvent/content_block_delta:text_delta
+    1895.4  completed    AssistantMessage
+    1895.7  control      StreamEvent/content_block_stop
+    1926.3  incremental  StreamEvent/message_delta
+    1927.5  control      StreamEvent/message_stop
+    2021.0  terminal     Result/success(is_error=False)
+counts: {'incremental': 3, 'completed': 1, 'control': 6, 'terminal': 1, 'other': 0}
+timing: first_incremental=1605.9ms  completed=1895.4ms  result=2021.0ms
+terminal result is_error=False
+answer preview (36 chars): 'Apple\nBanana\nOrange\nMango\nStrawberry'
+genuinely_incremental=True  buffered_at_completion=False
+
+stop(): disconnected
+
+=== C1 evaluation ===
+session_stable=True (sid=8685b77c-60a7-447d-a950-2e202c3d55c9)
+both_turns_terminal_ok=True
+events_captured_both=True
+genuinely_incremental_both=True  any_buffered_at_completion=False
+
+Limitations / scope:
+- Proves C1 (bidirectional streaming) ONLY; makes no claim about C2-C6.
+- Single host/run; text-only prompts; verdict is reproducible, the session_id is not.
+VERDICT: PASS
+REASON: 2 turns over one stable session_id=8685b77c-60a7-447d-a950-2e202c3d55c9; each emitted a clean terminal result; genuinely incremental StreamEvent deltas streamed OUT before completion in BOTH turns (turn1 incr=3, turn2 incr=3). Bidirectional 'message in mid-session -> event stream out' demonstrated.

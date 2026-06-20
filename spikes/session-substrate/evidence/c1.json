@@ -1,0 +1,8 @@
+{
+  "criterion": "c1",
+  "verdict": "PASS",
+  "observed_reason": "2 turns over one stable session_id=8685b77c-60a7-447d-a950-2e202c3d55c9; each emitted a clean terminal result; genuinely incremental StreamEvent deltas streamed OUT before completion in BOTH turns (turn1 incr=3, turn2 incr=3). Bidirectional 'message in mid-session -> event stream out' demonstrated.",
+  "timestamp": "2026-06-20T19:52:54.130735+00:00",
+  "transcript_path": "c1.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}
