@@ -46,7 +46,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T5 — A-harness: persistent session lifecycle (start/resume/send/stop) (053ca9b)
 - [x] T6 — A · C1 bidirectional streaming check (fb4247e)
 - [x] T7 — A · C2 per-tool permission decision check (sandboxed) (c8d9f3c)
-- [ ] T8 — A · C3 AskUserQuestion answered programmatically
+- [x] T8 — A · C3 AskUserQuestion answered programmatically (4eeaa9f — PARTIAL)
 - [ ] T9 — A · C4 ExitPlanMode approve/reject + feedback
 - [ ] T10 — C5 test skill fixture (emits permission + AskUserQuestion/ExitPlanMode)
 - [ ] T11 — A · C5 skill invocation through the same channels
@@ -147,7 +147,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Acceptance:**
   - WHEN AskUserQuestion fires mid-session, the check SHALL answer it from code with no TTY and confirm the session continued on that answer — verdict + transcript. **(X3)** *(make-or-break)*
 - **Tests:** none — verdict + transcript is the artifact.
-- **Status:** todo
+- **Status:** done (4eeaa9f) — **PARTIAL (not a native PASS)**. A real AskUserQuestion request was intercepted programmatically via `can_use_tool` with **no TTY**. **Native `allow` and `updated_input` injection did NOT provide a structured answer** (both return "The user did not answer the questions"). A **deny-with-answer-message workaround** caused the session to continue on the **code-selected** answer; differing **Alpha/Bravo** trials (code picked each) both echoed correctly → the selection is **code-driven**, not model prompt-following/guess. The workaround rides an **error/denial channel** (`tool_result is_error=True`) and **depends on the model interpreting natural-language text**. **No native structured AskUserQuestion answer API exists in `claude-agent-sdk==0.2.105`** (zero special-casing; callback only allows/denies). **Multi-select & complex-question robustness remain unproven.** **Substrate B must still be tested for C3 in T15** before the substrate is locked (design S1). Both independent reviewers confirmed **PARTIAL** (23/23). Feeds ADR-001 Option C / hybrid. C3 only — no C1/C2/C4–C6 claim.
 
 ### T9 — A · C4 ExitPlanMode approve/reject + feedback ⭐
 - **Goal:** Prove a proposed plan is surfaced and can be approved **or** rejected with feedback programmatically, and the session honors the verdict.
