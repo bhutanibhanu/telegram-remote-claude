@@ -39,7 +39,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
   evidence-producing task T4, T6–T17; consolidated final gate at T18.)
 
 ## Task list
-- [ ] T1 — Spike scaffold + isolated, ignored venv + recorded deps
+- [x] T1 — Spike scaffold + isolated, ignored venv + recorded deps (9792e15)
 - [ ] T2 — Secret scrubber utility + unit test
 - [ ] T3 — Evidence recorder + transcript-capture helper
 - [ ] T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe
@@ -73,7 +73,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - The production files `requirements.txt` and `requirements-dev.txt` SHALL remain byte-for-byte unchanged (verify with `git diff`). **(X2)**
   - No file under `engine/`, `bot.py`, `claude_runner.py`, `session_manager.py`, `permissions.py`, or `render.py` is created or modified (design anti-goal).
 - **Tests:** none — scaffold; verified by `git status`/`git diff` per acceptance.
-- **Status:** todo
+- **Status:** done (9792e15) — 2 independent reviewers: ALL PASS.
 
 ### T2 — Secret scrubber utility + unit test
 - **Goal:** A reusable `scrub()` that redacts tokens/keys/secrets from text before any transcript is written, with a real unit test — the one tested unit in the spike (SB3).
