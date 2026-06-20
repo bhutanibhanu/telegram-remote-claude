@@ -289,3 +289,18 @@ async def test_empty_result_is_ok(monkeypatch):
     monkeypatch.setattr(runner, "_invoke", fake)
     res = await runner.run(1, "x")
     assert res.ok and res.text == ""
+
+
+async def test_missing_cwd_reports_clear_error(monkeypatch):
+    runner = ClaudeRunner(make_config())
+    runner._cwds[1] = "/no/such/dir/xyz123"
+    invoked = []
+
+    async def fake(cmd, stdin, cwd):
+        invoked.append(cmd)
+        return 0, ok_json(), ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    res = await runner.run(1, "x")
+    assert not res.ok and "directory" in (res.error or "").lower()
+    assert invoked == []  # never attempted to launch claude in a bad cwd

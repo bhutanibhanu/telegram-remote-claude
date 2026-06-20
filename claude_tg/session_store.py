@@ -43,4 +43,8 @@ class JsonSessionStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        try:
+            tmp.chmod(0o600)  # holds chat ids, cwds, and Claude session ids
+        except OSError:
+            pass
         tmp.replace(self.path)  # atomic on the same filesystem

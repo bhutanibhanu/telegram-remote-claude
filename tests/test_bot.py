@@ -168,3 +168,12 @@ def test_authorized():
     bot = TelegramClaudeBot(make_config(allowed=(1, 2)), FakeRunner())
     assert bot._authorized(make_update(1)) is True
     assert bot._authorized(make_update(3)) is False
+
+
+async def test_cmd_reset_unauthorized_ignored():
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(allowed=(1,)), runner)
+    upd = make_update(999, "")
+    await bot.cmd_reset(upd, make_ctx())
+    assert runner.reset_calls == []
+    upd.message.reply_text.assert_not_awaited()

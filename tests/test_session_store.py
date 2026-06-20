@@ -23,3 +23,9 @@ def test_corrupt_file_ignored(tmp_path):
     p.write_text("not json{")
     store = JsonSessionStore(p)
     assert store.load() == {}
+
+
+def test_state_file_permissions(tmp_path):
+    p = tmp_path / "s.json"
+    JsonSessionStore(p).update(1, session_id="x", cwd="/a")
+    assert (p.stat().st_mode & 0o777) == 0o600

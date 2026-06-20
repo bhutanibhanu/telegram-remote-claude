@@ -143,6 +143,11 @@ class ClaudeRunner:
             return result
 
     async def _run_once(self, chat_id: int, prompt: str, cwd: str) -> ClaudeResult:
+        if not Path(cwd).is_dir():
+            return ClaudeResult(
+                ok=False, text="",
+                error=f"Working directory does not exist: {cwd}. Use /cd to set a valid one.",
+            )
         cmd = self._build_cmd(chat_id)
         try:
             code, out, err = await self._invoke(cmd, prompt, cwd)

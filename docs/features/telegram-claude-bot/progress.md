@@ -9,9 +9,11 @@
 - [x] Entry point (`main.py`, `run.sh`)
 - [x] Unit tests (config, util, session_store, claude_runner) — 30 passing
 - [x] README + `.env.example` + design doc
-- [ ] Subagent review loop (correctness / security / edge-cases / run-it) → fix blockers
-- [ ] Codex QA
+- [x] Subagent review loop (correctness / security / edge-cases / run-it) — 2 rounds, all SHIP, 0 blockers
+- [x] Codex QA — SHIP, 0 blockers (49 tests verified independently); hardening applied
 - [ ] Phone-side setup by user (BotFather token + chat id)
+
+Final: 52 tests passing. All reviewers (4 subagents × 2 rounds + Codex) returned SHIP with zero blockers.
 
 ## Acceptance criteria
 - `pytest` green.

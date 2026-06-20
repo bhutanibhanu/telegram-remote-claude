@@ -24,8 +24,8 @@ def main() -> None:
     app = bot.build_application()
 
     log.info(
-        "Starting Claude Telegram bot | allowed chats: %s | workdir: %s | model: %s | skip_permissions: %s",
-        sorted(config.allowed_chat_ids),
+        "Starting Claude Telegram bot | %d allowed chat(s) | workdir: %s | model: %s | skip_permissions: %s",
+        len(config.allowed_chat_ids),
         config.workdir,
         config.model or "(default)",
         config.skip_permissions,
