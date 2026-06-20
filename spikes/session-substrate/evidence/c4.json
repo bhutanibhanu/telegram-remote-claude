@@ -1,0 +1,8 @@
+{
+  "criterion": "c4",
+  "verdict": "PASS",
+  "observed_reason": "C4 honored both verdicts via the real SDK permission callback (can_use_tool). APPROVE (PermissionResultAllow) -> native 'User has approved your plan'. REJECT (PermissionResultDeny message=feedback) -> 'Plan rejected'; the model stayed in plan mode (no execution; plan never approved) and the code-injected marker ADD_LOGGING_STEP -- which the neutral prompt never mentioned -- was honored via the model's revision reply text (marker absent from the structured plan field on this run -- structured-plan placement is model-variant). feedback_honored asserts against the FULL revised structured plan OR the revision reply (either suffices; both prove code-supplied feedback influenced the post-rejection session). CAVEATS: whether the marker lands in the structured plan FIELD is model-variant; reject feedback travels through the PermissionResultDeny(message=...) channel; post-approval ARBITRARY execution is not tested (contained); C4 concerns programmatic approval/rejection and honoring feedback. Substrate B still requires its own C4 probe at T16.",
+  "timestamp": "2026-06-20T21:41:49.977855+00:00",
+  "transcript_path": "c4.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

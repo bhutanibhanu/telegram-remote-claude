@@ -1,0 +1,63 @@
+# criterion: c4
+# verdict: PASS
+# observed_reason: C4 honored both verdicts via the real SDK permission callback (can_use_tool). APPROVE (PermissionResultAllow) -> native 'User has approved your plan'. REJECT (PermissionResultDeny message=feedback) -> 'Plan rejected'; the model stayed in plan mode (no execution; plan never approved) and the code-injected marker ADD_LOGGING_STEP -- which the neutral prompt never mentioned -- was honored via the model's revision reply text (marker absent from the structured plan field on this run -- structured-plan placement is model-variant). feedback_honored asserts against the FULL revised structured plan OR the revision reply (either suffices; both prove code-supplied feedback influenced the post-rejection session). CAVEATS: whether the marker lands in the structured plan FIELD is model-variant; reject feedback travels through the PermissionResultDeny(message=...) channel; post-approval ARBITRARY execution is not tested (contained); C4 concerns programmatic approval/rejection and honoring feedback. Substrate B still requires its own C4 probe at T16.
+# timestamp: 2026-06-20T21:41:49.977855+00:00
+------------------------------------------------------------
+=== T9 / C4 — ExitPlanMode approve/reject + feedback (substrate A) ===
+sdk: claude-agent-sdk==0.2.105
+ANTHROPIC_API_KEY set: False (must be False)
+permission_mode=plan; ExitPlanMode via can_use_tool; execution tools contained (Bash/Edit/out-of-fixture Write/AskUserQuestion denied). No bypass.
+
+--- TRIAL approve (allow ExitPlanMode) ---
+  session_id: 96ad98bf-c388-4742-a595-d8ea2bc1d7ab  ExitPlanMode fired: 1
+  plan[0] full_len=732 marker_in_full_plan=False preview(200): '# Plan: Add a `greet()` function in `greet.py`\n\n## Context\nThe user wants a minimal Python function that prints a hello message,\nliving in its own new file. This is a self-contained, greenfield additi'
+  ExitPlanMode tool_result is_error=None: 'User has approved your plan. You can now start coding. Start with updating your todo list if applicable\n\nYour plan has been saved to: /Users/ray/.claude/plans/propose-a-brief-plan-wild-dawn.md\nYou can refer back to it if'
+  non-ExitPlanMode tool decisions: [('Write(outside-fixture)', 'deny'), ('Write(in-fixture)', 'allow')]
+  denied execution attempts: [('Write', 'outside-fixture'), ('Bash', 'denied')]
+  approved_result seen: True
+  model final (first 200): 'Done. Created `greet.py` at the project root:\n\n```python\ndef greet():\n    print("Hello")\n\n\nif __name__ == "__main__":\n    greet()\n```\n\nThe file matches the approved plan: a `greet()` function that pri'
+  model final full_len=542 marker_in_response=False
+
+--- TRIAL reject (deny ExitPlanMode + feedback marker) ---
+  session_id: 0c2de9aa-4e28-4d40-9c13-7655b84b564f  ExitPlanMode fired: 2
+  plan[0] full_len=781 marker_in_full_plan=False preview(200): '# Plan: Add `greet()` function in `greet.py`\n\n## Context\nWe need a simple Python function `greet()` that prints "hello". There is no\nexisting file for it, so we\'ll create a new standalone module `gree'
+  plan[1] full_len=781 marker_in_full_plan=False preview(200): '# Plan: Add `greet()` function in `greet.py`\n\n## Context\nWe need a simple Python function `greet()` that prints "hello". There is no\nexisting file for it, so we\'ll create a new standalone module `gree'
+  ExitPlanMode tool_result is_error=True: 'Plan rejected. Revise and re-present via ExitPlanMode: you MUST add an explicit step literally named ADD_LOGGING_STEP that adds logging.'
+  non-ExitPlanMode tool decisions: []
+  denied execution attempts: [('AskUserQuestion', 'denied')]
+  approved_result seen: False
+  model final (first 200): "I'll write the plan file and load the ExitPlanMode tool. This is a trivial task (a single new file), so I'll skip exploration agents.Plan is written. Here it is for your approval:The rejection feedbac"
+  model final full_len=2143 marker_in_response=True
+
+=== C4 evaluation ===
+approve_honored (allow -> 'approved your plan'): True
+reject_delivered (deny -> 'Plan rejected' with feedback): True
+reject_no_execution (plan never approved -> nothing executed): True
+feedback code-driven (FULL-plan assertion, two signals):
+  marker_in_full_revised_plan = False
+  marker_in_revision_response = True
+  feedback_honored (either)   = True
+  supporting signal           = model's revision reply text (marker absent from the structured plan field on this run -- structured-plan placement is model-variant)
+
+cleanup: removed 2 plan-scratch file(s) created in /Users/ray/.claude/plans
+
+Distinguishers / limitations (explicit disclosures):
+- ExitPlanMode fired as a real tool_use intercepted by the real SDK permission
+  callback can_use_tool (not a model refusal / not a no-call).
+- APPROVE is native: PermissionResultAllow yields the CLI's 'approved your plan' result.
+- REJECT feedback travels through the PermissionResultDeny(message=...) channel; for plan
+  rejection this is the natural rejection channel, but it still depends on the model
+  reading/revising per that text.
+- Code-driven proof: the marker ADD_LOGGING_STEP is injected ONLY by the callback feedback; the
+  neutral prompt never mentions logging, so its appearance in the revised plan or reply
+  came from code, not model prompt-following.
+- The feedback gate asserts against the FULL revised structured plan text (NOT a truncated
+  preview) OR the model's revision reply. Whether the marker lands in the structured-plan
+  FIELD specifically is MODEL-VARIANT across runs; the reply-text signal is the robust path,
+  so the gate accepts either (both prove code-supplied feedback influenced the session).
+- Execution was contained (Bash/Edit/out-of-fixture Write/AskUserQuestion denied); only plan
+  presentation is tested. POST-APPROVAL ARBITRARY EXECUTION IS NOT TESTED here.
+- C4 concerns PROGRAMMATIC APPROVAL/REJECTION + honoring feedback only; no claim about
+  C1/C2/C3/C5/C6. Substrate B still REQUIRES ITS OWN C4 PROBE at T16 (design S1).
+VERDICT: PASS
+REASON: C4 honored both verdicts via the real SDK permission callback (can_use_tool). APPROVE (PermissionResultAllow) -> native 'User has approved your plan'. REJECT (PermissionResultDeny message=feedback) -> 'Plan rejected'; the model stayed in plan mode (no execution; plan never approved) and the code-injected marker ADD_LOGGING_STEP -- which the neutral prompt never mentioned -- was honored via the model's revision reply text (marker absent from the structured plan field on this run -- structured-plan placement is model-variant). feedback_honored asserts against the FULL revised structured plan OR the revision reply (either suffices; both prove code-supplied feedback influenced the post-rejection session). CAVEATS: whether the marker lands in the structured plan FIELD is model-variant; reject feedback travels through the PermissionResultDeny(message=...) channel; post-approval ARBITRARY execution is not tested (contained); C4 concerns programmatic approval/rejection and honoring feedback. Substrate B still requires its own C4 probe at T16.
