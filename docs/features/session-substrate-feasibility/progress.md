@@ -44,7 +44,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T3 — Evidence recorder + transcript-capture helper (dc2a0c3)
 - [x] T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe (587334d)
 - [x] T5 — A-harness: persistent session lifecycle (start/resume/send/stop) (053ca9b)
-- [ ] T6 — A · C1 bidirectional streaming check
+- [x] T6 — A · C1 bidirectional streaming check (fb4247e)
 - [ ] T7 — A · C2 per-tool permission decision check (sandboxed)
 - [ ] T8 — A · C3 AskUserQuestion answered programmatically
 - [ ] T9 — A · C4 ExitPlanMode approve/reject + feedback
@@ -126,7 +126,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Acceptance:**
   - WHEN the check runs ≥2 turns over one live session, it SHALL capture the streamed events and emit `PASS/FAIL/PARTIAL` with the observed reason. **(X3)**
 - **Tests:** none — verdict + transcript is the artifact.
-- **Status:** todo
+- **Status:** done (fb4247e) — **C1 PASS**. Two turns over one persistent session (stable session_id); a 2nd operator message mid-session was accepted without a new session. Genuine `text_delta` events arrived **before** the completed `AssistantMessage` and the terminal `Result/success(is_error=False)` in both turns. Streaming is **coarse-grained (≈3–4 deltas/turn), not guaranteed token-level**; some runs also emit `signature_delta` (extended-thinking) events — the PASS rests on observed `text_delta` deltas. Host CLI auth, no API key; evidence `evidence/c1.*` scrubbed (X3); spike-only, no production files. **Two independent reviewers returned ALL PASS** (12/12 bullets each). C1 only — no C2–C6 claim.
 
 ### T7 — A · C2 per-tool permission decision check (sandboxed)
 - **Goal:** Prove code is consulted before a risky tool runs and its allow/deny is honored — one risky tool denied (does not execute), a second allowed (does).
