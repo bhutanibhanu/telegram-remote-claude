@@ -48,7 +48,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T7 — A · C2 per-tool permission decision check (sandboxed) (c8d9f3c)
 - [x] T8 — A · C3 AskUserQuestion answered programmatically (4eeaa9f — PARTIAL)
 - [x] T9 — A · C4 ExitPlanMode approve/reject + feedback (275a9b1 — PASS)
-- [ ] T10 — C5 test skill fixture (emits permission + AskUserQuestion/ExitPlanMode)
+- [x] T10 — C5 test skill fixture (emits permission + AskUserQuestion/ExitPlanMode) (e54507a)
 - [ ] T11 — A · C5 skill invocation through the same channels
 - [ ] T12 — A · C6 session resume by id across process runs
 - [ ] T13 — B-harness: CLI `stream-json` driver + permission-mechanism discovery
@@ -187,7 +187,19 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Acceptance:**
   - WHEN the skill is invoked in-session, it SHALL emit at least one permission prompt and one interactive-tool prompt (AskUserQuestion and/or ExitPlanMode).
 - **Tests:** none — fixture; exercised by T11.
-- **Status:** todo
+- **Status:** done (e54507a) — fixture `test_skill/spike-c5-probe/SKILL.md` (name `spike-c5-probe`).
+  Valid SKILL.md frontmatter; instructions deterministically drive (1) a per-tool **permission**
+  request — a single contained `Write` of `c5_skill_sentinel.txt` (C2 channel) — and (2) an
+  **AskUserQuestion** (2-option single-select, `Alpha`/`Bravo` — C3 channel), then a machine-checkable
+  `C5_DONE:<option>` completion line. Hard constraints forbid other tools/files and ExitPlanMode
+  (C5 design allows "AskUserQuestion **and/or** ExitPlanMode"). Stored plainly (not under `.claude/`)
+  so the committed fixture is never mistaken for live config; T11 copies it into a disposable
+  `<tempcwd>/.claude/skills/` and loads it via `skills=["spike-c5-probe"]`, `setting_sources=["project"]`.
+  No production files; no repo-root `.claude/`; no secrets. **Two independent reviewers (acceptance +
+  adversarial) both ACCEPT** the fixture. Behavioral emission proof is deferred to T11; reviewers
+  flagged for T11: **allow** the sentinel Write so the skill proceeds, and run **differing-option
+  trials** to prove the `C5_DONE` value is code-driven (C5 completion inherits C3's PARTIAL
+  deny-channel / model-interpretation caveat).
 
 ### T11 — A · C5 skill invocation through the same channels
 - **Goal:** Prove the C5 test skill is invoked in-session and its interactive prompts flow through the **same** permission/question/plan channels proven in C2–C4, driven to completion.
