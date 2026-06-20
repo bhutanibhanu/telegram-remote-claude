@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.tmp
+.pytest_cache/
+.claude_tg_sessions.json
