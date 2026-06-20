@@ -42,7 +42,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T1 — Spike scaffold + isolated, ignored venv + recorded deps (9792e15)
 - [x] T2 — Secret scrubber utility + unit test (bc9facf)
 - [x] T3 — Evidence recorder + transcript-capture helper (dc2a0c3)
-- [ ] T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe
+- [x] T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe (587334d)
 - [ ] T5 — A-harness: persistent session lifecycle (start/resume/send/stop)
 - [ ] T6 — A · C1 bidirectional streaming check
 - [ ] T7 — A · C2 per-tool permission decision check (sandboxed)
@@ -106,7 +106,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the Agent SDK is installed, its exact version SHALL be reflected in `requirements.lock` (re-verify **X2**); production dep files stay unchanged.
   - The preflight evidence SHALL pass the secret scan before commit. **(X3)**
 - **Tests:** none — evidence-producing harness; the recorded output is the artifact.
-- **Status:** todo
+- **Status:** done (587334d) — PASS: `claude-agent-sdk==0.2.105` exists, installs into the spike venv, and imports (Python 3.14.5, claude CLI 2.1.183) — refutes the prior "SDK doesn't exist" research. SDK+deps pinned in `requirements.lock` (X2), production deps untouched; evidence scrubbed + secret-scanned clean (X3); independent audit returned SUPPORTED. T4 probes existence/version/import only — no C1–C6 claim.
 
 ### T5 — A-harness: persistent session lifecycle (start/resume/send/stop)
 - **Goal:** Stand up the Agent SDK persistent client and the `start` / `resume` / `send` / `stop` lifecycle the C1–C6 checks drive against.
