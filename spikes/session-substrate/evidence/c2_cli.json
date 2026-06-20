@@ -1,0 +1,8 @@
+{
+  "criterion": "c2_cli",
+  "verdict": "PASS",
+  "observed_reason": "Genuine per-tool permission decision honored OVER THE WIRE (substrate B, raw CLI stream-json control protocol): a can_use_tool control_request for Write to denied-marker arrived over the wire, our deny control_response was honored and the tool did NOT execute (file absent); a can_use_tool for Write to allowed-marker was answered allow and executed (file present with sentinel). SAME tool (Write), opposite per-request decisions over the wire (not global --allowedTools config); the callback fired over the wire both times (not refusal/no-call); denied not executed (not post-exec failure); repo untouched; resolved-target containment enforced (policy-level).",
+  "timestamp": "2026-06-20T22:52:00.094954+00:00",
+  "transcript_path": "c2_cli.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

@@ -1,0 +1,74 @@
+# criterion: c2_cli
+# verdict: PASS
+# observed_reason: Genuine per-tool permission decision honored OVER THE WIRE (substrate B, raw CLI stream-json control protocol): a can_use_tool control_request for Write to denied-marker arrived over the wire, our deny control_response was honored and the tool did NOT execute (file absent); a can_use_tool for Write to allowed-marker was answered allow and executed (file present with sentinel). SAME tool (Write), opposite per-request decisions over the wire (not global --allowedTools config); the callback fired over the wire both times (not refusal/no-call); denied not executed (not post-exec failure); repo untouched; resolved-target containment enforced (policy-level).
+# timestamp: 2026-06-20T22:52:00.094954+00:00
+------------------------------------------------------------
+=== T14 / C2 — per-tool permission decision OVER THE WIRE (substrate B, sandboxed) ===
+substrate B: raw `claude` CLI over stream-json control protocol (NO claude-agent-sdk).
+claude --version: 2.1.185 (Claude Code)
+ANTHROPIC_API_KEY set: False (must be False)
+permission_mode=default; --permission-prompt-tool stdio (set automatically by the harness when a can_use_tool callback is provided); NO bypass / NO --dangerously-skip. Write is NOT in allowed/disallowed lists -> the control-protocol callback is the sole decision point for Write.
+disposable fixture (outside repo): /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6
+
+# containment policy unit-check (pure decide()):
+  inside/allowed   -> allow (expected allow OK) [policy: allowed-marker.txt permitted inside fixture]
+  inside/denied    -> deny  (expected deny  OK) [policy: deny-by-default (only allowed-marker.txt permitted)]
+  outside fixture  -> deny  (expected deny  OK) [containment: target resolves OUTSIDE fixture]
+  traversal abs    -> deny  (expected deny  OK) [containment: target resolves OUTSIDE fixture]
+  traversal rel    -> deny  (expected deny  OK) [containment: target resolves OUTSIDE fixture]
+  no target        -> deny  (expected deny  OK) [deny-by-default: Write with no file target]
+  containment unit-check all-pass: True
+spawn command: claude --output-format stream-json --verbose -p --input-format stream-json --permission-mode default --permission-prompt-tool stdio --allowedTools Read,LS,Glob,Grep --disallowedTools Bash,Edit,NotebookEdit,WebFetch,WebSearch
+
+start(): subprocess spawned; reader thread running
+initialize(): control handshake done; reply keys=['account', 'agents', 'available_output_styles', 'commands', 'feedback_survey_config', 'models', 'output_style', 'pid']
+
+--- turn 1 ---
+  [tool_use]    Write {'file_path': '/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6/denied-marker.txt', 'content': '<14 chars>'}
+  [tool_result] is_error=True policy: deny-by-default (only allowed-marker.txt permitted)
+  turn 1: tool_use=1 tool_results=1 text_msgs=1 result_subtype='success' result_is_error=False
+
+--- turn 2 ---
+  [tool_use]    Write {'file_path': '/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6/allowed-marker.txt', 'content': '<10 chars>'}
+  [tool_result] is_error=None File created successfully at: /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6/allowed-marker.txt (file state is
+  turn 2: tool_use=1 tool_results=1 text_msgs=1 result_subtype='success' result_is_error=False
+
+stop(): stdin closed, subprocess terminated, threads joined
+
+# recorded permission decisions (callback log, in order):
+    7845.4ms  Write   deny   target=/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6/denied-marker.txt  reason=policy: deny-by-default (only allowed-marker.txt permitted)  input={'file_path': '/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6/denied-marker.txt', 'content': '<14 chars>'}
+   14675.1ms  Write   allow  target=/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6/allowed-marker.txt  reason=policy: allowed-marker.txt permitted inside fixture  input={'file_path': '/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6/allowed-marker.txt', 'content': '<10 chars>'}
+
+# can_use_tool control_requests received over the wire (CLI -> driver):
+  wire can_use_tool: tool='Write' file_path='/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6/denied-marker.txt'
+  wire can_use_tool: tool='Write' file_path='/private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6/allowed-marker.txt'
+
+# filesystem proof:
+  denied-marker exists?  False   (expected: False -> not executed)
+  allowed-marker exists? True  content_has_sentinel=True (expected: True / True)
+  repo NEW changes during run: NONE (expected NONE -> tool activity did not touch the repo)
+  (pre-existing uncommitted entries, ignored as not run-induced: ['?? spikes/session-substrate/checks/c2_permission_cli.py'])
+
+# distinguishers:
+  denied callback fired over the wire (model DID attempt Write -> not refusal/no-call): True
+  allowed callback fired over the wire: True
+  denied NOT executed (blocked before exec, not post-exec failure): True
+  allowed executed with expected content: True
+  SAME tool (Write) denied once + allowed once over the wire -> per-request gate, NOT global config: True
+  repository untouched by run (no new changes): True
+  containment policy unit-check passed (deny outside-fixture + traversal): True
+cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t14-c2-cli-37f7uat6']
+
+cleanup: removed fixture /private/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t14_c2_cli_37f7uat6 (exists now: False)
+
+Limitations / scope:
+- Proves C2 (per-tool permission decision) on SUBSTRATE B ONLY; no claim about C1/C3-C6.
+- Mechanism = stream-json control protocol activated by the UNDOCUMENTED
+  `--permission-prompt-tool stdio` spawn flag (T13 finding); B couples directly to this
+  host CLI flag -> pin/monitor the CLI version, treat a missing/changed flag as fail-clean.
+- Containment is enforced by the callback resolving the target path; the CLI still runs the
+  tool in-process, so containment is POLICY-LEVEL (callback denies out-of-fixture targets),
+  NOT an OS/kernel sandbox. Effects were confined to a temp dir; repo untouched.
+- Single host/run; verdict reproducible, session_id/paths are not.
+VERDICT: PASS
+REASON: Genuine per-tool permission decision honored OVER THE WIRE (substrate B, raw CLI stream-json control protocol): a can_use_tool control_request for Write to denied-marker arrived over the wire, our deny control_response was honored and the tool did NOT execute (file absent); a can_use_tool for Write to allowed-marker was answered allow and executed (file present with sentinel). SAME tool (Write), opposite per-request decisions over the wire (not global --allowedTools config); the callback fired over the wire both times (not refusal/no-call); denied not executed (not post-exec failure); repo untouched; resolved-target containment enforced (policy-level).
