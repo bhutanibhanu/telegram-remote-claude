@@ -1,0 +1,96 @@
+# criterion: c6
+# verdict: PASS
+# observed_reason: Cross-process resume PROVEN: phase A (process 1) planted code-generated codeword C6_6707a26f in session 0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6; phase B (SEPARATE process, fresh interpreter) resumed BY ID (same id 0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6, fork_session unset) and returned the exact codeword though its prompt never contained it -> session history was retained across process runs. BOTH negative controls were blind: the same-cwd no-resume control did NOT know the codeword (rules out SHARED-CWD LEAKAGE -- retention comes from resuming the id, not from sharing the project directory), and the diff-cwd no-resume control also did not (rules out guessing). OBSERVED: resuming the same id from a DIFFERENT cwd failed ('ProcessError: Command failed with exit code 1 (exit code: 1)') -> resume is cwd/project-scoped (the id is not a global handle); persist (session_id, cwd) together and resume from the original cwd.
+# timestamp: 2026-06-20T22:22:59.834995+00:00
+------------------------------------------------------------
+=== T12 / C6 — session resume by id ACROSS PROCESS RUNS (substrate A) ===
+sdk: claude-agent-sdk==0.2.105
+claude CLI: 2.1.185 (Claude Code)
+orchestrator pid=92081 python=python (phases run as SEPARATE child processes)
+ANTHROPIC_API_KEY set: False (must be False -- host CLI auth only)
+fork_session: NOT set (default False) -> resume continues SAME id, does not fork to a new id
+SDK project-key fn available for exact cleanup: True
+cwd (phase A + B + control_same, shared, temp): /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t12_c6_ab_jrailrms
+cwd (control_diff, separate, temp): /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t12_c6_ctl_llgt_muy
+cwd (cwd-coupling probe, different, temp): /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t12_c6_xdir_wa9zmpkf
+~/.claude/plans snapshot before: []
+~/.claude/projects entry count before: 68
+
+--- PHASE A (process 1): start fresh session, plant codeword ---
+  [phase a] pid-exit=0 (separate interpreter: python)
+  [phase a stderr] C6_PLANT_REPLY='STORED'
+  phase A session_id (recorded): 0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6
+  phase A planted codeword: C6_6707a26f  (random token; not a secret)
+
+--- PHASE B (process 2, SEPARATE): resume by id, ask for codeword ---
+  phase B prompt does NOT contain the codeword (asks 'what codeword did I ask you to remember?')
+  [phase b] pid-exit=0 (separate interpreter: python)
+  phase B resumed/observed session_id: 0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6
+  phase B answer: 'C6_6707a26f'
+
+--- NEGATIVE CONTROL (same cwd, NO resume): fresh start() in cwd_ab ---
+  proves retention is NOT cwd-scoped leakage: same project scope as
+  phase A/B but a brand-new session that never resumed.
+  [phase control_same] pid-exit=0 (separate interpreter: python)
+  control_same session_id: 3ad6d170-dba1-4143-932c-ab806faada38
+  control_same answer: "You didn't ask me to remember any codeword — this is the start of our conversation, and there's nothing earlier in it. I have no codeword to give you."
+
+--- NEGATIVE CONTROL (different cwd, NO resume): fresh start() ---
+  [phase control_diff] pid-exit=0 (separate interpreter: python)
+  control_diff session_id: 378041e9-cc88-4a7f-9d9f-234ac3d8ec34
+  control_diff answer: "You didn't ask me to remember any codeword — this is the start of our conversation, and there's no earlier message with a codeword in it. I don't have anything to recall here."
+
+--- CWD-COUPLING PROBE: resume phase A's id from a DIFFERENT cwd ---
+  expected to FAIL ('No conversation found') if resume is cwd-scoped.
+  [phase resume_diff] pid-exit=0 (separate interpreter: python)
+  [phase resume_diff stderr] No conversation found with session ID: 0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6
+  resume_diff_cwd FAILED (expected True): True
+  resume_diff_cwd error: 'ProcessError: Command failed with exit code 1 (exit code: 1)'
+  resume_diff_cwd answer (should be empty): ''
+  resume_diff_cwd observed session_id: None
+
+=== C6 evaluation ===
+phase B resumed SAME id (sid_b==sid_a): True  (sid_a=0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6, sid_b=0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6)
+resume forked to a NEW id: False  (would indicate fork_session semantics; should be False)
+codeword retained in phase B answer: True  (word=C6_6707a26f)
+control_same (same cwd, no resume) knew codeword: False  (MUST be False -> rules out shared-cwd leakage)
+control_diff (diff cwd, no resume) knew codeword: False  (MUST be False -> rules out guessing)
+BOTH negative controls blind: True
+OBSERVATION cwd-coupling: resume from a DIFFERENT cwd failed: True (returned-word=False)
+  -> resume is CWD/PROJECT-SCOPED: the id alone is not a global handle (err: 'ProcessError: Command failed with exit code 1 (exit code: 1)').
+
+~/.claude/plans snapshot after: []
+plan-scratch created by run: none
+~/.claude/projects entries before/after run: 68 -> 70 (new this run: ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t12-c6-ab-jrailrms', '-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t12-c6-ctl-llgt-muy'])
+  cleanup match set -> exact SDK names: ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t12-c6-ab-jrailrms', '-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t12-c6-ctl-llgt-muy', '-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t12-c6-xdir-wa9zmpkf']
+  cleanup match set -> unique cwd tokens: [REDACTED] 't12-c6-ctl-llgt-muy', 't12-c6-xdir-wa9zmpkf']
+  REMOVED project-transcript dir (exact=True, token=[REDACTED] -private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t12-c6-ab-jrailrms
+  REMOVED project-transcript dir (exact=True, token=[REDACTED] -private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-t12-c6-ctl-llgt-muy
+~/.claude/projects entry count after cleanup: 68 (removed 2 this run)
+temp cwds removed: /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t12_c6_ab_jrailrms, /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t12_c6_ctl_llgt_muy, /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/t12_c6_xdir_wa9zmpkf
+
+Limitations / scope:
+- Proves C6 (cross-process resume with retained context) ONLY; no C1-C5 claim.
+- The codeword is code-generated & absent from phase B's prompt, so a correct
+  answer can only come from resumed history; BOTH negative controls (same-cwd
+  no-resume, diff-cwd no-resume) being blind rule out guessing AND shared-cwd
+  leakage -- retention is attributable to resuming the id.
+- Distinguishes SDK resume mechanism from model cooperation: SDK loads history;
+  the model merely reads it back. fork_session is left unset (default False).
+- RESUME IS CWD/PROJECT-SCOPED: resuming the same session id from a DIFFERENT
+  cwd fails ('No conversation found') -- the id alone is not a global handle.
+  The CLI persists transcripts at ~/.claude/projects/<sanitized-cwd>/
+  <session_id>.jsonl. OPERATIONAL RULE for P1: persist (session_id, cwd)
+  together and resume only from the original project cwd.
+- NOT TESTED HERE (deferred to P1 RB3): resume after a CRASH mid-turn (torn
+  transcript / fail-clean), concurrent or double resume of the same id
+  (substrate does not prevent double-attach -- the engine must), resume of aged
+  sessions or across a CLI/SDK upgrade. C6 proves the clean-restart happy path
+  only.
+- HOUSEKEEPING (RB6): ~/.claude/projects/<sanitized-cwd>/ transcript dirs
+  survive deletion of the working dir; deleting a project workspace does not
+  reclaim its session transcripts. (This check cleans up only the dirs it
+  creates, conservatively, by exact SDK-derived name + unique temp token.)
+- Single host/run; session ids are not reproducible across runs (verdict is).
+VERDICT: PASS
+REASON: Cross-process resume PROVEN: phase A (process 1) planted code-generated codeword C6_6707a26f in session 0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6; phase B (SEPARATE process, fresh interpreter) resumed BY ID (same id 0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6, fork_session unset) and returned the exact codeword though its prompt never contained it -> session history was retained across process runs. BOTH negative controls were blind: the same-cwd no-resume control did NOT know the codeword (rules out SHARED-CWD LEAKAGE -- retention comes from resuming the id, not from sharing the project directory), and the diff-cwd no-resume control also did not (rules out guessing). OBSERVED: resuming the same id from a DIFFERENT cwd failed ('ProcessError: Command failed with exit code 1 (exit code: 1)') -> resume is cwd/project-scoped (the id is not a global handle); persist (session_id, cwd) together and resume from the original cwd.

@@ -1,0 +1,8 @@
+{
+  "criterion": "c6",
+  "verdict": "PASS",
+  "observed_reason": "Cross-process resume PROVEN: phase A (process 1) planted code-generated codeword C6_6707a26f in session 0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6; phase B (SEPARATE process, fresh interpreter) resumed BY ID (same id 0d84f7b1-eb68-4c7c-b3d2-38bbedc521f6, fork_session unset) and returned the exact codeword though its prompt never contained it -> session history was retained across process runs. BOTH negative controls were blind: the same-cwd no-resume control did NOT know the codeword (rules out SHARED-CWD LEAKAGE -- retention comes from resuming the id, not from sharing the project directory), and the diff-cwd no-resume control also did not (rules out guessing). OBSERVED: resuming the same id from a DIFFERENT cwd failed ('ProcessError: Command failed with exit code 1 (exit code: 1)') -> resume is cwd/project-scoped (the id is not a global handle); persist (session_id, cwd) together and resume from the original cwd.",
+  "timestamp": "2026-06-20T22:22:59.834995+00:00",
+  "transcript_path": "c6.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}
