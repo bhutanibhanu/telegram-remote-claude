@@ -40,7 +40,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 
 ## Task list
 - [x] T1 — Spike scaffold + isolated, ignored venv + recorded deps (9792e15)
-- [ ] T2 — Secret scrubber utility + unit test
+- [x] T2 — Secret scrubber utility + unit test (bc9facf)
 - [ ] T3 — Evidence recorder + transcript-capture helper
 - [ ] T4 — Preflight: Python + `claude` CLI versions + Agent SDK probe
 - [ ] T5 — A-harness: persistent session lifecycle (start/resume/send/stop)
@@ -84,7 +84,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN `scrub()` receives text with no secrets, it SHALL return it unchanged.
   - The scrubber SHALL be the single chokepoint every transcript write passes through (see T3).
 - **Tests:** **Real pytest unit test** (`test_scrub.py`) asserting: known token shapes are redacted; benign text is preserved; idempotent on already-scrubbed text. This is the only required automated test in the spike.
-- **Status:** todo
+- **Status:** done (bc9facf) — 16 tests pass under spike-local pytest.ini; 2 independent reviewers (incl. adversarial leak/over-redaction probes): ALL PASS.
 
 ### T3 — Evidence recorder + transcript-capture helper
 - **Goal:** Shared helper that records a per-criterion `PASS/FAIL/PARTIAL` result with its captured session transcript, routing every write through the T2 scrubber.
