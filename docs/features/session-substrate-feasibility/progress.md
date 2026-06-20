@@ -50,7 +50,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T9 — A · C4 ExitPlanMode approve/reject + feedback (275a9b1 — PASS)
 - [x] T10 — C5 test skill fixture (emits permission + AskUserQuestion/ExitPlanMode) (e54507a)
 - [x] T11 — A · C5 skill invocation through the same channels (95362da — PASS)
-- [ ] T12 — A · C6 session resume by id across process runs
+- [x] T12 — A · C6 session resume by id across process runs (a5c3452 — PASS)
 - [ ] T13 — B-harness: CLI `stream-json` driver + permission-mechanism discovery
 - [ ] T14 — B · C2 permission decision over the wire (sandboxed)
 - [ ] T15 — B · C3 AskUserQuestion over `stream-json`
@@ -239,7 +239,27 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Acceptance:**
   - WHEN run A starts a session and records its id, and run B (separate process) resumes that id, the check SHALL demonstrate retained context — verdict + transcript. **(X3)**
 - **Tests:** none — verdict + transcript is the artifact.
-- **Status:** todo
+- **Status:** done (a5c3452) — **C6 PASS**. Genuine **cross-process** resume proven: phase A (a separate
+  python interpreter) planted a **code-generated, unguessable** codeword (`C6_<hex>`, via
+  `secrets.token_hex`) in a fresh session and recorded its id; phase B (a **distinct** process,
+  spawned via `subprocess`) **resumed by id** and returned the exact codeword **though phase B's
+  prompt never contained it** → conversation history was retained across process runs. The resumed
+  id was the **same** (`fork_session` unset → continue, not fork). **Two negative controls** were
+  both blind: a **same-cwd no-resume** control (rules out shared-cwd leakage — retention comes from
+  resuming the id, not from sharing the project dir) and a diff-cwd no-resume control (rules out
+  guessing). **OBSERVED operational property:** resuming the same id from a **DIFFERENT cwd FAILS**
+  (`No conversation found with session ID`) → **resume is cwd/project-scoped**; the CLI persists
+  transcripts at `~/.claude/projects/<sanitized-cwd>/<session_id>.jsonl`. **P1 rule:** persist
+  `(session_id, cwd)` together and resume only from the original project cwd. **NOT TESTED (deferred
+  to P1 RB3):** resume after a crash mid-turn (torn transcript / fail-clean), concurrent/double
+  resume of the same id (substrate does NOT prevent double-attach — the engine must), aged sessions,
+  resume across a CLI/SDK upgrade — C6 proves the clean-restart happy path only. **RB6 housekeeping:**
+  project transcript dirs survive working-dir deletion (the check now cleans the dirs it creates).
+  Text-only containment; host CLI auth, no API key; evidence `evidence/c6.*` scrubbed + secret-scan
+  clean (X3). **Four fresh independent reviewers total** — acceptance+live-reproduction, adversarial,
+  a session-recovery/reliability specialist, and an enhancement-confirmation reviewer — **all AGREE
+  PASS**; the cwd-coupling caveats and the sharper same-cwd control were added in response to the
+  adversarial + specialist findings. C6 only — no C1–C5 claim.
 
 ### T13 — B-harness: CLI `stream-json` driver + permission-mechanism discovery
 - **Goal:** Drive `claude -p --input-format stream-json --output-format stream-json`, parse the event stream, and record how permission decisions are actually answered over the wire on the installed CLI version (the design flags `--permission-prompt-tool` as absent on v2.1.183 — record the real mechanism).
