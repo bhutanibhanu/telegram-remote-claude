@@ -6,7 +6,7 @@ _Plan generated 2026-06-20 from design.md · 19 tasks · supervised build_
 > drafted normalized engine interface, and a filled **ADR-001 (Proposed)** + go/no-go.
 > The `spikes/session-substrate/` tree is throwaway-quality but **retained** as a
 > reproducible, non-production reference (design S3). Per the design's Test policy, the
-> spike is **not** held to the repo's 52-test snapshot and gets **no unit-test suite** —
+> spike is **not** held to the repo's 53-test snapshot and gets **no unit-test suite** —
 > the *evidence* (runnable checks + scrubbed transcripts) is the verification artifact.
 > The **only** code with a real unit test is the secret scrubber (T2), because secret
 > hygiene (SB3) gates every committed transcript.
@@ -20,10 +20,13 @@ _Plan generated 2026-06-20 from design.md · 19 tasks · supervised build_
 These three were added at plan approval and gate the whole spike. The build loop must hold
 each task to them where relevant; they are also bound inline to the tasks they most affect.
 
-- **X1 — Sandboxed risky tests.** WHEN any check exercises a risky tool (Write/Bash/edit),
-  it SHALL run inside a controlled temporary fixture directory (e.g. `tempfile.mkdtemp()`),
-  and SHALL NOT be able to read, write, or delete anything in the repository tree or the
-  user's personal files. (Primary tasks: T7, T14.)
+- **X1 — Controlled risky tests (not an OS sandbox).** WHEN a check exercises a risky tool,
+  it SHALL use a dedicated temporary fixture directory and prefer deterministic sentinel `Write`
+  operations over arbitrary Bash. Where the substrate exposes a permission callback, the harness
+  SHALL resolve targets and deny anything outside the fixture. The check SHALL record repository
+  status before/after and verify only the expected sentinel changed. If a substrate cannot enforce
+  containment, the result SHALL say so explicitly as `PARTIAL`/`FAIL`; cwd alone must never be
+  described as a security boundary. (Primary tasks: T7, T14.)
 - **X2 — Isolated, recorded deps.** WHEN the spike needs third-party packages, they SHALL be
   installed into an **isolated, git-ignored** virtual environment scoped to the spike, with
   **exact versions recorded** in a committed spike-local lock. Production dependency files
@@ -131,8 +134,10 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Files (expected):** `spikes/session-substrate/checks/c2_permission.py`, `evidence/c2.*`.
 - **Acceptance:**
   - WHEN a risky tool (e.g. `Write`/`Bash`) is denied programmatically, it SHALL NOT execute; WHEN a second is allowed, it SHALL execute — both captured with verdict + transcript. **(X3)**
-  - The risky tool SHALL operate **only inside a controlled temporary fixture dir** and SHALL be unable to touch the repo tree or personal files; the test sets cwd/targets to that temp dir and verifies nothing outside it changed. **(X1)**
-- **Tests:** none — verdict + transcript is the artifact (sandbox boundary asserted within the check).
+  - The check SHALL follow **X1**: use a deterministic sentinel operation in a temporary fixture,
+    enforce resolved-target containment through the permission callback where supported, and record
+    repository status before/after. Any inability to enforce containment SHALL be documented in the verdict.
+- **Tests:** none — verdict + transcript + recorded containment checks are the artifact.
 - **Status:** todo
 
 ### T8 — A · C3 AskUserQuestion answered programmatically ⭐
@@ -197,7 +202,9 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Files (expected):** `spikes/session-substrate/checks/c2_permission_cli.py`, `evidence/c2_cli.*`.
 - **Acceptance:**
   - WHEN a risky tool is denied/allowed over the wire, the check SHALL confirm honored behavior — verdict + transcript. **(X3)**
-  - The risky tool SHALL run **only inside a controlled temp fixture dir**, unable to touch the repo or personal files. **(X1)**
+  - The check SHALL follow **X1**: use a deterministic sentinel operation in a temporary fixture,
+    enforce resolved-target containment where the CLI mechanism permits it, and record repository
+    status before/after. Any inability to enforce containment SHALL be documented in the verdict.
 - **Tests:** none — verdict + transcript is the artifact.
 - **Status:** todo
 
@@ -226,7 +233,9 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Acceptance:**
   - WHEN `run_all.py` runs, it SHALL print a C1–C6 × {A,B} matrix of `PASS/FAIL/PARTIAL` and persist it to `evidence/`. **(X3)**
   - WHEN substrate A is FAIL/PARTIAL on a non-make-or-break criterion, the corresponding B check SHALL also be exercised; otherwise B beyond C2/C3/C4 MAY be skipped (recorded as N/A with reason).
-  - Re-running on the same machine SHALL reproduce the per-criterion verdicts (reproducibility NFR).
+  - Re-running on the same machine SHALL use the same documented procedure and stable evidence
+    format; verdict discrepancies caused by model/substrate variability SHALL be preserved and
+    explained rather than hidden or treated automatically as a harness failure.
 - **Tests:** none — the matrix output is the artifact.
 - **Status:** todo
 
