@@ -252,9 +252,41 @@ class Engine:
         The substrate's ``send`` is already bounded + fail-clean (RB2): a timeout or
         driver error is yielded as a ``driver_error`` event, not raised, so this loop
         always terminates with the sentinel and never hangs.
+
+        **Dedup the interactive ask/plan (the single point — engine policy).** The
+        interactive ``AskUserQuestion`` / ``ExitPlanMode`` reach the operator on TWO
+        paths: (1) the adapter maps the assistant-message ``ToolUseBlock`` to an
+        ``AskEvent`` / ``PlanEvent`` onto this substrate stream — but this arrives
+        *before* the SDK fires ``can_use_tool``, so **no pending decision exists yet**
+        and a decision made against it would be lost (``resolve() -> False``); and (2)
+        the engine injects the authoritative ``AskEvent`` / ``PlanEvent`` from the
+        permission channel in :meth:`_answer_hold`, *synced with* registering the
+        pending (``PendingRegistry.await_decision`` registers synchronously before its
+        first await, so the injected copy is always resolvable). These two tools ALWAYS
+        traverse ``can_use_tool`` (P0 C3/C4 + the T9 live run), so every substrate-stream
+        ask/plan is paired with an engine-injected one — we drop the substrate copy here.
+        Net: exactly ONE ask/plan per request reaches the operator, and it is always
+        resolvable (no duplicate keyboard, no pre-registration race).
+
+        (Assumption: production does NOT pre-approve these via ``allowed_tools`` OR a
+        ``permissions.allow`` rule in the user/project ``~/.claude`` settings the SDK reads
+        — either would suppress ``can_use_tool`` for that tool, so the injected copy would
+        not come and this drop would remove a prompt with no replacement. The engine never
+        sets ``allowed_tools`` for ask/plan (see ``adapter_sdk._make_can_use_tool``); a
+        hand-added settings allow-rule for ``AskUserQuestion``/``ExitPlanMode`` is the only
+        way to break this invariant.)
         """
         try:
             async for event in self._substrate.send(prompt, timeout=timeout):
+                if isinstance(event, (AskEvent, PlanEvent)):
+                    # Drop: the engine injects the authoritative, pending-synced copy.
+                    log.debug(
+                        "dropping substrate-stream %s (id=%s); engine injects the "
+                        "authoritative copy via the permission channel",
+                        type(event).__name__,
+                        getattr(event, "tool_use_id", None),
+                    )
+                    continue
                 await queue.put(event)
         finally:
             await queue.put(_STREAM_DONE)

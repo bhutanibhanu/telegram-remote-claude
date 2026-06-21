@@ -455,3 +455,158 @@ async def test_engine_ordinary_tool_does_not_hold_or_inject():
     assert not any(isinstance(e, (AskEvent, PlanEvent)) for e in collected)
     assert eng._pending.pending_ids == []
     assert any(getattr(e, "text", "") == "wrote" for e in collected)
+
+
+# ===========================================================================
+# T10: dedup the DOUBLE ask/plan path (engine policy in _drain_substrate).
+#
+# A live run (spikes/p1-live-verify/evidence/v3_plan_reject.transcript.txt) showed
+# the interactive ask/plan reaching the operator TWICE for one tool_use_id:
+#   1. the adapter maps the assistant-message ToolUseBlock(Ask/Plan) onto the
+#      substrate event stream — and this arrives FIRST, BEFORE can_use_tool fires,
+#      so NO pending is registered yet (a decision against it -> resolve() -> False,
+#      and is lost — in the live run v3's plan-reject was dropped);
+#   2. the engine injects the authoritative Ask/Plan from the permission channel in
+#      _answer_hold, synced with registering the pending (resolvable).
+# The fix drops the substrate-stream copy; exactly ONE (the injected, resolvable)
+# event must reach the operator.
+# ===========================================================================
+
+
+class DoublePathSubstrate:
+    """Mock substrate that reproduces the LIVE double-path for one ask/plan.
+
+    Mirrors the real adapter+SDK timing for an interactive tool:
+      1. ``send`` yields a **substrate-origin** Ask/PlanEvent for ``tool_use_id``
+         (what ``adapter_sdk._normalize_block`` emits from the assistant ToolUseBlock)
+         — this is the PREMATURE copy that arrives before any pending exists;
+      2. THEN it calls ``decision_callback(tool_name, tool_input, tool_use_id)`` for the
+         SAME id and blocks on it (the SDK's ``can_use_tool``), which is what makes the
+         engine inject its authoritative copy + register the pending;
+      3. records the returned decision and yields a post-event reflecting allow/deny.
+
+    Wired with ``decision_callback = engine.on_tool_request`` (as the SDK adapter does).
+    """
+
+    def __init__(self, *, tool_name, tool_input, tool_use_id, stream_event, post_factory=None):
+        self._tool_name = tool_name
+        self._tool_input = tool_input
+        self._tool_use_id = tool_use_id
+        self._stream_event = stream_event  # the substrate-origin Ask/PlanEvent (path 1)
+        self._post_factory = post_factory
+        self.session_id = "S1"
+        self.decision_callback = None
+        self.last_decision = None
+        self.calls = []
+
+    async def start(self):
+        self.calls.append(("start",))
+
+    async def send(self, prompt, *, timeout=120.0):
+        self.calls.append(("send", prompt, timeout))
+        # (1) the adapter's copy comes off the substrate stream FIRST — before the
+        #     permission channel fires, mirroring the live ordering (no pending yet).
+        yield self._stream_event
+        # (2) now the SDK raises can_use_tool -> engine injects + registers + holds.
+        decision = await self.decision_callback(
+            self._tool_name, self._tool_input, self._tool_use_id
+        )
+        self.last_decision = decision
+        if self._post_factory is not None:
+            ev = self._post_factory(decision)
+            if ev is not None:
+                yield ev
+
+    async def stop(self):
+        self.calls.append(("stop",))
+
+
+async def test_engine_dedups_double_ask_path_keeps_only_injected_resolvable():
+    # The substrate stream yields a premature AskEvent (adapter copy) for tu-dup AND
+    # the SDK then fires can_use_tool for the same id. The engine must drop the
+    # substrate copy and surface ONLY the injected one — which is resolvable.
+    from claude_tg.engine.types import QuestionAnswer, TextEvent
+
+    sub = DoublePathSubstrate(
+        tool_name="AskUserQuestion",
+        tool_input={"questions": [{"question": "Pick?"}]},
+        tool_use_id="tu-dup",
+        stream_event=AskEvent(
+            questions=[{"question": "Pick?"}], tool_use_id="tu-dup", session_id="S1"
+        ),
+        post_factory=lambda d: TextEvent(
+            text=f"answered={d.updated_input.get('answers')}", session_id="S1"
+        ),
+    )
+    eng = _wire(sub)
+    await eng.start()
+
+    resolved: list[bool] = []
+
+    async def operator():
+        # The pending only exists once the INJECTED copy registers it. Poll, then
+        # resolve. (The premature substrate copy registers no pending — see false-pass
+        # note: without the fix the operator would also see that copy, and resolving
+        # against it first would return False.)
+        for _ in range(1000):
+            if eng._pending.has_pending("tu-dup"):
+                break
+            await asyncio.sleep(0)
+        resolved.append(eng.resolve("tu-dup", QuestionAnswer({"Pick?": "Bravo"})))
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    await op
+    await eng.stop()
+
+    # EXACTLY ONE AskEvent reaches the operator (the injected, resolvable one) — the
+    # substrate-stream duplicate was dropped. Without the fix there would be TWO.
+    asks = [e for e in collected if isinstance(e, AskEvent)]
+    assert len(asks) == 1
+    assert asks[0].tool_use_id == "tu-dup"
+    # The decision was honored (pending was registered when the injected copy fired).
+    assert resolved == [True]
+    assert sub.last_decision.allow is True
+    assert sub.last_decision.updated_input["answers"] == {"Pick?": "Bravo"}
+    texts = [e.text for e in collected if isinstance(e, TextEvent)]
+    assert any("Bravo" in t for t in texts)
+
+
+async def test_engine_dedups_double_plan_path_keeps_only_injected_resolvable():
+    # Same double-path, for ExitPlanMode + a plan REJECT-with-feedback (the v3 case the
+    # live run dropped). The reject must be honored against the single injected copy.
+    sub = DoublePathSubstrate(
+        tool_name="ExitPlanMode",
+        tool_input={"plan": "do X then Y"},
+        tool_use_id="tu-dup-plan",
+        stream_event=PlanEvent(
+            plan="do X then Y", tool_use_id="tu-dup-plan", session_id="S1"
+        ),
+    )
+    eng = _wire(sub)
+    await eng.start()
+
+    resolved: list[bool] = []
+
+    async def operator():
+        for _ in range(1000):
+            if eng._pending.has_pending("tu-dup-plan"):
+                break
+            await asyncio.sleep(0)
+        resolved.append(
+            eng.resolve("tu-dup-plan", PlanVerdict(approve=False, feedback="revise it"))
+        )
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    await op
+    await eng.stop()
+
+    # EXACTLY ONE PlanEvent (the injected one); the substrate duplicate was dropped.
+    plans = [e for e in collected if isinstance(e, PlanEvent)]
+    assert len(plans) == 1
+    assert plans[0].tool_use_id == "tu-dup-plan"
+    # The reject + feedback was honored (resolvable because the pending was registered).
+    assert resolved == [True]
+    assert sub.last_decision.allow is False
+    assert sub.last_decision.message == "revise it"
