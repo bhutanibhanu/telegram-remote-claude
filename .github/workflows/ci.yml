@@ -1,0 +1,68 @@
+# CI gate for the Claude Telegram bot (P1 / decision-log #6).
+#
+# Runs the full quality bar on every push and PR: tests + lint + type-check +
+# secret-scan. Branch protection on the default branch should REQUIRE this
+# workflow ("CI / test (3.12)") to be green before a PR can merge — that is what
+# turns this from advisory into an actual gate (configure in repo Settings ->
+# Branches -> branch protection -> "Require status checks to pass").
+#
+# No secrets: the test suite mocks the Claude substrate (ClaudeRunner._invoke is
+# monkeypatched in every test), so CI needs NO ANTHROPIC/Claude API key, no host
+# `claude` CLI, and makes no network calls to Claude. Do not add such secrets here.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the baseline; 3.13 is cheap insurance against version drift.
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev dependencies
+        # requirements-dev.txt pulls in runtime deps (-r requirements.txt) plus
+        # pytest / pytest-asyncio / ruff / mypy. No Claude API key required.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Tests (pytest)
+        # Substrate is mocked; no network to Claude, no API key.
+        run: python -m pytest
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type-check (mypy)
+        # Lenient baseline (see pyproject.toml); green on the current codebase.
+        run: mypy
+
+      - name: Secret scan (SB3)
+        # Dependency-light, offline scan of git-tracked files. Fails on a real
+        # token/key shape; passes on the clean repo.
+        run: python scripts/secret_scan.py

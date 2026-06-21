@@ -1,3 +1,7 @@
 -r requirements.txt
 pytest>=8
 pytest-asyncio>=0.23
+# Lint + type-check for CI (added in P1/T3). Pinned to a compatible floor with a
+# major upper bound so CI is reproducible but still gets patch/minor fixes.
+ruff>=0.15,<1.0
+mypy>=1.11,<2.0

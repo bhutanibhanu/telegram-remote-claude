@@ -1,0 +1,56 @@
+# Project tooling config (lint + type-check). This file configures dev tooling
+# ONLY — it is NOT a packaging manifest and does not change runtime behavior or
+# runtime dependencies (those stay in requirements.txt). Introduced in P1/T3
+# alongside CI so pushes/PRs are gated on tests + lint + type-check + secret-scan.
+#
+# BASELINE INTENT: deliberately LENIENT so it is GREEN on the current codebase
+# without retrofitting. Each "tighten later" note marks where we'd raise the bar
+# once the team opts in. Do not treat the current leniency as the target state.
+
+[tool.ruff]
+# Match the CI baseline interpreter.
+target-version = "py312"
+line-length = 110
+# Lint our code + tests + helper scripts; never the spike sandboxes or venvs.
+extend-exclude = ["spikes", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+# Near-default rule set. Defaults are E (pycodestyle errors) + F (pyflakes); we
+# add a few high-signal, low-noise rule groups that already pass on this repo.
+#   I  = import sorting (isort)
+#   B  = flake8-bugbear (likely-bug patterns)
+# tighten later: enable UP (pyupgrade) once we can apply its autofixes — at the
+# T3 baseline UP would rewrite frozen runtime code (e.g. asyncio.TimeoutError ->
+# TimeoutError in claude_runner.py/bot.py), which this task must not touch. Also
+# consider SIM, RET, PTH, ANN and a stricter overall set.
+select = ["E", "F", "I", "B"]
+ignore = [
+    "E501",  # line-too-long: formatting-only; not enforced at baseline (no formatter gate yet).
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests favor terse fixtures/mocks; don't hold them to the package's bar.
+"tests/**" = ["B"]
+
+[tool.mypy]
+python_version = "3.12"
+# Lenient baseline: missing third-party stubs must not fail CI, and we are NOT
+# running --strict. This keeps the gate green on day one.
+ignore_missing_imports = true       # tighten later: install/declare stubs, then drop this.
+warn_unused_ignores = true
+warn_redundant_casts = true
+# Only type-check the runtime package + entry point. Tests use heavy mocking and
+# are intentionally out of scope for the type gate at baseline.
+files = ["claude_tg", "main.py"]
+exclude = "(^|/)spikes/"
+
+# python-telegram-bot ships py.typed, so its `Update`/`Chat`/`Message` are typed
+# as Optional. bot.py narrows them at runtime via the `_ok()` / `_authorized()`
+# guard helpers, which mypy cannot follow across the call boundary, producing
+# false-positive `union-attr` errors. Scope the relaxation to JUST this module
+# and JUST that error code rather than weakening the whole project.
+# tighten later: add local `assert ... is not None` (or inline the guard) in
+# bot.py and remove this override.
+[[tool.mypy.overrides]]
+module = "claude_tg.bot"
+disable_error_code = ["union-attr"]
