@@ -1,0 +1,8 @@
+{
+  "criterion": "v1_ask",
+  "verdict": "PASS",
+  "observed_reason": "ask emitted (1 q); resolved natively with code-chosen label 'OPT_4B18F0'; non-error result echoed the chosen label.",
+  "timestamp": "2026-06-21T08:29:50.824245+00:00",
+  "transcript_path": "v1_ask.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

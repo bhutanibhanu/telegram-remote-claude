@@ -1,0 +1,25 @@
+# criterion: v5_cancel
+# verdict: PASS
+# observed_reason: ask elicited then engine.cancel() unwound the held callback cleanly (no hang); a following trivial turn completed → session still usable (RB4).
+# timestamp: 2026-06-21T08:30:52.154562+00:00
+------------------------------------------------------------
+=== V5 cancel live (RB4) (v5_cancel) [live] ===
+  mode: live
+  asks_seen: 1
+  turn1_unwound_no_hang: True
+  followup_completed: True
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: 'Use the AskUserQuestion tool to ask me a single yes/no question (header "Confirm", question "Proceed?", options "Yes" and "No"). Wait for my'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782043200, rate_limit_type='five_hour)
+    ask(tool_use_id=toolu_01JE4btsD5FHCv916qvzJKht, questions=['Proceed?'], options=[['Yes', 'No']])
+    [code] cancel() instead of answering -> aborted 1
+    text(incremental=False, 166 chars): It looks like the question was cancelled, so I don't have your answer yet. I'll hold here and not take any further action. Just let me know how you'd like to proceed.
+    result(is_error=False, subtype=success, num_turns=2): It looks like the question was cancelled, so I don't have your answer yet. I'll hold here and not take any further action. Just let me know how you'd like to proceed.
+  --- follow-up turn (session must still be usable) ---
+  >>> send: 'Reply with exactly: OK'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    text(incremental=False, 2 chars): OK
+    result(is_error=False, subtype=success, num_turns=1): OK
+  -> trial verdict: PASS — ask elicited then engine.cancel() unwound the held callback cleanly (no hang); a following trivial turn completed → session still usable (RB4).

@@ -1,0 +1,8 @@
+{
+  "criterion": "v3_plan_reject",
+  "verdict": "PASS",
+  "observed_reason": "plan emitted then rejected with feedback on the deny channel; the revision incorporated the feedback (marker 'REJECT_MARKER_42A6930D' or instructed token present in a subsequent plan/text) — deny-message feedback channel works.",
+  "timestamp": "2026-06-21T08:30:32.932016+00:00",
+  "transcript_path": "v3_plan_reject.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

@@ -1,0 +1,8 @@
+{
+  "criterion": "v5_cancel",
+  "verdict": "PASS",
+  "observed_reason": "ask elicited then engine.cancel() unwound the held callback cleanly (no hang); a following trivial turn completed → session still usable (RB4).",
+  "timestamp": "2026-06-21T08:30:52.154562+00:00",
+  "transcript_path": "v5_cancel.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

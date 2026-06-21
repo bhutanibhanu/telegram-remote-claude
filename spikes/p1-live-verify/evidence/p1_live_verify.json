@@ -1,0 +1,8 @@
+{
+  "criterion": "p1_live_verify",
+  "verdict": "PASS",
+  "observed_reason": "The full normalized engine works end-to-end: AskUserQuestion answered via the native answers-map (code-chosen label echoed back), ExitPlanMode approve proceeds, reject+feedback revises on the deny-message channel, context is retained across turns in one session with a clean stop; the answer-hold resolve path was driven from code exactly as the bot's callback handler does. Containment held (repo unchanged, no leaked CLI pids).",
+  "timestamp": "2026-06-21T08:30:52.201036+00:00",
+  "transcript_path": "p1_live_verify.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

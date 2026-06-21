@@ -1,0 +1,8 @@
+{
+  "criterion": "v4_context_stop",
+  "verdict": "PASS",
+  "observed_reason": "two non-error turns in one session; turn-2 recalled the code-set codeword 'CODEWORD_9943B150' (context retained); engine.stop() clean.",
+  "timestamp": "2026-06-21T08:30:40.313219+00:00",
+  "transcript_path": "v4_context_stop.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

@@ -1,0 +1,24 @@
+# criterion: v4_context_stop
+# verdict: PASS
+# observed_reason: two non-error turns in one session; turn-2 recalled the code-set codeword 'CODEWORD_9943B150' (context retained); engine.stop() clean.
+# timestamp: 2026-06-21T08:30:40.313219+00:00
+------------------------------------------------------------
+=== V4 context retention + clean stop (v4_context_stop) [live] ===
+  mode: live
+  codeword: CODEWORD_9943B150
+  codeword_in_turn2: True
+  two_results: True
+  stop_clean: True
+  stop_error: None
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: 'Remember this codeword for later: CODEWORD_9943B150. Just acknowledge you stored it.'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782043200, rate_limit_type='five_hour)
+    text(incremental=False, 75 chars): Stored. The codeword is **CODEWORD_9943B150** — I'll remember it for later.
+    result(is_error=False, subtype=success, num_turns=1): Stored. The codeword is **CODEWORD_9943B150** — I'll remember it for later.
+  >>> send: 'What was the codeword I asked you to remember? Reply with just the codeword.'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    text(incremental=False, 17 chars): CODEWORD_9943B150
+    result(is_error=False, subtype=success, num_turns=1): CODEWORD_9943B150
+  -> trial verdict: PASS — two non-error turns in one session; turn-2 recalled the code-set codeword 'CODEWORD_9943B150' (context retained); engine.stop() clean.

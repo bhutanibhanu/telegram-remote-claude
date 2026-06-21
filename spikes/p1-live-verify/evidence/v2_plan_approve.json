@@ -1,0 +1,8 @@
+{
+  "criterion": "v2_plan_approve",
+  "verdict": "PASS",
+  "observed_reason": "plan emitted (1); approved via PlanVerdict(approve=True); non-error continuation (model proceeded after approval).",
+  "timestamp": "2026-06-21T08:30:06.330616+00:00",
+  "transcript_path": "v2_plan_approve.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

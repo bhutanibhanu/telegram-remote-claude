@@ -1,0 +1,25 @@
+# criterion: v1_ask
+# verdict: PASS
+# observed_reason: ask emitted (1 q); resolved natively with code-chosen label 'OPT_4B18F0'; non-error result echoed the chosen label.
+# timestamp: 2026-06-21T08:29:50.824245+00:00
+------------------------------------------------------------
+=== V1 AskUserQuestion answer (v1_ask) [live] ===
+  mode: live
+  marker_a: OPT_4B18F0
+  marker_b: OPT_714D95
+  chosen_label: OPT_4B18F0
+  ask_emitted: True
+  non_error_result: True
+  chosen_in_output: True
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: 'Use the AskUserQuestion tool to ask me to choose between exactly two options with the labels "OPT_4B18F0" and "OPT_714D95" (header "Pick", q'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782043200, rate_limit_type='five_hour)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    ask(tool_use_id=toolu_019rUKK1E5AQMim4KLPgMNaG, questions=['Pick one option'], options=[['OPT_4B18F0', 'OPT_714D95']])
+    [code] resolve(ask toolu_019rUKK1E5AQMim4KLPgMNaG) -> True :: QuestionAnswer(answers={'Pick one option': 'OPT_4B18F0'})
+    text(incremental=False, 21 chars): FINAL_PICK=OPT_4B18F0
+    result(is_error=False, subtype=success, num_turns=2): FINAL_PICK=OPT_4B18F0
+  -> trial verdict: PASS — ask emitted (1 q); resolved natively with code-chosen label 'OPT_4B18F0'; non-error result echoed the chosen label.

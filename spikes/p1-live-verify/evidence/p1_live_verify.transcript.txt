@@ -1,0 +1,175 @@
+# criterion: p1_live_verify
+# verdict: PASS
+# observed_reason: The full normalized engine works end-to-end: AskUserQuestion answered via the native answers-map (code-chosen label echoed back), ExitPlanMode approve proceeds, reject+feedback revises on the deny-message channel, context is retained across turns in one session with a clean stop; the answer-hold resolve path was driven from code exactly as the bot's callback handler does. Containment held (repo unchanged, no leaked CLI pids).
+# timestamp: 2026-06-21T08:30:52.201036+00:00
+------------------------------------------------------------
+=== T9 / P1 — LIVE end-to-end verify (real engine path, contained) ===
+mode: live
+sdk: claude-agent-sdk==0.2.105 (ADR-001 environment of record)
+ANTHROPIC_API_KEY set: False (MUST be False — host CLI auth only)
+git porcelain BEFORE (set): [' M tests/test_answer_hold.py', '?? docs/features/streaming-engine/verify.md', '?? spikes/p1-live-verify/', 'M claude_tg/engine/engine.py']
+descendant claude pids BEFORE: []
+substrate cwd (temp, OUTSIDE repo): /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p1_live_verify_4y8egt70
+
+>>> running v1_ask ...
+=== V1 AskUserQuestion answer (v1_ask) [live] ===
+  mode: live
+  marker_a: OPT_4B18F0
+  marker_b: OPT_714D95
+  chosen_label: OPT_4B18F0
+  ask_emitted: True
+  non_error_result: True
+  chosen_in_output: True
+  session_id: 53395073-ac6a-4961-b97f-269afedf4278
+  --- event transcript ---
+  >>> send: 'Use the AskUserQuestion tool to ask me to choose between exactly two options with the labels "OPT_4B18F0" and "OPT_714D95" (header "Pick", q'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782043200, rate_limit_type='five_hour)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    ask(tool_use_id=toolu_019rUKK1E5AQMim4KLPgMNaG, questions=['Pick one option'], options=[['OPT_4B18F0', 'OPT_714D95']])
+    [code] resolve(ask toolu_019rUKK1E5AQMim4KLPgMNaG) -> True :: QuestionAnswer(answers={'Pick one option': 'OPT_4B18F0'})
+    text(incremental=False, 21 chars): FINAL_PICK=OPT_4B18F0
+    result(is_error=False, subtype=success, num_turns=2): FINAL_PICK=OPT_4B18F0
+  -> trial verdict: PASS — ask emitted (1 q); resolved natively with code-chosen label 'OPT_4B18F0'; non-error result echoed the chosen label.
+
+    -> v1_ask: PASS — ask emitted (1 q); resolved natively with code-chosen label 'OPT_4B18F0'; non-error result echoed the chosen label.
+
+>>> running v2_plan_approve ...
+=== V2 ExitPlanMode approve (v2_plan_approve) [live] ===
+  mode: live
+  plan_emitted: True
+  non_error_result: True
+  no_driver_or_turn_error: True
+  session_id: 74a5190c-7f42-4c0e-bcd0-5e7db29b109a
+  --- event transcript ---
+  >>> send: 'Propose a SHORT, purely conversational two-step plan for what you would SAY in reply to a greeting (no file edits, no commands, no tools — t'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782043200, rate_limit_type='five_hour)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    text(incremental=False, 156 chars): I'll load the ExitPlanMode tool schema and write the plan file. Since this is a purely conversational task about wording, no codebase exploration is needed.
+    tool_use(ToolSearch): ToolSearch(query=select:ExitPlanMode, max_results=1)
+    tool_use(Write): Write(file_path=/Users/ray/.claude/plans/propose-a-short-purely-parallel-codd.md, content=<628 chars>)
+    text(incremental=False, 243 chars): Here's my proposed two-step wording plan for replying to a greeting:  1. **Greet back warmly** — return the greeting in a friendly, natural tone. 2. **Invite next steps** — briefly offer to help and p
+    plan(tool_use_id=toolu_011fCq7tZKQHehvcfZr2UCMD, 628 chars): # Plan: Conversational greeting reply
+
+## Context
+The user asked for a short, purely conversational plan describing what to *say*
+in reply to a greeting. This is about wording only — no file edits, co
+    [code] resolve(plan toolu_011fCq7tZKQHehvcfZr2UCMD) -> True :: PlanVerdict(approve=True, feedback=None)
+    status(phase=connected, model=None, detail=status)
+    text(incremental=False, 63 chars): Hey there! 👋 Great to see you — what can I help you with today?
+    result(is_error=False, subtype=success, num_turns=4): Hey there! 👋 Great to see you — what can I help you with today?
+  -> trial verdict: PASS — plan emitted (1); approved via PlanVerdict(approve=True); non-error continuation (model proceeded after approval).
+
+    -> v2_plan_approve: PASS — plan emitted (1); approved via PlanVerdict(approve=True); non-error continuation (model proceeded after approval).
+
+>>> running v3_plan_reject ...
+=== V3 ExitPlanMode reject + feedback (v3_plan_reject) [live] ===
+  mode: live
+  marker: REJECT_MARKER_42A6930D
+  plan_emitted: True
+  marker_or_incorporation: True
+  num_plans: 2
+  session_id: 16e8b711-b8d2-40be-b557-08989df38f46
+  --- event transcript ---
+  >>> send: 'Propose a SHORT, purely conversational plan (no files, no commands) for replying to a greeting, then call ExitPlanMode. If I reject with fee'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782043200, rate_limit_type='five_hour)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    tool_use(ToolSearch): ToolSearch(query=select:ExitPlanMode, max_results=1)
+    tool_use(Write): Write(file_path=/Users/ray/.claude/plans/propose-a-short-purely-memoized-badger.md, content=<415 chars>)
+    text(incremental=False, 68 chars): I've drafted a short conversational plan for replying to a greeting.
+    plan(tool_use_id=toolu_012x8RD1EKztcQaRahsdXN1u, 415 chars): # Plan: Reply to a Greeting
+
+## Context
+The user wants a short, purely conversational reply to a greeting. No files,
+no commands, no code — just a friendly response.
+
+## Approach
+1. Acknowledge the gr
+    [code] resolve(plan toolu_012x8RD1EKztcQaRahsdXN1u) -> True :: PlanVerdict(approve=False, feedback='Reject. Please revise: rewrite the plan so the greeting is in PIRATE speak. Include this exact tracking token in your revised plan text: REJECT_MARKER_42A6930D')
+    text(incremental=False, 57 chars): I've revised the plan so the greeting is in pirate speak.
+    tool_use(Edit): Edit(replace_all=False, file_path=/Users/ray/.claude/plans/propose-a-short-purely-memoized-badger.md, old_string=<385 chars>, new_string=<513 chars>)
+    plan(tool_use_id=toolu_01LEwohyPKfFwH9Umi4Aa6Pg, 543 chars): # Plan: Reply to a Greeting
+
+## Context
+The user wants a short, purely conversational reply to a greeting — now in
+PIRATE speak. No files, no commands, no code — just a friendly response.
+
+Tracking to
+    [code] resolve(plan toolu_01LEwohyPKfFwH9Umi4Aa6Pg) -> True :: PlanVerdict(approve=True, feedback=None)
+    status(phase=connected, model=None, detail=status)
+    text(incremental=False, 106 chars): Ahoy there, matey! Cap'n Claude be at yer service. What treasure can I help ye hunt down today, arrr? 🏴‍☠️
+    result(is_error=False, subtype=success, num_turns=6): Ahoy there, matey! Cap'n Claude be at yer service. What treasure can I help ye hunt down today, arrr? 🏴‍☠️
+  -> trial verdict: PASS — plan emitted then rejected with feedback on the deny channel; the revision incorporated the feedback (marker 'REJECT_MARKER_42A6930D' or instructed token present in a subsequent plan/text) — deny-message feedback channel works.
+
+    -> v3_plan_reject: PASS — plan emitted then rejected with feedback on the deny channel; the revision incorporated the feedback (marker 'REJECT_MARKER_42A6930D' or instructed token present in a subsequent plan/text) — deny-message feedback channel works.
+
+>>> running v4_context_stop ...
+=== V4 context retention + clean stop (v4_context_stop) [live] ===
+  mode: live
+  codeword: CODEWORD_9943B150
+  codeword_in_turn2: True
+  two_results: True
+  stop_clean: True
+  stop_error: None
+  session_id: a5d29f27-9dda-49f0-af1b-ca923f688182
+  --- event transcript ---
+  >>> send: 'Remember this codeword for later: CODEWORD_9943B150. Just acknowledge you stored it.'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782043200, rate_limit_type='five_hour)
+    text(incremental=False, 75 chars): Stored. The codeword is **CODEWORD_9943B150** — I'll remember it for later.
+    result(is_error=False, subtype=success, num_turns=1): Stored. The codeword is **CODEWORD_9943B150** — I'll remember it for later.
+  >>> send: 'What was the codeword I asked you to remember? Reply with just the codeword.'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    text(incremental=False, 17 chars): CODEWORD_9943B150
+    result(is_error=False, subtype=success, num_turns=1): CODEWORD_9943B150
+  -> trial verdict: PASS — two non-error turns in one session; turn-2 recalled the code-set codeword 'CODEWORD_9943B150' (context retained); engine.stop() clean.
+
+    -> v4_context_stop: PASS — two non-error turns in one session; turn-2 recalled the code-set codeword 'CODEWORD_9943B150' (context retained); engine.stop() clean.
+
+>>> running v5_cancel ...
+=== V5 cancel live (RB4) (v5_cancel) [live] ===
+  mode: live
+  asks_seen: 1
+  turn1_unwound_no_hang: True
+  followup_completed: True
+  session_id: 4bf4d927-a5c2-4a3b-ac01-8998ac2d444a
+  --- event transcript ---
+  >>> send: 'Use the AskUserQuestion tool to ask me a single yes/no question (header "Confirm", question "Proceed?", options "Yes" and "No"). Wait for my'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782043200, rate_limit_type='five_hour)
+    ask(tool_use_id=toolu_01JE4btsD5FHCv916qvzJKht, questions=['Proceed?'], options=[['Yes', 'No']])
+    [code] cancel() instead of answering -> aborted 1
+    text(incremental=False, 166 chars): It looks like the question was cancelled, so I don't have your answer yet. I'll hold here and not take any further action. Just let me know how you'd like to proceed.
+    result(is_error=False, subtype=success, num_turns=2): It looks like the question was cancelled, so I don't have your answer yet. I'll hold here and not take any further action. Just let me know how you'd like to proceed.
+  --- follow-up turn (session must still be usable) ---
+  >>> send: 'Reply with exactly: OK'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    text(incremental=False, 2 chars): OK
+    result(is_error=False, subtype=success, num_turns=1): OK
+  -> trial verdict: PASS — ask elicited then engine.cancel() unwound the held callback cleanly (no hang); a following trivial turn completed → session still usable (RB4).
+
+    -> v5_cancel: PASS — ask elicited then engine.cancel() unwound the held callback cleanly (no hang); a following trivial turn completed → session still usable (RB4).
+  cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-p1-live-verify-4y8egt70']
+
+=== per-trial verdicts ===
+  v1_ask             PASS      ask emitted (1 q); resolved natively with code-chosen label 'OPT_4B18F0'; non-error result echoed the chosen label.
+  v2_plan_approve    PASS      plan emitted (1); approved via PlanVerdict(approve=True); non-error continuation (model proceeded after approval).
+  v3_plan_reject     PASS      plan emitted then rejected with feedback on the deny channel; the revision incorporated the feedback (marker 'REJECT_MARKER_42A6930D' or instructed token present in a subsequent plan/text) — deny-message feedback channel works.
+  v4_context_stop    PASS      two non-error turns in one session; turn-2 recalled the code-set codeword 'CODEWORD_9943B150' (context retained); engine.stop() clean.
+  v5_cancel          PASS      ask elicited then engine.cancel() unwound the held callback cleanly (no hang); a following trivial turn completed → session still usable (RB4).
+
+=== CONTAINMENT / CLEANUP ===
+  total runtime: 69.6s (~1.2 min)
+  descendant claude pids AFTER: []  leaked: [] (expected: [])
+  git porcelain NEW during run: NONE (repo must be UNCHANGED; temp cwd lives OUTSIDE the repo)
+  ANTHROPIC_API_KEY set: False (expected False)
+
+OVERALL VERDICT: PASS
+REASON: The full normalized engine works end-to-end: AskUserQuestion answered via the native answers-map (code-chosen label echoed back), ExitPlanMode approve proceeds, reject+feedback revises on the deny-message channel, context is retained across turns in one session with a clean stop; the answer-hold resolve path was driven from code exactly as the bot's callback handler does. Containment held (repo unchanged, no leaked CLI pids).

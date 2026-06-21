@@ -1,0 +1,45 @@
+# criterion: v3_plan_reject
+# verdict: PASS
+# observed_reason: plan emitted then rejected with feedback on the deny channel; the revision incorporated the feedback (marker 'REJECT_MARKER_42A6930D' or instructed token present in a subsequent plan/text) — deny-message feedback channel works.
+# timestamp: 2026-06-21T08:30:32.932016+00:00
+------------------------------------------------------------
+=== V3 ExitPlanMode reject + feedback (v3_plan_reject) [live] ===
+  mode: live
+  marker: REJECT_MARKER_42A6930D
+  plan_emitted: True
+  marker_or_incorporation: True
+  num_plans: 2
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: 'Propose a SHORT, purely conversational plan (no files, no commands) for replying to a greeting, then call ExitPlanMode. If I reject with fee'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782043200, rate_limit_type='five_hour)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    tool_use(ToolSearch): ToolSearch(query=select:ExitPlanMode, max_results=1)
+    tool_use(Write): Write(file_path=/Users/ray/.claude/plans/propose-a-short-purely-memoized-badger.md, content=<415 chars>)
+    text(incremental=False, 68 chars): I've drafted a short conversational plan for replying to a greeting.
+    plan(tool_use_id=toolu_012x8RD1EKztcQaRahsdXN1u, 415 chars): # Plan: Reply to a Greeting
+
+## Context
+The user wants a short, purely conversational reply to a greeting. No files,
+no commands, no code — just a friendly response.
+
+## Approach
+1. Acknowledge the gr
+    [code] resolve(plan toolu_012x8RD1EKztcQaRahsdXN1u) -> True :: PlanVerdict(approve=False, feedback='Reject. Please revise: rewrite the plan so the greeting is in PIRATE speak. Include this exact tracking token in your revised plan text: REJECT_MARKER_42A6930D')
+    text(incremental=False, 57 chars): I've revised the plan so the greeting is in pirate speak.
+    tool_use(Edit): Edit(replace_all=False, file_path=/Users/ray/.claude/plans/propose-a-short-purely-memoized-badger.md, old_string=<385 chars>, new_string=<513 chars>)
+    plan(tool_use_id=toolu_01LEwohyPKfFwH9Umi4Aa6Pg, 543 chars): # Plan: Reply to a Greeting
+
+## Context
+The user wants a short, purely conversational reply to a greeting — now in
+PIRATE speak. No files, no commands, no code — just a friendly response.
+
+Tracking to
+    [code] resolve(plan toolu_01LEwohyPKfFwH9Umi4Aa6Pg) -> True :: PlanVerdict(approve=True, feedback=None)
+    status(phase=connected, model=None, detail=status)
+    text(incremental=False, 106 chars): Ahoy there, matey! Cap'n Claude be at yer service. What treasure can I help ye hunt down today, arrr? 🏴‍☠️
+    result(is_error=False, subtype=success, num_turns=6): Ahoy there, matey! Cap'n Claude be at yer service. What treasure can I help ye hunt down today, arrr? 🏴‍☠️
+  -> trial verdict: PASS — plan emitted then rejected with feedback on the deny channel; the revision incorporated the feedback (marker 'REJECT_MARKER_42A6930D' or instructed token present in a subsequent plan/text) — deny-message feedback channel works.
