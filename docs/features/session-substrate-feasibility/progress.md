@@ -56,7 +56,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T15 — B · C3 AskUserQuestion over `stream-json` (90cdc1d — PASS native)
 - [x] T16 — B · C4 ExitPlanMode over `stream-json` (acc586f — PASS)
 - [x] T17 — `run_all.py`: C1–C6 PASS/FAIL/PARTIAL matrix (+ B contingency) (ec93ecf)
-- [ ] T18 — Draft normalized engine interface + final evidence secret-scan gate
+- [x] T18 — Draft normalized engine interface + final evidence secret-scan gate (95ffbf3)
 - [ ] T19 — Fill ADR-001 (Proposed) + go/no-go writeup
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
@@ -441,7 +441,25 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - The drafted interface SHALL cover Events out (`text`, `tool_use`, `ask`, `plan`, `error`, `result`, `status`), Decisions in (permission verdict, question answer, plan verdict, free-text reply, cancel), and Lifecycle (`start`, `resume`, `send`, `stop`) — a draft contract, not an implementation.
   - WHEN evidence is about to be committed, an automated secret scan SHALL run over **all transcripts and the staged files**, and a **clean result SHALL be recorded** in `evidence/secret-scan.txt`; a non-clean scan blocks the commit. **(X3, consolidated)**
 - **Tests:** none — design artifact + recorded scan result.
-- **Status:** todo
+- **Status:** done (95ffbf3) — two deliverables. (1) `normalized_interface.md` — a clearly-marked **P0 DRAFT
+  contract** (not an implementation) covering all required surfaces grounded in the spike's OBSERVED shapes
+  on BOTH substrates: **Events out** (`text`, `tool_use`, `ask`, `plan`, `error`, `result`, `status`),
+  **Decisions in** (permission verdict allow-once/allow-session/deny[+reason]/modified-input, question answer,
+  plan verdict approve/reject+feedback, free-text reply, cancel), **Lifecycle** (`start`, `resume`, `send`,
+  `stop`). Records the load-bearing empirical findings: C3 question answer = **native `answers` map keyed by
+  question text on the ALLOW channel** (deny-message fallback; free-text "Other" + multi-question asks flagged
+  UNPROVEN); C4 plan verdict = approve(allow)/reject(deny+message), **no native plan-feedback field**
+  (schema-confirmed), post-approval execution still permission-gated; C2 allow **must carry `updatedInput`**
+  (ZodError gotcha on B); C6 resume **cwd/project-scoped** (persist `(session_id, cwd)`), `fork_session=False`
+  continues same id, guard double-attach; cancel via `control_cancel_request`/disconnect (untested-but-handled
+  on B). (2) `evidence/secret-scan.txt` — **consolidated X3 gate**: scan over all 49 spike text files;
+  **OVERALL VERDICT CLEAN** — all 33 evidence/docs files (every transcript, result JSON, matrix, README, lock,
+  SKILL, both new files) free of secret-shaped content; the 9 secret-SHAPED hits are confined to the
+  scrubber's own regex library + deliberate fake test fixtures + `token`/`secret`-named identifiers
+  (non-gating, by design). **Two fresh independent reviewers (acceptance + independent evidence-class scan;
+  adversarial + full-tree independent regex hunt) both AGREE** the interface is complete/evidence-grounded/
+  accurate (no invented API; UNPROVEN flags correct) and gave a **DEFINITIVE finding: no real secret of any
+  kind anywhere in the spike tree** (evidence OR source); the EVIDENCE-vs-SOURCE split is legitimate.
 
 ### T19 — Fill ADR-001 (Proposed) + go/no-go writeup
 - **Goal:** Fill ADR-001 to status *Proposed* — Decision + justification, per-C1–C6 evidence log, the normalized engine interface, and Consequences (incl. any C3/C4 workaround or hybrid) — and write the owner-facing go/no-go recommendation. Acceptance (G-ADR) is out of scope.
