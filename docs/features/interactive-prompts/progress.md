@@ -28,7 +28,7 @@ _Plan generated 2026-06-21 from design.md · 2 tasks · autonomous supervised bu
   surface beyond the launch. Regression floor: **342** P1+P2 tests.
 
 ## Task list
-- [ ] T1 — Skill-launch passthrough (`on_skill_command` in `bot.py`) · unit
+- [x] T1 — Skill-launch passthrough (`on_skill_command` in `bot.py`) · unit (52fb42d)
 - [ ] T2 — Live `/grill` end-to-end verify + owner phone checklist · live probe
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
@@ -62,7 +62,21 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   non-allowlisted chat triggers no session call (SB1); (d) empty/`/`-only/garbage never raises and leaves the
   session usable (RB1); (e) **both** one-shot and streaming engine modes route the forwarded command. Test
   behavior, not implementation detail.
-- **Status:** todo
+- **Status:** done (52fb42d) — one new `on_skill_command` handler in `bot.py` forwards an unregistered
+  slash-command verbatim (leading `/` + args intact) via a shared `_run_turn` extracted from `on_message`
+  (behavior-preserving no-op refactor — only a local `text`→`reply` rename). Registered as
+  `MessageHandler(allowed & filters.COMMAND, …)` **after** the `CommandHandler`s, so PTB first-match-wins
+  lets the bot's own commands win (a real `/reset` is never forwarded). **SB1** defense in depth: the
+  `allowed` chat filter on the registration **and** the `_ok` recheck as the handler's first line — a
+  non-allowlisted chat reaches neither runner nor streaming session. **RB1**: missing message / `None` /
+  empty / whitespace text no-op; `/`-only + unicode garbage forward as ordinary turns; never raises.
+  `HELP_TEXT` updated. **19 unit tests** (verbatim forward one-shot + streaming; all 8 reserved commands
+  win via PTB's **real** `check_update` over the actual handler list; unauthorized → no session call in
+  both modes + dropped at the routing layer; empty/whitespace/`/`-only/garbage/missing never raise + session
+  still usable). Gates green from `.venv` (**361 passed**, ruff/mypy/secret-scan clean — above the 342
+  floor). Independent reviewer **AGREE** with 3 load-bearing mutation probes (guard removed → SB1 tests fail;
+  registration reordered → bot-commands-win tests fail; empty-text guard removed → RB1 tests fail). **Only
+  `claude_tg/bot.py` changed in production** (+47/−3); relay/gating/runner untouched.
 
 ### T2 — Live `/grill` end-to-end verify + owner phone checklist
 - **Goal:** Prove the launch path composes the full loop **live** — a `/grill` run from a chat reaches the
