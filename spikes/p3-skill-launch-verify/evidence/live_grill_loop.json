@@ -1,0 +1,8 @@
+{
+  "criterion": "live_grill_loop",
+  "verdict": "PASS",
+  "observed_reason": "the unregistered /grill command, forwarded VERBATIM, reached the engine and LAUNCHED the skill: 2 AskEvent(s) were surfaced and answered (first option each), 1 risky tool(s) were gated + allow_once'd, and the loop ran to a non-error ResultEvent in 114.6s without hanging. A brief was written under the temp cwd (PROJECT_BRIEF_7274F53FED.md). The full P1 relay + P2 gating compose under the P3 launch path.",
+  "timestamp": "2026-06-21T23:47:40.432300+00:00",
+  "transcript_path": "live_grill_loop.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

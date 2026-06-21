@@ -1,0 +1,25 @@
+# criterion: scripted_drive_loop
+# verdict: PASS
+# observed_reason: the scripted /grill loop surfaced 1 AskEvent(s) (relay drove), the first option of each was answered (answers rode back to the substrate as {'What kind of app is this?': 'CLI tool'}), the risky Write was allow_once'd (1 PermissionEvent), and the loop ran to a non-error ResultEvent with the brief written under the temp cwd. The ask→answer→permission→result drive-loop + predicates are correct and can't false-pass (no ask -> FAIL).
+# timestamp: 2026-06-21T23:38:18.266796+00:00
+------------------------------------------------------------
+=== scripted drive-loop (ask -> answer -> permission allow_once -> result -> doc) (scripted_drive_loop) [mock] ===
+  mode: mock
+  ask_events: 1
+  permission_events: 1
+  answers_rode_back_to_substrate: {'What kind of app is this?': 'CLI tool'}
+  write_allowed: True
+  doc_written_in_temp_cwd: True
+  non_error_result: True
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: '/grill a tiny CLI todo app in Python'
+    status(phase=init, model=scripted, detail=None)
+    text(incremental=False, 37 chars): Let me interrogate this project idea.
+    ask(tool_use_id=grill-ask-1, 1 question(s)): What kind of app is this? -> [CLI tool, Web app]
+    [code] resolve(ask grill-ask-1) -> True :: answered first option of 1 question(s)
+    text(incremental=False, 69 chars): Got it: {'What kind of app is this?': 'CLI tool'}. Writing the brief.
+    permission(tool=Write, tool_use_id=grill-write-1): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p3_skill_launch_verify_nr7skn8b/PROJECT_BRIEF_4AE74DBAA9.md, content=<38 chars>)
+    [code] resolve(permission grill-write-1, tool=Write) -> True :: verdict=allow_once (CONTAINED; sweep catches any stray)
+    result(is_error=False, subtype=success, num_turns=1): Brief written.
+  -> trial verdict: PASS — the scripted /grill loop surfaced 1 AskEvent(s) (relay drove), the first option of each was answered (answers rode back to the substrate as {'What kind of app is this?': 'CLI tool'}), the risky Write was allow_once'd (1 PermissionEvent), and the loop ran to a non-error ResultEvent with the brief written under the temp cwd. The ask→answer→permission→result drive-loop + predicates are correct and can't false-pass (no ask -> FAIL).

@@ -1,0 +1,74 @@
+# criterion: p3_skill_launch_verify
+# verdict: PASS
+# observed_reason: The live /grill loop PASSED: an unregistered slash-command, forwarded verbatim, reached the engine and LAUNCHED the skill (>=1 AskEvent surfaced + answered), risky writes were gated + allow_once'd, and the loop ran to a non-error result without hanging — P1 relay + P2 gating compose under the P3 launch path. Containment held (repo unchanged, no leaked CLI pids; any stray brief swept).
+# timestamp: 2026-06-21T23:47:40.476123+00:00
+------------------------------------------------------------
+=== T2 / P3 — LIVE end-to-end verify: skill-launch passthrough (full loop, contained) ===
+mode: live
+sdk: claude-agent-sdk==0.2.105 (ADR-001 environment of record)
+ANTHROPIC_API_KEY set: False (MUST be False — host CLI auth only)
+git porcelain BEFORE (set): ['?? HANDOFF.md', '?? docs/features/interactive-prompts/verify.md', '?? spikes/p3-skill-launch-verify/']
+descendant claude pids BEFORE: []
+substrate/grill cwd (temp, OUTSIDE repo): /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p3_skill_launch_verify_ku0qwg1a
+
+>>> running live_grill_loop ...
+=== LIVE /grill loop (launch -> ask/answer -> gated write -> doc) (live_grill_loop) [live] ===
+  mode: live
+  instructed_doc_path: /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p3_skill_launch_verify_ku0qwg1a/PROJECT_BRIEF_7274F53FED.md
+  elapsed_seconds: 114.6
+  ask_events: 2
+  permission_events: 1
+  permission_tools: ['Write']
+  doc_written_in_temp_cwd: True
+  non_error_result: True
+  timeout: False
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: '/grill a tiny CLI todo app in Python. Keep it brief: ask me at most two or three AskUserQuestion rounds, then write the project brief to EXACTLY this absolute p'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782091800, rate_limit_type='five_hour)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    text(incremental=False, 232 chars): I'll keep this tight. Since you've already told me it's a brand-new project (a tiny Python CLI todo app), I'll skip the "where are we" question and go straight 
+    ask(tool_use_id=toolu_0147ytBgLQjUFbh9qvZK2cNM, 4 question(s)): Where should todos be stored? This drives the data model and almost everything e -> [JSON file, SQLite, Plain text] | What's the must-have command set for v0? Pick the scope you actually want to shi -> [Add/list/done, Core + edit/delete, CRUD + priority/due] | Who is this for and how does it get run? -> [Just me, local, Pip-installable, Team/internal] | What should this explicitly NOT become? (Anti-goals keep scope honest.) -> [No sync/cloud, No TUI/GUI, No collaboration, No integrations]
+    [code] resolve(ask toolu_0147ytBgLQjUFbh9qvZK2cNM) -> True :: answered first option of 4 question(s)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    text(incremental=False, 208 chars): Got it: JSON file, minimal add/list/done, personal local tool, staying offline-only. That's a clean, tight scope — good. One more round to lock the implementati
+    ask(tool_use_id=toolu_01WfKZJwPjCX7jFDxgiNt1m4, 4 question(s)): What builds the CLI? For add/list/done with no deps, this matters. -> [argparse (stdlib) (Recommended), Typer, Click] | How do you mark a task done — i.e. how is each task identified on the CLI? -> [Stable integer ID (Recommended), List position, Text match] | What makes this 'done' for you? A concrete success bar. -> [I use it daily, Fast + reliable, Clean, extensible code] | How much testing do you want for a personal tool this size? -> [pytest on core logic (Recommended), Full coverage, Manual only]
+    [code] resolve(ask toolu_01WfKZJwPjCX7jFDxgiNt1m4) -> True :: answered first option of 4 question(s)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    text(incremental=False, 51 chars): Everything I need is locked. Writing the brief now.
+    tool_use(Write): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p3_skill_launch_verify_ku0qwg1a/PROJECT_BRIEF_7274F53FED.md, content=<9543 chars>)
+    permission(tool=Write, tool_use_id=toolu_01NNVE5QJQbgrFhzr1Zya2Yh): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p3_skill_launch_verify_ku0qwg1a/PROJECT_BRIEF_7274F53FED.md, content=<9543 chars>)
+    [code] resolve(permission toolu_01NNVE5QJQbgrFhzr1Zya2Yh, tool=Write) -> True :: verdict=allow_once (CONTAINED; sweep catches any stray)
+    text(incremental=False, 1539 chars): Brief written to `/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p3_skill_launch_verify_ku0qwg1a/PROJECT_BRIEF_7274F53FED.md`.  The five decisions/risks that 
+    result(is_error=False, subtype=success, num_turns=4): Brief written to `/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p3_skill_launch_verify_ku0qwg1a/PROJECT_BRIEF_7274F53FED.md`.
+
+The five decisions/risks that 
+  -> trial verdict: PASS — the unregistered /grill command, forwarded VERBATIM, reached the engine and LAUNCHED the skill: 2 AskEvent(s) were surfaced and answered (first option each), 1 risky tool(s) were gated + allow_once'd, and the loop ran to a non-error ResultEvent in 114.6s without hanging. A brief was written under the temp cwd (PROJECT_BRIEF_7274F53FED.md). The full P1 relay + P2 gating compose under the P3 launch path.
+
+    -> live_grill_loop: PASS — the unregistered /grill command, forwarded VERBATIM, reached the engine and LAUNCHED the skill: 2 AskEvent(s) were surfaced and answered (first option each), 1 risky tool(s) were gated + allow_once'd, and the loop ran to a non-error ResultEvent in 114.6s without hanging. A brief was written under the temp cwd (PROJECT_BRIEF_7274F53FED.md). The full P1 relay + P2 gating compose under the P3 launch path.
+  cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-p3-skill-launch-verify-ku0qwg1a']
+
+=== per-trial verdicts ===
+  live_grill_loop        PASS      the unregistered /grill command, forwarded VERBATIM, reached the engine and LAUNCHED the skill: 2 AskEvent(s) were surfaced and answered (first option each), 1 risky tool(s) were gated + allow_once'd, and the loop ran to a non-error ResultEvent in 114.6s without hanging. A brief was written under the temp cwd (PROJECT_BRIEF_7274F53FED.md). The full P1 relay + P2 gating compose under the P3 launch path.
+
+=== CONTAINMENT / CLEANUP ===
+  total runtime: 114.6s (~1.9 min)
+  descendant claude pids AFTER: []  leaked: [] (expected: [])
+  git porcelain NEW during run: NONE (repo must be UNCHANGED; temp cwd lives OUTSIDE the repo)
+  brief files swept from $HOME / ~/.claude (strays): NONE
+  ANTHROPIC_API_KEY set: False (expected False)
+
+OVERALL VERDICT: PASS
+REASON: The live /grill loop PASSED: an unregistered slash-command, forwarded verbatim, reached the engine and LAUNCHED the skill (>=1 AskEvent surfaced + answered), risky writes were gated + allow_once'd, and the loop ran to a non-error result without hanging — P1 relay + P2 gating compose under the P3 launch path. Containment held (repo unchanged, no leaked CLI pids; any stray brief swept).

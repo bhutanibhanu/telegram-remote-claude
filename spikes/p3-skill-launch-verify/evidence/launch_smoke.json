@@ -1,0 +1,8 @@
+{
+  "criterion": "launch_smoke",
+  "verdict": "PASS",
+  "observed_reason": "on_skill_command forwarded '/grill build me X' VERBATIM (leading / + args intact) all the way down to Substrate.send (one hop below engine.send) — the launch path composes the bot→StreamingSession→Engine→Substrate chain; and a registered bot command (/reset) was handled by its own CommandHandler and NOT forwarded as a skill (bot commands win, D1).",
+  "timestamp": "2026-06-21T23:38:18.265727+00:00",
+  "transcript_path": "launch_smoke.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

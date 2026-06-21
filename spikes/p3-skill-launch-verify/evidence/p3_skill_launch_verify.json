@@ -1,0 +1,8 @@
+{
+  "criterion": "p3_skill_launch_verify",
+  "verdict": "PASS",
+  "observed_reason": "The live /grill loop PASSED: an unregistered slash-command, forwarded verbatim, reached the engine and LAUNCHED the skill (>=1 AskEvent surfaced + answered), risky writes were gated + allow_once'd, and the loop ran to a non-error result without hanging — P1 relay + P2 gating compose under the P3 launch path. Containment held (repo unchanged, no leaked CLI pids; any stray brief swept).",
+  "timestamp": "2026-06-21T23:47:40.476123+00:00",
+  "transcript_path": "p3_skill_launch_verify.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

@@ -1,0 +1,8 @@
+{
+  "criterion": "scripted_drive_loop",
+  "verdict": "PASS",
+  "observed_reason": "the scripted /grill loop surfaced 1 AskEvent(s) (relay drove), the first option of each was answered (answers rode back to the substrate as {'What kind of app is this?': 'CLI tool'}), the risky Write was allow_once'd (1 PermissionEvent), and the loop ran to a non-error ResultEvent with the brief written under the temp cwd. The ask→answer→permission→result drive-loop + predicates are correct and can't false-pass (no ask -> FAIL).",
+  "timestamp": "2026-06-21T23:38:18.266796+00:00",
+  "transcript_path": "scripted_drive_loop.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}
