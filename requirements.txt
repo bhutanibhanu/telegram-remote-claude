@@ -1,1 +1,7 @@
 python-telegram-bot>=21,<22
+# Substrate A — the streaming engine's session runtime (ADR-001: claude-agent-sdk
+# primary). Pinned EXACTLY to the version of record (0.2.105) — the version the P0
+# spike + the T1 async-hold de-risk were proven on. Per ADR-001 ("pin + monitor"),
+# bump deliberately (re-run the de-risk) rather than floating, since A/B share the
+# CLI control protocol and a version change can shift behavior.
+claude-agent-sdk==0.2.105

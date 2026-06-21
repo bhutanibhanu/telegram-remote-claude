@@ -48,6 +48,29 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+#: Valid values for ENGINE_MODE (S4 flag). ``oneshot`` keeps today's behavior; the
+#: live bot is never broken until the owner flips to ``streaming``.
+ENGINE_MODES = ("oneshot", "streaming")
+
+
+def parse_engine_mode(raw: str | None) -> str:
+    """Parse + validate ENGINE_MODE (default ``oneshot``).
+
+    The S4 migration flag: ``oneshot`` (default) routes to the existing one-shot
+    runner unchanged; ``streaming`` selects the new engine. Empty/unset -> default;
+    case-insensitive; anything else is a configuration error (fail loud at startup,
+    not silently fall back, so a typo can't quietly disable streaming).
+    """
+    if raw is None or not raw.strip():
+        return "oneshot"
+    mode = raw.strip().lower()
+    if mode not in ENGINE_MODES:
+        raise ValueError(
+            f"ENGINE_MODE must be one of {ENGINE_MODES}, got {raw!r}"
+        )
+    return mode
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -58,6 +81,9 @@ class Config:
     timeout_seconds: int = 600
     skip_permissions: bool = True
     state_file: Path | None = None
+    # S4 migration flag: "oneshot" (default, existing behavior) | "streaming" (P1 engine).
+    # bot.py reads this to select the runner; T4 only parses/validates it (T7 wires the switch).
+    engine_mode: str = "oneshot"
 
     @classmethod
     def from_env(cls, dotenv_path: str | os.PathLike[str] | None = ".env") -> "Config":
@@ -92,6 +118,8 @@ class Config:
         state_raw = (os.environ.get("CLAUDE_STATE_FILE") or "").strip()
         state_file = Path(state_raw).expanduser() if state_raw else None
 
+        engine_mode = parse_engine_mode(os.environ.get("ENGINE_MODE"))
+
         return cls(
             bot_token=token,
             allowed_chat_ids=frozenset(allowed),
@@ -101,4 +129,5 @@ class Config:
             timeout_seconds=timeout,
             skip_permissions=skip,
             state_file=state_file,
+            engine_mode=engine_mode,
         )
