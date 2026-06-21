@@ -33,7 +33,7 @@ _Plan generated 2026-06-21 from design.md · 8 tasks · autonomous supervised bu
 ## Task list
 - [x] T1 — ADR-003: permission-gating model · doc (a211432)
 - [x] T2 — Risk classifier + per-session policy state (`permissions.py`) · unit (81185f2)
-- [ ] T3 — Engine approval gate: classify + hold-for-approval + verdict mapping · unit (mock)
+- [x] T3 — Engine approval gate: classify + hold-for-approval + verdict mapping · unit (mock) (aeb29ac)
 - [ ] T4 — Render permission prompt + `permission` callback kind + `/yolo` indicator · unit
 - [ ] T5 — Bot/session wiring: route taps (SB1) + grants + `/yolo`/`/unyolo` + reset-clear · unit
 - [ ] T6 — SB5 posture: no streaming bypass + blast-radius docs + fail-closed config · unit + docs
@@ -115,7 +115,21 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Tests:** unit (mock substrate) — allow path (safe/granted/yolo, no prompt), hold+allow-once, hold+
   allow-session (2nd use auto-allowed), deny→canned message, backstop+cancel auto-deny (no wedge), ask/plan
   unaffected, post-approval still gated.
-- **Status:** todo
+- **Status:** done (aeb29ac) — engine gate replaces P1 auto-allow (ADR-003). New types: `PermissionEvent`
+  (body-free summary, SB3), `PermissionDecision` (allow_once/allow_session/deny), `DENIED_MESSAGE`,
+  `safe_input_summary` (SDK-free). `on_tool_request`: ask/plan → answer-hold **unchanged**; ordinary →
+  `policy.needs_approval` False (safe/grant/yolo) → allow no prompt; risky + no `tool_use_id` →
+  **fail-closed deny** (SB6); else `_permission_hold` (inject `PermissionEvent` + hold on the **shared**
+  `PendingRegistry` + map verdict). `_verdict_for`: allow_session → `policy.grant_session(name)` (in the
+  engine, on resolve, per-NAME — ADR-001 caveat) + allow; allow_once → allow; deny → deny(`DENIED_MESSAGE`).
+  `Engine.__init__` `permission_policy` defaults to a fresh `PermissionPolicy()` → **fail-closed default**.
+  **RB4 for free:** backstop → `PermissionVerdict(deny)` and `/cancel` → `Cancel` both fall through
+  `decision_to_substrate` → substrate **DENY** (never auto-allow, never hang); `decision_to_substrate` stays
+  **pure**. **Verified by me on 0.2.105:** pytest **295 passed** (+11), ruff/mypy/secret-scan clean. **One
+  fresh independent reviewer AGREES done** — traced RB4 backstop/cancel→deny (mutation: flip backstop→allow
+  fails a test), false-pass mutations caught (drop grant → suppression fails; revert to auto-allow → 9 tests
+  fail with correct blast radius), P1 tests re-pointed not weakened. Scope: `engine.py`/`types.py`/`__init__`
+  + 2 engine tests; permissions/adapter/render/bot/stream_session/config/main untouched. Render/bot = T4/T5.
 
 ### T4 — Render permission prompt + `permission` callback kind + `/yolo` indicator
 - **Goal:** Map `PermissionEvent` → Telegram message + the 3-button keyboard; extend the callback codec;
