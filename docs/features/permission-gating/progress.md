@@ -2,6 +2,13 @@
 
 _Plan generated 2026-06-21 from design.md · 8 tasks · autonomous supervised build_
 
+> **✅ P2 COMPLETE (2026-06-21).** T1–T8 done, committed, and pushed on `feat/permission-gating` (stacked on
+> P1's `feat/streaming-engine`). The live permission-gate verify (T8) is **PASS** against real Claude. Risky
+> tools now pause for `[Allow once]`/`[Allow for session]`/`[Deny]`; reads/search run free; `/yolo` is the one
+> loud, off-by-default bypass; the streaming default introduces **no** bypass (SB5); one-shot is untouched
+> (D3). Remaining before cutover: owner phone-verify per [`verify.md`](verify.md), then flip
+> `ENGINE_MODE=streaming`. Full SB consolidation + threat model = **P6**.
+
 > **P2 — per-tool permission gating.** Replaces P1's interim "ordinary tool → auto-allow" posture with a
 > real approval gate: risky tools pause for **[Allow once] / [Allow for session] / [Deny]**, reads/search
 > run free, an unanswered prompt auto-denies at the 60-min backstop, `/cancel` aborts a waiting prompt, and
@@ -38,7 +45,7 @@ _Plan generated 2026-06-21 from design.md · 8 tasks · autonomous supervised bu
 - [x] T5 — Bot/session wiring: route taps (SB1) + grants + `/yolo`/`/unyolo` + reset-clear · unit (bf70dc7)
 - [x] T6 — SB5 posture: no streaming bypass + blast-radius docs + fail-closed config · unit + docs (e6bc40a)
 - [x] T7 — SB/RB test matrix (SB5/SB1/RB4 + classifier + allow-once-vs-session + post-approval-gated) · unit (12da401)
-- [ ] T8 — Live end-to-end verify (real Claude) + owner phone-verify checklist · live probe
+- [x] T8 — Live end-to-end verify (real Claude) + owner phone-verify checklist · live probe (9630f61)
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
 
@@ -255,7 +262,19 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - The owner checklist SHALL give exact phone steps to confirm each of the above under `ENGINE_MODE=streaming`.
   - No API key; effects contained; evidence scrubbed (SB3).
 - **Tests:** none — live verdict + transcript + owner checklist are the artifacts.
-- **Status:** todo
+- **Status:** done (9630f61) — `spikes/p2-permission-verify/verify_permissions.py` drives the **real** engine
+  (with the harness-owned shared `PermissionPolicy`) end-to-end against **real Claude** with code-injected
+  verdicts (mirrors the bot's SB1-checked permission tap), + the owner phone-verify checklist
+  `docs/features/permission-gating/verify.md`. **LIVE run (host CLI auth, NO API key, 195.5s): OVERALL
+  PASS** — V1 risky→held→`allow_once`→RAN, V2 risky→held→`deny`→BLOCKED (model adapted), V3 `allow_session`
+  → 1 prompt for 2 uses (suppressed), V4 safe Read → no prompt, V5 `/yolo` → risky ran free + `/unyolo`
+  re-gated, V6 `/cancel` → held request clean-aborted + session usable (RB4). Predicates code-driven (unique
+  markers + `PermissionEvent` counts). Containment held (temp cwd outside repo, repo unchanged, no leaked
+  CLI pids, evidence scrubbed); a `--mock` mode self-tests deterministically. **The first live run SURFACED
+  a containment finding** — an *allowed* risky Write is NOT sandboxed (ADR-001: cwd is not an OS boundary),
+  so writes leaked into `$HOME`; **fixed** in the harness (every prompt directs an absolute temp path; a
+  `$HOME` stray-sweep flags + removes any leak) and the committed evidence is the post-fix re-run (PASS).
+  Scope: new `spikes/p2-permission-verify/` + `docs/.../verify.md`; no production code.
 
 ## Rules
 - **Flag-gated, branch-only.** All work on `feat/permission-gating`; **never merge to main**; the live
