@@ -1,0 +1,20 @@
+# criterion: t1_3_interactive
+# verdict: PASS
+# observed_reason: held 120.0s then native answer honored; session continued on code choice 'Bravo'.
+# timestamp: 2026-06-21T05:09:50.708832+00:00
+------------------------------------------------------------
+=== T1.3 interactive-answer hold (t1_3_interactive) ===
+  hold_requested: 120.0
+  hold_awaited: 120.0
+  fired: 1
+  decision: allow(answers-map)
+  control_survived: True
+  answered_not_error: True
+  session_continued: True
+  chosen: Bravo
+  result_is_error: False
+  sid: [REDACTED]
+  error: None
+  final: FINAL_PICK=Bravo
+  tool_results: [(None, 'Your questions have been answered: "Pick one option"="Bravo". You can now continue with these answers in mind.')]
+  -> trial verdict: PASS — held 120.0s then native answer honored; session continued on code choice 'Bravo'.

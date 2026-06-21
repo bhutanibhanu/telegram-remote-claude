@@ -1,0 +1,8 @@
+{
+  "criterion": "t1_5_backstop",
+  "verdict": "PASS",
+  "observed_reason": "backstop auto-resolved at ~60.0s (DENY+notify); tool not executed; session usable after (2nd turn OK).",
+  "timestamp": "2026-06-21T05:18:37.958456+00:00",
+  "transcript_path": "t1_5_backstop.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

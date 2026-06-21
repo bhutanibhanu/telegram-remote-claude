@@ -1,0 +1,20 @@
+# criterion: t1_5_backstop
+# verdict: PASS
+# observed_reason: backstop auto-resolved at ~60.0s (DENY+notify); tool not executed; session usable after (2nd turn OK).
+# timestamp: 2026-06-21T05:18:37.958456+00:00
+------------------------------------------------------------
+=== T1.5 harness-side backstop (t1_5_backstop) ===
+  backstop_at: 60.0
+  fired: 3
+  auto_resolved_after: 60.0
+  notify_logged: True
+  decision: auto-deny(backstop)
+  result1_is_error: False
+  executed: False
+  second_turn_ok: True
+  session_usable_after: True
+  sid: [REDACTED]
+  error: None
+  final2: BACKSTOP_SESSION_OK
+  notify: ['BACKSTOP fired after 60s: no human decision -> auto-DENY', 'BACKSTOP fired after 60s: no human decision -> auto-DENY', 'BACKSTOP fired after 60s: no human decision -> auto-DENY']
+  -> trial verdict: PASS — backstop auto-resolved at ~60.0s (DENY+notify); tool not executed; session usable after (2nd turn OK).

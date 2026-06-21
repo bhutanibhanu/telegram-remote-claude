@@ -1,0 +1,8 @@
+{
+  "criterion": "t1_3_interactive",
+  "verdict": "PASS",
+  "observed_reason": "held 120.0s then native answer honored; session continued on code choice 'Bravo'.",
+  "timestamp": "2026-06-21T05:09:50.708832+00:00",
+  "transcript_path": "t1_3_interactive.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

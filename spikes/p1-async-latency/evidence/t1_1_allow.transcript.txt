@@ -1,0 +1,18 @@
+# criterion: t1_1_allow
+# verdict: PASS
+# observed_reason: held 120.0s then ALLOW honored; tool executed; clean result.
+# timestamp: 2026-06-21T05:05:33.273082+00:00
+------------------------------------------------------------
+=== T1.1 hold-then-ALLOW (t1_1_allow) ===
+  hold_requested: 120.0
+  hold_awaited: 120.0
+  fired: 1
+  decision: allow
+  control_survived: True
+  executed: True
+  result_is_error: False
+  session_continued: True
+  sid: [REDACTED]
+  error: None
+  final: Done. Created the file `ok.txt` with the content `P1_ASYNC_OK`.
+  -> trial verdict: PASS — held 120.0s then ALLOW honored; tool executed; clean result.

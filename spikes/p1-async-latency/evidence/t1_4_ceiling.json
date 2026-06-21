@@ -1,0 +1,8 @@
+{
+  "criterion": "t1_4_ceiling",
+  "verdict": "PASS",
+  "observed_reason": "no ceiling observed <= 300.0s (~5.0 min); allow honored after the long hold.",
+  "timestamp": "2026-06-21T05:14:59.780834+00:00",
+  "transcript_path": "t1_4_ceiling.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

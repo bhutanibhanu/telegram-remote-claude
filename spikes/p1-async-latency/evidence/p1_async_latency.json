@@ -1,0 +1,8 @@
+{
+  "criterion": "p1_async_latency",
+  "verdict": "PASS",
+  "observed_reason": "Multi-minute holds (>=120s) are tolerated on ALLOW, DENY, and the native interactive answer; the session continues on the resolved decision in every case; the harness-side backstop works (auto-resolves a pending decision with a timer + notify, session usable after); and no near-term ceiling was observed up to ~5 min. The SDK does not bound the can_use_tool callback (no fail_after on the inbound control request), so the 60-min backstop can be implemented engine-side as a timer over a pending-decision Future. Engine build (T4+) may proceed.",
+  "timestamp": "2026-06-21T05:18:38.004131+00:00",
+  "transcript_path": "p1_async_latency.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

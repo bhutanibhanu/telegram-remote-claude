@@ -1,0 +1,18 @@
+# criterion: t1_2_deny
+# verdict: PASS
+# observed_reason: held 120.0s then DENY honored; tool did NOT execute; session clean.
+# timestamp: 2026-06-21T05:07:42.252157+00:00
+------------------------------------------------------------
+=== T1.2 hold-then-DENY (t1_2_deny) ===
+  hold_requested: 120.0
+  hold_awaited: 120.0
+  fired: 1
+  decision: deny
+  control_survived: True
+  executed: False
+  result_is_error: False
+  session_continued: True
+  sid: [REDACTED]
+  error: None
+  final: The write was denied by a policy hook (T1.2), so the file was not created. I didn't make any other changes. Let me know how you'd like to proceed.
+  -> trial verdict: PASS — held 120.0s then DENY honored; tool did NOT execute; session clean.

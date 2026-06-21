@@ -1,0 +1,17 @@
+# criterion: t1_4_ceiling
+# verdict: PASS
+# observed_reason: no ceiling observed <= 300.0s (~5.0 min); allow honored after the long hold.
+# timestamp: 2026-06-21T05:14:59.780834+00:00
+------------------------------------------------------------
+=== T1.4 ceiling probe (t1_4_ceiling) ===
+  hold_requested: 300.0
+  hold_awaited: 300.0
+  fired: 1
+  decision: allow
+  control_survived: True
+  executed: True
+  result_is_error: False
+  ceiling_observed: None
+  sid: [REDACTED]
+  error: None
+  -> trial verdict: PASS — no ceiling observed <= 300.0s (~5.0 min); allow honored after the long hold.

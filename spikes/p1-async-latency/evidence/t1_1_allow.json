@@ -1,0 +1,8 @@
+{
+  "criterion": "t1_1_allow",
+  "verdict": "PASS",
+  "observed_reason": "held 120.0s then ALLOW honored; tool executed; clean result.",
+  "timestamp": "2026-06-21T05:05:33.273082+00:00",
+  "transcript_path": "t1_1_allow.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

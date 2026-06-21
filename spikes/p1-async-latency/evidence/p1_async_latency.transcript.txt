@@ -1,0 +1,131 @@
+# criterion: p1_async_latency
+# verdict: PASS
+# observed_reason: Multi-minute holds (>=120s) are tolerated on ALLOW, DENY, and the native interactive answer; the session continues on the resolved decision in every case; the harness-side backstop works (auto-resolves a pending decision with a timer + notify, session usable after); and no near-term ceiling was observed up to ~5 min. The SDK does not bound the can_use_tool callback (no fail_after on the inbound control request), so the 60-min backstop can be implemented engine-side as a timer over a pending-decision Future. Engine build (T4+) may proceed.
+# timestamp: 2026-06-21T05:18:38.004131+00:00
+------------------------------------------------------------
+=== T1 / P1 — async-latency DE-RISK SPIKE (substrate A, live, contained) ===
+sdk: claude-agent-sdk==0.2.105 (ADR-001 environment of record)
+ANTHROPIC_API_KEY set: False (MUST be False — host CLI auth only)
+P1_FAST (smoke) mode: False  | holds: short=120.0s ceiling=300.0s backstop_at=60.0s margin=90.0s
+
+SDK FACTS (from reading claude-agent-sdk==0.2.105 source):
+  * Query._handle_control_request does `await self.can_use_tool(...)` with NO
+    fail_after/timeout — the SDK waits indefinitely for the callback (query.py ~L408).
+  * Each inbound control request is its own spawned task; only a CLI-sent
+    control_cancel_request cancels it (query.py ~L239/~L279). Any ceiling is CLI/model-side.
+  * The 60s timeout (_send_control_request, ~L502) is OUTBOUND only (initialize/interrupt/
+    set_permission_mode) — it does NOT bound the held permission callback.
+  * receive_response() has no client-side timeout; OUR harness adds asyncio.wait_for, so each
+    send() below is given timeout=hold+margin so the harness never aborts the wait first.
+
+descendant claude pids before: []
+git porcelain (set) before run: ['?? spikes/p1-async-latency/']
+
+>>> running T1.1 hold-then-ALLOW ...
+  cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-p1-allow-lef-9bvw']
+=== T1.1 hold-then-ALLOW (t1_1_allow) ===
+  hold_requested: 120.0
+  hold_awaited: 120.0
+  fired: 1
+  decision: allow
+  control_survived: True
+  executed: True
+  result_is_error: False
+  session_continued: True
+  sid: [REDACTED]
+  error: None
+  final: Done. Created the file `ok.txt` with the content `P1_ASYNC_OK`.
+  -> trial verdict: PASS — held 120.0s then ALLOW honored; tool executed; clean result.
+
+
+>>> running T1.2 hold-then-DENY ...
+  cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-p1-deny-2hu2n98d']
+=== T1.2 hold-then-DENY (t1_2_deny) ===
+  hold_requested: 120.0
+  hold_awaited: 120.0
+  fired: 1
+  decision: deny
+  control_survived: True
+  executed: False
+  result_is_error: False
+  session_continued: True
+  sid: [REDACTED]
+  error: None
+  final: The write was denied by a policy hook (T1.2), so the file was not created. I didn't make any other changes. Let me know how you'd like to proceed.
+  -> trial verdict: PASS — held 120.0s then DENY honored; tool did NOT execute; session clean.
+
+
+>>> running T1.3 interactive-answer hold ...
+  cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-p1-ask-9b7a16qh']
+=== T1.3 interactive-answer hold (t1_3_interactive) ===
+  hold_requested: 120.0
+  hold_awaited: 120.0
+  fired: 1
+  decision: allow(answers-map)
+  control_survived: True
+  answered_not_error: True
+  session_continued: True
+  chosen: Bravo
+  result_is_error: False
+  sid: [REDACTED]
+  error: None
+  final: FINAL_PICK=Bravo
+  tool_results: [(None, 'Your questions have been answered: "Pick one option"="Bravo". You can now continue with these answers in mind.')]
+  -> trial verdict: PASS — held 120.0s then native answer honored; session continued on code choice 'Bravo'.
+
+
+>>> running T1.4 ceiling probe (~5 min) ...
+  cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-p1-ceil-jjuti772']
+=== T1.4 ceiling probe (t1_4_ceiling) ===
+  hold_requested: 300.0
+  hold_awaited: 300.0
+  fired: 1
+  decision: allow
+  control_survived: True
+  executed: True
+  result_is_error: False
+  ceiling_observed: None
+  sid: [REDACTED]
+  error: None
+  -> trial verdict: PASS — no ceiling observed <= 300.0s (~5.0 min); allow honored after the long hold.
+
+
+>>> running T1.5 harness-side backstop ...
+  cleaned CLI project transcript dir(s): ['-private-var-folders-x4-xw02s3m5245fscxksd7wzl1w0000gn-T-p1-backstop-h6-ffnx0']
+=== T1.5 harness-side backstop (t1_5_backstop) ===
+  backstop_at: 60.0
+  fired: 3
+  auto_resolved_after: 60.0
+  notify_logged: True
+  decision: auto-deny(backstop)
+  result1_is_error: False
+  executed: False
+  second_turn_ok: True
+  session_usable_after: True
+  sid: [REDACTED]
+  error: None
+  final2: BACKSTOP_SESSION_OK
+  notify: ['BACKSTOP fired after 60s: no human decision -> auto-DENY', 'BACKSTOP fired after 60s: no human decision -> auto-DENY', 'BACKSTOP fired after 60s: no human decision -> auto-DENY']
+  -> trial verdict: PASS — backstop auto-resolved at ~60.0s (DENY+notify); tool not executed; session usable after (2nd turn OK).
+
+
+=== per-trial verdicts ===
+  t1_1_allow         PASS      held 120.0s then ALLOW honored; tool executed; clean result.
+  t1_2_deny          PASS      held 120.0s then DENY honored; tool did NOT execute; session clean.
+  t1_3_interactive   PASS      held 120.0s then native answer honored; session continued on code choice 'Bravo'.
+  t1_4_ceiling       PASS      no ceiling observed <= 300.0s (~5.0 min); allow honored after the long hold.
+  t1_5_backstop      PASS      backstop auto-resolved at ~60.0s (DENY+notify); tool not executed; session usable after (2nd turn OK).
+
+=== OVERALL VERDICT REASONING ===
+  core 120s holds (allow/deny/interactive) all PASS: True
+  harness-side backstop PASS: True
+  ceiling probe: no ceiling <= ~5 min
+
+=== CONTAINMENT / CLEANUP ===
+  total runtime: 911.4s (~15.2 min)
+  descendant claude pids after: []  leaked: [] (expected: [])
+  git porcelain NEW during run: NONE (temp fixtures live OUTSIDE the repo)
+  ANTHROPIC_API_KEY set: False (expected False)
+
+OVERALL VERDICT: PASS
+REASON: Multi-minute holds (>=120s) are tolerated on ALLOW, DENY, and the native interactive answer; the session continues on the resolved decision in every case; the harness-side backstop works (auto-resolves a pending decision with a timer + notify, session usable after); and no near-term ceiling was observed up to ~5 min. The SDK does not bound the can_use_tool callback (no fail_after on the inbound control request), so the 60-min backstop can be implemented engine-side as a timer over a pending-decision Future. Engine build (T4+) may proceed.

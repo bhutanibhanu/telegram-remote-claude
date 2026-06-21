@@ -1,0 +1,8 @@
+{
+  "criterion": "t1_2_deny",
+  "verdict": "PASS",
+  "observed_reason": "held 120.0s then DENY honored; tool did NOT execute; session clean.",
+  "timestamp": "2026-06-21T05:07:42.252157+00:00",
+  "transcript_path": "t1_2_deny.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}
