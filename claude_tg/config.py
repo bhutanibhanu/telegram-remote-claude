@@ -71,6 +71,35 @@ def parse_engine_mode(raw: str | None) -> str:
     return mode
 
 
+#: Default answer-hold backstop: 60 minutes (decision-log #4 / ADR-002). The engine's
+#: per-request timer auto-resolves a pending interactive decision to DENY + notify when
+#: this elapses, leaving the session usable. Configurable via ``ANSWER_BACKSTOP_SECONDS``.
+DEFAULT_ANSWER_BACKSTOP_SECONDS = 3600
+
+
+def parse_answer_backstop_seconds(raw: str | None) -> int:
+    """Parse + validate ANSWER_BACKSTOP_SECONDS (default 3600 = 60 min).
+
+    The streaming engine holds a pending ``ask``/``plan`` request open while the
+    operator decides; this is the harness-side backstop (ADR-002) that auto-denies +
+    notifies if no answer arrives. Empty/unset -> default; must be a positive integer
+    (fail loud on a bad value rather than silently using a surprising hold length).
+    Per ADR-002 the figure should sit BELOW any later-observed CLI/model ceiling — the
+    5-60 min band is untested — so it is deliberately configurable down.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_ANSWER_BACKSTOP_SECONDS
+    try:
+        seconds = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"ANSWER_BACKSTOP_SECONDS must be an integer, got {raw!r}"
+        ) from exc
+    if seconds <= 0:
+        raise ValueError("ANSWER_BACKSTOP_SECONDS must be positive")
+    return seconds
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -84,6 +113,10 @@ class Config:
     # S4 migration flag: "oneshot" (default, existing behavior) | "streaming" (P1 engine).
     # bot.py reads this to select the runner; T4 only parses/validates it (T7 wires the switch).
     engine_mode: str = "oneshot"
+    # Streaming engine answer-hold backstop (ADR-002): seconds to hold a pending
+    # ask/plan request before auto-denying + notifying. Default 60 min; T7 passes it
+    # to the Engine. Only consulted in streaming mode.
+    answer_backstop_seconds: int = DEFAULT_ANSWER_BACKSTOP_SECONDS
 
     @classmethod
     def from_env(cls, dotenv_path: str | os.PathLike[str] | None = ".env") -> "Config":
@@ -119,6 +152,9 @@ class Config:
         state_file = Path(state_raw).expanduser() if state_raw else None
 
         engine_mode = parse_engine_mode(os.environ.get("ENGINE_MODE"))
+        answer_backstop = parse_answer_backstop_seconds(
+            os.environ.get("ANSWER_BACKSTOP_SECONDS")
+        )
 
         return cls(
             bot_token=token,
@@ -130,4 +166,5 @@ class Config:
             skip_permissions=skip,
             state_file=state_file,
             engine_mode=engine_mode,
+            answer_backstop_seconds=answer_backstop,
         )

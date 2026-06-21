@@ -22,6 +22,7 @@ Public surface:
 from __future__ import annotations
 
 from .engine import Engine
+from .pending import DEFAULT_BACKSTOP_SECONDS, PendingRegistry
 from .substrate import DecisionCallback, Substrate, SubstrateBAdapter
 from .types import (
     AskEvent,
@@ -44,6 +45,8 @@ from .types import (
 
 __all__ = [
     "Engine",
+    "PendingRegistry",
+    "DEFAULT_BACKSTOP_SECONDS",
     "Substrate",
     "SubstrateBAdapter",
     "DecisionCallback",

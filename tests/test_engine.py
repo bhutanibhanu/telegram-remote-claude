@@ -20,15 +20,18 @@ import os
 import claude_agent_sdk as sdk
 import pytest
 
-from claude_tg.config import ENGINE_MODES, Config, parse_engine_mode
+from claude_tg.config import (
+    DEFAULT_ANSWER_BACKSTOP_SECONDS,
+    ENGINE_MODES,
+    Config,
+    parse_answer_backstop_seconds,
+    parse_engine_mode,
+)
 from claude_tg.engine import (
     AskEvent,
-    Cancel,
     Engine,
     ErrorEvent,
-    PermissionVerdict,
     PlanEvent,
-    QuestionAnswer,
     ResultEvent,
     StatusEvent,
     SubstrateDecision,
@@ -131,12 +134,17 @@ async def test_send_passes_configured_timeout_through():
 
 
 # ---------------------------------------------------------------------------
-# Decision seam: engine maps a Decision -> SubstrateDecision via the one mapper
+# Decision seam: the seam SHAPE (on_tool_request -> SubstrateDecision) is the T4
+# contract; T5 replaces the body with the answer-hold. Ordinary tools auto-allow
+# here (no waiting); the ask/plan answer-hold itself is covered in
+# test_answer_hold.py. These guard the seam's ordinary-tool path + return shape.
 # ---------------------------------------------------------------------------
 
 
-async def test_default_decision_provider_allows_with_record():
-    # T4 default provider: allow unchanged, echoing tool input as the record.
+async def test_ordinary_tool_request_auto_allows_with_record():
+    # P1 interim posture: an ordinary tool (not ask/plan) is auto-allowed, echoing
+    # the original tool input as the record (the B updatedInput gotcha), with NO wait
+    # on any operator decision.
     sub = FakeSubstrate()
     eng = Engine(sub)
     d = await eng.on_tool_request("Write", {"file_path": "/a"}, "tu1")
@@ -145,33 +153,11 @@ async def test_default_decision_provider_allows_with_record():
     assert d.updated_input == {"file_path": "/a"}
 
 
-async def test_engine_routes_question_answer_through_native_map():
-    # A custom provider that returns a QuestionAnswer -> engine maps it to the native
-    # answers-map allow (proves the seam wires to the single load-bearing mapper).
-    async def provider(tool_name, tool_input, tool_use_id):
-        return QuestionAnswer({"Pick?": "Bravo"})
-
-    sub = FakeSubstrate()
-    eng = Engine(sub, decision_provider=provider)
-    d = await eng.on_tool_request("AskUserQuestion", {"questions": [1]}, "tu9")
-    assert d.allow is True
-    assert d.updated_input == {"questions": [1], "answers": {"Pick?": "Bravo"}}
-
-
-async def test_engine_routes_deny_and_cancel():
-    async def deny_provider(tool_name, tool_input, tool_use_id):
-        return PermissionVerdict("deny", message="nope")
-
-    eng = Engine(FakeSubstrate(), decision_provider=deny_provider)
-    d = await eng.on_tool_request("Bash", {"command": "rm"}, None)
-    assert d.allow is False and d.message == "nope"
-
-    async def cancel_provider(tool_name, tool_input, tool_use_id):
-        return Cancel()
-
-    eng2 = Engine(FakeSubstrate(), decision_provider=cancel_provider)
-    d2 = await eng2.on_tool_request("Bash", {}, None)
-    assert d2.allow is False and d2.message == "cancelled"
+async def test_ordinary_tool_auto_allow_without_tool_use_id():
+    # The auto-allow path does not require a tool_use_id (ordinary tools may lack one).
+    eng = Engine(FakeSubstrate())
+    d = await eng.on_tool_request("Bash", {"command": "ls"}, None)
+    assert d.allow is True and d.updated_input == {"command": "ls"}
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +416,7 @@ def test_sdk_send_before_start_raises():
 @pytest.fixture(autouse=True)
 def _clean_engine_env(monkeypatch):
     for key in list(os.environ):
-        if key.startswith(("TELEGRAM_", "CLAUDE_", "ENGINE_")):
+        if key.startswith(("TELEGRAM_", "CLAUDE_", "ENGINE_", "ANSWER_")):
             monkeypatch.delenv(key, raising=False)
 
 
@@ -471,6 +457,55 @@ def test_config_invalid_engine_mode_raises(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
     monkeypatch.setenv("ENGINE_MODE", "nope")
+    with pytest.raises(ValueError):
+        Config.from_env(dotenv_path=None)
+
+
+# ---------------------------------------------------------------------------
+# ANSWER_BACKSTOP_SECONDS config parsing / validation (ADR-002, T5)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_answer_backstop_default_is_3600():
+    assert parse_answer_backstop_seconds(None) == 3600
+    assert parse_answer_backstop_seconds("") == 3600
+    assert parse_answer_backstop_seconds("   ") == 3600
+    assert DEFAULT_ANSWER_BACKSTOP_SECONDS == 3600
+
+
+def test_parse_answer_backstop_reads_override():
+    assert parse_answer_backstop_seconds("120") == 120
+    assert parse_answer_backstop_seconds(" 300 ") == 300
+
+
+def test_parse_answer_backstop_rejects_non_int_and_nonpositive():
+    with pytest.raises(ValueError):
+        parse_answer_backstop_seconds("abc")
+    with pytest.raises(ValueError):
+        parse_answer_backstop_seconds("0")
+    with pytest.raises(ValueError):
+        parse_answer_backstop_seconds("-5")
+
+
+def test_config_defaults_answer_backstop(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.answer_backstop_seconds == 3600  # 60-min default
+
+
+def test_config_reads_answer_backstop_override(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("ANSWER_BACKSTOP_SECONDS", "90")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.answer_backstop_seconds == 90
+
+
+def test_config_invalid_answer_backstop_raises(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("ANSWER_BACKSTOP_SECONDS", "nope")
     with pytest.raises(ValueError):
         Config.from_env(dotenv_path=None)
 
