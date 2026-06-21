@@ -1,6 +1,6 @@
 # Progress: streaming-engine (P1)
 
-_Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised build_
+_Plan generated 2026-06-21 from design.md · 9 tasks (+ T10, a verify-found fix) · autonomous supervised build_
 
 > **P1 — interactive streaming session engine.** Builds on ADR-001 (Substrate A =
 > `claude-agent-sdk==0.2.105`). Ships behind `ENGINE_MODE` (`oneshot` default → `streaming`); the
@@ -30,6 +30,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised bu
 - [x] T7 — Wire bot.py: ENGINE_MODE switch + SB1 callback handler + /cancel + routing · unit (3b90693)
 - [x] T8 — /cd path policy (SB2) + SB/RB test suite (RB7) · unit (45937a9)
 - [ ] T9 — Live end-to-end verify (programmatic, real Claude) + owner phone-verify checklist · live probe
+- [x] T10 — Dedup duplicate ask/plan emission (engine; found by T9 live verify) · unit (de65998)
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
 
@@ -267,6 +268,31 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - No API key; effects contained; evidence scrubbed (SB3).
 - **Tests:** none — live verdict + transcript + owner checklist are the artifacts.
 - **Status:** todo
+
+### T10 — Dedup duplicate ask/plan emission (engine; found by T9 live verify)
+- **Goal:** Ensure each interactive `ask`/`plan` reaches the operator exactly ONCE (no duplicate keyboard,
+  no pre-registration race) — discovered by the T9 live probe.
+- **Depends on:** T4/T5 (engine); surfaced by T9.
+- **Files:** `claude_tg/engine/engine.py`; `tests/test_answer_hold.py`.
+- **Acceptance:** an interactive request emitted on BOTH the substrate stream (adapter-normalized
+  `ToolUseBlock`) AND the engine's permission-channel injection SHALL surface to the operator exactly once
+  (the injected, pending-synced copy), and that copy SHALL be resolvable; ordinary tools unaffected.
+- **Tests:** unit — a double-path mock substrate; assert exactly one ask/plan + `resolve()==True` + decision honored.
+- **Status:** done (de65998) — root-caused from the T9 live probe (v3 reject was LOST + v5 `cancel` aborted
+  0): `AskUserQuestion`/`ExitPlanMode` reached the operator TWICE — (1) the adapter normalizes the
+  assistant-message `ToolUseBlock`→`Ask/PlanEvent` onto the substrate stream (arrives FIRST, before
+  `can_use_tool` fires → no pending registered → a decision on it no-ops, `resolve()→False`), and (2) the
+  engine injects the authoritative copy from the permission channel *synced with* the pending registration
+  (`await_decision` registers synchronously before its first await). Fix (single point, engine policy):
+  `Engine._drain_substrate` **drops** substrate-stream `Ask/PlanEvent` — these two tools ALWAYS traverse
+  `can_use_tool` (P0 C3/C4 + the T9 live run), so every substrate copy is paired with an injected one;
+  dropping it leaves exactly one, always-resolvable prompt. `adapter_sdk.normalize` left PURE (unchanged).
+  **Verified by me on 0.2.105:** pytest **247 passed** (+2 guard-dependent dedup tests, proven to FAIL
+  without the fix → 2 events), ruff/mypy/secret-scan clean. **One fresh independent reviewer AGREES done,
+  no required fixes** — confirmed at SDK source that `can_use_tool` always fires for ask/plan in the
+  production config, the pending registers synchronously, and the tests are genuinely guard-dependent.
+  **Re-running the T9 live probe with this fix → OVERALL PASS** (v3 reject delivered, v5 `cancel` aborted 1).
+  Scope: only `engine.py` + its test; adapter/stream_session/bot/render/config/runner/main untouched.
 
 ## Rules
 - **Flag-gated, branch-only.** All work on `feat/streaming-engine`; **never merge to main**; the live
