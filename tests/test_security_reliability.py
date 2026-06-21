@@ -605,3 +605,49 @@ def test_rb5_burst_coalesces_to_bounded_edits():
     assert len(edits) < 50  # the RB5 guarantee: bounded, never N
     flushed = coalescer.flush().actions  # trailing edge shows the newest line
     assert len(flushed) == 1 and flushed[0].text == "d49"
+
+
+# ===========================================================================
+# SB5 (P2) — the streaming path introduces no default bypass; /yolo is the only
+# (loud, off-by-default) one. Structural guards; behavioral SB5 (/yolo via the
+# bot) lives in the P2 SB/RB matrix.
+# ===========================================================================
+
+
+def test_sb5_streaming_factory_introduces_no_bypass():
+    """SB5: the streaming engine is fail-closed by default — no bypass on the default path.
+
+    The production engine factory wires the substrate in ``permission_mode="default"`` with
+    the engine's ``can_use_tool`` gate (``on_tool_request``) and the chat's shared
+    ``PermissionPolicy``. It passes NO ``--dangerously-skip-permissions`` / allow-all flag.
+    A regression that flipped the streaming path to a bypass mode (or dropped the gate /
+    policy wiring) trips these assertions.
+    """
+    from claude_tg.permissions import PermissionPolicy
+    from claude_tg.stream_session import _default_engine_factory
+
+    policy = PermissionPolicy()
+    engine = _default_engine_factory(
+        cwd="/tmp/p2-sb5", backstop_seconds=60.0, permission_policy=policy
+    )
+    sub = engine._substrate  # the SdkSubstrate the chat runs (no connect happens here)
+    assert sub._permission_mode == "default"  # the gating mode, NOT a bypass
+    assert sub._permission_mode != "bypassPermissions"
+    assert sub._decision_callback is not None  # the can_use_tool gate is wired
+    assert sub._allowed_tools is None  # nothing pre-allowed (no allow-all)
+    assert sub._disallowed_tools is None
+    assert engine._policy is policy  # the engine gates on the SHARED policy object
+
+
+def test_sb5_yolo_is_off_by_default_and_loud_when_on():
+    """SB5/D6: the ONLY bypass is /yolo — off by default, and loud when enabled.
+
+    A fresh ``PermissionPolicy`` gates risky tools (``yolo`` False); the ``/yolo`` enable
+    banner is non-empty and carries the ⚠️ glyph so allow-all is never silent.
+    """
+    from claude_tg.permissions import PermissionPolicy
+    from claude_tg.render import yolo_banner
+
+    assert PermissionPolicy().yolo is False  # never allow-all by default
+    banner = yolo_banner()
+    assert banner and "⚠️" in banner  # loud when on

@@ -272,3 +272,29 @@ allow-once-vs-session, deny-relay, post-approval-still-gated; RB7) → live veri
    unknown/WebFetch/MCP/WebSearch), allow-once-vs-session, canned-deny relay, **post-approval still gated**.
 8. **Live verify + owner checklist** — programmatic (real Claude: a risky tool pauses → allow/deny honored,
    allow-session suppresses, `/yolo`, `/cancel`, backstop), contained + scrubbed; `verify.md` phone-checklist.
+
+---
+
+## Security posture & blast radius (SB5/SB6)
+
+P2 shifts the trust model from "bypass + trust the operator" to **approval gates + path policy**:
+
+- **No default bypass on the streaming path (SB5).** The streaming engine runs the substrate in
+  `permission_mode="default"` with the engine's `can_use_tool` gate (`on_tool_request`) — it passes **no**
+  `--dangerously-skip-permissions` and no allow-all flag. Risky tools are held for approval; the engine is
+  **fail-closed by default** (a fresh `PermissionPolicy` gates everything risky). The **only** bypass is
+  `/yolo` — explicit, per-session, **off by default, loud when on** (⚠️ enable banner + a persistent
+  per-turn marker) and **cleared on `/reset`/restart** (never silently resumed; D6/D7).
+- **One-shot is the documented legacy exception (D3).** The retiring one-shot runner keeps
+  `--dangerously-skip-permissions` because it has **no approval channel**; it is **not** the go-forward path.
+  P2 does **not** flip the `ENGINE_MODE` default or retire one-shot — that is a later, owner-gated cleanup.
+  Until then its bypass is bounded by the same single-chat allowlist.
+- **Trust boundary.** Unchanged: secret bot token + chat-id allowlist (SB1, incl. button-callback taps).
+  Strengthened, not weakened — approval gates (this pipeline) + `/cd` path confinement (P1/SB2) replace the
+  old blanket bypass.
+- **Blast radius (SB6).** Single allowlisted operator, single active session. The risk classifier is
+  **fail-closed** (unknown/new tools gate) so the wrong-way error is *friction, not exposure*. Reads/search
+  run free; edits/shell/`WebFetch`/`mcp__*`/unknown are gated. **`cwd` is not an OS sandbox** (ADR-001) —
+  path confinement is policy-level (SB2); a granted or `/yolo`'d tool runs with the host user's privileges,
+  so `/yolo` is a deliberate, loud, per-session choice. Approving a plan greenlights **nothing** — every
+  risky tool still gates independently (the ADR-001 caveat). Full SB consolidation + threat model is **P6**.
