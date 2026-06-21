@@ -23,7 +23,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised bu
 ## Task list
 - [x] T1 — Async-latency de-risk spike (answer-hold) ⭐ **GATE** · live probe (18476f7 — PASS)
 - [x] T2 — ADR-002: async answer-hold mechanism · doc (36652c9)
-- [ ] T3 — CI + project test harness baseline · config
+- [x] T3 — CI + project test harness baseline · config (a4560f3)
 - [ ] T4 — Engine core: normalized types + substrate seam (A adapter) + lifecycle + events-out · unit (mock)
 - [ ] T5 — Decisions-in + async answer-hold + 60-min backstop + cancel · unit (mock)
 - [ ] T6 — Render layer: events→Telegram, inline keyboards, coalesce/throttle (RB5) · unit
@@ -92,7 +92,19 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - The existing test suite SHALL pass under CI; **no test invokes live Claude or the network** (substrate is mocked).
   - WHEN CI runs, it SHALL NOT require an API key or host CLI auth.
 - **Tests:** the existing suite runs green locally + the workflow is valid (lint the YAML / dry-run the job steps locally where possible).
-- **Status:** todo
+- **Status:** done (a4560f3) — GitHub Actions CI stood up (`.github/workflows/ci.yml`): on push + PR, matrix
+  Python 3.12/3.13, runs **pytest + ruff + mypy + secret-scan**; documents that branch protection must require
+  the check green (decision-log #6). `pyproject.toml` adds a **lenient-but-green** ruff (E/F/I/B; E501 off) +
+  mypy (`ignore_missing_imports`, non-strict, scoped to `claude_tg`+`main.py`, one `bot.py` `union-attr`
+  override) baseline with explicit "tighten later" notes. `scripts/secret_scan.py` (SB3) is a dependency-light
+  offline scan of **git-tracked** files reusing the P0 scrubber patterns (anthropic/openai/telegram/aws/bearer/
+  private-key + credential assignments), with placeholder allowlist. **Verified locally by me:** pytest **53
+  passed**, `ruff check` clean, `mypy` clean (7 files), secret-scan clean (102 files, exit 0) AND it correctly
+  FAILS on injected real-looking secrets; ci.yml parses. **No test touches the network/live-Claude/API key**
+  (substrate mocked via `_invoke` monkeypatch; grep confirms no subprocess/socket/http in `tests/`). Scope:
+  **requirements.txt + production runtime `.py` + spikes/ untouched**; only `.github/`, `pyproject.toml`,
+  `scripts/`, and dev-deps (`ruff`,`mypy`) in requirements-dev.txt changed. (Comprehensive review deferred to the
+  end-phase Verify+QA per the pipeline.)
 
 ### T4 — Engine core: normalized types + substrate seam (A adapter) + lifecycle + events-out
 - **Goal:** Implement the normalized engine contract for real: event/decision types (carrying a session id), a `Substrate` adapter protocol (A adapter built on `claude-agent-sdk`; B = documented slot), the `start/resume/send/stop` lifecycle, and events-out normalization — selectable via `ENGINE_MODE` with `oneshot` remaining the default.
