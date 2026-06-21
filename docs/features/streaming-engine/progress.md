@@ -24,7 +24,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised bu
 - [x] T1 — Async-latency de-risk spike (answer-hold) ⭐ **GATE** · live probe (18476f7 — PASS)
 - [x] T2 — ADR-002: async answer-hold mechanism · doc (36652c9)
 - [x] T3 — CI + project test harness baseline · config (a4560f3)
-- [ ] T4 — Engine core: normalized types + substrate seam (A adapter) + lifecycle + events-out · unit (mock)
+- [x] T4 — Engine core: normalized types + substrate seam (A adapter) + lifecycle + events-out · unit (mock) (cbfef05)
 - [ ] T5 — Decisions-in + async answer-hold + 60-min backstop + cancel · unit (mock)
 - [ ] T6 — Render layer: events→Telegram, inline keyboards, coalesce/throttle (RB5) · unit
 - [ ] T7 — Wire bot.py: ENGINE_MODE switch + SB1 callback handler + /cancel + routing · unit
@@ -117,7 +117,22 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - The `Substrate` seam SHALL have a built A adapter and a documented (not-implemented) B adapter slot (anti-goal: no B build).
   - WHEN the substrate errors/times out, the engine SHALL emit a clean `error` event (RB2), never hang.
 - **Tests:** unit — event normalization mapping, lifecycle, resume, ENGINE_MODE selection, RB2 clean-failure; all against a mock substrate (no network).
-- **Status:** todo
+- **Status:** done (cbfef05) — `claude_tg/engine/` package: **types.py** (7 events-out + 5 decisions-in
+  dataclasses, each event carrying `session_id`; the single load-bearing `decision_to_substrate` mapper
+  honoring every contract [FLAG] — native `answers`-map keyed by question text, plan-reject rides the deny
+  message, allow always returns a dict for the B `updatedInput` gotcha); **substrate.py** (`Substrate`
+  Protocol + documented NotImplemented **B-adapter slot**); **adapter_sdk.py** (Substrate-A over
+  claude-agent-sdk, **lazy SDK imports** so the package/mock-tests need no SDK; pure `normalize()` mapping
+  SDK messages→events incl. AskUserQuestion→Ask / ExitPlanMode→Plan / ToolResult(is_error)→Error /
+  RateLimitEvent→Status; bounded send → `driver_error` ErrorEvent, **never hangs (RB2)**; SB3-safe input
+  summary); **engine.py** (lifecycle passthrough + events-out stream + the decision seam; the answer-hold
+  itself is T5). `config.py` adds **ENGINE_MODE** (default `oneshot`); `requirements.txt` pins
+  **claude-agent-sdk==0.2.105** (the de-risked version; ADR-001 pin+monitor). **Verified by me on 0.2.105:**
+  pytest **99 passed** (53 existing + 46 new), ruff clean, mypy clean (12 files), secret-scan clean.
+  **One fresh independent reviewer** (correctness + contract-conformance + behavioral-tests + RB2 + lazy-import
+  + scope) **AGREES done, no required fixes** (introspected real SDK signatures; probed the wired seam).
+  Scope: **bot.py / claude_runner.py / main.py / spikes/ untouched** — one-shot path intact; the bot
+  ENGINE_MODE switch + decision-seam wiring are T7. (Comprehensive cross-check at the end-phase Verify+QA.)
 
 ### T5 — Decisions-in + async answer-hold + 60-min backstop + cancel
 - **Goal:** Implement decisions-in (question answer via native `answers` map; plan verdict allow / deny+feedback; free-text reply; cancel) and the async answer-hold (hold a pending `ask`/`plan` request open, resolve it back into the live session, 60-min backstop auto-resolve+notify, `/cancel` clean abort) — per ADR-002.
