@@ -2,6 +2,14 @@
 
 _Plan generated 2026-06-21 from design.md · 2 tasks · autonomous supervised build_
 
+> **✅ P3 COMPLETE (2026-06-21).** T1–T2 done, committed, and pushed on `feat/interactive-prompts` (stacked on
+> P2's `feat/permission-gating`, which carries P1+P2). The live `/grill` end-to-end verify (T2) is **PASS**
+> against real Claude: typing `/grill` (an unregistered slash-command) is forwarded **verbatim** to the
+> session and **launches the skill** — 2 AskUserQuestion rounds surfaced + answered, a `Write` gated +
+> allowed, run to a written brief, all contained. The headline ("run `/grill` from the phone") works: P1's
+> relay + P2's gating **compose** under the P3 launch path. Remaining before cutover: owner phone-verify per
+> [`verify.md`](verify.md), then flip `ENGINE_MODE=streaming` (default stays `oneshot` — the safe live path).
+
 > **P3 — interactive prompts / run skills from the phone.** The headline workflow: type `/grill` (or
 > `/pipeline`, `/scaffold`, …) in Telegram and the bot runs that skill **in the live Claude session**. P1
 > already shipped the interactive-tool relay (AskUserQuestion → buttons + "Other"; ExitPlanMode →
@@ -29,7 +37,7 @@ _Plan generated 2026-06-21 from design.md · 2 tasks · autonomous supervised bu
 
 ## Task list
 - [x] T1 — Skill-launch passthrough (`on_skill_command` in `bot.py`) · unit (52fb42d)
-- [ ] T2 — Live `/grill` end-to-end verify + owner phone checklist · live probe
+- [x] T2 — Live `/grill` end-to-end verify + owner phone checklist · live probe (d6b13ca)
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
 
@@ -104,7 +112,23 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
     win; confirm a non-allowlisted chat can't launch.
 - **Tests:** none — the live verdict + scrubbed transcript + `--mock` self-test + owner checklist are the
   artifacts.
-- **Status:** todo
+- **Status:** done (d6b13ca) — `spikes/p3-skill-launch-verify/verify_skill_launch.py` drives the launch path
+  end-to-end. `--mock` self-test: **launch-smoke** (the REAL bot + REAL `StreamingSession` over a recording
+  substrate → `on_skill_command("/grill …")` reaches `Substrate.send` **verbatim**, one hop below
+  `engine.send` — bridges T1's bot-boundary test) + **scripted drive-loop** (ask→answer→permission(allow_once)
+  →result; the native answers-map rides back). **LIVE run (host CLI auth, NO API key, 120.1s): OVERALL PASS**
+  — the unregistered `/grill`, forwarded verbatim, reached the engine and **LAUNCHED the skill**: 2 AskEvents
+  surfaced + answered (first option each), 1 risky `Write` gated + `allow_once`'d, ran to a non-error
+  ResultEvent, brief written to the exact absolute temp path. **P1 relay + P2 gating compose under the P3
+  launch path.** Containment held (temp cwd OUTSIDE the repo, repo unchanged, no leaked CLI pids,
+  `$HOME`/`~/.claude` swept clean, evidence scrubbed — SB3). Predicates code-driven + tolerant (assert on
+  mechanics: ≥1 AskEvent + non-error result; doc-write is a bonus) — a non-launch can't false-pass.
+  Independent reviewer **AGREE** with 2 load-bearing mutation probes (passthrough drops command →
+  launch-smoke FAILs; zero asks → live predicate can't PASS). **Orchestrator re-verify caught + fixed an SB3
+  gap** — the *overall* evidence file wasn't scrubbing the live session id (per-trial files were); now the
+  driver passes the collected session ids as `extra_secrets`, and the committed evidence is a post-fix live
+  re-run (PASS, UUID-grep clean). `docs/features/interactive-prompts/verify.md` is the owner phone checklist.
+  **No production code changed in T2** (spike + docs only).
 
 ## Rules
 - **Flag-gated, branch-only.** All work on `feat/interactive-prompts`; **never merge to main**; the live
