@@ -55,7 +55,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T14 — B · C2 permission decision over the wire (sandboxed) (dba7d5f — PASS)
 - [x] T15 — B · C3 AskUserQuestion over `stream-json` (90cdc1d — PASS native)
 - [x] T16 — B · C4 ExitPlanMode over `stream-json` (acc586f — PASS)
-- [ ] T17 — `run_all.py`: C1–C6 PASS/FAIL/PARTIAL matrix (+ B contingency)
+- [x] T17 — `run_all.py`: C1–C6 PASS/FAIL/PARTIAL matrix (+ B contingency) (ec93ecf)
 - [ ] T18 — Draft normalized engine interface + final evidence secret-scan gate
 - [ ] T19 — Fill ADR-001 (Proposed) + go/no-go writeup
 
@@ -415,7 +415,23 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
     format; verdict discrepancies caused by model/substrate variability SHALL be preserved and
     explained rather than hidden or treated automatically as a harness failure.
 - **Tests:** none — the matrix output is the artifact.
-- **Status:** todo
+- **Status:** done (ec93ecf) — `run_all.py` aggregates the canonical per-criterion evidence JSONs into the
+  **C1–C6 × {A,B} matrix**, printed + persisted to `evidence/matrix.json` + `evidence/matrix.md` (scrubbed, X3).
+  **Result:** C1 A=PASS/B=N-A · C2 A=PASS/B=PASS · C3 A=PASS/B=PASS · C4 A=PASS/B=PASS · C5 A=PASS/B=N-A ·
+  C6 A=PASS/B=N-A — **no FAIL, no PARTIAL** (C3 is native PASS on both after the correction). **B-contingency
+  (design S1) is ENFORCED, not just displayed:** B is tested unconditionally on C2/C3/C4; for C1/C5/C6 (A PASS,
+  non-make-or-break) B is **N-A with reason**; an adversarial reviewer verified that injecting an A FAIL/PARTIAL
+  on a contingent criterion makes `run_all.py` emit a CONTINGENCY VIOLATION and **exit non-zero** (does not
+  silently N-A). Reproducible: re-running default mode is pure aggregation (no live calls) and byte-stable except
+  the segregated `generated_at` timestamp; model-variance footnotes are preserved verbatim from source reasons
+  (no verdict recomputed/auto-flipped); fail-clean MISSING cell on absent/corrupt evidence. An optional
+  documented `--rerun` re-executes the checks (not the default; not run). Header records SDK/CLI versions,
+  GATE-1-GREEN (both make-or-break PASS on both substrates), C2/C3/C4 substrate-neutrality, and the A-vs-B
+  asymmetry (B's undocumented `--permission-prompt-tool stdio` coupling + hand-rolled plumbing; B scope = C2/C3/C4
+  per S1). **Two fresh independent reviewers (acceptance + reproduction, adversarial + S1-enforcement + fail-clean
+  probes) both AGREE** the matrix is accurate, honest, and reproducible. _(Companion forward-correction 6d0224c
+  refreshed the T11/C5 evidence wording to drop the now-false "no native C3 answer API" claim — C5 verdict
+  unchanged PASS.)_
 
 ### T18 — Draft normalized engine interface + final evidence secret-scan gate
 - **Goal:** From the observed event/decision shapes, draft the "events in / decisions out" normalized engine interface P1 inherits; then run the consolidated secret scan over all transcripts + staged files and record the clean result before evidence is committed.
