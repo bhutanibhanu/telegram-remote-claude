@@ -1,0 +1,548 @@
+"""Streaming-mode driver (T7) — the collaborator ``bot.py`` delegates to when
+``ENGINE_MODE=streaming``.
+
+The one-shot path (``claude_runner.ClaudeRunner``) is untouched; this module is the
+*parallel* streaming runner gated behind the S4 flag. It owns everything the live
+engine needs that the pure layers (``engine``/``render``) deliberately left to T7:
+
+* **Per-chat :class:`~claude_tg.engine.engine.Engine` lifecycle.** One engine per chat,
+  started lazily on the first turn (or resumed from the persisted ``(session_id, cwd)``
+  — the cwd-scoped-resume coupling, ADR-001 / C6). Harvested from
+  ``claude_runner``: the ``(session_id, cwd)`` persistence, ``--resume``, and the
+  per-chat single-active-turn lock (we do NOT rebuild those concepts).
+
+* **The turn lock (harvested ``ClaudeBusy`` invariant).** A per-chat
+  :class:`asyncio.Lock` guards the **turn driver** (``handle_message`` /
+  ``handle_cancel``-as-turn) so a chat runs one turn at a time — exactly the
+  single-active-run invariant ``ClaudeRunner`` enforces. **It deliberately does NOT
+  guard :meth:`resolve_callback`**: a button tap / "Other" reply resolves a pending
+  decision that the *currently running* turn is awaiting, so it MUST run concurrently
+  with the held turn (the turn loop is parked inside ``engine.send`` awaiting the
+  operator; the callback handler calls ``engine.resolve`` on the same loop to unblock
+  it). Locking the resolve would deadlock the very turn it must unblock.
+
+* **The send/edit + coalesce loop.** Drives ``engine.send(prompt)``, runs each event
+  through :func:`~claude_tg.render.render_event` via a per-turn
+  :class:`~claude_tg.render.Coalescer`, and performs the actual Telegram send / edit
+  the render layer deferred — batching incremental/status edits at the min interval,
+  flushing verbatim ask/plan/error/result as their own messages, attaching the
+  ask/plan inline keyboard. Persists ``session_id`` from the ``result`` event.
+
+* **The free-text "Other" / plan-reject state machine.** A per-chat pending-input
+  marker: when the operator taps "Other" on an ask or "Reject + feedback" on a plan,
+  the NEXT text message is captured as the free-text answer / reject feedback and
+  routed via ``engine.resolve`` instead of opening a new turn.
+
+**SB1 is enforced at the bot** (``filters.Chat(allowed)`` + an explicit
+``_authorized`` recheck in the handler) — this module is only reached for an
+already-authorized chat. **SB4/SB6:** prompts are passed to the engine verbatim; no
+message text is ever interpolated into a shell command or argument, and no bypass /
+permission-skip flag is introduced here (the engine's P1 posture — auto-allow ordinary
+tools inside the single allowlisted chat — is unchanged; per-tool gating is P2).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Optional, Protocol
+
+from .config import Config
+from .engine import (
+    AskEvent,
+    Engine,
+    PlanEvent,
+    PlanVerdict,
+    QuestionAnswer,
+    ResultEvent,
+    SubstrateDecision,
+)
+from .engine.adapter_sdk import SdkSubstrate
+from .render import (
+    Callback,
+    Coalescer,
+    RenderAction,
+    answers_from_ask,
+    decode_callback,
+)
+
+log = logging.getLogger(__name__)
+
+#: A coroutine that sends a NEW message and returns the sent message id (or None).
+#: ``reply_markup`` is the inline keyboard for an ask/plan (None otherwise).
+SendFn = Callable[..., Awaitable[Optional[int]]]
+#: A coroutine that edits an existing message's text in place (best-effort).
+EditFn = Callable[..., Awaitable[None]]
+
+
+class EngineFactory(Protocol):
+    """Builds an :class:`Engine` for a chat (injected so tests pass a mock).
+
+    The default production factory wires an :class:`SdkSubstrate` (Substrate A) with
+    the engine's decision callback; tests pass a factory returning a scripted fake.
+    """
+
+    def __call__(self, *, cwd: str, backstop_seconds: float) -> Engine: ...
+
+
+def _default_engine_factory(*, cwd: str, backstop_seconds: float) -> Engine:
+    """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
+
+    The substrate's ``decision_callback`` is the engine's own ``on_tool_request`` seam
+    (the async answer-hold). No bypass / skip-permissions flag is set — the engine's
+    P1 posture (auto-allow ordinary tools inside the single allowlisted chat) is the
+    default permission mode, unchanged (SB6).
+    """
+    engine: Engine
+
+    async def decision_callback(
+        tool_name: str, tool_input: dict, tool_use_id: Optional[str]
+    ) -> SubstrateDecision:
+        return await engine.on_tool_request(tool_name, tool_input, tool_use_id)
+
+    substrate = SdkSubstrate(
+        cwd=cwd,
+        permission_mode="default",
+        decision_callback=decision_callback,
+    )
+    engine = Engine(substrate, backstop_seconds=backstop_seconds)
+    return engine
+
+
+@dataclass
+class _ChatState:
+    """Per-chat streaming state (engine + turn lock + ask/plan + free-text marker)."""
+
+    cwd: str
+    engine: Optional[Engine] = None
+    started: bool = False
+    lock: asyncio.Lock = None  # type: ignore[assignment]
+    # The status-line message id for in-place coalesced edits (created on first edit).
+    status_message_id: Optional[int] = None
+    # The most recent ask/plan awaiting an answer (so a tap reconstructs the answer).
+    pending_ask: Optional[AskEvent] = None
+    pending_plan: Optional[PlanEvent] = None
+    # Free-text capture: when set, the NEXT text message is the answer/feedback for
+    # this tool_use_id, in this mode ("ask_other" -> QuestionAnswer; "plan_reject" ->
+    # PlanVerdict(approve=False)). Question index is kept for an "Other" answer.
+    awaiting_text_for: Optional[str] = None
+    awaiting_text_mode: Optional[str] = None  # "ask_other" | "plan_reject"
+    awaiting_text_question_index: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+
+
+class StreamingBusy(Exception):
+    """Raised when a chat already has a streaming turn in flight (harvested ClaudeBusy)."""
+
+
+class StreamingSession:
+    """Drives the streaming engine for every chat (the bot delegates here in streaming mode).
+
+    Construct ONE per bot. Methods are called from the Telegram handlers (single asyncio
+    loop). The turn lock guards :meth:`handle_message` (one turn per chat at a time —
+    the harvested ``ClaudeBusy`` invariant); :meth:`resolve_callback` is intentionally
+    lock-free so it can resolve the pending decision the held turn is awaiting.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        session_store=None,
+        engine_factory: Optional[EngineFactory] = None,
+        clock: Callable[[], float] = time.monotonic,
+        min_edit_interval: Optional[float] = None,
+    ) -> None:
+        self.config = config
+        self.store = session_store
+        self._engine_factory = engine_factory or _default_engine_factory
+        self._clock = clock
+        self._min_edit_interval = min_edit_interval
+        self._chats: dict[int, _ChatState] = {}
+        # Harvest persisted (session_id, cwd) so a streaming turn can resume.
+        self._resume_ids: dict[int, str] = {}
+        if self.store is not None:
+            data = self.store.load()
+            for key, entry in data.items():
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    cid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if entry.get("session_id"):
+                    self._resume_ids[cid] = entry["session_id"]
+                if entry.get("cwd"):
+                    self._chat(cid).cwd = entry["cwd"]
+
+    # -- per-chat state ------------------------------------------------------
+
+    def _chat(self, chat_id: int) -> _ChatState:
+        state = self._chats.get(chat_id)
+        if state is None:
+            state = _ChatState(cwd=str(self.config.workdir))
+            self._chats[chat_id] = state
+        return state
+
+    def get_cwd(self, chat_id: int) -> str:
+        return self._chat(chat_id).cwd
+
+    # -- engine lifecycle ----------------------------------------------------
+
+    async def _ensure_engine(self, state: _ChatState, chat_id: int) -> Engine:
+        """Lazily start (or resume) the chat's engine. Idempotent within a chat.
+
+        On first use: build the engine for the chat's cwd, then ``resume`` the persisted
+        ``(session_id, cwd)`` if one exists (cwd-scoped — C6), else ``start`` fresh. A
+        resume failure falls back to a fresh ``start`` (the dead id is dropped) so the
+        chat is never wedged on a stale session — harvested from the runner's
+        resume-failure recovery.
+        """
+        if state.engine is not None and state.started:
+            return state.engine
+        engine = state.engine or self._engine_factory(
+            cwd=state.cwd, backstop_seconds=float(self.config.answer_backstop_seconds)
+        )
+        state.engine = engine
+        resume_id = self._resume_ids.get(chat_id)
+        if resume_id:
+            try:
+                await engine.resume(resume_id)
+            except Exception:
+                log.info("resume failed for chat %s; starting a fresh session", chat_id)
+                self._resume_ids.pop(chat_id, None)
+                await engine.start()
+        else:
+            await engine.start()
+        state.started = True
+        return engine
+
+    def reset(self, chat_id: int) -> None:
+        """Drop the chat's session so the next turn starts fresh (harvested /reset).
+
+        Clears the persisted resume id and any in-memory engine + pending state. A
+        running turn (holding the lock) is not force-killed here; ``/cancel`` aborts a
+        live turn. This mirrors the one-shot runner's ``reset``.
+        """
+        self._resume_ids.pop(chat_id, None)
+        state = self._chats.get(chat_id)
+        if state is not None:
+            state.engine = None
+            state.started = False
+            state.status_message_id = None
+            self._clear_pending(state)
+        self._persist(chat_id, session_id=None)
+
+    def _persist(self, chat_id: int, *, session_id: Optional[str]) -> None:
+        if self.store is None:
+            return
+        state = self._chats.get(chat_id)
+        cwd = state.cwd if state is not None else None
+        try:
+            self.store.update(chat_id, session_id=session_id, cwd=cwd)
+        except Exception:
+            log.exception("failed to persist streaming session state for chat %s", chat_id)
+
+    # -- the turn driver (LOCK-GUARDED: one turn per chat) -------------------
+
+    async def handle_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        send: SendFn,
+        edit: EditFn,
+    ) -> None:
+        """Drive ONE operator turn (or capture a free-text answer) for ``chat_id``.
+
+        Free-text capture takes precedence: if the chat is awaiting an "Other" answer /
+        plan-reject feedback, this text is routed to ``engine.resolve`` (NOT a new turn)
+        and the held turn — still inside ``engine.send`` — continues. Otherwise it opens
+        a new turn via ``engine.send`` and renders the event stream.
+
+        Guarded by the per-chat turn lock (the harvested single-active-turn invariant):
+        a second concurrent message raises :class:`StreamingBusy` (the bot replies
+        "still working"), never two interleaved turns. The lock does NOT cover a
+        free-text resolve targeting an *already running* turn — that path must run
+        concurrently with the held turn, so it is handled before acquiring the lock.
+        """
+        state = self._chat(chat_id)
+
+        # Free-text capture for a prior "Other"/reject tap routes to resolve(), not a
+        # new turn — and must NOT take the turn lock (the awaiting turn holds it).
+        if state.awaiting_text_for is not None:
+            self._resolve_free_text(state, text)
+            return
+
+        if state.lock.locked():
+            raise StreamingBusy()
+
+        async with state.lock:
+            engine = await self._ensure_engine(state, chat_id)
+            await self._drive_turn(state, chat_id, engine, text, send=send, edit=edit)
+
+    async def _drive_turn(
+        self,
+        state: _ChatState,
+        chat_id: int,
+        engine: Engine,
+        prompt: str,
+        *,
+        send: SendFn,
+        edit: EditFn,
+    ) -> None:
+        """Iterate ``engine.send`` → render → Telegram send/edit (coalesced)."""
+        coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
+        # Status line for THIS turn starts unset; create on first edit_status.
+        state.status_message_id = None
+        async for event in engine.send(prompt):
+            # Remember an ask/plan so a tap can reconstruct the native answer.
+            if isinstance(event, AskEvent):
+                state.pending_ask = event
+            elif isinstance(event, PlanEvent):
+                state.pending_plan = event
+            elif isinstance(event, ResultEvent):
+                self._persist(chat_id, session_id=event.session_id or engine.session_id)
+            for action in coalescer.offer(event).actions:
+                await self._perform(state, action, send=send, edit=edit)
+        # End of turn: flush any trailing coalesced status line.
+        for action in coalescer.flush().actions:
+            await self._perform(state, action, send=send, edit=edit)
+
+    async def _perform(
+        self,
+        state: _ChatState,
+        action: RenderAction,
+        *,
+        send: SendFn,
+        edit: EditFn,
+    ) -> None:
+        """Execute ONE :class:`RenderAction` against Telegram (the deferred I/O)."""
+        if action.op == "none" or not action.chunks:
+            return
+        if action.op == "edit_status":
+            await self._edit_status(state, action, send=send, edit=edit)
+            return
+        # op == "new": one message per chunk. The keyboard rides the FIRST chunk only
+        # (a multi-chunk verbatim ask/plan is rare; the buttons attach to its head).
+        for i, chunk in enumerate(action.chunks):
+            if not chunk.strip():
+                continue
+            markup = action.reply_markup if i == 0 else None
+            await send(text=chunk, reply_markup=markup, parse_mode=action.parse_mode)
+
+    async def _edit_status(
+        self,
+        state: _ChatState,
+        action: RenderAction,
+        *,
+        send: SendFn,
+        edit: EditFn,
+    ) -> None:
+        """Edit the chat's single coalesced status line in place (create on first use)."""
+        body = action.text
+        if not body.strip():
+            return
+        if state.status_message_id is None:
+            mid = await send(text=body, reply_markup=None, parse_mode=action.parse_mode)
+            state.status_message_id = mid
+            return
+        try:
+            await edit(message_id=state.status_message_id, text=body, parse_mode=action.parse_mode)
+        except Exception:
+            # A failed edit (message gone / identical content) must never kill the turn
+            # (RB1/RB2). Fall back to a fresh status message so progress is not lost.
+            log.debug("status edit failed for chat; sending a fresh status line", exc_info=True)
+            mid = await send(text=body, reply_markup=None, parse_mode=action.parse_mode)
+            state.status_message_id = mid
+
+    # -- the callback resolve path (LOCK-FREE: SB1 enforced at the bot) ------
+
+    def resolve_callback(self, chat_id: int, data: object) -> "CallbackOutcome":
+        """Route a decoded inline-keyboard tap to the chat's pending request.
+
+        **The bot has already enforced SB1** (``filters.Chat(allowed)`` + an explicit
+        ``_authorized`` recheck) before calling this; an unauthorized chat never reaches
+        here. Defense in depth remains: a ``callback_data`` that ``decode_callback``
+        rejects (foreign / stale / malformed → ``None``) is IGNORED — no decision is
+        resolved, nothing raises (RB1). This is intentionally **lock-free**: it resolves
+        the pending decision the currently-running turn is awaiting (the turn loop is
+        parked inside ``engine.send``), so it must run concurrently with the held turn.
+
+        Mapping:
+
+        * ask option tap (``a``)   → :class:`QuestionAnswer` (native answers map) →
+          ``engine.resolve`` immediately.
+        * ask "Other" (``o``)      → set the free-text marker; the NEXT message is the
+          free-text answer (no resolve yet).
+        * plan approve (``p``/a)   → :class:`PlanVerdict` ``approve=True`` → resolve.
+        * plan reject  (``p``/r)   → set the free-text marker; the NEXT message is the
+          reject feedback (no resolve yet).
+
+        Returns a :class:`CallbackOutcome` describing what happened so the bot can craft
+        the ``answer_callback_query`` toast. A stale/forged callback that maps to no
+        pending request resolves nothing and returns ``handled=False``.
+        """
+        decoded = decode_callback(data)
+        if decoded is None:
+            return CallbackOutcome(handled=False, note="ignored")
+        state = self._chat(chat_id)
+        engine = state.engine
+        if engine is None:
+            # No live engine for this chat → nothing to resolve (stale button).
+            return CallbackOutcome(handled=False, note="no active session")
+
+        if decoded.kind == "ask":
+            return self._resolve_ask_option(state, engine, decoded)
+        if decoded.kind == "other":
+            return self._arm_ask_other(state, decoded)
+        if decoded.kind == "plan":
+            return self._resolve_plan(state, engine, decoded)
+        return CallbackOutcome(handled=False, note="ignored")
+
+    def _resolve_ask_option(
+        self, state: _ChatState, engine: Engine, decoded: Callback
+    ) -> "CallbackOutcome":
+        ask = state.pending_ask
+        if ask is None or ask.tool_use_id != decoded.tool_use_id:
+            return CallbackOutcome(handled=False, note="no matching question")
+        try:
+            answers = answers_from_ask(
+                ask,
+                int(decoded.question_index),  # type: ignore[arg-type]
+                int(decoded.option_index),  # type: ignore[arg-type]
+            )
+        except (IndexError, KeyError, TypeError):
+            # Stale/forged indices for a now-different ask — ignore (RB1).
+            return CallbackOutcome(handled=False, note="stale option")
+        resolved = engine.resolve(decoded.tool_use_id, QuestionAnswer(answers=answers))
+        if resolved:
+            state.pending_ask = None
+            label = next(iter(answers.values()), "")
+            return CallbackOutcome(handled=True, note=f"Answered: {label}")
+        return CallbackOutcome(handled=False, note="already answered")
+
+    def _arm_ask_other(self, state: _ChatState, decoded: Callback) -> "CallbackOutcome":
+        ask = state.pending_ask
+        if ask is None or ask.tool_use_id != decoded.tool_use_id:
+            return CallbackOutcome(handled=False, note="no matching question")
+        state.awaiting_text_for = decoded.tool_use_id
+        state.awaiting_text_mode = "ask_other"
+        state.awaiting_text_question_index = decoded.question_index
+        return CallbackOutcome(handled=True, note="Type your answer", expects_text=True)
+
+    def _resolve_plan(
+        self, state: _ChatState, engine: Engine, decoded: Callback
+    ) -> "CallbackOutcome":
+        plan = state.pending_plan
+        if plan is None or plan.tool_use_id != decoded.tool_use_id:
+            return CallbackOutcome(handled=False, note="no matching plan")
+        if decoded.plan_action == "approve":
+            resolved = engine.resolve(decoded.tool_use_id, PlanVerdict(approve=True))
+            if resolved:
+                state.pending_plan = None
+                return CallbackOutcome(handled=True, note="Plan approved")
+            return CallbackOutcome(handled=False, note="already decided")
+        # reject → capture feedback as the next message.
+        state.awaiting_text_for = decoded.tool_use_id
+        state.awaiting_text_mode = "plan_reject"
+        state.awaiting_text_question_index = None
+        return CallbackOutcome(handled=True, note="Type your feedback", expects_text=True)
+
+    def _resolve_free_text(self, state: _ChatState, text: str) -> None:
+        """Resolve a pending "Other"/reject with the just-typed ``text``; clear the marker.
+
+        Routed from :meth:`handle_message` (free-text capture takes precedence over a new
+        turn). An "Other" answer becomes a :class:`QuestionAnswer` keyed by the held
+        question text; reject feedback becomes :class:`PlanVerdict` ``approve=False`` with
+        the feedback on the deny channel. If the engine has nothing pending for the id
+        (already resolved / cancelled), this is a harmless no-op.
+        """
+        engine = state.engine
+        tool_use_id = state.awaiting_text_for
+        mode = state.awaiting_text_mode
+        q_idx = state.awaiting_text_question_index
+        # Clear FIRST so a failure can't wedge the chat in capture mode (RB1).
+        self._clear_pending_text(state)
+        if engine is None or tool_use_id is None:
+            return
+        if mode == "ask_other":
+            ask = state.pending_ask
+            question_text = ""
+            if ask is not None and q_idx is not None and 0 <= q_idx < len(ask.questions):
+                question_text = str(ask.questions[q_idx].get("question", ""))
+            engine.resolve(tool_use_id, QuestionAnswer(answers={question_text: text}))
+            state.pending_ask = None
+        elif mode == "plan_reject":
+            engine.resolve(tool_use_id, PlanVerdict(approve=False, feedback=text))
+            state.pending_plan = None
+
+    # -- cancel --------------------------------------------------------------
+
+    def handle_cancel(self, chat_id: int) -> int:
+        """Abort the chat's in-flight turn cleanly (RB4); clear any free-text capture.
+
+        Delegates to ``engine.cancel()`` (cancels every pending interactive request as a
+        clean deny, so a held turn unblocks and the session stays usable). Lock-free for
+        the same reason as :meth:`resolve_callback` — the turn being cancelled holds the
+        lock. Returns the number of pending requests aborted (0 if the engine is idle).
+        """
+        state = self._chats.get(chat_id)
+        if state is None or state.engine is None:
+            return 0
+        self._clear_pending(state)
+        return state.engine.cancel()
+
+    # -- shutdown ------------------------------------------------------------
+
+    async def shutdown(self) -> None:
+        """Stop every chat's engine (idempotent). For a clean process exit."""
+        for state in self._chats.values():
+            if state.engine is not None:
+                try:
+                    await state.engine.stop()
+                except Exception:
+                    log.exception("error stopping engine during shutdown")
+
+    # -- internals -----------------------------------------------------------
+
+    @staticmethod
+    def _clear_pending_text(state: _ChatState) -> None:
+        state.awaiting_text_for = None
+        state.awaiting_text_mode = None
+        state.awaiting_text_question_index = None
+
+    def _clear_pending(self, state: _ChatState) -> None:
+        self._clear_pending_text(state)
+        state.pending_ask = None
+        state.pending_plan = None
+
+
+@dataclass(frozen=True)
+class CallbackOutcome:
+    """Result of routing one inline-keyboard tap (so the bot can answer the query).
+
+    * ``handled``      — True iff the tap resolved a decision or armed free-text capture.
+    * ``note``         — a short toast string for ``answer_callback_query`` (operator
+                         feedback; never carries secrets).
+    * ``expects_text`` — True iff the bot should prompt the operator to type the next
+                         message (an "Other" answer / reject feedback).
+    """
+
+    handled: bool
+    note: str = ""
+    expects_text: bool = False
+
+
+__all__ = [
+    "StreamingSession",
+    "StreamingBusy",
+    "CallbackOutcome",
+    "EngineFactory",
+]

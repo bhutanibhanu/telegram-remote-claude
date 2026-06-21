@@ -10,6 +10,7 @@ from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -18,6 +19,7 @@ from telegram.ext import (
 
 from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
+from .stream_session import StreamingBusy, StreamingSession
 from .util import split_message
 
 log = logging.getLogger(__name__)
@@ -28,15 +30,27 @@ HELP_TEXT = (
     "Commands:\n"
     "/help — this help\n"
     "/reset — start a fresh Claude session (forget context)\n"
+    "/cancel — abort the in-flight run (streaming mode)\n"
     "/pwd — show the current working directory\n"
     "/cd <path> — change the working directory\n"
 )
 
 
 class TelegramClaudeBot:
-    def __init__(self, config: Config, runner: ClaudeRunner):
+    def __init__(
+        self,
+        config: Config,
+        runner: ClaudeRunner,
+        *,
+        streaming: StreamingSession | None = None,
+    ):
         self.config = config
         self.runner = runner
+        # S4 switch: the streaming collaborator is constructed (by main.py) ONLY when
+        # ENGINE_MODE=streaming. In oneshot mode it is None and EVERY path below behaves
+        # exactly as before — the live one-shot bot is untouched until the owner flips
+        # the flag. Streaming-mode methods delegate to this driver.
+        self.streaming = streaming if config.engine_mode == "streaming" else None
 
     # ---- auth ---------------------------------------------------------------
     def _authorized(self, update: Update) -> bool:
@@ -60,7 +74,24 @@ class TelegramClaudeBot:
         if not await self._ok(update) or update.message is None:
             return
         self.runner.reset(update.effective_chat.id)
+        if self.streaming is not None:
+            self.streaming.reset(update.effective_chat.id)
         await update.message.reply_text("🔄 Fresh Claude session started.")
+
+    async def cmd_cancel(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Abort the in-flight run cleanly (RB4). Streaming mode only; oneshot is a no-op."""
+        if not await self._ok(update) or update.message is None:
+            return
+        if self.streaming is None:
+            await update.message.reply_text(
+                "Nothing to cancel — one-shot mode runs each message to completion."
+            )
+            return
+        aborted = self.streaming.handle_cancel(update.effective_chat.id)
+        if aborted:
+            await update.message.reply_text(f"🛑 Cancelled ({aborted} pending request(s) aborted).")
+        else:
+            await update.message.reply_text("Nothing in flight to cancel.")
 
     async def cmd_pwd(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
@@ -89,6 +120,10 @@ class TelegramClaudeBot:
         if not text:
             return
         chat_id = update.effective_chat.id
+
+        if self.streaming is not None:
+            await self._on_message_streaming(update, ctx, chat_id, text)
+            return
 
         stop = asyncio.Event()
         typing = asyncio.create_task(self._keep_typing(ctx, chat_id, stop))
@@ -131,6 +166,89 @@ class TelegramClaudeBot:
                 continue
             await update.message.reply_text(chunk)
 
+    # ---- streaming mode (ENGINE_MODE=streaming) -----------------------------
+    async def _on_message_streaming(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str
+    ) -> None:
+        """Drive the streaming engine for one message (delegates to StreamingSession).
+
+        Binds send/edit closures to this chat (the actual Telegram I/O the render layer
+        deferred), then hands the turn to the driver. A second concurrent message raises
+        :class:`StreamingBusy` (one active turn per chat — the harvested ClaudeBusy
+        invariant) and we reply the same "still working" notice as one-shot mode. SB4: the
+        text is the engine's prompt, never interpolated into a shell command/argument.
+        """
+        assert self.streaming is not None
+        bot = ctx.bot
+
+        async def send(*, text: str, reply_markup=None, parse_mode=None) -> int | None:
+            msg = await bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode
+            )
+            return getattr(msg, "message_id", None)
+
+        async def edit(*, message_id: int, text: str, parse_mode=None) -> None:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text, parse_mode=parse_mode
+            )
+
+        try:
+            await self.streaming.handle_message(chat_id, text, send=send, edit=edit)
+        except StreamingBusy:
+            await update.message.reply_text(
+                "⏳ Still working on your previous message — it'll reply when done. "
+                "Send one message at a time."
+            )
+
+    async def on_callback(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Inline-keyboard tap handler — **the SB1 security boundary**.
+
+        A callback tap is new attack surface (SB1). PTB's ``CallbackQueryHandler`` cannot
+        be chat-filtered the way ``MessageHandler`` is (it filters by callback_data
+        pattern), so THIS explicit :meth:`_authorized` recheck is the authoritative
+        allowlist gate: an unauthorized / forged callback NEVER routes a decision (it
+        cannot approve a plan or answer a question) — if the chat is not allowlisted we
+        silently answer the callback query and return WITHOUT touching the engine. For an
+        authorized chat the
+        decode + routing lives in :meth:`StreamingSession.resolve_callback`, which ignores
+        any ``callback_data`` that fails to decode (foreign/stale/malformed → None) and
+        resolves nothing in that case (RB1). The callback query is ALWAYS answered (so the
+        client's spinner stops), even when ignored.
+        """
+        query = update.callback_query
+        if query is None:
+            return
+        # SB1: explicit allowlist recheck inside the handler (the filter is the first
+        # gate; this is defense in depth). An unauthorized tap is answered + dropped —
+        # never resolved.
+        if not self._authorized(update) or self.streaming is None:
+            await self._answer_callback(query)
+            return
+        chat = update.effective_chat
+        try:
+            outcome = self.streaming.resolve_callback(chat.id, query.data)
+        except Exception:  # RB1: a bad/garbage callback must never crash the handler
+            log.exception("error routing callback for chat %s", chat.id if chat else "?")
+            await self._answer_callback(query)
+            return
+        await self._answer_callback(query, outcome.note if outcome.handled else None)
+        if outcome.expects_text and outcome.note:
+            try:
+                await query.message.reply_text(f"✏️ {outcome.note}…")
+            except Exception:
+                pass
+
+    @staticmethod
+    async def _answer_callback(query, text: str | None = None) -> None:
+        """Answer a callback query (stops the client spinner); never raise (RB1)."""
+        try:
+            if text:
+                await query.answer(text=text)
+            else:
+                await query.answer()
+        except Exception:
+            pass
+
     # ---- errors -------------------------------------------------------------
     async def on_error(self, update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("unhandled error while processing update", exc_info=ctx.error)
@@ -146,8 +264,16 @@ class TelegramClaudeBot:
         allowed = filters.Chat(chat_id=list(self.config.allowed_chat_ids))
         app.add_handler(CommandHandler(["start", "help"], self.cmd_help, filters=allowed))
         app.add_handler(CommandHandler("reset", self.cmd_reset, filters=allowed))
+        app.add_handler(CommandHandler("cancel", self.cmd_cancel, filters=allowed))
         app.add_handler(CommandHandler("pwd", self.cmd_pwd, filters=allowed))
         app.add_handler(CommandHandler("cd", self.cmd_cd, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))
+        # SB1 (callback taps): PTB's CallbackQueryHandler filters by callback_data
+        # *pattern*, not by chat (no `filters=` like MessageHandler), so the authoritative
+        # allowlist gate for a tap is the explicit `_authorized` recheck inside
+        # on_callback — a non-allowlisted / forged tap is answered and dropped there,
+        # never routed to a decision. (allowed_updates also only enables callback_query
+        # in streaming mode; see main.py.)
+        app.add_handler(CallbackQueryHandler(self.on_callback, pattern=None))
         app.add_error_handler(self.on_error)
         return app
