@@ -34,7 +34,7 @@ _Plan generated 2026-06-21 from design.md · 8 tasks · autonomous supervised bu
 - [x] T1 — ADR-003: permission-gating model · doc (a211432)
 - [x] T2 — Risk classifier + per-session policy state (`permissions.py`) · unit (81185f2)
 - [x] T3 — Engine approval gate: classify + hold-for-approval + verdict mapping · unit (mock) (aeb29ac)
-- [ ] T4 — Render permission prompt + `permission` callback kind + `/yolo` indicator · unit
+- [x] T4 — Render permission prompt + `permission` callback kind + `/yolo` indicator · unit (c4779e5)
 - [ ] T5 — Bot/session wiring: route taps (SB1) + grants + `/yolo`/`/unyolo` + reset-clear · unit
 - [ ] T6 — SB5 posture: no streaming bypass + blast-radius docs + fail-closed config · unit + docs
 - [ ] T7 — SB/RB test matrix (SB5/SB1/RB4 + classifier + allow-once-vs-session + post-approval-gated) · unit
@@ -146,7 +146,16 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
     auto-allowed actions (D6).
 - **Tests:** unit — permission render + keyboard, codec round-trip + ≤64B + defensive decode of a permission
   payload, yolo indicator.
-- **Status:** todo
+- **Status:** done (c4779e5) — `render.py`: `PermissionEvent` → **verbatim** `RenderAction` (body-free
+  summary, SB3) + `permission_keyboard` [✅ Allow once / ☑️ Allow for session / ⛔ Deny]. Codec extended:
+  `KIND_PERMISSION="m"` (single char) + 1-char action codes o/s/d → `permission_action` once/session/deny;
+  `"m|<id>|<action>"` = **53 B** worst-case (≤64; `ValueError` past 64). `decode_callback` defensive
+  (unknown action / wrong arity / oversize / empty → `None`, never raises). `yolo_banner()`/`yolo_indicator()`
+  loud ⚠️ helpers (D6; placement is T5). **Verified by me on 0.2.105:** pytest **315 passed** (+20),
+  ruff/mypy/secret-scan clean. **One fresh independent reviewer AGREES done** — byte budget proven (53 B
+  worst, `ValueError` at 61-char id), defensive decode mutation-probed (fail-open → 4 subtests fail), no
+  regression to ask/plan codec, SB3 body-free render confirmed. Scope: `render.py` + `test_render.py` only.
+  Bot wiring (taps→verdict, `/yolo` command, indicator placement) = T5.
 
 ### T5 — Bot/session wiring: route taps (SB1) + grants + `/yolo`/`/unyolo` + reset-clear
 - **Goal:** Wire the permission taps, grant recording, `/yolo`/`/unyolo`, the loud indicator, and grant
