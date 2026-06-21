@@ -28,7 +28,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised bu
 - [x] T5 — Decisions-in + async answer-hold + 60-min backstop + cancel · unit (mock) (f050f57)
 - [x] T6 — Render layer: events→Telegram, inline keyboards, coalesce/throttle (RB5) · unit (6b9cf11)
 - [x] T7 — Wire bot.py: ENGINE_MODE switch + SB1 callback handler + /cancel + routing · unit (3b90693)
-- [ ] T8 — /cd path policy (SB2) + SB/RB test suite (RB7) · unit
+- [x] T8 — /cd path policy (SB2) + SB/RB test suite (RB7) · unit (45937a9)
 - [ ] T9 — Live end-to-end verify (programmatic, real Claude) + owner phone-verify checklist · live probe
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
@@ -234,7 +234,28 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - Dedicated tests SHALL exist for: SB1 (non-allowlisted message + callback ignored), SB2 (traversal/symlink-escape rejected), SB3 (no secrets in logs), SB4 (no shell injection from message text), RB1 (never crash on malformed input), RB2 (clean failure on engine/timeout error), RB5 (throttle/coalesce holds under burst). **(RB7: each has a test)**
   - The existing user-facing guarantees (allowlist ignore, chunking, command behavior) SHALL retain equivalent-or-stronger coverage.
 - **Tests:** unit — the SB/RB matrix above; substrate/engine mocked.
-- **Status:** todo
+- **Status:** done (45937a9) — SB2 `/cd` confinement + the RB7 SB/RB test matrix. New `claude_tg/paths.py`
+  (**pure**, no telegram/engine deps): `resolve_within_roots()` canonicalizes the operator arg (expand `~`,
+  resolve vs cwd, `Path.resolve(strict=False)` — follows BOTH symlinks AND `..`) then requires the canonical
+  target to equal/descend from a canonicalized `ALLOWED_ROOTS` entry (`is_relative_to`, no string-prefix
+  bug), else `PathNotAllowed`. **Fail-closed (SB6):** empty roots + not-`allow_any` rejects all; a malformed
+  arg (embedded NUL → `realpath` `ValueError`) is caught → `PathNotAllowed` (never crashes — RB1). `config.py`
+  adds `ALLOWED_ROOTS` (pathsep/comma list; **default `(workdir,)`** — confinement ON by default; workdir
+  defaults to `$HOME`) + `ALLOW_ANY_PATH=true` explicit opt-out. `bot.py` `cmd_cd` confines BEFORE `set_cwd`
+  (shared by oneshot+streaming; stores the canonical path); **`claude_runner.py` untouched**.
+  `tests/test_security_reliability.py` — a labeled RB7 matrix: SB1 (unauthorized message + forged callback
+  never resolve), SB2 (×11: `..`/absolute/**real on-disk symlink** escape rejected; inside/root/subdir/
+  `allow_any` accepted; empty-roots fail-closed), SB3 (bot token never logged; state `0600`), SB4 (prompt
+  never in argv — oneshot via stdin, streaming verbatim), RB1 (garbage callback + pathological `/cd`
+  no-crash), RB2 (engine error / `send`-failure → clean message, no hang [bounded `wait_for`], lock released
+  — not wedged), RB5 (50-delta burst → 1 edit). Existing `cmd_cd` tests reconciled (intent preserved via
+  `allow_any_path=True`) + new default-confinement-rejects test. **Verified by me on 0.2.105:** pytest **245
+  passed** (+33), ruff/mypy/secret-scan clean (secret-scan still FAILS on an injected token). **One fresh
+  independent reviewer AGREES done, no required fixes** — re-ran all gates, 14 adversarial SB2 bypass probes
+  correct, and a **mutation probe proved the symlink-escape test is guard-dependent** (cannot false-pass).
+  The **SB1 callback-path** boundary was independently re-confirmed at source by that reviewer (auth recheck
+  before any engine touch; forged tap never resolves). Scope: engine/render/stream_session/runner/main
+  untouched; oneshot default intact.
 
 ### T9 — Live end-to-end verify (programmatic, real Claude) + owner phone-verify checklist
 - **Goal:** Prove the full streaming path works **live** end-to-end against real Claude with code-injected operator decisions (no Telegram tap needed), and hand the owner a concrete phone-verification checklist for final acceptance under `ENGINE_MODE=streaming`.
