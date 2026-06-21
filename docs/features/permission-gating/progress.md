@@ -32,7 +32,7 @@ _Plan generated 2026-06-21 from design.md · 8 tasks · autonomous supervised bu
 
 ## Task list
 - [x] T1 — ADR-003: permission-gating model · doc (a211432)
-- [ ] T2 — Risk classifier + per-session policy state (`permissions.py`) · unit
+- [x] T2 — Risk classifier + per-session policy state (`permissions.py`) · unit (81185f2)
 - [ ] T3 — Engine approval gate: classify + hold-for-approval + verdict mapping · unit (mock)
 - [ ] T4 — Render permission prompt + `permission` callback kind + `/yolo` indicator · unit
 - [ ] T5 — Bot/session wiring: route taps (SB1) + grants + `/yolo`/`/unyolo` + reset-clear · unit
@@ -83,7 +83,15 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
     answer-hold path).
 - **Tests:** unit — classifier matrix (safe / risky / unknown→gate / WebFetch+MCP→gate / WebSearch→auto),
   grant record + per-name suppression, `clear()`, `yolo` on/off.
-- **Status:** todo
+- **Status:** done (81185f2) — `claude_tg/permissions.py` (**pure** — no telegram/engine/SDK/IO/async):
+  `is_risky()` fail-closed safe-allowlist (`SAFE_TOOLS`={Read,Glob,Grep,LS,TodoWrite,WebSearch}; everything
+  else incl. **WebFetch**/`mcp__*`/unknown/empty/non-str → RISKY; an **allowlist** check, never a deny-list)
+  + `PermissionPolicy` (in-memory per-session: `needs_approval`=False iff yolo|safe|per-name grant;
+  `grant_session` by NAME only [D4]; `set_yolo` [D6, off by default]; `clear()` drops grants+yolo [D7]).
+  **Verified by me on 0.2.105:** pytest **284 passed** (+37), ruff/mypy/secret-scan clean. **One fresh
+  independent reviewer AGREES done** — mutation-probed (a fail-OPEN flip fails 31/37 tests; the
+  anti-widening guard bites), purity + scope confirmed (only `permissions.py` + its test; engine/bot/render
+  untouched). Wiring is T3+.
 
 ### T3 — Engine approval gate: classify + hold-for-approval + verdict mapping
 - **Goal:** Gate risky ordinary tools at `engine.on_tool_request` via the policy + a held approval; ask/plan
