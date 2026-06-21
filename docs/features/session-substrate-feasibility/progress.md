@@ -57,7 +57,7 @@ each task to them where relevant; they are also bound inline to the tasks they m
 - [x] T16 — B · C4 ExitPlanMode over `stream-json` (acc586f — PASS)
 - [x] T17 — `run_all.py`: C1–C6 PASS/FAIL/PARTIAL matrix (+ B contingency) (ec93ecf)
 - [x] T18 — Draft normalized engine interface + final evidence secret-scan gate (95ffbf3)
-- [ ] T19 — Fill ADR-001 (Proposed) + go/no-go writeup
+- [x] T19 — Fill ADR-001 (Proposed) + go/no-go writeup (c5874b1)
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
 
@@ -470,7 +470,29 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - The ADR Decision/Options SHALL be consistent with the recorded evidence matrix (no claim beyond what was observed); if C3/C4 failed on both substrates, the writeup SHALL state the constrained-mode shape and recommend re-plan before P1.
   - A go/no-go writeup SHALL give the owner a clear recommendation grounded in the matrix.
 - **Tests:** none — documentation deliverable.
-- **Status:** todo
+- **Status:** done (c5874b1) — **ADR-001 filled to status Proposed** (NOT Accepted — owner decides at
+  G-ADR) + `go-no-go.md` written. **Decision: Substrate A (`claude-agent-sdk==0.2.105`) PRIMARY; Substrate B
+  (raw CLI `stream-json` control protocol) a proven, credible FALLBACK; Option C (hybrid) NOT adopted** (A
+  covers C3/C4 natively, so the hybrid trigger is unmet). **GATE 1 GREEN → GO:** both make-or-break criteria
+  (C3 AskUserQuestion, C4 ExitPlanMode) are answerable programmatically with no TTY on BOTH substrates, so the
+  design's "constrained mode / re-plan" risk is retired. C2/C3/C4 are substrate-NEUTRAL; the A-over-B call
+  rests on A's demonstrated full C1–C6 coverage (B is C2/C3/C4-only per S1 — C1/C5/C6 untested-by-design, not
+  failed) and on maintainability/managed-transport (B couples to the undocumented `--permission-prompt-tool
+  stdio` flag + hand-rolled NDJSON/threads). ADR contains: decision drivers ✓ per C1–C6, Options A/B/C
+  evidence, Decision + rationale, the Normalized engine interface (refs `normalized_interface.md`),
+  Consequences (workarounds: C2 updatedInput-on-allow; C3 native answers-map keyed by question text +
+  deny-message fallback; C4 reject-via-deny-message + post-approval execution still C2-gated; C6 persist
+  (session_id,cwd) + guard double-attach; SB1/SB5/SB6 hand-off; single-session/correlation-envelope for
+  P4/P5), unresolved risks (shared CLI-version coupling; **async human-in-the-loop permission latency — the
+  single most load-bearing untested assumption**; C4 reject model-interpretation dependence; C3 free-text
+  "Other"/multi-question + C6 crash/concurrent/aged/upgrade resume + C1/C5/C6-on-B all NOT tested; macOS-only),
+  and explicit "What P1 MAY / MUST NOT assume" lists + evidence log per C1–C6. **Reviewers: 4 fresh challenge
+  reviewers (architecture, adversarial, security, evidence-auditor) ENDORSED the decision; specified 13
+  accuracy/completeness corrections (off-menu "Zucchini" re-attributed as reviewer reproduction not in
+  committed evidence; rate_limit carrier observed-once-not-unexercised; C4 in-fixture post-approval Write
+  precision; SB1/SB5/SB6 added; breadth argument softened; 3 risks added; migration path fixed) — all applied
+  and confirmed by a 5th reviewer with no new overstatement.** No production files; status Proposed; no API
+  key; both docs secret-clean.
 
 ## Rules
 - **No production code.** Nothing under `engine/`, `bot.py`, `claude_runner.py`,
