@@ -31,7 +31,7 @@ _Plan generated 2026-06-21 from design.md · 8 tasks · autonomous supervised bu
   risky tool gates independently — T3 (behavior) + T7 (explicit test).
 
 ## Task list
-- [ ] T1 — ADR-003: permission-gating model · doc
+- [x] T1 — ADR-003: permission-gating model · doc (a211432)
 - [ ] T2 — Risk classifier + per-session policy state (`permissions.py`) · unit
 - [ ] T3 — Engine approval gate: classify + hold-for-approval + verdict mapping · unit (mock)
 - [ ] T4 — Render permission prompt + `permission` callback kind + `/yolo` indicator · unit
@@ -58,7 +58,14 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - ADR-003 SHALL state the **ADR-001 caveat**: approving a plan or one tool does **not** greenlight
     arbitrary execution — every risky tool gates independently.
 - **Tests:** none — documentation deliverable.
-- **Status:** todo
+- **Status:** done (a211432) — `docs/adr/ADR-003-permission-gating.md` written, status **Proposed**.
+  Records the model: fail-closed safe-allowlist (D1/D2 — Read/Glob/Grep/LS/TodoWrite/WebSearch auto; all
+  else incl. WebFetch/`mcp__*`/unknown gate), `[Allow once]`/`[Allow for session]`/`[Deny]` verdicts
+  (allow-session = engine-side per-tool-NAME grant over the ADR-001 per-request primitive), canned-deny
+  (D5), `/yolo` allow-all off-by-default + loud + in-memory (D6/D7), and the **reuse** of P1's
+  `PendingRegistry` hold/backstop/cancel for permission prompts (RB4). Binds the ADR-001 caveat
+  (post-approval / plan-approval never greenlights arbitrary execution — every risky tool gates
+  independently). Consistent with ADR-001/002.
 
 ### T2 — Risk classifier + per-session policy state (`permissions.py`)
 - **Goal:** A pure risk classifier (fail-closed safe-allowlist) + the per-session grant/`yolo` state the
