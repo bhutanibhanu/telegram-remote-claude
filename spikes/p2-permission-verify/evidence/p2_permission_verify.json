@@ -1,0 +1,8 @@
+{
+  "criterion": "p2_permission_verify",
+  "verdict": "PASS",
+  "observed_reason": "The permission gate works end-to-end: a risky tool is HELD; a code-injected allow_once runs it; deny blocks it and the session adapts; allow_session suppresses the second prompt for that tool; a safe read runs unprompted; /yolo runs risky tools free (and un-yolo re-gates); /cancel unwinds a held prompt cleanly and the session stays usable. The verdict was injected from code exactly as the bot's SB1-checked permission tap does. Containment held (repo unchanged, no leaked CLI pids).",
+  "timestamp": "2026-06-21T22:40:23.618777+00:00",
+  "transcript_path": "p2_permission_verify.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

@@ -1,0 +1,8 @@
+{
+  "criterion": "v5_yolo",
+  "verdict": "PASS",
+  "observed_reason": "under /yolo a risky Write ran with NO PermissionEvent (file note_9454CF4D2E.txt created); allow-all in effect. un-yolo re-gated (a fresh risky write HELD again). /yolo is the one loud bypass; un-yolo restores the gate.",
+  "timestamp": "2026-06-21T22:38:07.381542+00:00",
+  "transcript_path": "v5_yolo.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

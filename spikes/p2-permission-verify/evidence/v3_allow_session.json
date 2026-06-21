@@ -1,0 +1,8 @@
+{
+  "criterion": "v3_allow_session",
+  "verdict": "PASS",
+  "observed_reason": "two uses of 'Write' in one session emitted EXACTLY ONE PermissionEvent (allow_session on the first recorded the per-NAME grant; the second was auto-allowed, no second prompt); both files created. allow-session suppresses.",
+  "timestamp": "2026-06-21T22:37:44.185876+00:00",
+  "transcript_path": "v3_allow_session.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

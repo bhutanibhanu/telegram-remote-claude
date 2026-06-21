@@ -1,0 +1,8 @@
+{
+  "criterion": "v6_cancel",
+  "verdict": "PASS",
+  "observed_reason": "a risky tool was HELD then engine.cancel() unwound the held callback cleanly (no hang); the action did NOT run (file absent — cancel maps to deny); a following trivial turn completed -> session still usable (RB4).",
+  "timestamp": "2026-06-21T22:40:23.569005+00:00",
+  "transcript_path": "v6_cancel.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

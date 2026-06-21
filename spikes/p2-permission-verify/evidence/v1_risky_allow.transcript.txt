@@ -1,0 +1,24 @@
+# criterion: v1_risky_allow
+# verdict: PASS
+# observed_reason: risky tool 'Write' was HELD (PermissionEvent emitted); code injected allow_once; the action RAN (file note_D65615B24B.txt created with the code-chosen marker). Prompt-held + allow -> ran.
+# timestamp: 2026-06-21T22:37:17.445157+00:00
+------------------------------------------------------------
+=== V1 risky ALLOW (allow_once -> ran) (v1_risky_allow) [live] ===
+  mode: live
+  filename: note_D65615B24B.txt
+  marker: MARKER_D65615B24B
+  permission_emitted_for_risky: True
+  prompted_tools: ['Write']
+  file_created_with_marker: True
+  non_error_result: True
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: 'Create a file at EXACTLY this absolute path: /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_D65615B24B.txt\nIt'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782091800, rate_limit_type='five_hour)
+    tool_use(Write): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_D65615B24B.txt, content=<17 chars>)
+    permission(tool=Write, tool_use_id=toolu_01Jcn17tU3bxQyuT4JTkgMdV): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_D65615B24B.txt, content=<17 chars>)
+    [code] resolve(permission toolu_01Jcn17tU3bxQyuT4JTkgMdV) -> True :: verdict=allow_once
+    text(incremental=False, 160 chars): Done. Created the file at `/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_D65615B24B.txt` containing exactly `MARKER_D65615B24B`.
+    result(is_error=False, subtype=success, num_turns=2): Done. Created the file at `/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_D65615B24B.txt` containing exactly `MARKER_D65615B24B`.
+  -> trial verdict: PASS — risky tool 'Write' was HELD (PermissionEvent emitted); code injected allow_once; the action RAN (file note_D65615B24B.txt created with the code-chosen marker). Prompt-held + allow -> ran.

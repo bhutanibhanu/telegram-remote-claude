@@ -1,0 +1,32 @@
+# criterion: v3_allow_session
+# verdict: PASS
+# observed_reason: two uses of 'Write' in one session emitted EXACTLY ONE PermissionEvent (allow_session on the first recorded the per-NAME grant; the second was auto-allowed, no second prompt); both files created. allow-session suppresses.
+# timestamp: 2026-06-21T22:37:44.185876+00:00
+------------------------------------------------------------
+=== V3 allow-session SUPPRESSES (1 prompt for 2 uses) (v3_allow_session) [live] ===
+  mode: live
+  filenames: ['note_1744213629.txt', 'note_995959C5E4.txt']
+  markers: ['MARKER_1744213629', 'MARKER_995959C5E4']
+  granted_tool: Write
+  prompts_for_granted_tool: 1
+  total_permissions: 1
+  grant_recorded_on_policy: True
+  both_files_created: True
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send (two writes, same tool): 'note_1744213629.txt' then 'note_995959C5E4.txt'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782091800, rate_limit_type='five_hour)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    tool_use(Write): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_1744213629.txt, content=<17 chars>)
+    permission(tool=Write, tool_use_id=toolu_019SoFyWCmFot7DL6Pxgh6qs): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_1744213629.txt, content=<17 chars>)
+    [code] resolve(permission toolu_019SoFyWCmFot7DL6Pxgh6qs) -> True :: allow_session
+    tool_use(Write): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_995959C5E4.txt, content=<17 chars>)
+    text(incremental=False, 160 chars): Both files were written successfully, in order:  1. `note_1744213629.txt` → contains `MARKER_1744213629` 2. `note_995959C5E4.txt` → contains `MARKER_995959C5E4`
+    result(is_error=False, subtype=success, num_turns=3): Both files were written successfully, in order:
+
+1. `note_1744213629.txt` → contains `MARKER_1744213629`
+2. `note_995959C5E4.txt` → contains `MARKER_995959C5E4`
+  -> trial verdict: PASS — two uses of 'Write' in one session emitted EXACTLY ONE PermissionEvent (allow_session on the first recorded the per-NAME grant; the second was auto-allowed, no second prompt); both files created. allow-session suppresses.

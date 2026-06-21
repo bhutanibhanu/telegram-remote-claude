@@ -1,0 +1,8 @@
+{
+  "criterion": "v4_safe_free",
+  "verdict": "PASS",
+  "observed_reason": "a safe Read ran with NO PermissionEvent (ran unprompted) and the turn completed with a non-error result (and the read content surfaced). Safe tools are free.",
+  "timestamp": "2026-06-21T22:37:52.290797+00:00",
+  "transcript_path": "v4_safe_free.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

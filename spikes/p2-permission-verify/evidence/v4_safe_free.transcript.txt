@@ -1,0 +1,26 @@
+# criterion: v4_safe_free
+# verdict: PASS
+# observed_reason: a safe Read ran with NO PermissionEvent (ran unprompted) and the turn completed with a non-error result (and the read content surfaced). Safe tools are free.
+# timestamp: 2026-06-21T22:37:52.290797+00:00
+------------------------------------------------------------
+=== V4 safe FREE (no prompt) (v4_safe_free) [live] ===
+  mode: live
+  filename: note_ADD35C45B4.txt
+  marker: MARKER_ADD35C45B4
+  no_permission_emitted: True
+  prompted_tools: []
+  content_surfaced: True
+  non_error_result: True
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: 'Read the file `note_ADD35C45B4.txt` in the current directory using the Read tool and reply with its exact contents on a single line. Do not '
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782091800, rate_limit_type='five_hour)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    tool_use(Read): Read(file_path=note_ADD35C45B4.txt)
+    text(incremental=False, 38 chars): The exact contents:  MARKER_ADD35C45B4
+    result(is_error=False, subtype=success, num_turns=2): The exact contents:
+
+MARKER_ADD35C45B4
+  -> trial verdict: PASS — a safe Read ran with NO PermissionEvent (ran unprompted) and the turn completed with a non-error result (and the read content surfaced). Safe tools are free.

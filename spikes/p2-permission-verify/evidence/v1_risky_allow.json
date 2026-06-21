@@ -1,0 +1,8 @@
+{
+  "criterion": "v1_risky_allow",
+  "verdict": "PASS",
+  "observed_reason": "risky tool 'Write' was HELD (PermissionEvent emitted); code injected allow_once; the action RAN (file note_D65615B24B.txt created with the code-chosen marker). Prompt-held + allow -> ran.",
+  "timestamp": "2026-06-21T22:37:17.445157+00:00",
+  "transcript_path": "v1_risky_allow.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}

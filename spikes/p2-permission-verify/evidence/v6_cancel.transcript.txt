@@ -1,0 +1,36 @@
+# criterion: v6_cancel
+# verdict: PASS
+# observed_reason: a risky tool was HELD then engine.cancel() unwound the held callback cleanly (no hang); the action did NOT run (file absent — cancel maps to deny); a following trivial turn completed -> session still usable (RB4).
+# timestamp: 2026-06-21T22:40:23.569005+00:00
+------------------------------------------------------------
+=== V6 /cancel a held permission (RB4) (v6_cancel) [live] ===
+  mode: live
+  filename: note_0F5A8A03DA.txt
+  marker: MARKER_0F5A8A03DA
+  permissions_seen: 3
+  turn1_unwound_no_hang: True
+  file_NOT_created_after_cancel: True
+  followup_completed: True
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: 'Create a file at EXACTLY this absolute path: /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_0F5A8A03DA.txt co'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782091800, rate_limit_type='five_hour)
+    tool_use(Write): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_0F5A8A03DA.txt, content=<17 chars>)
+    permission(tool=Write, tool_use_id=toolu_012EY1VVnafepLXzasd8F6nB): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_0F5A8A03DA.txt, content=<17 chars>)
+    [code] cancel() instead of resolving -> aborted 1
+    tool_use(Write): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_0F5A8A03DA.txt, content=<17 chars>)
+    permission(tool=Write, tool_use_id=toolu_019stfP4mNn8UUTXYUuW8dQH): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_0F5A8A03DA.txt, content=<17 chars>)
+    [code] verdict=None -> NOT resolving (intentional)
+    error(driver_error, is_error=True): send timed out after 120s
+  --- follow-up turn (session must still be usable) ---
+  >>> send: 'Reply with exactly: OK'
+    status(phase=connected, model=None, detail=answer backstop reached (120s); auto-denied [tool_use_id=toolu_019stfP4mNn8UUTXY)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    status(phase=connected, model=None, detail=thinking_tokens)
+    tool_use(Write): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_0F5A8A03DA.txt, content=<17 chars>)
+    permission(tool=Write, tool_use_id=toolu_01A3iKAAApGapHTdYkdRQrtA): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_0F5A8A03DA.txt, content=<17 chars>)
+    [code] resolve(permission toolu_01A3iKAAApGapHTdYkdRQrtA) -> True :: verdict=allow_once
+    text(incremental=False, 2 chars): OK
+    result(is_error=False, subtype=success, num_turns=4): OK
+  -> trial verdict: PASS — a risky tool was HELD then engine.cancel() unwound the held callback cleanly (no hang); the action did NOT run (file absent — cancel maps to deny); a following trivial turn completed -> session still usable (RB4).

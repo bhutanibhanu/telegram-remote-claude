@@ -1,0 +1,31 @@
+# criterion: v5_yolo
+# verdict: PASS
+# observed_reason: under /yolo a risky Write ran with NO PermissionEvent (file note_9454CF4D2E.txt created); allow-all in effect. un-yolo re-gated (a fresh risky write HELD again). /yolo is the one loud bypass; un-yolo restores the gate.
+# timestamp: 2026-06-21T22:38:07.381542+00:00
+------------------------------------------------------------
+=== V5 /yolo (risky runs free; un-yolo restores) (v5_yolo) [live] ===
+  mode: live
+  filenames: ['note_9454CF4D2E.txt', 'note_A1D6A289C9.txt']
+  markers: ['MARKER_9454CF4D2E', 'MARKER_A1D6A289C9']
+  yolo_on: True
+  permissions_under_yolo: 0
+  file1_created_under_yolo: True
+  permissions_after_unyolo: 1
+  prompted_tools: ['Write']
+  session_id: [REDACTED]
+  --- event transcript ---
+  >>> send: 'Create a file at EXACTLY this absolute path: /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_9454CF4D2E.txt co'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    status(phase=rate_limit, model=None, detail=RateLimitInfo(status='allowed', resets_at=1782091800, rate_limit_type='five_hour)
+    tool_use(Write): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_9454CF4D2E.txt, content=<17 chars>)
+    text(incremental=False, 152 chars): Done. Created the file at `/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_9454CF4D2E.txt` containing `MARKER_9454CF4D2E`.
+    result(is_error=False, subtype=success, num_turns=2): Done. Created the file at `/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_9454CF4D2E.txt` containing `MARKER_9454CF4D2E`.
+  --- /unyolo: gating must return ---
+  >>> send: 'Now create a file at EXACTLY this absolute path: /var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_A1D6A289C9.tx'
+    status(phase=init, model=claude-opus-4-8[1m], detail=None)
+    tool_use(Write): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_A1D6A289C9.txt, content=<17 chars>)
+    permission(tool=Write, tool_use_id=toolu_01Vg22nqKFNNGfPo8qP4ZtNH): Write(file_path=/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_A1D6A289C9.txt, content=<17 chars>)
+    [code] resolve(permission toolu_01Vg22nqKFNNGfPo8qP4ZtNH) -> True :: verdict=allow_once
+    text(incremental=False, 152 chars): Done. Created the file at `/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_A1D6A289C9.txt` containing `MARKER_A1D6A289C9`.
+    result(is_error=False, subtype=success, num_turns=2): Done. Created the file at `/var/folders/x4/xw02s3m5245fscxksd7wzl1w0000gn/T/p2_perm_verify_c9ltm2sc/note_A1D6A289C9.txt` containing `MARKER_A1D6A289C9`.
+  -> trial verdict: PASS — under /yolo a risky Write ran with NO PermissionEvent (file note_9454CF4D2E.txt created); allow-all in effect. un-yolo re-gated (a fresh risky write HELD again). /yolo is the one loud bypass; un-yolo restores the gate.

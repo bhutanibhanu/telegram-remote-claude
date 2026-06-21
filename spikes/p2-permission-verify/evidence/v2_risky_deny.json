@@ -1,0 +1,8 @@
+{
+  "criterion": "v2_risky_deny",
+  "verdict": "PASS",
+  "observed_reason": "risky tool 'Write' was HELD; code injected deny; the action did NOT run (file note_4F3238598C.txt absent) and the session continued (no crash, terminal result reached — the model adapted to the canned denial). Prompt-held + deny -> blocked.",
+  "timestamp": "2026-06-21T22:37:30.022682+00:00",
+  "transcript_path": "v2_risky_deny.transcript.txt",
+  "recorder": "evidence_recorder/1"
+}
