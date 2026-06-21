@@ -25,12 +25,15 @@ from .engine import Engine
 from .pending import DEFAULT_BACKSTOP_SECONDS, PendingRegistry
 from .substrate import DecisionCallback, Substrate, SubstrateBAdapter
 from .types import (
+    DENIED_MESSAGE,
     AskEvent,
     Cancel,
     Decision,
     ErrorEvent,
     Event,
     FreeTextReply,
+    PermissionDecision,
+    PermissionEvent,
     PermissionVerdict,
     PlanEvent,
     PlanVerdict,
@@ -41,6 +44,7 @@ from .types import (
     TextEvent,
     ToolUseEvent,
     decision_to_substrate,
+    safe_input_summary,
 )
 
 __all__ = [
@@ -55,17 +59,21 @@ __all__ = [
     "ToolUseEvent",
     "AskEvent",
     "PlanEvent",
+    "PermissionEvent",
     "ErrorEvent",
     "ResultEvent",
     "StatusEvent",
     "Event",
+    "safe_input_summary",
     # decisions
     "PermissionVerdict",
+    "PermissionDecision",
     "QuestionAnswer",
     "PlanVerdict",
     "FreeTextReply",
     "Cancel",
     "Decision",
+    "DENIED_MESSAGE",
     "SubstrateDecision",
     "decision_to_substrate",
 ]

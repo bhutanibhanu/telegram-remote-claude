@@ -22,14 +22,18 @@ import pytest
 
 from claude_tg.engine import Engine, PendingRegistry
 from claude_tg.engine.types import (
+    DENIED_MESSAGE,
     AskEvent,
     Cancel,
+    PermissionDecision,
+    PermissionEvent,
     PermissionVerdict,
     PlanEvent,
     PlanVerdict,
     QuestionAnswer,
     StatusEvent,
 )
+from claude_tg.permissions import PermissionPolicy
 
 
 async def drain(aiter):
@@ -430,19 +434,23 @@ async def test_engine_resolve_unknown_id_is_noop_rb1():
     assert eng.cancel() == 0
 
 
-# ---- ordinary tools never hold (auto-allow, no operator decision) ----------
+# ---- policy-allowed ordinary tools never hold (no operator decision) --------
 
 
-async def test_engine_ordinary_tool_does_not_hold_or_inject():
-    # An ordinary (non ask/plan) tool request is auto-allowed immediately, with no
-    # pending entry created and nothing injected — it never waits on an operator.
+async def test_engine_policy_allowed_tool_does_not_hold_or_inject():
+    # An ordinary tool the policy ALLOWS (here Read — a safe read in the allowlist) is
+    # allowed immediately, with no pending entry created and nothing injected — it never
+    # waits on an operator. (Under the P2 gated default a RISKY tool would HOLD instead;
+    # that path is covered by the permission-gate tests below — false-pass note: were
+    # the gate missing/auto-allow left in, the RISKY-hold tests would not hold and the
+    # gated-by-default test would see an allow, not a PermissionEvent.)
     from claude_tg.engine.types import TextEvent
 
     sub = HoldingSubstrate(
-        tool_name="Write",
-        tool_input={"file_path": "/a", "content": "x"},
-        tool_use_id="tu-write",
-        post_factory=lambda d: TextEvent(text="wrote", session_id="S1"),
+        tool_name="Read",
+        tool_input={"file_path": "/a"},
+        tool_use_id="tu-read",
+        post_factory=lambda d: TextEvent(text="read", session_id="S1"),
     )
     eng = _wire(sub)
     await eng.start()
@@ -450,11 +458,372 @@ async def test_engine_ordinary_tool_does_not_hold_or_inject():
     collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
 
     assert sub.last_decision.allow is True
-    assert sub.last_decision.updated_input == {"file_path": "/a", "content": "x"}
-    # No ask/plan injected for an ordinary tool.
-    assert not any(isinstance(e, (AskEvent, PlanEvent)) for e in collected)
+    assert sub.last_decision.updated_input == {"file_path": "/a"}
+    # No prompt of any kind injected for a policy-allowed tool.
+    assert not any(
+        isinstance(e, (AskEvent, PlanEvent, PermissionEvent)) for e in collected
+    )
     assert eng._pending.pending_ids == []
-    assert any(getattr(e, "text", "") == "wrote" for e in collected)
+    assert any(getattr(e, "text", "") == "read" for e in collected)
+
+
+# ===========================================================================
+# P2 / T3: the permission gate over the ordinary-tool branch (ADR-003 §2/§4).
+#
+# A risky, not-granted tool HOLDS for an operator PermissionDecision exactly as an
+# ask/plan holds — reusing the SAME PendingRegistry (so RB4 backstop/cancel apply for
+# free). These use the HoldingSubstrate (one request/turn) and a TwoToolSubstrate
+# (two sequential requests/turn, sharing the engine's policy) to prove allow-once
+# RE-asks, allow-session SUPPRESSES (per tool NAME), deny carries the canned message,
+# /yolo runs free, and the ADR-001 caveat (one grant frees nothing else).
+# Substrate mocked; no live Claude/network; deterministic (resolve / short backstop).
+# ===========================================================================
+
+
+class TwoToolSubstrate:
+    """Mock substrate whose ``send`` fires TWO sequential tool requests in one turn.
+
+    Each request blocks on ``decision_callback`` (the SDK's ``can_use_tool``) before the
+    next is issued, so an operator resolves them in order — and the SECOND request goes
+    through the engine's gate AFTER any allow-session grant from the first is recorded.
+    Records every returned :class:`SubstrateDecision` in ``decisions``. The two requests
+    may be the same tool name (re-ask / suppress tests) or different (ADR-001 caveat).
+    """
+
+    def __init__(self, *, requests):
+        # requests: list of (tool_name, tool_input, tool_use_id)
+        self._requests = requests
+        self.session_id = "S1"
+        self.decision_callback = None
+        self.decisions = []
+        self.calls = []
+
+    async def start(self):
+        self.calls.append(("start",))
+
+    async def send(self, prompt, *, timeout=120.0):
+        from claude_tg.engine.types import TextEvent
+
+        self.calls.append(("send", prompt, timeout))
+        for (name, tool_input, tuid) in self._requests:
+            decision = await self.decision_callback(name, tool_input, tuid)
+            self.decisions.append(decision)
+            # A post-event per request so a test can see the turn kept streaming.
+            yield TextEvent(
+                text=f"{tuid}:{'allow' if decision.allow else 'deny'}", session_id="S1"
+            )
+
+    async def stop(self):
+        self.calls.append(("stop",))
+
+
+async def _resolve_when_pending(eng, tool_use_id, decision):
+    """Poll the registry (same loop, no real wait) then resolve — deterministic."""
+    for _ in range(2000):
+        if eng._pending.has_pending(tool_use_id):
+            break
+        await asyncio.sleep(0)
+    return eng.resolve(tool_use_id, decision)
+
+
+# ---- risky tool HOLDS, emits a body-free PermissionEvent, allow-once allows -
+
+
+async def test_engine_risky_tool_holds_and_emits_permission_event_then_allow_once():
+    sub = HoldingSubstrate(
+        tool_name="Write",
+        tool_input={"file_path": "/a.py", "content": "x"},
+        tool_use_id="tu-w1",
+    )
+    eng = _wire(sub)  # fresh default policy -> Write gates
+    await eng.start()
+
+    op = asyncio.create_task(
+        _resolve_when_pending(eng, "tu-w1", PermissionDecision("allow_once"))
+    )
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    assert await op is True
+    await eng.stop()
+
+    # A PermissionEvent reached the operator (held), correlated by id.
+    perms = [e for e in collected if isinstance(e, PermissionEvent)]
+    assert len(perms) == 1
+    assert perms[0].tool_name == "Write"
+    assert perms[0].tool_use_id == "tu-w1"
+    # allow_once -> substrate allow (this request only).
+    assert sub.last_decision.allow is True
+
+
+async def test_engine_risky_permission_event_summary_is_body_free_sb3():
+    # SB3: the emitted PermissionEvent summary carries a LENGTH for a body field, never
+    # the raw contents (a Write's long `content` shows `<N chars>`, not the text).
+    big = "S3CR3T" * 100  # 600 chars; must NOT appear verbatim in the summary
+    sub = HoldingSubstrate(
+        tool_name="Write",
+        tool_input={"file_path": "/a.py", "content": big},
+        tool_use_id="tu-sb3",
+    )
+    eng = _wire(sub)
+    await eng.start()
+
+    op = asyncio.create_task(
+        _resolve_when_pending(eng, "tu-sb3", PermissionDecision("deny"))
+    )
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    await op
+    await eng.stop()
+
+    perms = [e for e in collected if isinstance(e, PermissionEvent)]
+    assert len(perms) == 1
+    summary = perms[0].tool_input_summary
+    assert big not in summary  # the raw body is absent
+    assert "<600 chars>" in summary  # a length is present instead
+    assert "/a.py" in summary  # the (safe) path is shown
+
+
+async def test_engine_allow_once_does_not_grant_second_use_re_holds():
+    # allow-once allows THIS request only: a SECOND use of the same tool still HOLDS
+    # (no grant recorded). False-pass guard: if allow_once wrongly recorded a grant,
+    # the second request would auto-allow and emit no second PermissionEvent.
+    sub = TwoToolSubstrate(
+        requests=[
+            ("Write", {"file_path": "/a"}, "tu-1"),
+            ("Write", {"file_path": "/b"}, "tu-2"),
+        ]
+    )
+    eng = _wire(sub)
+    await eng.start()
+
+    async def operator():
+        await _resolve_when_pending(eng, "tu-1", PermissionDecision("allow_once"))
+        # The SECOND use must hold again (allow-once granted nothing).
+        await _resolve_when_pending(eng, "tu-2", PermissionDecision("allow_once"))
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    await op
+    await eng.stop()
+
+    perms = [e for e in collected if isinstance(e, PermissionEvent)]
+    # TWO prompts: the second use re-asked (allow-once did NOT grant the session).
+    assert [p.tool_use_id for p in perms] == ["tu-1", "tu-2"]
+    assert all(d.allow for d in sub.decisions)  # both allowed (once each)
+
+
+async def test_engine_allow_session_grants_and_suppresses_second_prompt():
+    # allow-session records the per-NAME grant so the SECOND use auto-allows with NO
+    # second prompt. False-pass guard: if the grant were NOT recorded (drop
+    # _verdict_for's grant_session call), the second use would HOLD and emit a second
+    # PermissionEvent — this test would then see two prompts and FAIL.
+    sub = TwoToolSubstrate(
+        requests=[
+            ("Write", {"file_path": "/a"}, "tu-1"),
+            ("Write", {"file_path": "/b"}, "tu-2"),
+        ]
+    )
+    eng = _wire(sub)
+    await eng.start()
+
+    async def operator():
+        # Only the FIRST use needs an operator verdict; the second auto-allows.
+        await _resolve_when_pending(eng, "tu-1", PermissionDecision("allow_session"))
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    await op
+    await eng.stop()
+
+    perms = [e for e in collected if isinstance(e, PermissionEvent)]
+    # EXACTLY ONE prompt: the second use was auto-allowed by the session grant.
+    assert [p.tool_use_id for p in perms] == ["tu-1"]
+    assert all(d.allow for d in sub.decisions)  # both allowed
+    assert eng._policy.is_granted("Write")  # the grant is recorded on the policy
+
+
+async def test_engine_allow_session_is_per_tool_name_other_risky_tool_still_holds():
+    # ADR-001 caveat: granting Write does NOT free a DIFFERENT risky tool (Bash) — each
+    # gates independently. The second (Bash) request must still HOLD and prompt.
+    sub = TwoToolSubstrate(
+        requests=[
+            ("Write", {"file_path": "/a"}, "tu-write"),
+            ("Bash", {"command": "rm -rf /"}, "tu-bash"),
+        ]
+    )
+    eng = _wire(sub)
+    await eng.start()
+
+    async def operator():
+        await _resolve_when_pending(eng, "tu-write", PermissionDecision("allow_session"))
+        # Bash is a DIFFERENT tool — it must still hold despite the Write grant.
+        await _resolve_when_pending(eng, "tu-bash", PermissionDecision("allow_once"))
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    await op
+    await eng.stop()
+
+    perms = [e for e in collected if isinstance(e, PermissionEvent)]
+    # BOTH tools prompted: the Write grant greenlit nothing about Bash.
+    assert [p.tool_name for p in perms] == ["Write", "Bash"]
+    assert eng._policy.is_granted("Write")
+    assert not eng._policy.is_granted("Bash")  # never granted
+
+
+async def test_engine_deny_maps_to_substrate_deny_with_canned_message():
+    # deny -> a substrate deny carrying the canned DENIED_MESSAGE (D5; no free text).
+    sub = HoldingSubstrate(
+        tool_name="Bash",
+        tool_input={"command": "ls"},
+        tool_use_id="tu-deny",
+    )
+    eng = _wire(sub)
+    await eng.start()
+
+    op = asyncio.create_task(
+        _resolve_when_pending(eng, "tu-deny", PermissionDecision("deny"))
+    )
+    await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    await op
+    await eng.stop()
+
+    assert sub.last_decision.allow is False
+    assert sub.last_decision.message == DENIED_MESSAGE
+
+
+async def test_engine_yolo_allows_risky_tool_with_no_prompt():
+    # /yolo (policy.set_yolo(True)) makes every tool run free: a risky Bash is allowed
+    # with NO prompt and no hold. False-pass guard: without the gate consulting the
+    # policy, this would still pass — but the gated-by-default + deny tests would fail;
+    # this isolates the yolo bypass specifically.
+    from claude_tg.engine.types import TextEvent
+
+    policy = PermissionPolicy()
+    policy.set_yolo(True)
+    sub = HoldingSubstrate(
+        tool_name="Bash",
+        tool_input={"command": "rm -rf /tmp/x"},
+        tool_use_id="tu-yolo",
+        post_factory=lambda d: TextEvent(text="ran", session_id="S1"),
+    )
+    eng = Engine(sub, permission_policy=policy)
+    sub.decision_callback = eng.on_tool_request
+    await eng.start()
+    # No operator at all — if it held, drain would block forever.
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+
+    assert sub.last_decision.allow is True
+    assert not any(isinstance(e, PermissionEvent) for e in collected)  # no prompt
+    assert eng._pending.pending_ids == []
+    assert any(getattr(e, "text", "") == "ran" for e in collected)
+
+
+async def test_engine_live_grant_allows_risky_tool_with_no_prompt():
+    # A pre-existing allow-session grant (e.g. from an earlier turn) makes that tool run
+    # free with no prompt — the engine consults the injected policy.
+    policy = PermissionPolicy()
+    policy.grant_session("Write")
+    sub = HoldingSubstrate(
+        tool_name="Write",
+        tool_input={"file_path": "/a", "content": "x"},
+        tool_use_id="tu-granted",
+    )
+    eng = Engine(sub, permission_policy=policy)
+    sub.decision_callback = eng.on_tool_request
+    await eng.start()
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+
+    assert sub.last_decision.allow is True
+    assert not any(isinstance(e, PermissionEvent) for e in collected)
+    assert eng._pending.pending_ids == []
+
+
+# ---- RB4: backstop + cancel on a PERMISSION hold resolve to DENY (no wedge) -
+
+
+async def test_engine_permission_backstop_auto_denies_and_session_usable_rb4():
+    # RB4: nobody answers a permission prompt; a SHORT backstop fires, the held request
+    # resolves to a substrate DENY (NOT auto-allow), a notify status reaches the
+    # operator, and the turn completes — the session stays usable. No real wait.
+    from claude_tg.engine.types import TextEvent
+
+    sub = HoldingSubstrate(
+        tool_name="Bash",
+        tool_input={"command": "ls"},
+        tool_use_id="tu-bs-perm",
+        post_factory=lambda d: TextEvent(text="post", session_id="S1"),
+    )
+    eng = Engine(sub, backstop_seconds=0.05)  # short, injected; fresh default policy
+    sub.decision_callback = eng.on_tool_request
+    await eng.start()
+
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    await eng.stop()
+
+    # Backstop auto-DENIED the permission hold (never auto-allowed).
+    assert sub.last_decision.allow is False
+    assert "backstop" in (sub.last_decision.message or "")
+    # A notify status reached the operator and the turn still completed (usable).
+    statuses = [e for e in collected if isinstance(e, StatusEvent)]
+    assert any("backstop" in (s.detail or "") for s in statuses)
+    assert any(getattr(e, "text", "") == "post" for e in collected)
+    assert eng._pending.pending_ids == []
+
+
+async def test_engine_permission_cancel_aborts_held_request_to_deny_rb4():
+    # RB4: /cancel on a pending PERMISSION request resolves it to a clean deny (NOT an
+    # allow); the turn unwinds cleanly and keeps streaming (no wedge).
+    from claude_tg.engine.types import TextEvent
+
+    sub = HoldingSubstrate(
+        tool_name="Write",
+        tool_input={"file_path": "/a", "content": "x"},
+        tool_use_id="tu-cancel-perm",
+        post_factory=lambda d: TextEvent(text="resumed-after-cancel", session_id="S1"),
+    )
+    eng = Engine(sub, backstop_seconds=100)  # long: prove cancel (not backstop) wins
+    sub.decision_callback = eng.on_tool_request
+    await eng.start()
+
+    async def operator():
+        for _ in range(2000):
+            if eng._pending.has_pending("tu-cancel-perm"):
+                break
+            await asyncio.sleep(0)
+        assert eng.cancel("tu-cancel-perm") == 1
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+    await op
+    await eng.stop()
+
+    # Cancel resolved the hold to a clean abort -> deny (never auto-allow).
+    assert sub.last_decision.allow is False
+    assert sub.last_decision.message == "cancelled"
+    assert any(
+        getattr(e, "text", "") == "resumed-after-cancel" for e in collected
+    )
+
+
+async def test_engine_ask_plan_route_to_answer_hold_not_permission_gate():
+    # The ask/plan branch is UNCHANGED by P2: even with a default (gating) policy
+    # present, AskUserQuestion/ExitPlanMode route to the answer-hold and emit their OWN
+    # event — never a PermissionEvent (they are answered, not permission-gated).
+    for tool_name, tool_input, tuid, ev_type, verdict in [
+        ("AskUserQuestion", {"questions": [{"question": "Pick?"}]}, "tu-a",
+         AskEvent, QuestionAnswer({"Pick?": "Bravo"})),
+        ("ExitPlanMode", {"plan": "do X"}, "tu-p", PlanEvent, PlanVerdict(approve=True)),
+    ]:
+        sub = HoldingSubstrate(tool_name=tool_name, tool_input=tool_input, tool_use_id=tuid)
+        eng = _wire(sub)  # fresh default policy: gates risky tools, but NOT ask/plan
+        await eng.start()
+        op = asyncio.create_task(_resolve_when_pending(eng, tuid, verdict))
+        collected = await asyncio.wait_for(drain(eng.send("go")), timeout=5)
+        await op
+        await eng.stop()
+
+        assert any(isinstance(e, ev_type) for e in collected)  # its own prompt
+        assert not any(isinstance(e, PermissionEvent) for e in collected)  # NOT gated
+        assert sub.last_decision.allow is True
 
 
 # ===========================================================================

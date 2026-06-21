@@ -27,12 +27,19 @@ into the outgoing stream the moment it registers the hold. The injection and the
 substrate's own events are merged through one :class:`asyncio.Queue` so neither is
 dropped and the await never deadlocks the stream.
 
-**Interim P1 tool posture (design S3).** Ordinary tools (Write/Bash/Read/…) are
-**auto-allowed** here — the request is allowed unchanged, echoing the original input as
-the record. Per-tool permission GATING (deny-by-default, allow/deny buttons) is **P2**;
-this introduces **no bypass flag** — it is the same single-allowlisted-chat,
-default-permission posture P0 ran, just expressed at the engine seam. P2 replaces this
-branch with real gating (see the marker in :meth:`on_tool_request`).
+**P2 tool posture (ADR-003).** Ordinary tools (Write/Bash/Read/…) are now run through
+a fail-closed permission gate (replacing P1's interim auto-allow). The engine consults
+an injected :class:`~claude_tg.permissions.PermissionPolicy`: a tool the policy reports
+as **allowed** (safe read/search, a live allow-session grant, or ``/yolo``) runs free
+with no prompt; a **risky, not-granted** tool is **held for approval** — a
+:class:`~claude_tg.engine.types.PermissionEvent` (body-free summary, SB3) is injected
+onto the turn stream and the request is held via the **same** ``PendingRegistry`` the
+ask/plan answer-hold uses, until the operator's
+:class:`~claude_tg.engine.types.PermissionDecision` (allow-once / allow-session / deny)
+resolves it. The default ``PermissionPolicy`` gates risky tools, so the engine is
+**fail-closed by default**; ``/yolo`` is the one loud, per-session bypass (no
+``--dangerously-skip-permissions`` on this path, SB5). See :meth:`on_tool_request` /
+:meth:`_permission_hold`.
 
 The engine owns the ``(session_id, cwd)`` coupling at the call site (wired in T7); the
 substrate does not enforce the cwd-scoped-resume / double-attach rules (ADR-001 / C6),
@@ -45,17 +52,22 @@ import asyncio
 import logging
 from typing import Any, AsyncIterator, Optional
 
+from ..permissions import PermissionPolicy
 from .pending import DEFAULT_BACKSTOP_SECONDS, PendingRegistry
 from .substrate import Substrate
 from .types import (
+    DENIED_MESSAGE,
     AskEvent,
     Decision,
     Event,
+    PermissionDecision,
+    PermissionEvent,
     PermissionVerdict,
     PlanEvent,
     StatusEvent,
     SubstrateDecision,
     decision_to_substrate,
+    safe_input_summary,
 )
 
 log = logging.getLogger(__name__)
@@ -81,12 +93,19 @@ class Engine:
         *,
         send_timeout: float = 120.0,
         backstop_seconds: float = DEFAULT_BACKSTOP_SECONDS,
+        permission_policy: PermissionPolicy | None = None,
     ) -> None:
         self._substrate = substrate
         self._send_timeout = send_timeout
         self._backstop_seconds = backstop_seconds
+        # The per-session permission policy the gate consults (ADR-003). Defaulting to a
+        # FRESH PermissionPolicy() makes the engine fail-closed: a fresh policy has no
+        # grants and yolo off, so every risky tool gates. The bot (T5) injects the
+        # session's shared policy so /yolo + allow-session grants + /reset-clear apply.
+        self._policy = permission_policy if permission_policy is not None else PermissionPolicy()
         # The answer-hold registry: PendingDecision Futures keyed by tool_use_id, with
         # the per-request backstop timer. notify() pushes the operator-facing event.
+        # Shared by the ask/plan answer-hold AND the P2 permission hold (RB4 for free).
         self._pending = PendingRegistry(
             backstop_seconds=backstop_seconds,
             notify=self._on_backstop,
@@ -114,7 +133,7 @@ class Engine:
         """Resolve one substrate tool/interactive request to a substrate decision.
 
         This is the callback the engine hands the substrate (see
-        :class:`~claude_tg.engine.substrate.DecisionCallback`). Two paths:
+        :class:`~claude_tg.engine.substrate.DecisionCallback`). Three paths:
 
         * **AskUserQuestion / ExitPlanMode** → the async answer-hold. Inject the
           corresponding :class:`AskEvent`/:class:`PlanEvent` (with ``tool_use_id``) so
@@ -123,25 +142,50 @@ class Engine:
           :class:`~claude_tg.engine.types.Decision` is mapped through the **single**
           load-bearing mapper :func:`~claude_tg.engine.types.decision_to_substrate`
           (native answers-map / plan-reject-rides-deny / allow-carries-updated_input).
+          This branch is **unchanged** by P2 — ask/plan are answered, not gated.
 
-        * **ordinary tools** (Write/Bash/Read/…) → **auto-allow**, echoing the original
-          input as the record (the B ``updatedInput`` gotcha). P1 interim posture
-          (design S3): NO per-tool gating, NO bypass flag — P2 replaces this branch.
+        * **ordinary tool the policy ALLOWS** (safe read/search, a live allow-session
+          grant, or ``/yolo``) → **allow** with no prompt, echoing the original input as
+          the record (the B ``updatedInput`` gotcha).
+
+        * **ordinary RISKY tool, not granted** → **hold for approval**
+          (:meth:`_permission_hold`): inject a :class:`PermissionEvent` (body-free
+          summary, SB3) and hold the request on the SAME ``PendingRegistry`` until the
+          operator's :class:`PermissionDecision` (or the backstop/cancel) resolves it
+          (ADR-003 §2/§4; replaces P1's interim auto-allow).
         """
         if tool_name in (ASK_TOOL, PLAN_TOOL) and tool_use_id is not None:
             return await self._answer_hold(tool_name, tool_input, tool_use_id)
 
-        # --- ordinary tool: auto-allow (P1 interim posture; gating is P2) -------
-        # NOTE(P2): this is THE site where per-tool permission gating (deny-by-default,
-        # allow/deny/allow-session, the risk classifier) replaces auto-allow. P1
-        # introduces NO bypass — a bare allow echoes the original input as the record
-        # (the B updatedInput gotcha; decision_to_substrate guarantees a dict), exactly
-        # the substrate-default posture P0 ran inside the single allowlisted chat
-        # (design S3 / SB6). No bypass flag is introduced.
-        log.debug("auto-allow ordinary tool %s (P1 interim; P2 gates)", tool_name)
-        return decision_to_substrate(
-            PermissionVerdict(behavior="allow"), tool_input=tool_input
-        )
+        # --- ordinary tool: the P2 permission gate (ADR-003 §2/§4) --------------
+        # Ask the per-session policy whether this tool may run without a prompt. False
+        # iff it is a safe read/search, has a live allow-session grant, or /yolo is on
+        # (PermissionPolicy.needs_approval). In that case allow with no prompt, echoing
+        # the original input as the record (decision_to_substrate guarantees a dict —
+        # the B updatedInput gotcha).
+        if not self._policy.needs_approval(tool_name, tool_input):
+            log.debug("policy allows tool %s without prompt", tool_name)
+            return decision_to_substrate(
+                PermissionVerdict(behavior="allow"), tool_input=tool_input
+            )
+
+        # Risky + not granted → hold for an operator verdict. A permission hold needs a
+        # tool_use_id to route the verdict back (mirrors the ask/plan guard); if a risky
+        # tool somehow arrives without one we CANNOT open a resolvable hold, so we fail
+        # CLOSED and deny rather than auto-allow (SB6 — never run a risky tool we can't
+        # gate). This should not happen on the live path (the SDK supplies an id).
+        if tool_use_id is None:
+            log.warning(
+                "risky tool %s arrived with no tool_use_id; cannot route approval — "
+                "failing closed (deny)",
+                tool_name,
+            )
+            return decision_to_substrate(
+                PermissionVerdict(behavior="deny", message=DENIED_MESSAGE),
+                tool_input=tool_input,
+            )
+
+        return await self._permission_hold(tool_name, tool_input, tool_use_id)
 
     async def _answer_hold(
         self,
@@ -160,6 +204,85 @@ class Engine:
 
         # 3) Map the decision through the single load-bearing mapper (every [FLAG]).
         return decision_to_substrate(decision, tool_input=tool_input)
+
+    async def _permission_hold(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        tool_use_id: str,
+    ) -> SubstrateDecision:
+        """Hold a risky tool for operator approval and map the verdict (ADR-003 §2/§4).
+
+        Mirrors :meth:`_answer_hold` — same inject + hold + map shape, reusing the SAME
+        ``PendingRegistry`` — but for a permission prompt rather than an ask/plan:
+
+        1. Inject a :class:`PermissionEvent` (BODY-FREE summary, SB3) onto the turn
+           stream so the operator SEES the ``[Allow once] / [Allow for session] / [Deny]``
+           choice, correlated by ``tool_use_id``.
+        2. Register + ``await`` the pending decision (bounded by the backstop). It is
+           resolved by exactly one of: the operator's :class:`PermissionDecision`
+           (:meth:`resolve`), the 60-min backstop (auto-deny + notify), or
+           :meth:`cancel` — RB4 comes for free from the shared registry.
+        3. Map the resolved decision to a substrate verdict:
+
+           * :class:`PermissionDecision` ``allow_once`` → allow (this request only).
+           * :class:`PermissionDecision` ``allow_session`` → record the per-tool-NAME
+             grant **here, on resolve** (so the SECOND use of this tool this session
+             auto-allows — D4) **then** allow. The grant is recorded in the engine, not
+             the pure mapper, because it is a side effect over the policy.
+           * :class:`PermissionDecision` ``deny`` → deny carrying :data:`DENIED_MESSAGE`
+             (D5).
+           * a **backstop / cancel** resolution arrives NOT as a ``PermissionDecision``
+             but as a :class:`PermissionVerdict` ``deny`` (the registry's backstop) or a
+             :class:`Cancel` (``/cancel`` / turn cancel). Both fall through to
+             :func:`decision_to_substrate`, which maps each to a substrate **deny** — so
+             a backstopped or cancelled permission request becomes a deny, never hangs
+             and never auto-allows (RB4).
+
+        **ADR-001 caveat:** ``allow_session`` grants ONLY ``tool_name`` (per-name, T2);
+        a different risky tool is unaffected — nothing here broadens the grant.
+        """
+        # 1) Surface the prompt with its tool_use_id; the summary is body-free (SB3).
+        self._inject(
+            PermissionEvent(
+                tool_name=tool_name,
+                tool_input_summary=safe_input_summary(tool_name, tool_input),
+                tool_use_id=tool_use_id,
+                session_id=self.session_id,
+            )
+        )
+
+        # 2) Hold on the SHARED registry until resolved (operator / backstop / cancel).
+        decision = await self._pending.await_decision(tool_use_id, tool_name)
+
+        # 3) Map the resolved decision. An operator PermissionDecision is translated to a
+        #    PermissionVerdict (recording an allow-session grant as a side effect first);
+        #    a backstop PermissionVerdict(deny) or a Cancel falls straight through to the
+        #    single mapper, which denies it (RB4 — never auto-allow a backstop/cancel).
+        if isinstance(decision, PermissionDecision):
+            decision = self._verdict_for(tool_name, decision)
+        return decision_to_substrate(decision, tool_input=tool_input)
+
+    def _verdict_for(
+        self, tool_name: str, decision: PermissionDecision
+    ) -> PermissionVerdict:
+        """Translate an operator :class:`PermissionDecision` into a permission verdict.
+
+        Records the per-tool-NAME allow-session grant (D4) as a side effect for
+        ``allow_session`` BEFORE returning the allow, so the grant is in place the next
+        time this tool is requested this session (the false-pass guard: drop this
+        ``grant_session`` and the allow-session-suppresses test re-prompts on the second
+        use). ``deny`` carries the canned :data:`DENIED_MESSAGE` (D5).
+        """
+        if decision.verdict == "allow_session":
+            # Record the grant HERE, on resolve, keyed by NAME only (ADR-001 caveat:
+            # this greenlights nothing about any other risky tool).
+            self._policy.grant_session(tool_name)
+            return PermissionVerdict(behavior="allow")
+        if decision.verdict == "allow_once":
+            return PermissionVerdict(behavior="allow")
+        # deny (D5) — the canned message the model adapts to (no free-text reason in P2).
+        return PermissionVerdict(behavior="deny", message=DENIED_MESSAGE)
 
     # -- engine API for the bot (T7 will call these) -------------------------
 

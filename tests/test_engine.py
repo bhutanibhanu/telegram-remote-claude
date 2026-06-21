@@ -134,30 +134,37 @@ async def test_send_passes_configured_timeout_through():
 
 
 # ---------------------------------------------------------------------------
-# Decision seam: the seam SHAPE (on_tool_request -> SubstrateDecision) is the T4
-# contract; T5 replaces the body with the answer-hold. Ordinary tools auto-allow
-# here (no waiting); the ask/plan answer-hold itself is covered in
-# test_answer_hold.py. These guard the seam's ordinary-tool path + return shape.
+# Decision seam: the seam SHAPE (on_tool_request -> SubstrateDecision). T5 wired the
+# ask/plan answer-hold; P2/T3 wires the permission gate over the ordinary-tool branch.
+# A SAFE ordinary tool the policy allows runs free here (no waiting); the RISKY
+# hold-for-approval path + verdict mapping live in test_answer_hold.py. These guard the
+# seam's allow path + return shape under the new gated default.
 # ---------------------------------------------------------------------------
 
 
-async def test_ordinary_tool_request_auto_allows_with_record():
-    # P1 interim posture: an ordinary tool (not ask/plan) is auto-allowed, echoing
-    # the original tool input as the record (the B updatedInput gotcha), with NO wait
-    # on any operator decision.
+async def test_safe_ordinary_tool_request_allows_with_record():
+    # P2 gated posture: a SAFE ordinary tool (Read — in the safe allowlist, the policy
+    # reports it does not need approval) is allowed with NO prompt, echoing the original
+    # tool input as the record (the B updatedInput gotcha), with no wait on an operator.
     sub = FakeSubstrate()
-    eng = Engine(sub)
-    d = await eng.on_tool_request("Write", {"file_path": "/a"}, "tu1")
+    eng = Engine(sub)  # fresh default policy: safe tool runs free, risky tools gate
+    d = await eng.on_tool_request("Read", {"file_path": "/a"}, "tu1")
     assert isinstance(d, SubstrateDecision)
     assert d.allow is True
     assert d.updated_input == {"file_path": "/a"}
 
 
-async def test_ordinary_tool_auto_allow_without_tool_use_id():
-    # The auto-allow path does not require a tool_use_id (ordinary tools may lack one).
+async def test_risky_tool_without_tool_use_id_fails_closed_to_deny():
+    # P2 change from the P1 interim auto-allow: a RISKY tool with no tool_use_id cannot
+    # open a routable approval hold, so the engine fails CLOSED and denies (SB6) rather
+    # than auto-allowing — never run a risky tool we cannot gate. (A fresh default policy
+    # gates Bash.)
+    from claude_tg.engine import DENIED_MESSAGE
+
     eng = Engine(FakeSubstrate())
     d = await eng.on_tool_request("Bash", {"command": "ls"}, None)
-    assert d.allow is True and d.updated_input == {"command": "ls"}
+    assert d.allow is False
+    assert d.message == DENIED_MESSAGE
 
 
 # ---------------------------------------------------------------------------

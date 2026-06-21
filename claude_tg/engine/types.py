@@ -93,6 +93,30 @@ class PlanEvent:
     kind: Literal["plan"] = "plan"
 
 
+@dataclass(frozen=True)
+class PermissionEvent:
+    """A risky tool held for operator approval (P2, ADR-003 §2/§4).
+
+    The engine injects this onto the outgoing stream when a tool the policy reports
+    as needing approval is requested — mirroring how :class:`AskEvent`/:class:`PlanEvent`
+    surface the interactive prompts — so the operator SEES the
+    ``[Allow once] / [Allow for session] / [Deny]`` choice it must make, correlated by
+    ``tool_use_id``. The verdict comes back as a :class:`PermissionDecision` routed to
+    the held :class:`~claude_tg.engine.pending.PendingRegistry` request (T4 renders the
+    prompt; T5 routes the tap).
+
+    ``tool_input_summary`` is **body-free** (lengths / short values, NOT raw contents,
+    SB3) — built by :func:`safe_input_summary`. The raw tool input never rides this
+    event, so a Write's file contents or a Bash secret are never surfaced or logged.
+    """
+
+    tool_name: str
+    tool_input_summary: str
+    tool_use_id: str
+    session_id: str | None = None
+    kind: Literal["permission"] = "permission"
+
+
 # Error origin: a tool failed, the turn failed, or the substrate/driver failed.
 ErrorKind = Literal["tool_error", "turn_error", "driver_error"]
 
@@ -145,10 +169,41 @@ Event = Union[
     ToolUseEvent,
     AskEvent,
     PlanEvent,
+    PermissionEvent,
     ErrorEvent,
     ResultEvent,
     StatusEvent,
 ]
+
+
+# Fields whose values are free-text bodies — collapse to a length, never dump (SB3).
+_BODY_FIELDS = frozenset({"content", "new_string", "old_string"})
+# Fields that are path/command/url-like — short, useful, truncated (never a body).
+_IDENT_FIELDS = frozenset({"file_path", "path", "command", "pattern", "url"})
+
+
+def safe_input_summary(tool_name: str, tool_input: dict[str, Any] | None) -> str:
+    """Render a tool's input WITHOUT dumping bodies — lengths, not content (SB3).
+
+    A **pure**, SDK-free mirror of ``adapter_sdk._safe_input_summary``'s lengths-not-
+    bodies style, kept here so the engine can build a :class:`PermissionEvent` summary
+    without importing the adapter (the engine is substrate-neutral). Large free-text
+    fields (``content`` / ``new_string`` / ``old_string``) collapse to a ``<N chars>``
+    count; path/command/url-like fields are truncated; everything else is short. The
+    raw body of a sensitive field is therefore NEVER present in the returned string —
+    a Write's ``content`` shows ``content=<500 chars>``, not the 500 characters.
+    """
+    if not isinstance(tool_input, dict):
+        return f"{tool_name}({str(tool_input)[:80]})"
+    parts: list[str] = []
+    for k, v in tool_input.items():
+        if k in _BODY_FIELDS:
+            parts.append(f"{k}=<{len(str(v))} chars>")
+        elif k in _IDENT_FIELDS:
+            parts.append(f"{k}={str(v)[:160]}")
+        else:
+            parts.append(f"{k}={str(v)[:40]}")
+    return f"{tool_name}({', '.join(parts)})"
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +273,37 @@ class Cancel:
     """Abort a waiting/in-flight run cleanly (§2 ``cancel`` / RB4)."""
 
 
+# The canned denial relayed to the model when the operator denies a tool call
+# (ADR-003 §2, D5 — a fixed message the model adapts to; NO free-text reason in P2).
+DENIED_MESSAGE = "Operator denied this tool call."
+
+
+@dataclass(frozen=True)
+class PermissionDecision:
+    """The operator's verdict on a held risky-tool prompt (P2, ADR-003 §2, D5).
+
+    Carried in from the bot (T5) and routed to the held
+    :class:`~claude_tg.engine.pending.PendingRegistry` request the engine opened in
+    ``Engine._permission_hold``. The engine maps the three verdicts:
+
+    * ``allow_once`` -> allow this request only (the next use of the tool re-asks).
+    * ``allow_session`` -> record an engine-side per-tool-NAME grant **then** allow, so
+      subsequent uses of that tool name this session auto-allow with no prompt (D4).
+    * ``deny`` -> a substrate deny carrying :data:`DENIED_MESSAGE` (D5).
+
+    This is distinct from :class:`PermissionVerdict` (the lower-level allow/deny the
+    substrate mapper speaks): a ``PermissionDecision`` is the *operator-facing* tap
+    (it knows about allow-once vs allow-session, which is engine-side state, ADR-001);
+    the engine translates it into a :class:`PermissionVerdict` after recording any grant.
+    """
+
+    verdict: Literal["allow_once", "allow_session", "deny"]
+
+
 #: Discriminated union of every decision the bot can route in.
 Decision = Union[
     PermissionVerdict,
+    PermissionDecision,
     QuestionAnswer,
     PlanVerdict,
     FreeTextReply,
@@ -333,20 +416,24 @@ __all__ = [
     "ToolUseEvent",
     "AskEvent",
     "PlanEvent",
+    "PermissionEvent",
     "ErrorEvent",
     "ResultEvent",
     "StatusEvent",
     "Event",
     "ErrorKind",
     "StatusPhase",
+    "safe_input_summary",
     # decisions
     "PermissionVerdict",
+    "PermissionDecision",
     "QuestionAnswer",
     "PlanVerdict",
     "FreeTextReply",
     "Cancel",
     "Decision",
     "PermissionScope",
+    "DENIED_MESSAGE",
     # mapping
     "SubstrateDecision",
     "decision_to_substrate",
