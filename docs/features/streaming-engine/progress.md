@@ -27,7 +27,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised bu
 - [x] T4 — Engine core: normalized types + substrate seam (A adapter) + lifecycle + events-out · unit (mock) (cbfef05)
 - [x] T5 — Decisions-in + async answer-hold + 60-min backstop + cancel · unit (mock) (f050f57)
 - [x] T6 — Render layer: events→Telegram, inline keyboards, coalesce/throttle (RB5) · unit (6b9cf11)
-- [ ] T7 — Wire bot.py: ENGINE_MODE switch + SB1 callback handler + /cancel + routing · unit
+- [x] T7 — Wire bot.py: ENGINE_MODE switch + SB1 callback handler + /cancel + routing · unit (3b90693)
 - [ ] T8 — /cd path policy (SB2) + SB/RB test suite (RB7) · unit
 - [ ] T9 — Live end-to-end verify (programmatic, real Claude) + owner phone-verify checklist · live probe
 
@@ -199,7 +199,31 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN `/cancel` is sent, the waiting run SHALL abort cleanly (RB4).
   - No message text SHALL be interpolated into shell commands/args (SB4); no new bypass introduced (SB6).
 - **Tests:** unit — callback allowlist enforcement (SB1), routing to pending request, ENGINE_MODE switch keeps one-shot default, /cancel; mock engine.
-- **Status:** todo
+- **Status:** done (3b90693) — `bot.py` + `main.py` wire the streaming engine behind the
+  **ENGINE_MODE switch** (oneshot DEFAULT unchanged — the 53 original tests pass byte-identical; streaming
+  delegates to a new `claude_tg/stream_session.py` `StreamingSession`). **Streaming driver:** per-chat `Engine`
+  (lazy start / resume from persisted `(session_id, cwd)` with fresh-start fallback), a per-chat `asyncio.Lock`
+  guarding the TURN (not the resolve), a `_drive_turn` send/edit loop honoring the `Coalescer` (incremental/status
+  → edit-in-place; verbatim ask/plan/error/result → own messages + keyboards), session_id persisted from the
+  result event. **SB1 (the security boundary):** PTB 21.x `CallbackQueryHandler` can't be chat-filtered, so the
+  authoritative gate is the explicit `_authorized(update)` recheck inside `on_callback` (reads the
+  Telegram-delivered `effective_chat.id`, not anything in `callback_data`) — an unauthorized/no-streaming tap is
+  answered + dropped BEFORE any engine touch (never resolves a decision); `allowed_updates` enables callback_query
+  only in streaming mode. `resolve_callback` ignores `decode_callback`→None (foreign/stale/malformed) and any
+  `tool_use_id`/index that doesn't match the held request (no resolve, RB1 try/except, query always answered).
+  **Free-text state machine:** ask "Other" / plan "Reject+feedback" arm a per-chat marker → the NEXT message is
+  captured as the answer/feedback (cleared first so a failure can't wedge). **/cancel** → `engine.cancel()`
+  (RB4). SB4 (prompt verbatim, no shell interpolation) + SB6 (no bypass; `permission_mode=default`). **Verified
+  on 0.2.105:** pytest **212 passed** (53 originals preserved + T4-T6 + 30 new T7), ruff/mypy/secret-scan clean.
+  **Reviews:** correctness reviewer AGREES done (one-shot byte-identical, no lock/resolve deadlock, free-text
+  ordering bug fixed + mutation-probed, tests proven non-false-passing). The dedicated **security-reviewer
+  subagent was repeatedly blocked by a content/auto-mode filter false-positive**, so **SB1 was verified directly
+  by the orchestrator** (read `on_callback`+`resolve_callback`: auth-before-engine-touch, decode→None ignored,
+  id-match required, RB1) + the SB1 unit tests (unauthorized chat → resolve never called; malformed → ignored).
+  **REMAINING FOLLOW-UP:** when the filter allows, run a fresh independent security review of the SB1 callback
+  path for completeness (the implementation is verified; this is belt-and-suspenders). Scope:
+  claude_runner/engine/render/config/session_store/spikes untouched; only bot.py + main.py modified + the driver
+  + 2 test files new.
 
 ### T8 — /cd path policy (SB2) + SB/RB test suite (RB7)
 - **Goal:** Harden `/cd` with canonicalization + `ALLOWED_ROOTS` containment (SB2), and add the dedicated SB/RB tests the cross-cutting baseline requires (RB7).
