@@ -63,6 +63,7 @@ from .engine.types import (
     AskEvent,
     ErrorEvent,
     Event,
+    PermissionEvent,
     PlanEvent,
     ResultEvent,
     StatusEvent,
@@ -137,28 +138,54 @@ class RenderAction:
 #
 # Scheme (``|``-delimited ASCII):
 #
-#     ask:    "a|<tool_use_id>|<question_index>.<option_index>"
-#     other:  "o|<tool_use_id>|<question_index>"       (free-text "Other" affordance)
-#     plan:   "p|<tool_use_id>|a"  (approve)  /  "p|<tool_use_id>|r"  (reject+feedback)
+#     ask:        "a|<tool_use_id>|<question_index>.<option_index>"
+#     other:      "o|<tool_use_id>|<question_index>"   (free-text "Other" affordance)
+#     plan:       "p|<tool_use_id>|a"  (approve)  /  "p|<tool_use_id>|r"  (reject)
+#     permission: "m|<tool_use_id>|o"  (allow once) / "...|s" (session) / "...|d" (deny)
 #
-# Kind is a single ASCII char ('a'/'o'/'p'); payload is a small int (or int.int / a
-# single letter) — NEVER the option label (labels can be long / unicode / > 64 B on
+# Kind is a single ASCII char ('a'/'o'/'p'/'m'); payload is a small int (or int.int /
+# a single letter) — NEVER the option label (labels can be long / unicode / > 64 B on
 # their own). T7 recovers the label from the held AskEvent via the indices (see
-# module docstring + answers_from_ask below).
+# module docstring + answers_from_ask below). The permission kind needs no indices —
+# its tool_use_id alone routes the verdict back to the held request — so the payload
+# is just a single action char (o/s/d), keeping the data tiny next to the ~49-byte id.
 #
-# Byte budget (worst case): "a|" (2) + tool_use_id + "|" (1) + "QQ.OO" (<=5 for
-# question 0..99, option 0..99). With a generous 49-char id (toolu_ + 36-char UUID +
-# slack) that is 2 + 49 + 1 + 5 = 57 <= 64. encode_callback ASSERTS the bound so an
-# over-long id fails loudly at build time rather than Telegram rejecting it at send.
+# Byte budget (worst case):
+#   * ask: "a|" (2) + tool_use_id + "|" (1) + "QQ.OO" (<=5 for question 0..99,
+#     option 0..99). With a generous 49-char id (toolu_ + 36-char UUID + slack) that
+#     is 2 + 49 + 1 + 5 = 57 <= 64.
+#   * permission: "m|" (2) + tool_use_id + "|" (1) + action char (1) = 2 + 49 + 1 + 1
+#     = 53 <= 64. (A full "permission|<id>|session" string would be ~68 B and blow the
+#     limit — hence the 1-char kind + 1-char action code.)
+# encode_callback ASSERTS the bound so an over-long id fails loudly at build time
+# rather than Telegram rejecting it at send.
 
 CALLBACK_LIMIT = 64
 
 KIND_ASK = "a"
 KIND_OTHER = "o"
 KIND_PLAN = "p"
+#: Permission-prompt kind (P2, ADR-003 §2). A single char ('m'; 'a'/'o'/'p' are
+#: taken) so "m|<~49-byte id>|<action>" stays ~53 B under Telegram's 64-byte limit —
+#: a literal "permission|<id>|session" would be ~68 B and fail _check_limit.
+KIND_PERMISSION = "m"
 
 PLAN_APPROVE = "a"
 PLAN_REJECT = "r"
+
+#: Permission verdict action codes — 1 char each (byte budget; see KIND_PERMISSION).
+#: 'o'=allow-once, 's'=allow-session, 'd'=deny. They map to the operator-facing
+#: PermissionDecision verdicts (allow_once / allow_session / deny) in T5.
+PERMISSION_ONCE = "o"
+PERMISSION_SESSION = "s"
+PERMISSION_DENY = "d"
+
+#: Action char -> the ``permission_action`` value carried on the decoded Callback.
+_PERMISSION_ACTIONS: dict[str, Literal["once", "session", "deny"]] = {
+    PERMISSION_ONCE: "once",
+    PERMISSION_SESSION: "session",
+    PERMISSION_DENY: "deny",
+}
 
 _SEP = "|"
 
@@ -167,21 +194,25 @@ _SEP = "|"
 class Callback:
     """A decoded ``callback_data`` payload (the result of :func:`decode_callback`).
 
-    * ``kind``           — ``"ask"`` | ``"other"`` | ``"plan"``.
-    * ``tool_use_id``    — the request id the answer routes back to (correlation).
-    * ``question_index`` — index into ``AskEvent.questions`` (ask / other only).
-    * ``option_index``   — index into that question's ``options`` (ask only).
-    * ``plan_action``    — ``"approve"`` | ``"reject"`` (plan only).
+    * ``kind``              — ``"ask"`` | ``"other"`` | ``"plan"`` | ``"permission"``.
+    * ``tool_use_id``       — the request id the answer routes back to (correlation).
+    * ``question_index``    — index into ``AskEvent.questions`` (ask / other only).
+    * ``option_index``      — index into that question's ``options`` (ask only).
+    * ``plan_action``       — ``"approve"`` | ``"reject"`` (plan only).
+    * ``permission_action`` — ``"once"`` | ``"session"`` | ``"deny"`` (permission only).
 
     Indices (not labels) are carried so T7 reconstructs the native ``answers`` map
-    from the held :class:`AskEvent`; see :func:`answers_from_ask`.
+    from the held :class:`AskEvent`; see :func:`answers_from_ask`. The permission
+    verdict needs no indices — ``tool_use_id`` alone routes it to the held request
+    (T5 turns ``permission_action`` into the engine's ``PermissionDecision``).
     """
 
-    kind: Literal["ask", "other", "plan"]
+    kind: Literal["ask", "other", "plan", "permission"]
     tool_use_id: str
     question_index: Optional[int] = None
     option_index: Optional[int] = None
     plan_action: Optional[Literal["approve", "reject"]] = None
+    permission_action: Optional[Literal["once", "session", "deny"]] = None
 
 
 def _check_limit(data: str) -> str:
@@ -204,13 +235,17 @@ def encode_callback(
     question_index: Optional[int] = None,
     option_index: Optional[int] = None,
     plan_action: Optional[str] = None,
+    payload: Optional[str] = None,
 ) -> str:
     """Encode ``(kind, tool_use_id, payload)`` into <=64-byte ``callback_data``.
 
     Round-trips with :func:`decode_callback`. The payload is an **index** for ask
-    (``question_index``[.``option_index``]) or ``a``/``r`` for plan — never a label.
-    Raises ``ValueError`` if the result would exceed 64 bytes (loud at build time;
-    see the byte-budget note above) or on a missing/invalid id or payload.
+    (``question_index``[.``option_index``]), ``a``/``r`` for plan, or a 1-char action
+    code (``o``/``s``/``d``) for permission — never a label. ``payload`` carries the
+    permission action char (the permission kind needs no indices; its ``tool_use_id``
+    alone routes the verdict). Raises ``ValueError`` if the result would exceed 64
+    bytes (loud at build time; see the byte-budget note above) or on a missing/invalid
+    id or payload.
     """
     if not tool_use_id:
         raise ValueError("tool_use_id is required for callback_data")
@@ -222,19 +257,26 @@ def encode_callback(
             raise ValueError("ask callback requires question_index and option_index")
         if question_index < 0 or option_index < 0:
             raise ValueError("indices must be non-negative")
-        payload = f"{question_index}.{option_index}"
+        data_payload = f"{question_index}.{option_index}"
     elif kind == KIND_OTHER:
         if question_index is None or question_index < 0:
             raise ValueError("other callback requires a non-negative question_index")
-        payload = str(question_index)
+        data_payload = str(question_index)
     elif kind == KIND_PLAN:
         if plan_action not in (PLAN_APPROVE, PLAN_REJECT):
             raise ValueError(f"plan_action must be {PLAN_APPROVE!r} or {PLAN_REJECT!r}")
-        payload = plan_action
+        data_payload = plan_action
+    elif kind == KIND_PERMISSION:
+        if payload not in _PERMISSION_ACTIONS:
+            raise ValueError(
+                f"permission callback requires payload in "
+                f"{sorted(_PERMISSION_ACTIONS)!r}, got {payload!r}"
+            )
+        data_payload = payload
     else:
         raise ValueError(f"unknown callback kind: {kind!r}")
 
-    return _check_limit(f"{kind}{_SEP}{tool_use_id}{_SEP}{payload}")
+    return _check_limit(f"{kind}{_SEP}{tool_use_id}{_SEP}{data_payload}")
 
 
 def decode_callback(data: object) -> Optional[Callback]:
@@ -283,6 +325,13 @@ def decode_callback(data: object) -> Optional[Callback]:
         if payload == PLAN_REJECT:
             return Callback(kind="plan", tool_use_id=tool_use_id, plan_action="reject")
         return None
+    if kind == KIND_PERMISSION:
+        action = _PERMISSION_ACTIONS.get(payload)
+        if action is None:  # unknown action char -> ignorable (defensive, SB1/RB1)
+            return None
+        return Callback(
+            kind="permission", tool_use_id=tool_use_id, permission_action=action
+        )
     return None
 
 
@@ -404,6 +453,90 @@ def plan_keyboard(plan: PlanEvent) -> InlineKeyboardMarkup:
     )
 
 
+def permission_keyboard(event: PermissionEvent) -> InlineKeyboardMarkup:
+    """Build the ``[Allow once] / [Allow for session] / [Deny]`` keyboard for a risky tool.
+
+    Mirrors :func:`ask_keyboard`/:func:`plan_keyboard`: each button's ``callback_data``
+    is the compact permission encoding (kind ``m`` + the held ``tool_use_id`` +
+    a 1-char action code), so a tap decodes to the verdict T5 routes to the held
+    :class:`~claude_tg.engine.pending.PendingRegistry` request (ADR-003 §2):
+
+    * **✅ Allow once**        -> ``once``    (allow this request only; the next use re-asks).
+    * **☑️ Allow for session** -> ``session`` (record an engine-side per-tool-NAME grant + allow).
+    * **⛔ Deny**              -> ``deny``    (substrate deny carrying the canned message, D5).
+
+    The three buttons stack one-per-row so the (potentially wide) labels stay readable
+    on a phone. ``tool_use_id`` is required (the engine sets it when emitting the
+    :class:`PermissionEvent`); without it there is nothing to route a verdict to.
+    """
+    tool_use_id = event.tool_use_id
+    if not tool_use_id:
+        raise ValueError(
+            "PermissionEvent.tool_use_id is required to build a permission keyboard"
+        )
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    text="✅ Allow once",
+                    callback_data=encode_callback(
+                        KIND_PERMISSION, tool_use_id, payload=PERMISSION_ONCE
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="☑️ Allow for session",
+                    callback_data=encode_callback(
+                        KIND_PERMISSION, tool_use_id, payload=PERMISSION_SESSION
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⛔ Deny",
+                    callback_data=encode_callback(
+                        KIND_PERMISSION, tool_use_id, payload=PERMISSION_DENY
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# /yolo loud indicator (D6) — pure render strings; T5/bot decides WHERE to show them
+# ---------------------------------------------------------------------------
+
+#: Loud, unambiguous warning glyph for the bypass posture. A double caution sign so it
+#: cannot be mistaken for an ordinary status emoji (D6 — "/yolo" must never be silently on).
+_YOLO_GLYPH = "⚠️"
+
+
+def yolo_banner() -> str:
+    """The loud one-shot banner shown when ``/yolo`` is **enabled** (D6).
+
+    A pure string (T5 sends it on the ``/yolo`` toggle); kept here so the wording lives
+    with the other render strings. Loud + unambiguous: it spells out that every tool now
+    runs with **no approval prompt** until ``/unyolo`` (so allow-all is never silent).
+    """
+    return (
+        f"{_YOLO_GLYPH} YOLO MODE ON {_YOLO_GLYPH}\n"
+        "Every tool now runs WITHOUT an approval prompt — no permission gate is "
+        "active. Send /unyolo to turn it back off."
+    )
+
+
+def yolo_indicator() -> str:
+    """A short persistent ``⚠️`` marker for an auto-allowed / outbound action under ``/yolo``.
+
+    A pure prefix string T5 can prepend to messages while ``/yolo`` is on (e.g. on each
+    auto-allowed tool line) so the bypass shows on **every** affected action, not just
+    once at enable time (D6). Loud and compact.
+    """
+    return f"{_YOLO_GLYPH} YOLO"
+
+
 # ---------------------------------------------------------------------------
 # Event -> RenderAction (the verbatim-vs-one-liner split)
 # ---------------------------------------------------------------------------
@@ -465,6 +598,8 @@ def render_event(event: Event) -> RenderAction:
 
     * ``ask``  -> verbatim message body (the questions, chunked) + the option keyboard.
     * ``plan`` -> verbatim plan text (chunked) + ``[Approve]``/``[Reject+feedback]``.
+    * ``permission`` -> verbatim prompt (tool name + body-free summary, chunked) +
+      the ``[Allow once]``/``[Allow for session]``/``[Deny]`` keyboard (ADR-003 §2).
     * ``error``-> verbatim error block.
     * ``result`` -> verbatim final answer (or a compact done-footer).
     * ``text`` (assembled) -> verbatim assistant message (chunked, ``op="new"``).
@@ -493,6 +628,14 @@ def render_event(event: Event) -> RenderAction:
             verbatim=True,
         )
 
+    if isinstance(event, PermissionEvent):
+        return RenderAction(
+            op="new",
+            chunks=_chunk(_render_permission_body(event)),
+            reply_markup=permission_keyboard(event),
+            verbatim=True,
+        )
+
     if isinstance(event, ErrorEvent):
         return _render_error(event)
 
@@ -518,6 +661,23 @@ def render_event(event: Event) -> RenderAction:
 
     # Unknown/foreign event — render nothing rather than crash (RB1 spirit).
     return RenderAction.none()
+
+
+def _render_permission_body(event: PermissionEvent) -> str:
+    """Verbatim prompt body for a held risky tool (ADR-003 §2; SB3 body-free).
+
+    Built from ``tool_name`` + the **already-body-free** ``tool_input_summary`` (the
+    engine's :func:`~claude_tg.engine.types.safe_input_summary` produced it — lengths,
+    not contents). This module does **not** re-summarize or expand it: re-deriving a
+    summary here would risk surfacing a raw body (a Write's ``content``, a Bash secret),
+    so the SB3-safe string is rendered exactly as given. The keyboard (built separately)
+    is the verdict surface.
+    """
+    return (
+        f"🔐 Permission needed — Claude wants to run {event.tool_name}:\n"
+        f"{event.tool_input_summary}\n\n"
+        "Allow once, allow for this session, or deny?"
+    )
 
 
 def _render_ask_body(ask: AskEvent) -> str:
@@ -732,14 +892,25 @@ __all__ = [
     # keyboards + codec
     "ask_keyboard",
     "plan_keyboard",
+    "permission_keyboard",
     "encode_callback",
     "decode_callback",
     "Callback",
     "answers_from_ask",
     "CALLBACK_LIMIT",
+    "KIND_ASK",
+    "KIND_OTHER",
+    "KIND_PLAN",
+    "KIND_PERMISSION",
+    "PERMISSION_ONCE",
+    "PERMISSION_SESSION",
+    "PERMISSION_DENY",
     # one-liners
     "tool_use_line",
     "status_line",
+    # /yolo loud indicator (D6)
+    "yolo_banner",
+    "yolo_indicator",
     # coalesce / throttle
     "Coalescer",
     "FlushResult",

@@ -28,6 +28,7 @@ from telegram import InlineKeyboardMarkup
 from claude_tg.engine.types import (
     AskEvent,
     ErrorEvent,
+    PermissionEvent,
     PlanEvent,
     ResultEvent,
     StatusEvent,
@@ -36,6 +37,7 @@ from claude_tg.engine.types import (
 )
 from claude_tg.render import (
     CALLBACK_LIMIT,
+    KIND_PERMISSION,
     Coalescer,
     RenderAction,
     answers_from_ask,
@@ -43,8 +45,11 @@ from claude_tg.render import (
     coalesce_stream,
     decode_callback,
     encode_callback,
+    permission_keyboard,
     plan_keyboard,
     render_event,
+    yolo_banner,
+    yolo_indicator,
 )
 
 # A realistic SDK tool_use_id: the ``toolu_`` prefix + a UUID-shaped body (worst case
@@ -89,6 +94,20 @@ def make_ask(n_options: int = 2, *, tool_use_id: str = REAL_TOOL_USE_ID, n_quest
     return AskEvent(questions=questions, tool_use_id=tool_use_id, session_id="s1")
 
 
+def make_permission(
+    *,
+    tool_name: str = "Bash",
+    tool_input_summary: str = "Bash(command=pytest -q)",
+    tool_use_id: str = REAL_TOOL_USE_ID,
+) -> PermissionEvent:
+    return PermissionEvent(
+        tool_name=tool_name,
+        tool_input_summary=tool_input_summary,
+        tool_use_id=tool_use_id,
+        session_id="s1",
+    )
+
+
 # ============================================================================
 # Event -> RenderAction mapping
 # ============================================================================
@@ -110,6 +129,58 @@ def test_plan_renders_verbatim_new_message_with_approve_reject():
     assert action.verbatim is True
     assert "Step 1\nStep 2" in action.text
     assert isinstance(action.reply_markup, InlineKeyboardMarkup)
+
+
+def test_permission_renders_verbatim_new_message_with_three_buttons():
+    action = render_event(make_permission(tool_name="Bash"))
+    assert action.op == "new"
+    assert action.verbatim is True
+    assert isinstance(action.reply_markup, InlineKeyboardMarkup)
+    # The tool name + the (body-free) summary are shown verbatim in the prompt body.
+    assert "Bash" in action.text
+    assert "Bash(command=pytest -q)" in action.text
+    # Three verdict buttons.
+    buttons = _all_buttons(action.reply_markup)
+    assert len(buttons) == 3
+    labels = [b.text for b in buttons]
+    assert any("Allow once" in label for label in labels)
+    assert any("session" in label for label in labels)
+    assert any("Deny" in label for label in labels)
+
+
+def test_permission_buttons_round_trip_to_once_session_deny():
+    action = render_event(make_permission())
+    assert action.reply_markup is not None
+    decoded = [decode_callback(b.callback_data) for b in _all_buttons(action.reply_markup)]
+    assert all(cb is not None and cb.kind == "permission" for cb in decoded)
+    assert all(cb.tool_use_id == REAL_TOOL_USE_ID for cb in decoded if cb)
+    actions = {cb.permission_action for cb in decoded if cb}
+    assert actions == {"once", "session", "deny"}
+
+
+def test_permission_render_is_body_free_sb3():
+    # SB3: the summary is already lengths-not-bodies; render.py must NOT expand it.
+    # A Write whose 600-char content collapsed to "content=<600 chars>" must show that
+    # marker and NOT the raw 600-char body.
+    raw_body = "S3CR3T-" + "x" * 593  # 600 chars of "content" the operator must not see
+    assert len(raw_body) == 600
+    summary = "Write(file_path=/tmp/secret.txt, content=<600 chars>)"
+    action = render_event(
+        make_permission(tool_name="Write", tool_input_summary=summary)
+    )
+    assert "content=<600 chars>" in action.text  # the safe marker is present
+    assert raw_body not in action.text  # the raw body is absent (SB3)
+    assert "S3CR3T" not in action.text
+
+
+def test_permission_keyboard_requires_tool_use_id():
+    # PermissionEvent.tool_use_id is non-optional in the type, but the keyboard guards
+    # an empty id (nothing to route a verdict to) the same way ask/plan do.
+    ev = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(command=ls)", tool_use_id=""
+    )
+    with pytest.raises(ValueError):
+        permission_keyboard(ev)
 
 
 def test_error_renders_verbatim_no_keyboard():
@@ -280,6 +351,62 @@ def test_callback_round_trip_plan(tid):
         assert cb is not None and cb.kind == "plan" and cb.plan_action == expected
 
 
+@pytest.mark.parametrize("tid", [REAL_TOOL_USE_ID, UUID_TOOL_USE_ID])
+def test_callback_round_trip_permission(tid):
+    for action_char, expected in (("o", "once"), ("s", "session"), ("d", "deny")):
+        data = encode_callback(KIND_PERMISSION, tid, payload=action_char)
+        cb = decode_callback(data)
+        assert cb is not None
+        assert cb.kind == "permission"
+        assert cb.tool_use_id == tid
+        assert cb.permission_action == expected
+
+
+def test_permission_callback_data_within_64_bytes_with_realistic_id():
+    # The byte-budget proof for the new kind: even a worst-case ~49-char toolu_ id
+    # ("m|<id>|<1-char action>") must fit Telegram's 64-byte callback_data limit. A
+    # literal "permission|<id>|session" would be ~68 B and blow it — hence 1-char
+    # kind + 1-char action code.
+    long_id = "toolu_" + "a" * 43  # 49 chars, the worst case the docstring cites
+    assert len(long_id) == 49
+    for action_char in ("o", "s", "d"):
+        data = encode_callback(KIND_PERMISSION, long_id, payload=action_char)
+        assert len(data.encode("utf-8")) <= CALLBACK_LIMIT
+    # The realistic SDK ids the keyboard actually builds with are well under budget too.
+    for tid in (REAL_TOOL_USE_ID, UUID_TOOL_USE_ID):
+        for action_char in ("o", "s", "d"):
+            data = encode_callback(KIND_PERMISSION, tid, payload=action_char)
+            assert len(data.encode("utf-8")) <= CALLBACK_LIMIT
+
+
+def test_encode_rejects_bad_permission_action():
+    # An unknown / multi-char / empty action char fails LOUDLY at build time.
+    for bad in ("x", "once", "", "O"):
+        with pytest.raises(ValueError):
+            encode_callback(KIND_PERMISSION, REAL_TOOL_USE_ID, payload=bad)
+    with pytest.raises(ValueError):
+        encode_callback(KIND_PERMISSION, REAL_TOOL_USE_ID)  # missing payload
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "m|tid|x",  # unknown action char -> None (NOT silently allowed)
+        "m|tid|O",  # case-sensitive: uppercase is not a valid action
+        "m|tid|once",  # multi-char payload (wrong arity for permission)
+        "m|tid|",  # empty payload
+        "m||o",  # empty id
+        "m|tid|o.o",  # extra index part the permission kind never uses
+        "m|only_two",  # wrong field count
+        "m|tid|o|extra",  # too many fields
+    ],
+)
+def test_decode_rejects_malformed_permission_data(bad):
+    # The trust boundary that feeds SB1/RB1 at T5: a tampered/stale permission tap with
+    # an unknown action char (or wrong shape) decodes to None, never a spurious verdict.
+    assert decode_callback(bad) is None
+
+
 def test_callback_data_is_within_64_bytes_with_real_uuid_and_max_indices():
     # The byte-budget proof: a real-length id + the largest indices a (1..4 questions,
     # many options) ask would realistically produce must still fit Telegram's 64-byte
@@ -291,6 +418,15 @@ def test_callback_data_is_within_64_bytes_with_real_uuid_and_max_indices():
     ask = make_ask(n_options=20, n_questions=4)
     for button in _all_buttons(ask_keyboard(ask)):
         assert len(button.callback_data.encode("utf-8")) <= CALLBACK_LIMIT
+
+
+def test_permission_keyboard_buttons_within_64_bytes():
+    # Every button the permission keyboard builds is within Telegram's budget, even
+    # with a real-length SDK tool_use_id.
+    for tid in (REAL_TOOL_USE_ID, UUID_TOOL_USE_ID):
+        markup = permission_keyboard(make_permission(tool_use_id=tid))
+        for button in _all_buttons(markup):
+            assert len(button.callback_data.encode("utf-8")) <= CALLBACK_LIMIT
 
 
 def test_encode_rejects_overlong_tool_use_id():
@@ -375,6 +511,25 @@ def test_end_to_end_button_to_answers_map():
 
 
 # ============================================================================
+# /yolo loud indicator (D6)
+# ============================================================================
+
+
+def test_yolo_banner_is_loud_nonempty_warning():
+    banner = yolo_banner()
+    assert banner  # non-empty
+    assert "⚠️" in banner  # loud, unambiguous (D6 — never silently on)
+    # It spells out that the bypass is active so it can't be missed.
+    assert "/unyolo" in banner
+
+
+def test_yolo_indicator_is_loud_nonempty_marker():
+    indicator = yolo_indicator()
+    assert indicator  # non-empty
+    assert "⚠️" in indicator  # loud prefix for each auto-allowed action (D6)
+
+
+# ============================================================================
 # Coalesce / throttle (RB5)
 # ============================================================================
 
@@ -452,6 +607,21 @@ def test_verbatim_ask_and_plan_flush_immediately():
         assert len(result.actions) == 1
         assert result.actions[0].op == "new"
         assert result.actions[0].verbatim is True
+
+
+def test_verbatim_permission_flushes_pending_status_then_itself():
+    clock = FakeClock()
+    coalescer = Coalescer(now=clock, min_interval=100.0)  # huge interval
+    coalescer.offer(TextEvent(text="status1", incremental=True))  # leading flush
+    coalescer.offer(TextEvent(text="status2", incremental=True))  # buffered (newest)
+    # A permission prompt is verbatim: it must flush pending status FIRST (ordering),
+    # then itself immediately, regardless of the throttle interval.
+    result = coalescer.offer(make_permission())
+    ops = [(a.op, a.text) for a in result.actions]
+    assert ops[0][0] == "edit_status" and ops[0][1] == "status2"  # pending flushed
+    assert ops[1][0] == "new"  # the permission prompt, verbatim + immediate
+    assert result.actions[1].verbatim is True
+    assert result.actions[1].reply_markup is not None
 
 
 def test_none_events_buffer_nothing():
