@@ -6,7 +6,7 @@ from claude_tg.claude_runner import ClaudeBusy, ClaudeResult
 from claude_tg.config import Config
 
 
-def make_config(allowed=(1,)):
+def make_config(allowed=(1,), *, allowed_roots=(), allow_any_path=False):
     return Config(
         bot_token="t",
         allowed_chat_ids=frozenset(allowed),
@@ -16,6 +16,8 @@ def make_config(allowed=(1,)):
         timeout_seconds=5,
         skip_permissions=True,
         state_file=None,
+        allowed_roots=allowed_roots,
+        allow_any_path=allow_any_path,
     )
 
 
@@ -25,6 +27,7 @@ class FakeRunner:
         self._raises = raises
         self.run_calls = []
         self.reset_calls = []
+        self.set_cwd_calls = []
         self.cwd = "/work"
 
     async def run(self, chat_id, text):
@@ -40,6 +43,7 @@ class FakeRunner:
         return self.cwd
 
     def set_cwd(self, chat_id, path):
+        self.set_cwd_calls.append((chat_id, path))
         if path == "/bad":
             raise NotADirectoryError(path)
         self.cwd = path
@@ -123,20 +127,37 @@ async def test_on_message_empty_text_no_run():
 
 
 async def test_cmd_cd_happy(tmp_path):
+    # tmp_path is outside the /work workdir; allow_any_path=True keeps SB2 from
+    # short-circuiting so this still exercises the happy set_cwd path (its intent).
     runner = FakeRunner()
-    bot = TelegramClaudeBot(make_config(), runner)
+    bot = TelegramClaudeBot(make_config(allow_any_path=True), runner)
     upd = make_update(1, "")
     await bot.cmd_cd(upd, make_ctx(args=[str(tmp_path)]))
-    assert runner.cwd == str(tmp_path)
-    assert str(tmp_path) in upd.message.reply_text.await_args.args[0]
+    # The runner is handed the CANONICAL path (resolve() may prepend /private on macOS).
+    assert runner.cwd == str(tmp_path.resolve())
+    assert str(tmp_path.resolve()) in upd.message.reply_text.await_args.args[0]
 
 
 async def test_cmd_cd_not_a_dir():
+    # allow_any_path=True so SB2 passes and the NotADirectoryError branch is reached
+    # (the original intent of this test). /bad does not exist -> runner raises.
     runner = FakeRunner()
-    bot = TelegramClaudeBot(make_config(), runner)
+    bot = TelegramClaudeBot(make_config(allow_any_path=True), runner)
     upd = make_update(1, "")
     await bot.cmd_cd(upd, make_ctx(args=["/bad"]))
     assert "not a directory" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_cd_default_confinement_rejects_out_of_root(tmp_path):
+    # NEW (SB2): with default confinement (allowed_roots confined to /work, no opt-out),
+    # a /cd to a path outside the root is REFUSED before the runner is touched.
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(allowed_roots=(Path("/work"),)), runner)
+    upd = make_update(1, "")
+    await bot.cmd_cd(upd, make_ctx(args=[str(tmp_path)]))  # tmp_path is outside /work
+    assert "not allowed" in upd.message.reply_text.await_args.args[0].lower()
+    assert runner.set_cwd_calls == [], "set_cwd must NOT be called on a refused path"
+    assert runner.cwd == "/work"  # unchanged
 
 
 async def test_cmd_cd_usage():

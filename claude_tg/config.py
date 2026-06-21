@@ -48,6 +48,31 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def parse_allowed_roots(raw: str, *, default: Path) -> tuple[Path, ...]:
+    """Parse the ``/cd`` confinement allow-list (SB2), tolerant of separators.
+
+    Splits ``raw`` on BOTH ``os.pathsep`` (``:`` on POSIX, ``;`` on Windows) AND comma
+    — mirroring :func:`parse_chat_ids`'s tolerance so the owner can use whichever feels
+    natural — and ``expanduser().resolve()`` each entry to a canonical absolute path.
+
+    **If none are given, returns ``(default,)``** — this is the locked design decision
+    (T8 / progress.md SB2): confinement is ON by default and the single default root is
+    the workdir (which itself defaults to ``$HOME``). The owner widens by listing roots
+    here, or disables containment entirely via ``ALLOW_ANY_PATH=true``. Returning the
+    default (never an empty tuple) means "unset" is safe-but-usable, while an explicitly
+    empty allow-list combined with ``allow_any=False`` would fail closed at resolve time.
+    """
+    roots: list[Path] = []
+    for part in raw.replace(os.pathsep, ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        roots.append(Path(part).expanduser().resolve())
+    if not roots:
+        return (default,)
+    return tuple(roots)
+
+
 #: Valid values for ENGINE_MODE (S4 flag). ``oneshot`` keeps today's behavior; the
 #: live bot is never broken until the owner flips to ``streaming``.
 ENGINE_MODES = ("oneshot", "streaming")
@@ -117,6 +142,15 @@ class Config:
     # ask/plan request before auto-denying + notifying. Default 60 min; T7 passes it
     # to the Engine. Only consulted in streaming mode.
     answer_backstop_seconds: int = DEFAULT_ANSWER_BACKSTOP_SECONDS
+    # SB2 /cd path confinement (decision-log: confinement ON by default). The canonical
+    # roots a `/cd` target must sit inside; the default is `(workdir,)` (set by
+    # from_env), so an unset ALLOWED_ROOTS confines /cd to the workdir (which itself
+    # defaults to $HOME). The owner widens via ALLOWED_ROOTS. An empty tuple combined
+    # with allow_any_path=False rejects every /cd (fail-closed, SB6).
+    allowed_roots: tuple[Path, ...] = ()
+    # SB2 explicit opt-out: ALLOW_ANY_PATH=true disables /cd containment entirely (the
+    # owner takes the wheel). Default False — confinement is the safe default (SB6).
+    allow_any_path: bool = False
 
     @classmethod
     def from_env(cls, dotenv_path: str | os.PathLike[str] | None = ".env") -> "Config":
@@ -156,6 +190,15 @@ class Config:
             os.environ.get("ANSWER_BACKSTOP_SECONDS")
         )
 
+        # SB2 /cd confinement. Default the allow-list to the workdir so an unset
+        # ALLOWED_ROOTS still confines /cd (ON by default); ALLOW_ANY_PATH=true is the
+        # explicit owner opt-out. workdir is already expanduser()'d above; resolve it so
+        # the default root is canonical and compares cleanly against canonical targets.
+        allowed_roots = parse_allowed_roots(
+            os.environ.get("ALLOWED_ROOTS", ""), default=workdir.resolve()
+        )
+        allow_any_path = _env_bool("ALLOW_ANY_PATH", False)
+
         return cls(
             bot_token=token,
             allowed_chat_ids=frozenset(allowed),
@@ -167,4 +210,6 @@ class Config:
             state_file=state_file,
             engine_mode=engine_mode,
             answer_backstop_seconds=answer_backstop,
+            allowed_roots=allowed_roots,
+            allow_any_path=allow_any_path,
         )

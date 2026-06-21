@@ -19,6 +19,7 @@ from telegram.ext import (
 
 from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
+from .paths import PathNotAllowed, resolve_within_roots
 from .stream_session import StreamingBusy, StreamingSession
 from .util import split_message
 
@@ -32,7 +33,7 @@ HELP_TEXT = (
     "/reset — start a fresh Claude session (forget context)\n"
     "/cancel — abort the in-flight run (streaming mode)\n"
     "/pwd — show the current working directory\n"
-    "/cd <path> — change the working directory\n"
+    "/cd <path> — change the working directory (confined to the permitted roots)\n"
 )
 
 
@@ -101,12 +102,29 @@ class TelegramClaudeBot:
     async def cmd_cd(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
             return
+        chat_id = update.effective_chat.id
         arg = " ".join(ctx.args).strip() if ctx.args else ""
         if not arg:
             await update.message.reply_text("Usage: /cd <path>")
             return
+        # SB2: canonicalize (resolves symlinks AND ..) and confine to ALLOWED_ROOTS
+        # BEFORE touching the runner. A path that escapes the permitted roots is
+        # refused here and never reaches set_cwd — this guard holds for BOTH oneshot
+        # and streaming modes (cmd_cd is shared). ALLOW_ANY_PATH=true is the opt-out.
         try:
-            new_cwd = self.runner.set_cwd(update.effective_chat.id, arg)
+            target = resolve_within_roots(
+                arg,
+                cwd=self.runner.get_cwd(chat_id),
+                allowed_roots=self.config.allowed_roots,
+                allow_any=self.config.allow_any_path,
+            )
+        except PathNotAllowed:
+            await update.message.reply_text(
+                f"❌ Path not allowed (outside the permitted roots): {arg}"
+            )
+            return
+        try:
+            new_cwd = self.runner.set_cwd(chat_id, str(target))
         except NotADirectoryError:
             await update.message.reply_text(f"❌ Not a directory: {arg}")
             return
