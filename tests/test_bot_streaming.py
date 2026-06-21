@@ -58,6 +58,7 @@ class FakeStreaming:
         self.resolve_calls = []
         self.cancel_calls = []
         self.reset_calls = []
+        self.yolo_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
         self._busy = busy
 
@@ -76,6 +77,9 @@ class FakeStreaming:
 
     def reset(self, chat_id):
         self.reset_calls.append(chat_id)
+
+    def set_yolo(self, chat_id, on):
+        self.yolo_calls.append((chat_id, on))
 
 
 def make_update(chat_id=1, text="hello"):
@@ -166,6 +170,28 @@ async def test_callback_from_unauthorized_chat_never_resolves():
     assert streaming.resolve_calls == []
 
 
+async def test_permission_callback_from_unauthorized_chat_never_resolves():
+    # SB1 for a PERMISSION tap: a forged "m|tid|s" (allow-for-session) from a chat that
+    # is NOT allowlisted must be answered + dropped — resolve_callback never reached, so
+    # an attacker cannot approve a risky tool. False-pass guard: if on_callback skipped
+    # the _authorized recheck for permission taps this would record a resolve call.
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_callback_update(chat_id=999, data="m|tid|s")  # NOT allowlisted
+    await bot.on_callback(upd, make_ctx())
+    upd.callback_query.answer.assert_awaited()
+    assert streaming.resolve_calls == []
+
+
+async def test_permission_callback_from_authorized_chat_routes_to_resolve():
+    streaming = FakeStreaming(outcome=CallbackOutcome(handled=True, note="Allowed once"))
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_callback_update(chat_id=1, data="m|tid|o")
+    await bot.on_callback(upd, make_ctx())
+    assert streaming.resolve_calls == [(1, "m|tid|o")]
+    upd.callback_query.answer.assert_awaited()
+
+
 async def test_callback_from_authorized_chat_routes_to_resolve():
     streaming = FakeStreaming(outcome=CallbackOutcome(handled=True, note="Answered: Red"))
     bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
@@ -241,6 +267,56 @@ async def test_cmd_reset_also_resets_streaming():
     upd = make_update(1, "/reset")
     await bot.cmd_reset(upd, make_ctx())
     assert streaming.reset_calls == [1]
+
+
+# ---------------------------------------------------------------------------
+# /yolo + /unyolo wiring (P2, D6).
+# ---------------------------------------------------------------------------
+
+
+async def test_cmd_yolo_streaming_sets_yolo_and_replies_loud_banner():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/yolo")
+    await bot.cmd_yolo(upd, make_ctx())
+    assert streaming.yolo_calls == [(1, True)]
+    # The reply is the LOUD banner — carries the ⚠️ glyph (allow-all never silent, D6).
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "⚠️" in reply
+
+
+async def test_cmd_unyolo_streaming_clears_yolo():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/unyolo")
+    await bot.cmd_unyolo(upd, make_ctx())
+    assert streaming.yolo_calls == [(1, False)]
+    assert "restored" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_yolo_oneshot_is_explained_not_applied():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/yolo")
+    await bot.cmd_yolo(upd, make_ctx())
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_yolo_unauthorized_ignored():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(999, "/yolo")
+    await bot.cmd_yolo(upd, make_ctx())
+    assert streaming.yolo_calls == []
+    upd.message.reply_text.assert_not_awaited()
+
+
+async def test_cmd_unyolo_unauthorized_ignored():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(999, "/unyolo")
+    await bot.cmd_unyolo(upd, make_ctx())
+    assert streaming.yolo_calls == []
+    upd.message.reply_text.assert_not_awaited()
 
 
 def test_build_application_registers_callback_handler():

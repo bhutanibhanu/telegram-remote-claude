@@ -233,7 +233,7 @@ def make_streaming_session(engine: FakeEngine, *, config=None, store=None) -> St
     return StreamingSession(
         config or make_config(engine_mode="streaming"),
         session_store=store,
-        engine_factory=lambda *, cwd, backstop_seconds: engine,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
         clock=lambda: 0.0,  # frozen clock: status edits are always "due"
     )
 

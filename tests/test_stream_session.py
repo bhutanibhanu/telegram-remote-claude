@@ -19,6 +19,7 @@ from claude_tg.config import Config
 from claude_tg.engine.types import (
     AskEvent,
     ErrorEvent,
+    PermissionDecision,
     PlanEvent,
     PlanVerdict,
     QuestionAnswer,
@@ -54,7 +55,7 @@ HOLD = object()  # sentinel in a script: park send() here until a resolve/cancel
 
 
 class FakeEngine:
-    def __init__(self, script: list, *, session_id="sess-1"):
+    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True):
         self._script = script
         self.session_id = session_id
         self.resolve_calls: list[tuple[str, object]] = []
@@ -62,6 +63,9 @@ class FakeEngine:
         self.started = False
         self.resumed: str | None = None
         self.stopped = False
+        # What resolve() returns — True = a pending request was resolved (the live
+        # path); False simulates a stale/already-decided id (nothing pending).
+        self._resolve_result = resolve_result
         # Set when send() parks on a HOLD; resolve()/cancel() set it to release.
         self._gate = asyncio.Event()
 
@@ -87,7 +91,7 @@ class FakeEngine:
     def resolve(self, tool_use_id: str, decision) -> bool:
         self.resolve_calls.append((tool_use_id, decision))
         self._gate.set()
-        return True
+        return self._resolve_result
 
     def cancel(self, tool_use_id=None) -> int:
         self.cancel_calls.append(tool_use_id)
@@ -117,7 +121,10 @@ def make_session(engine: FakeEngine, *, config=None, store=None, clock=None) -> 
     return StreamingSession(
         config or make_config(),
         session_store=store,
-        engine_factory=lambda *, cwd, backstop_seconds: engine,
+        # The factory accepts the chat's shared permission_policy (P2) but the scripted
+        # FakeEngine ignores it — the policy mutations under test act on state.policy
+        # directly (the SAME object the real engine would receive).
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
         clock=clock or (lambda: 0.0),  # frozen clock: every status edit is "due"
     )
 
@@ -281,6 +288,127 @@ async def test_ask_other_then_free_text_resolves_with_answer():
     rec = Recorder()
     await session.handle_message(1, "Charlie", send=rec.send, edit=rec.edit)
     assert engine.resolve_calls == [("tid", QuestionAnswer(answers={"Name?": "Charlie"}))]
+
+
+# ---------------------------------------------------------------------------
+# Permission taps (P2) — m|tid|o / |s / |d -> the engine's PermissionDecision verdict.
+# ---------------------------------------------------------------------------
+
+
+async def test_permission_allow_once_maps_to_decision():
+    engine = FakeEngine([])
+    session = make_session(engine)
+    await session._ensure_engine(session._chat(1), 1)
+
+    outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="o"))
+    assert outcome.handled is True
+    assert outcome.note == "Allowed once"
+    assert engine.resolve_calls == [("tid", PermissionDecision(verdict="allow_once"))]
+
+
+async def test_permission_allow_session_maps_to_decision():
+    # The SESSION only routes the verdict; the GRANT is recorded by the engine on
+    # resolve (T3 _verdict_for), so the session must NOT touch the policy here.
+    engine = FakeEngine([])
+    session = make_session(engine)
+    await session._ensure_engine(session._chat(1), 1)
+
+    outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="s"))
+    assert outcome.handled is True
+    assert outcome.note == "Allowed for session"
+    assert engine.resolve_calls == [("tid", PermissionDecision(verdict="allow_session"))]
+    # No grant recorded by the session itself (the engine owns that — fake doesn't).
+    assert session._chat(1).policy.granted_tools() == frozenset()
+
+
+async def test_permission_deny_maps_to_decision():
+    engine = FakeEngine([])
+    session = make_session(engine)
+    await session._ensure_engine(session._chat(1), 1)
+
+    outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="d"))
+    assert outcome.handled is True
+    assert outcome.note == "Denied"
+    assert engine.resolve_calls == [("tid", PermissionDecision(verdict="deny"))]
+
+
+async def test_permission_tap_with_no_active_engine_is_ignored():
+    engine = FakeEngine([])
+    session = make_session(engine)  # engine not started for this chat
+    outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="o"))
+    assert outcome.handled is False
+    assert engine.resolve_calls == []
+
+
+async def test_permission_tap_for_stale_request_returns_not_handled():
+    # A well-formed permission tap whose id has nothing pending (already decided /
+    # backstopped): the engine's resolve() returns False -> handled=False, benign note.
+    engine = FakeEngine([], resolve_result=False)
+    session = make_session(engine)
+    await session._ensure_engine(session._chat(1), 1)
+    outcome = session.resolve_callback(1, encode_callback("m", "gone", payload="o"))
+    assert outcome.handled is False
+    assert outcome.note == "no pending request"
+    # resolve() WAS attempted (id alone routes a permission verdict) but found nothing.
+    assert engine.resolve_calls == [("gone", PermissionDecision(verdict="allow_once"))]
+
+
+# ---------------------------------------------------------------------------
+# /yolo + /reset policy state (P2, D6/D7) on the shared per-chat policy.
+# ---------------------------------------------------------------------------
+
+
+async def test_set_yolo_flips_chat_policy():
+    engine = FakeEngine([])
+    session = make_session(engine)
+    assert session._chat(1).policy.yolo is False
+    session.set_yolo(1, True)
+    assert session._chat(1).policy.yolo is True
+    session.set_yolo(1, False)
+    assert session._chat(1).policy.yolo is False
+
+
+async def test_reset_clears_policy_grants_and_yolo():
+    # D7: /reset must drop allow-session grants AND turn /yolo off so the next session
+    # starts fail-closed. False-pass guard: if reset() skipped policy.clear() this fails.
+    engine = FakeEngine([])
+    session = make_session(engine)
+    state = session._chat(1)
+    state.policy.set_yolo(True)
+    state.policy.grant_session("Bash")
+    assert state.policy.yolo is True and state.policy.granted_tools() == frozenset({"Bash"})
+
+    session.reset(1)
+    assert state.policy.yolo is False
+    assert state.policy.granted_tools() == frozenset()
+
+
+async def test_driven_turn_shows_loud_yolo_indicator():
+    # D6 "loud throughout": with /yolo on, a driven turn leads with a ⚠️ marker so an
+    # in-progress allow-all session is never silent.
+    engine = FakeEngine(
+        [ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")]
+    )
+    session = make_session(engine)
+    session.set_yolo(1, True)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert any("⚠️" in s["text"] for s in rec.sends), "yolo turn must carry a loud ⚠️"
+
+
+async def test_driven_turn_has_no_yolo_indicator_when_off():
+    # Inverse: with the gate on (yolo off) no ⚠️ marker is prepended to the turn.
+    engine = FakeEngine(
+        [ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert not any("⚠️ YOLO" in s["text"] for s in rec.sends)
 
 
 # ---------------------------------------------------------------------------

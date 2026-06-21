@@ -20,6 +20,7 @@ from telegram.ext import (
 from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
 from .paths import PathNotAllowed, resolve_within_roots
+from .render import yolo_banner
 from .stream_session import StreamingBusy, StreamingSession
 from .util import split_message
 
@@ -32,6 +33,8 @@ HELP_TEXT = (
     "/help — this help\n"
     "/reset — start a fresh Claude session (forget context)\n"
     "/cancel — abort the in-flight run (streaming mode)\n"
+    "/yolo — run every tool with NO approval prompt this session (streaming mode)\n"
+    "/unyolo — restore the per-tool permission gate (streaming mode)\n"
     "/pwd — show the current working directory\n"
     "/cd <path> — change the working directory (confined to the permitted roots)\n"
 )
@@ -93,6 +96,45 @@ class TelegramClaudeBot:
             await update.message.reply_text(f"🛑 Cancelled ({aborted} pending request(s) aborted).")
         else:
             await update.message.reply_text("Nothing in flight to cancel.")
+
+    async def cmd_yolo(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Turn ON ``/yolo`` — every tool runs with NO approval prompt this session (P2, D6).
+
+        Streaming mode only (the permission gate is a streaming-engine concept; one-shot
+        has no per-tool gating). Mirrors :meth:`cmd_cancel`: the ``_ok`` allowlist guard
+        first, then delegate to the session. The reply is the LOUD enable banner
+        (``render.yolo_banner`` — carries the ``⚠️`` glyph) so allow-all is never silent
+        at toggle time; the session keeps it loud throughout each turn (D6).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if self.streaming is None:
+            await update.message.reply_text(
+                "Permission gating (and /yolo) applies to streaming mode only — "
+                "one-shot mode has no per-tool approval prompts."
+            )
+            return
+        self.streaming.set_yolo(update.effective_chat.id, True)
+        await update.message.reply_text(yolo_banner())
+
+    async def cmd_unyolo(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Turn OFF ``/yolo`` — restore the fail-closed per-tool permission gate (P2, D6).
+
+        Streaming mode only (mirrors :meth:`cmd_yolo`). After this, risky tools are held
+        for approval again. A clear confirmation so the operator knows gating is back on.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if self.streaming is None:
+            await update.message.reply_text(
+                "Permission gating (and /yolo) applies to streaming mode only — "
+                "one-shot mode has no per-tool approval prompts."
+            )
+            return
+        self.streaming.set_yolo(update.effective_chat.id, False)
+        await update.message.reply_text(
+            "✅ Gating restored — risky tools will ask for approval again (/yolo is off)."
+        )
 
     async def cmd_pwd(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
@@ -283,6 +325,8 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler(["start", "help"], self.cmd_help, filters=allowed))
         app.add_handler(CommandHandler("reset", self.cmd_reset, filters=allowed))
         app.add_handler(CommandHandler("cancel", self.cmd_cancel, filters=allowed))
+        app.add_handler(CommandHandler("yolo", self.cmd_yolo, filters=allowed))
+        app.add_handler(CommandHandler("unyolo", self.cmd_unyolo, filters=allowed))
         app.add_handler(CommandHandler("pwd", self.cmd_pwd, filters=allowed))
         app.add_handler(CommandHandler("cd", self.cmd_cd, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))

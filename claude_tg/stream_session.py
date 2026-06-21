@@ -47,13 +47,14 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import Optional, Protocol
+from dataclasses import dataclass, field
+from typing import Literal, Optional, Protocol
 
 from .config import Config
 from .engine import (
     AskEvent,
     Engine,
+    PermissionDecision,
     PlanEvent,
     PlanVerdict,
     QuestionAnswer,
@@ -61,12 +62,14 @@ from .engine import (
     SubstrateDecision,
 )
 from .engine.adapter_sdk import SdkSubstrate
+from .permissions import PermissionPolicy
 from .render import (
     Callback,
     Coalescer,
     RenderAction,
     answers_from_ask,
     decode_callback,
+    yolo_indicator,
 )
 
 log = logging.getLogger(__name__)
@@ -77,24 +80,51 @@ SendFn = Callable[..., Awaitable[Optional[int]]]
 #: A coroutine that edits an existing message's text in place (best-effort).
 EditFn = Callable[..., Awaitable[None]]
 
+#: The three operator verdicts the engine understands (mirrors PermissionDecision.verdict).
+PermissionVerdictName = Literal["allow_once", "allow_session", "deny"]
+
+#: Decoded permission tap action -> the engine's PermissionDecision verdict (P2,
+#: ADR-003 §2). ``render.decode_callback`` already constrains the action to these three.
+_PERMISSION_VERDICTS: dict[str, PermissionVerdictName] = {
+    "once": "allow_once",
+    "session": "allow_session",
+    "deny": "deny",
+}
+#: Verdict -> the short operator-facing toast for answer_callback_query (no secrets).
+_PERMISSION_NOTES: dict[PermissionVerdictName, str] = {
+    "allow_once": "Allowed once",
+    "allow_session": "Allowed for session",
+    "deny": "Denied",
+}
+
 
 class EngineFactory(Protocol):
     """Builds an :class:`Engine` for a chat (injected so tests pass a mock).
 
     The default production factory wires an :class:`SdkSubstrate` (Substrate A) with
     the engine's decision callback; tests pass a factory returning a scripted fake.
+    ``permission_policy`` is the chat's single per-session :class:`PermissionPolicy`
+    (P2, ADR-003): the SAME object the session mutates via ``/yolo`` and clears on
+    ``/reset``, handed in so the engine's gate and the session act on one policy.
     """
 
-    def __call__(self, *, cwd: str, backstop_seconds: float) -> Engine: ...
+    def __call__(
+        self, *, cwd: str, backstop_seconds: float, permission_policy: PermissionPolicy
+    ) -> Engine: ...
 
 
-def _default_engine_factory(*, cwd: str, backstop_seconds: float) -> Engine:
+def _default_engine_factory(
+    *, cwd: str, backstop_seconds: float, permission_policy: PermissionPolicy
+) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
     The substrate's ``decision_callback`` is the engine's own ``on_tool_request`` seam
-    (the async answer-hold). No bypass / skip-permissions flag is set — the engine's
-    P1 posture (auto-allow ordinary tools inside the single allowlisted chat) is the
-    default permission mode, unchanged (SB6).
+    (the async answer-hold + the P2 permission gate). No bypass / skip-permissions flag
+    is set (SB5): the engine consults the injected ``permission_policy`` and is
+    fail-closed by default — risky tools are held for approval unless a grant or
+    ``/yolo`` allows them. ``permission_policy`` is the chat's shared policy (the one the
+    session mutates), so ``/yolo``, allow-session grants, and ``/reset``-clear all act on
+    a single object.
     """
     engine: Engine
 
@@ -108,7 +138,11 @@ def _default_engine_factory(*, cwd: str, backstop_seconds: float) -> Engine:
         permission_mode="default",
         decision_callback=decision_callback,
     )
-    engine = Engine(substrate, backstop_seconds=backstop_seconds)
+    engine = Engine(
+        substrate,
+        backstop_seconds=backstop_seconds,
+        permission_policy=permission_policy,
+    )
     return engine
 
 
@@ -119,6 +153,11 @@ class _ChatState:
     cwd: str
     engine: Optional[Engine] = None
     started: bool = False
+    # The chat's single per-session permission policy (P2, ADR-003). A FRESH one per
+    # chat (fail-closed: no grants, yolo off). The SAME object is handed to the engine
+    # (so the engine's gate + allow-session grants act on it) and mutated by the session
+    # (/yolo via set_yolo, dropped by clear() on /reset).
+    policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     lock: asyncio.Lock = None  # type: ignore[assignment]
     # The status-line message id for in-place coalesced edits (created on first edit).
     status_message_id: Optional[int] = None
@@ -193,6 +232,18 @@ class StreamingSession:
     def get_cwd(self, chat_id: int) -> str:
         return self._chat(chat_id).cwd
 
+    def set_yolo(self, chat_id: int, on: bool) -> None:
+        """Flip the chat's ``/yolo`` allow-all bit on its shared policy (P2, D6).
+
+        ``/yolo`` -> ``True`` (every tool runs with NO approval prompt this session);
+        ``/unyolo`` -> ``False`` (the fail-closed gate is restored). Mutates the SAME
+        :class:`PermissionPolicy` object the engine's gate consults, so the bypass takes
+        effect immediately for in-flight and subsequent turns. The bot makes the toggle
+        loud (the enable banner); :meth:`_drive_turn` keeps it loud throughout (the
+        persistent ``⚠️`` turn marker). Cleared by :meth:`reset` (D7).
+        """
+        self._chat(chat_id).policy.set_yolo(on)
+
     # -- engine lifecycle ----------------------------------------------------
 
     async def _ensure_engine(self, state: _ChatState, chat_id: int) -> Engine:
@@ -207,7 +258,9 @@ class StreamingSession:
         if state.engine is not None and state.started:
             return state.engine
         engine = state.engine or self._engine_factory(
-            cwd=state.cwd, backstop_seconds=float(self.config.answer_backstop_seconds)
+            cwd=state.cwd,
+            backstop_seconds=float(self.config.answer_backstop_seconds),
+            permission_policy=state.policy,
         )
         state.engine = engine
         resume_id = self._resume_ids.get(chat_id)
@@ -226,9 +279,12 @@ class StreamingSession:
     def reset(self, chat_id: int) -> None:
         """Drop the chat's session so the next turn starts fresh (harvested /reset).
 
-        Clears the persisted resume id and any in-memory engine + pending state. A
-        running turn (holding the lock) is not force-killed here; ``/cancel`` aborts a
-        live turn. This mirrors the one-shot runner's ``reset``.
+        Clears the persisted resume id and any in-memory engine + pending state, AND
+        wipes the chat's :class:`PermissionPolicy` (drops every allow-session grant and
+        turns ``/yolo`` off — D7) so a reset/new session always restarts **fail-closed**:
+        no inherited grants, no silently-resumed allow-all posture. A running turn
+        (holding the lock) is not force-killed here; ``/cancel`` aborts a live turn. This
+        mirrors the one-shot runner's ``reset``.
         """
         self._resume_ids.pop(chat_id, None)
         state = self._chats.get(chat_id)
@@ -237,6 +293,8 @@ class StreamingSession:
             state.started = False
             state.status_message_id = None
             self._clear_pending(state)
+            # D7: drop grants + yolo so the next session starts fail-closed.
+            state.policy.clear()
         self._persist(chat_id, session_id=None)
 
     def _persist(self, chat_id: int, *, session_id: Optional[str]) -> None:
@@ -297,10 +355,19 @@ class StreamingSession:
         send: SendFn,
         edit: EditFn,
     ) -> None:
-        """Iterate ``engine.send`` → render → Telegram send/edit (coalesced)."""
+        """Iterate ``engine.send`` → render → Telegram send/edit (coalesced).
+
+        D6 "loud throughout": if the chat's policy has ``/yolo`` on, lead the turn with a
+        persistent ``⚠️`` marker (its OWN message, before any event renders) so an
+        in-progress allow-all session is never silent — the bypass shows on every turn,
+        not just at the ``/yolo`` toggle. A plain ``send`` (no coalescer / no status-line
+        edit) so it cannot be overwritten by the in-place status edits that follow.
+        """
         coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
         # Status line for THIS turn starts unset; create on first edit_status.
         state.status_message_id = None
+        if state.policy.yolo:
+            await send(text=yolo_indicator(), reply_markup=None, parse_mode=None)
         async for event in engine.send(prompt):
             # Remember an ask/plan so a tap can reconstruct the native answer.
             if isinstance(event, AskEvent):
@@ -404,6 +471,8 @@ class StreamingSession:
             return self._arm_ask_other(state, decoded)
         if decoded.kind == "plan":
             return self._resolve_plan(state, engine, decoded)
+        if decoded.kind == "permission":
+            return self._resolve_permission(engine, decoded)
         return CallbackOutcome(handled=False, note="ignored")
 
     def _resolve_ask_option(
@@ -454,6 +523,31 @@ class StreamingSession:
         state.awaiting_text_mode = "plan_reject"
         state.awaiting_text_question_index = None
         return CallbackOutcome(handled=True, note="Type your feedback", expects_text=True)
+
+    def _resolve_permission(
+        self, engine: Engine, decoded: Callback
+    ) -> "CallbackOutcome":
+        """Route a permission tap to the held risky-tool request (P2, ADR-003 §2).
+
+        Maps the decoded ``permission_action`` to the engine's three-way
+        :class:`~claude_tg.engine.types.PermissionDecision` verdict and resolves the held
+        request by ``tool_use_id`` (no held-event lookup needed — the verdict needs no
+        indices, unlike ask/plan; the id alone routes it). Lock-free like the ask/plan
+        resolve: it unblocks the held turn parked inside ``engine.send``.
+
+        **The allow-session GRANT is recorded by the engine on resolve** (T3
+        ``Engine._verdict_for``), NOT here — the session only translates the tap to a
+        verdict and routes it. A stale/forged tap that resolves nothing (no live engine,
+        already decided, backstopped) returns ``handled=False`` with a benign note.
+        """
+        verdict = _PERMISSION_VERDICTS.get(decoded.permission_action or "")
+        if verdict is None:  # unknown action (defensive; decode already validates)
+            return CallbackOutcome(handled=False, note="ignored")
+        resolved = engine.resolve(decoded.tool_use_id, PermissionDecision(verdict=verdict))
+        if resolved:
+            return CallbackOutcome(handled=True, note=_PERMISSION_NOTES[verdict])
+        # Nothing pending for this id — already decided / backstopped / cancelled.
+        return CallbackOutcome(handled=False, note="no pending request")
 
     def _resolve_free_text(self, state: _ChatState, text: str) -> None:
         """Resolve a pending "Other"/reject with the just-typed ``text``; clear the marker.
