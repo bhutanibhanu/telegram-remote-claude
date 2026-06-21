@@ -2,6 +2,11 @@
 
 _Plan generated 2026-06-21 from design.md · 9 tasks (+ T10, a verify-found fix) · autonomous supervised build_
 
+> **✅ P1 COMPLETE (2026-06-21).** T1–T10 done, committed, and pushed on `feat/streaming-engine`. The live
+> end-to-end verify (T9) is **PASS** against real Claude (host CLI auth, no API key). Remaining before
+> cutover: owner phone-verify per [`verify.md`](verify.md), then flip `ENGINE_MODE=streaming`. Per-tool
+> permission gating is **P2**.
+
 > **P1 — interactive streaming session engine.** Builds on ADR-001 (Substrate A =
 > `claude-agent-sdk==0.2.105`). Ships behind `ENGINE_MODE` (`oneshot` default → `streaming`); the
 > live one-shot bot is never broken. Per-tool permission gating is **P2** (not here); multi-project
@@ -29,7 +34,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks (+ T10, a verify-found fix)
 - [x] T6 — Render layer: events→Telegram, inline keyboards, coalesce/throttle (RB5) · unit (6b9cf11)
 - [x] T7 — Wire bot.py: ENGINE_MODE switch + SB1 callback handler + /cancel + routing · unit (3b90693)
 - [x] T8 — /cd path policy (SB2) + SB/RB test suite (RB7) · unit (45937a9)
-- [ ] T9 — Live end-to-end verify (programmatic, real Claude) + owner phone-verify checklist · live probe
+- [x] T9 — Live end-to-end verify (programmatic, real Claude) + owner phone-verify checklist · live probe (7c6e5ba)
 - [x] T10 — Dedup duplicate ask/plan emission (engine; found by T9 live verify) · unit (de65998)
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
@@ -267,7 +272,21 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - The owner checklist SHALL give exact steps to run `/grill` (or an AskUserQuestion-emitting flow) from a real chat under `ENGINE_MODE=streaming` and confirm: option buttons + answer + continuation, plan approve/reject+feedback, live coalesced rendering, `/cancel`.
   - No API key; effects contained; evidence scrubbed (SB3).
 - **Tests:** none — live verdict + transcript + owner checklist are the artifacts.
-- **Status:** todo
+- **Status:** done (7c6e5ba) — `spikes/p1-live-verify/verify_streaming.py` drives the **real** engine
+  end-to-end against **real Claude** with code-injected operator decisions (mirrors the bot's resolve path),
+  + the owner phone-verify checklist `docs/features/streaming-engine/verify.md`. **LIVE run (host CLI auth,
+  NO API key, 69.6s): OVERALL PASS** — V1 AskUserQuestion answered via the native answers-map (code-chosen
+  label echoed back), V2 ExitPlanMode approve proceeds, V3 reject+feedback revises on the deny-message
+  channel, V4 context retained across 2 turns in one session + clean stop, V5 `/cancel` unwinds a held ask
+  cleanly + session stays usable (RB4). Each predicate is code-driven (a random marker the model can only
+  surface via the injected decision → can't false-pass) and tolerant of model nondeterminism. **Containment
+  held:** temp cwd OUTSIDE the repo, `git status` unchanged before/after, no leaked CLI pids, evidence
+  scrubbed (SB3) + secret-scan clean; a `--mock` mode self-tests the drive-loop deterministically. **The
+  live probe SURFACED a real bug** (duplicate ask/plan emission that lost the v3 reject + made v5 cancel
+  abort 0) → fixed in **T10**; the committed evidence is the post-fix re-run (PASS). Note: plan mode is used
+  to elicit `ExitPlanMode` (as P0/C4 did); the engine's plan-verdict path is mode-independent, so it is still
+  the real engine path under test. Scope: new `spikes/p1-live-verify/` + `docs/.../verify.md` only; no
+  production code changed.
 
 ### T10 — Dedup duplicate ask/plan emission (engine; found by T9 live verify)
 - **Goal:** Ensure each interactive `ask`/`plan` reaches the operator exactly ONCE (no duplicate keyboard,
