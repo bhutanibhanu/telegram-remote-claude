@@ -25,7 +25,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised bu
 - [x] T2 — ADR-002: async answer-hold mechanism · doc (36652c9)
 - [x] T3 — CI + project test harness baseline · config (a4560f3)
 - [x] T4 — Engine core: normalized types + substrate seam (A adapter) + lifecycle + events-out · unit (mock) (cbfef05)
-- [ ] T5 — Decisions-in + async answer-hold + 60-min backstop + cancel · unit (mock)
+- [x] T5 — Decisions-in + async answer-hold + 60-min backstop + cancel · unit (mock) (f050f57)
 - [ ] T6 — Render layer: events→Telegram, inline keyboards, coalesce/throttle (RB5) · unit
 - [ ] T7 — Wire bot.py: ENGINE_MODE switch + SB1 callback handler + /cancel + routing · unit
 - [ ] T8 — /cd path policy (SB2) + SB/RB test suite (RB7) · unit
@@ -145,7 +145,22 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN `/cancel` is issued on a waiting run, the engine SHALL abort the pending request cleanly without wedging state (RB4).
   - A pending request SHALL be keyed so the answer routes to the correct request (`tool_use_id` / request id) — forward-compatible toward P4/P5 correlation.
 - **Tests:** unit — answer routing, plan verdict honoring, backstop auto-resolve, cancel; mock substrate; deterministic timers (no real 60-min wait).
-- **Status:** todo
+- **Status:** done (f050f57) — `claude_tg/engine/pending.py` (`PendingRegistry`): a per-request
+  `asyncio.Future[Decision]` keyed by `tool_use_id`, awaited inside the decision callback, resolved by
+  exactly one of (a) operator `resolve(tool_use_id, decision)`, (b) a per-request **backstop timer**
+  (auto-resolve → DENY + notify; default 60 min via `ANSWER_BACKSTOP_SECONDS`, injectable for tests), or
+  (c) `cancel(tool_use_id|None)` (clean deny abort). `engine.py`: `on_tool_request` routes ask/plan →
+  `_answer_hold` (injects the `AskEvent`/`PlanEvent` with `tool_use_id` onto the turn's `asyncio.Queue`
+  merge stream so the operator sees it, then awaits the pending), and **ordinary tools → auto-allow**
+  (P1 interim per S3 — NO per-tool gating, NO bypass flag; P2 replaces this branch). `send()` merges the
+  bounded substrate stream + injected events via a producer/consumer queue (no deadlock; producer cancelled
+  in `finally`). Decisions mapped through the single `decision_to_substrate`. **Verified by me on 0.2.105:**
+  pytest **123 passed** (+24), ruff clean, mypy clean (13 files), secret-scan clean; tests deterministic
+  (0.05 s backstop, no real waits) and the end-to-end `HoldingSubstrate` would HANG if `resolve`/backstop
+  failed to unblock (can't false-pass). **One fresh independent reviewer (concurrency-focused: 12 adversarial
+  no-hang/no-leak/no-race probes + RB4 + contract) AGREES done, no required fixes.** RB4 honored
+  (cancel + backstop don't wedge; session usable after); RB1 (stray/late `resolve` no-crash). Scope:
+  adapter/substrate/types/bot/runner/main/spikes untouched; T4 seam signature unchanged.
 
 ### T6 — Render layer: events→Telegram, inline keyboards, coalesce/throttle (RB5)
 - **Goal:** Map normalized events to Telegram output — verbatim for meaningful output (questions/plans/errors/results), one-liner/status otherwise; inline keyboards for `ask` (one button per option + "Other") and `plan` (`[Approve]`/`[Reject + feedback]`); coalesce + throttle updates (edit-in-place status message; respect ~1 msg/s/chat).
