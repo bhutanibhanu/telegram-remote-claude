@@ -22,7 +22,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised bu
 
 ## Task list
 - [x] T1 — Async-latency de-risk spike (answer-hold) ⭐ **GATE** · live probe (18476f7 — PASS)
-- [ ] T2 — ADR-002: async answer-hold mechanism · doc
+- [x] T2 — ADR-002: async answer-hold mechanism · doc (36652c9)
 - [ ] T3 — CI + project test harness baseline · config
 - [ ] T4 — Engine core: normalized types + substrate seam (A adapter) + lifecycle + events-out · unit (mock)
 - [ ] T5 — Decisions-in + async answer-hold + 60-min backstop + cancel · unit (mock)
@@ -73,7 +73,15 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - ADR-002 SHALL document the hold/resolve/timeout(backstop)/cancel mechanism grounded in T1's recorded evidence (no claim beyond what T1 observed); status **Proposed**; consistent with ADR-001.
   - IF T1 was PARTIAL/FAIL, ADR-002 SHALL state the constrained shape / required redesign instead.
 - **Tests:** none — documentation deliverable.
-- **Status:** todo
+- **Status:** done (36652c9) — `docs/adr/ADR-002-async-answer-hold.md` written, status **Proposed**, grounded
+  in T1's PASS evidence (120s/300s holds honored; SDK has no `fail_after` on the inbound `can_use_tool`).
+  **Decision:** answer-hold = an engine-side `PendingDecision` Future per request (keyed by `tool_use_id` +
+  session id), awaited inside `can_use_tool`, resolved by (a) the operator's SB1-checked Telegram decision,
+  (b) a **harness-side backstop timer** (auto-resolve → DENY+notify; default 60 min, configurable), or
+  (c) `/cancel` — the engine never relies on the SDK to bound the hold. Carries the reviewer caveat: the
+  **5–60 min CLI-side ceiling is UNTESTED** (extrapolated from ≤5 min + the no-timeout fact) → backstop below
+  any observed ceiling, keep-alive if needed, optional ~10–15 min ceiling probe before long holds. Claims
+  audited against T1 evidence; consistent with ADR-001 + the normalized-interface decisions-in contract.
 
 ### T3 — CI + project test harness baseline
 - **Goal:** Stand up GitHub Actions CI (decision-log #6) gating merges, and ensure the existing behavioral test snapshot runs as regression coverage; substrate mocked, no live Claude/network in CI.
