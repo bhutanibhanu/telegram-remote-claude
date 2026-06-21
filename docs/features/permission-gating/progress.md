@@ -36,7 +36,7 @@ _Plan generated 2026-06-21 from design.md · 8 tasks · autonomous supervised bu
 - [x] T3 — Engine approval gate: classify + hold-for-approval + verdict mapping · unit (mock) (aeb29ac)
 - [x] T4 — Render permission prompt + `permission` callback kind + `/yolo` indicator · unit (c4779e5)
 - [x] T5 — Bot/session wiring: route taps (SB1) + grants + `/yolo`/`/unyolo` + reset-clear · unit (bf70dc7)
-- [ ] T6 — SB5 posture: no streaming bypass + blast-radius docs + fail-closed config · unit + docs
+- [x] T6 — SB5 posture: no streaming bypass + blast-radius docs + fail-closed config · unit + docs (e6bc40a)
 - [ ] T7 — SB/RB test matrix (SB5/SB1/RB4 + classifier + allow-once-vs-session + post-approval-gated) · unit
 - [ ] T8 — Live end-to-end verify (real Claude) + owner phone-verify checklist · live probe
 
@@ -203,7 +203,17 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
     SHALL be documented (SB6).
 - **Tests:** unit — assert the streaming command/path builds **no** skip-permissions flag; `yolo` off by
   default. (Docs otherwise.)
-- **Status:** todo
+- **Status:** done (e6bc40a) — SB5 posture confirmed + documented. Streaming path = `permission_mode="default"`
+  + the `can_use_tool` gate + the shared `PermissionPolicy`, **no** `--dangerously-skip-permissions` /
+  allow-all flag → fail-closed by default; `/yolo` is the only bypass (off by default, loud). Guard tests
+  (`test_security_reliability.py`): the factory wires default-mode + gate + shared policy and no bypass;
+  `PermissionPolicy().yolo` is False + `yolo_banner` is loud (⚠️). `design.md` gains a **"Security posture &
+  blast radius (SB5/SB6)"** section: the trust-model shift (approval gates + path policy, not bypass), the
+  one-shot legacy exception (D3 — no `ENGINE_MODE` flip), and the blast radius (single operator/chat;
+  classifier fail-closed; `cwd` not an OS sandbox; plan-approval greenlights nothing — ADR-001 caveat; full
+  SB consolidation = P6). **Verified by me on 0.2.105:** pytest **333 passed** (+2), ruff/mypy/secret-scan
+  clean. Done directly (docs + structural guards, like T1's ADR); behavioral SB5 (`/yolo` via the bot) is in
+  the T7 matrix. Scope: `design.md` + `test_security_reliability.py`.
 
 ### T7 — SB/RB test matrix (SB5/SB1/RB4 + classifier + allow-once-vs-session + post-approval-gated)
 - **Goal:** The dedicated P2 security + reliability tests the cross-cutting baseline requires (RB7).
