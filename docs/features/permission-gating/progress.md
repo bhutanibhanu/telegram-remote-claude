@@ -35,7 +35,7 @@ _Plan generated 2026-06-21 from design.md · 8 tasks · autonomous supervised bu
 - [x] T2 — Risk classifier + per-session policy state (`permissions.py`) · unit (81185f2)
 - [x] T3 — Engine approval gate: classify + hold-for-approval + verdict mapping · unit (mock) (aeb29ac)
 - [x] T4 — Render permission prompt + `permission` callback kind + `/yolo` indicator · unit (c4779e5)
-- [ ] T5 — Bot/session wiring: route taps (SB1) + grants + `/yolo`/`/unyolo` + reset-clear · unit
+- [x] T5 — Bot/session wiring: route taps (SB1) + grants + `/yolo`/`/unyolo` + reset-clear · unit (bf70dc7)
 - [ ] T6 — SB5 posture: no streaming bypass + blast-radius docs + fail-closed config · unit + docs
 - [ ] T7 — SB/RB test matrix (SB5/SB1/RB4 + classifier + allow-once-vs-session + post-approval-gated) · unit
 - [ ] T8 — Live end-to-end verify (real Claude) + owner phone-verify checklist · live probe
@@ -174,7 +174,19 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - No bypass flag SHALL be introduced on the streaming path (SB5/SB6).
 - **Tests:** unit (mock engine) — tap→verdict routing, SB1 forged/non-allowlisted tap ignored, allow-session
   suppression, `/yolo`+`/unyolo`, `/reset` clears grants+yolo.
-- **Status:** todo
+- **Status:** done (bf70dc7) — `bot.py` + `stream_session.py` wire the gate. A single per-chat
+  `PermissionPolicy` (fresh, fail-closed) is **shared** engine↔session: `_ChatState.policy` is threaded
+  through the `EngineFactory` → `Engine(permission_policy=…)`, so `/yolo` + the engine's allow-session grant
+  + `/reset`-clear all act on ONE object. `resolve_callback` `permission` branch → `_resolve_permission`
+  maps the tap (once/session/deny) → `PermissionDecision` → `engine.resolve` (grant recorded **engine-side**,
+  T3 — not here). `/yolo` + `/unyolo` commands (allowlisted via `_ok`; streaming-only; loud `yolo_banner`
+  reply) registered with the `allowed` filter; **`on_callback`/`_authorized` UNCHANGED** (permission taps
+  ride the existing SB1-checked handler). `_drive_turn` leads each turn with a standalone ⚠️
+  `yolo_indicator()` while yolo on (D6, uncoalescable). `reset` → `policy.clear()` (D7). **Verified by me on
+  0.2.105:** pytest **331 passed** (+16), ruff/mypy/secret-scan clean. **One fresh independent reviewer
+  AGREES done** — load-bearing probes confirmed (drop `reset` `clear()` → /reset test fails; drop
+  `_authorized` → unauthorized permission-tap test fails), shared-policy + verdict mapping correct. Scope:
+  `bot.py`/`stream_session.py` + 3 test files; engine/permissions/render/config/main untouched.
 
 ### T6 — SB5 posture: no streaming bypass + blast-radius docs + fail-closed config
 - **Goal:** Ensure the streaming default introduces no bypass, document the trust-model shift + the one-shot
