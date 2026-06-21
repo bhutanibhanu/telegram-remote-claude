@@ -37,7 +37,7 @@ _Plan generated 2026-06-21 from design.md · 8 tasks · autonomous supervised bu
 - [x] T4 — Render permission prompt + `permission` callback kind + `/yolo` indicator · unit (c4779e5)
 - [x] T5 — Bot/session wiring: route taps (SB1) + grants + `/yolo`/`/unyolo` + reset-clear · unit (bf70dc7)
 - [x] T6 — SB5 posture: no streaming bypass + blast-radius docs + fail-closed config · unit + docs (e6bc40a)
-- [ ] T7 — SB/RB test matrix (SB5/SB1/RB4 + classifier + allow-once-vs-session + post-approval-gated) · unit
+- [x] T7 — SB/RB test matrix (SB5/SB1/RB4 + classifier + allow-once-vs-session + post-approval-gated) · unit (12da401)
 - [ ] T8 — Live end-to-end verify (real Claude) + owner phone-verify checklist · live probe
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
@@ -229,7 +229,17 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - **post-approval still gated** — a second risky tool after one approval still prompts; approving a plan
     does NOT free subsequent risky tools (the ADR-001 caveat).
 - **Tests:** unit — the matrix above; substrate/engine mocked; no live Claude/network.
-- **Status:** todo
+- **Status:** done (12da401) — a consolidated, clearly-labeled P2 SB/RB matrix in `test_security_reliability.py`
+  (9 new tests + an audit index mapping each RB7 item → its dedicated test). Covers: **SB5** behavioral (risky
+  HOLDS by default; `/yolo` runs free), **SB1** (forged permission tap never allows), **RB4** (permission
+  cancel + backstop → deny, session usable), **classifier** (safe/risky/unknown/WebFetch/`mcp__*`/WebSearch),
+  allow-once-re-holds vs allow-session-suppresses (+ a different tool still holds), **canned-deny** relays
+  `DENIED_MESSAGE`, and the load-bearing **NEW post-approval / plan-approval** tests (approving a plan or one
+  tool does NOT greenlight a DIFFERENT risky tool — ADR-001 caveat, driven end-to-end through the real
+  `Engine`). **Verified by me on 0.2.105:** pytest **342 passed** (+9), ruff/mypy/secret-scan clean;
+  tests-only. **One fresh independent reviewer AGREES done** — all 9 drive the REAL `Engine` (not vacuous),
+  the plan-approval-caveat test is empirically load-bearing (2 injected leak mutations → FAIL), audit index
+  accurate, overlap honestly labeled (no dead-weight). Scope: `test_security_reliability.py` only.
 
 ### T8 — Live end-to-end verify (real Claude) + owner phone-verify checklist
 - **Goal:** Prove the gate works **live** end-to-end against real Claude with code-injected verdicts, and
