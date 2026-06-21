@@ -37,6 +37,8 @@ HELP_TEXT = (
     "/unyolo — restore the per-tool permission gate (streaming mode)\n"
     "/pwd — show the current working directory\n"
     "/cd <path> — change the working directory (confined to the permitted roots)\n"
+    "\nAny *other* slash-command (e.g. /grill, /pipeline, /scaffold) is forwarded "
+    "verbatim and runs as a skill in the Claude session.\n"
 )
 
 
@@ -179,8 +181,43 @@ class TelegramClaudeBot:
         text = (update.message.text or "").strip()
         if not text:
             return
-        chat_id = update.effective_chat.id
+        await self._run_turn(update, ctx, update.effective_chat.id, text)
 
+    async def on_skill_command(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Forward any *unregistered* slash-command verbatim to the active session (P3, D1).
+
+        Registered as ``MessageHandler(allowed & filters.COMMAND, …)`` **after** the
+        specific ``CommandHandler``s, so PTB's first-match-wins routing means a real bot
+        command (``/reset``, ``/cd``, …) is consumed by its own handler and only an
+        *unregistered* command (``/grill``, ``/pipeline``, …) falls through to here. The
+        text is then run as an ordinary turn — the same dispatch path :meth:`on_message`
+        uses — so the slash-command launches that skill in the live session.
+
+        SB1: this is a new inbound surface, so it carries the SAME guards as every other
+        handler — the ``allowed`` filter on the registration AND the ``_ok`` recheck below
+        (defense in depth). A non-allowlisted chat reaches neither the runner nor the
+        streaming session. RB1: a missing/empty/whitespace command no-ops (after strip),
+        and ``/`` only / unicode garbage is just forwarded as a turn — the handler never
+        raises and the session stays usable. The command is forwarded VERBATIM (leading
+        ``/`` and args intact); we do not validate, rewrite, or allowlist skill names (D1/D2).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        text = (update.message.text or "").strip()
+        if not text:
+            return
+        await self._run_turn(update, ctx, update.effective_chat.id, text)
+
+    async def _run_turn(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str
+    ) -> None:
+        """Run ``text`` as one turn for ``chat_id`` — the shared dispatch both the message
+        handler and the skill-launch passthrough route through (one path, no duplication).
+
+        Streaming mode hands the turn to the :class:`StreamingSession`; one-shot mode runs
+        it through the runner and replies (chunked). Callers MUST have already done the
+        ``_ok`` allowlist recheck and the empty-text guard.
+        """
         if self.streaming is not None:
             await self._on_message_streaming(update, ctx, chat_id, text)
             return
@@ -200,8 +237,8 @@ class TelegramClaudeBot:
             await asyncio.gather(typing, return_exceptions=True)
 
         if result.ok:
-            text = result.text if (result.text and result.text.strip()) else "✅ (Claude returned no text.)"
-            await self._reply_chunked(update, text)
+            reply = result.text if (result.text and result.text.strip()) else "✅ (Claude returned no text.)"
+            await self._reply_chunked(update, reply)
         else:
             await self._reply_chunked(update, f"⚠️ {result.error or 'Something went wrong.'}")
 
@@ -330,6 +367,13 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("pwd", self.cmd_pwd, filters=allowed))
         app.add_handler(CommandHandler("cd", self.cmd_cd, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))
+        # P3 skill-launch passthrough (D1): forward any *unregistered* slash-command verbatim
+        # to the session. Registered AFTER the specific CommandHandlers above so PTB's
+        # first-match-wins routing lets a real bot command (/reset, /cd, …) be consumed by
+        # its own handler — only an unregistered command (/grill, /pipeline, …) falls through
+        # here. SB1: same `allowed` chat filter as every other handler (the `_ok` recheck
+        # inside on_skill_command is defense in depth).
+        app.add_handler(MessageHandler(allowed & filters.COMMAND, self.on_skill_command))
         # SB1 (callback taps): PTB's CallbackQueryHandler filters by callback_data
         # *pattern*, not by chat (no `filters=` like MessageHandler), so the authoritative
         # allowlist gate for a tap is the explicit `_authorized` recheck inside
