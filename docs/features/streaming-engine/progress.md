@@ -21,7 +21,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised bu
   **RB5** rate-limit safety (throttle/coalesce under burst) · **RB7** each of RB1/RB2/RB5 has a test — T8.
 
 ## Task list
-- [ ] T1 — Async-latency de-risk spike (answer-hold) ⭐ **GATE** · live probe
+- [x] T1 — Async-latency de-risk spike (answer-hold) ⭐ **GATE** · live probe (18476f7 — PASS)
 - [ ] T2 — ADR-002: async answer-hold mechanism · doc
 - [ ] T3 — CI + project test harness baseline · config
 - [ ] T4 — Engine core: normalized types + substrate seam (A adapter) + lifecycle + events-out · unit (mock)
@@ -45,7 +45,25 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN a pending request exceeds a **configurable backstop** (tested at a SHORT interval, e.g. 60–120 s — NOT a literal 60-min wait), the harness SHALL auto-resolve (deny) and the session SHALL remain usable (RB4-shape).
   - The check SHALL emit a clear **PASS / PARTIAL / FAIL** with evidence; **a FAIL/PARTIAL GATES the engine** (stop + escalate to owner; do not build T4+ until resolved or the answer flow is redesigned). No API key (host CLI auth). Effects contained; evidence scrubbed + secret-scanned (SB3).
 - **Tests:** none — the verdict + scrubbed transcript is the artifact (mirrors P0 evidence policy).
-- **Status:** todo
+- **Status:** done (18476f7) — **PASS — GATE GREEN, engine (T4+) may proceed.** Live run (15.2 min, host CLI
+  auth, no API key): **120 s** holds inside `can_use_tool` were honored on ALLOW (tool executed), DENY (tool
+  blocked), and the **native AskUserQuestion `answers`-map** (session continued on the code-chosen label
+  `Bravo`); a **300 s (5-min) ceiling probe** showed **no ceiling**; a **harness-side backstop** auto-resolved a
+  pending decision (DENY + notify) at 60 s and the **same session stayed usable** (2nd turn OK). Root cause
+  confirmed at SDK source (`claude_agent_sdk/_internal/query.py`): the inbound `can_use_tool` control request is
+  `await`ed with **no `fail_after`/timeout** (the 60 s timeout is OUTBOUND only), so the SDK does not bound the
+  hold — the **60-min backstop is implementable engine-side as a timer over a pending-decision Future** (the T1.5
+  pattern). Containment: no leaked CLI pids, repo untouched during the run, deny-by-default path policy; evidence
+  scrubbed (the unscrubbed stdout redirect log was dropped before commit). **Two fresh independent reviewers
+  (acceptance + adversarial) both AGREE PASS**, each confirming the SDK no-timeout fact at source and reproducing
+  the wiring via a fast smoke. **CAVEAT for ADR-002 (T2):** the 60-min figure is an **extrapolation** from a
+  ≤5-min empirical hold + the SDK no-timeout fact — any **CLI/model-side ceiling in the 5–60 min band**
+  (request-idle / streaming-inactivity / model-turn wall-clock) is **UNTESTED**. ADR-002 must (a) disclose this,
+  (b) make the backstop a **harness-side timer over a Future** (never depend on the SDK holding one control
+  request 60 min), (c) recommend keep-alive or a backstop set below any later-observed ceiling, and consider a
+  one-off ~10–15 min ceiling probe before relying on holds > 5 min. Minor (deferred, verdict-neutral): T1.2's
+  `session_continued` predicate is lenient (`is_error is not None`) though the run had `is_error=False`; T1.3's
+  echo check is backed by the native tool-result so not guess-ambiguous.
 
 ### T2 — ADR-002: async answer-hold mechanism
 - **Goal:** Record, from T1 evidence, how a pending interactive/permission request is held, resolved, timed out (60-min backstop), and cancelled — the contract T4–T7 implement.
