@@ -26,7 +26,7 @@ _Plan generated 2026-06-21 from design.md · 9 tasks · autonomous supervised bu
 - [x] T3 — CI + project test harness baseline · config (a4560f3)
 - [x] T4 — Engine core: normalized types + substrate seam (A adapter) + lifecycle + events-out · unit (mock) (cbfef05)
 - [x] T5 — Decisions-in + async answer-hold + 60-min backstop + cancel · unit (mock) (f050f57)
-- [ ] T6 — Render layer: events→Telegram, inline keyboards, coalesce/throttle (RB5) · unit
+- [x] T6 — Render layer: events→Telegram, inline keyboards, coalesce/throttle (RB5) · unit (6b9cf11)
 - [ ] T7 — Wire bot.py: ENGINE_MODE switch + SB1 callback handler + /cancel + routing · unit
 - [ ] T8 — /cd path policy (SB2) + SB/RB test suite (RB7) · unit
 - [ ] T9 — Live end-to-end verify (programmatic, real Claude) + owner phone-verify checklist · live probe
@@ -172,7 +172,22 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN a burst of `text`/`status` deltas arrives, the renderer SHALL coalesce/throttle (edit a status message rather than flood) and SHALL NOT exceed Telegram send limits (RB5).
   - WHEN rendering, sensitive content SHALL NOT be logged (SB3); long output SHALL chunk (preserve existing chunking behavior).
 - **Tests:** unit — event→message mapping (verbatim vs one-liner), keyboard construction, coalesce/throttle under simulated burst (RB5), chunking.
-- **Status:** todo
+- **Status:** done (6b9cf11) — `claude_tg/render.py` (pure logic; T7 executes the Telegram calls). `RenderAction`
+  (op `new`/`edit_status`/`none`, pre-split chunks via `util.split_message`, optional `reply_markup`):
+  **verbatim** (own message) for `ask`/`plan`/`error`/`result`/assembled-`text`; **one-liner edit-in-place**
+  for `tool_use`/`status`/incremental-`text`. **Inline keyboards:** `ask` → one button per option + per-question
+  "Other (free text)"; `plan` → [Approve]/[Reject+feedback]. **`callback_data` codec** `kind|tool_use_id|payload`
+  (payload = option **index**, never the label; plan = approve/reject) — **≤64 bytes asserted at build**,
+  round-trippable, and **`decode_callback` is defensive** (non-str/empty/>64B/wrong-arity/unknown-kind/foreign →
+  `None`, never raises) which feeds **SB1** at T7; `answers_from_ask(ask, q_idx, o_idx)` reconstructs the native
+  question-text→label answers-map. **Coalescer (RB5)** with an **injected clock** (leading + trailing edge,
+  newest-wins): a 50-delta burst → **1 edit**, verbatim events force-flush in order; tests drive a `FakeClock`
+  (no real sleeps). SB3: `tool_use` renders the event's `tool_input_summary` (lengths-not-bodies); render.py
+  logs nothing. **Verified by me on 0.2.105:** pytest **182 passed** (+59), ruff clean, mypy clean (14 files),
+  secret-scan clean; no test touches Telegram/network. Scope: engine/bot/util/config/main/spikes untouched.
+  **Deferred to T7:** the actual send/edit/answer_callback calls + real rate-limit waiting, SB1 allowlist on
+  decoded callbacks, routing decoded taps to the engine decision seam, "Other"/reject free-text prompting.
+  (Comprehensive cross-check at the end-phase Verify+QA.)
 
 ### T7 — Wire bot.py: ENGINE_MODE switch + SB1 callback handler + /cancel + routing
 - **Goal:** Integrate the engine into `bot.py`: select engine via `ENGINE_MODE`; add an inline-keyboard **callback handler that is allowlist-checked (SB1)**; route a button tap / "Other" reply / plan verdict back into the engine's pending request; add `/cancel`. One-shot path stays default.
