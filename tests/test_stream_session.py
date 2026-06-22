@@ -32,11 +32,26 @@ from claude_tg.render import RenderAction, encode_callback
 from claude_tg.stream_session import StreamingBusy, StreamingSession
 
 
-def make_config(allowed=(1,), engine_mode="streaming", state_file=None):
+def make_config(
+    allowed=(1,),
+    engine_mode="streaming",
+    state_file=None,
+    workdir="/work",
+    *,
+    allowed_roots=(),
+    allow_any_path=True,
+):
+    # NOTE (T7): turn-behavior tests default to ``allow_any_path=True`` so that
+    # ``_ensure_engine``'s SB2 cwd re-validation (added in T7) NO-OPS — these tests are
+    # about the turn loop / callback plumbing, not path confinement. Empty roots +
+    # ``allow_any_path=False`` is fail-closed *everywhere* (you could not /new either), so
+    # making turns respect it is correct; we simply give these tests a config where work
+    # is actually permitted. The SB2 refusal itself is exercised by focused new tests
+    # below that pass REAL ``allowed_roots`` + real dirs with ``allow_any_path=False``.
     return Config(
         bot_token="t",
         allowed_chat_ids=frozenset(allowed),
-        workdir=Path("/work"),
+        workdir=Path(workdir),
         claude_bin="claude",
         model=None,
         timeout_seconds=5,
@@ -44,6 +59,8 @@ def make_config(allowed=(1,), engine_mode="streaming", state_file=None):
         state_file=state_file,
         engine_mode=engine_mode,
         answer_backstop_seconds=3600,
+        allowed_roots=allowed_roots,
+        allow_any_path=allow_any_path,
     )
 
 
@@ -1208,3 +1225,239 @@ async def test_resume_failure_falls_back_to_fresh_start(tmp_path):
         session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
     )
     assert engine.started is True  # fell back to a fresh start despite the resume boom
+
+
+# ===========================================================================
+# P4 (T7): resume hardening — SB2 cwd re-validation on the turn path + RB3
+# resume-failure operator notice + RB3 interrupted-turn-on-restart recovery.
+#
+# These use a REAL JsonSessionStore and REAL allowed_roots + real tmp dirs (so the
+# SB2 re-validation has teeth, not allow_any_path=True like the turn-plumbing
+# fixtures). The engine is still a scripted FakeEngine (no SDK / no network).
+# ===========================================================================
+
+
+def make_roots_config(tmp_path, *, root, allow_any_path=False):
+    """A streaming Config whose ``allowed_roots`` is a REAL dir (SB2 has teeth).
+
+    Used by the T7 SB2 turn-path tests: ``allow_any_path=False`` so the driver's cwd
+    re-validation actually confines (unlike the default turn fixtures which no-op it)."""
+    return make_config(
+        workdir=str(root), allowed_roots=(Path(root),), allow_any_path=allow_any_path
+    )
+
+
+async def test_turn_refused_when_cwd_no_longer_within_roots(tmp_path):
+    # SB2 (T7): a project whose stored cwd is OUTSIDE allowed_roots (config narrowed since
+    # /new, allow_any_path=False) → the turn is REFUSED via send and the engine is NEVER
+    # built/started (no factory call, no hang). The lock is released (RB1/SB6 fail-closed).
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"  # a real dir, but OUTSIDE the permitted root
+    outside.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "drifted", str(outside), make_active=True)
+
+    factory_calls: list[str] = []
+
+    def boom_factory(*, cwd, backstop_seconds, permission_policy):
+        factory_calls.append(cwd)  # must NOT be called — SB2 refuses before building
+        raise AssertionError("engine factory must not run when cwd is out-of-roots")
+
+    session = StreamingSession(
+        make_roots_config(tmp_path, root=root),
+        session_store=store,
+        engine_factory=boom_factory,
+        clock=lambda: 0.0,
+    )
+    rec = Recorder()
+    # No hang: the refusal returns promptly (bounded so a wiring regression fails fast).
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+
+    # The engine was never built (the authoritative gate fired before the factory).
+    assert factory_calls == []
+    # A clear refusal naming the out-of-roots dir was sent; no turn content followed.
+    assert len(rec.sends) == 1
+    refusal = rec.sends[0]["text"]
+    assert "no longer" in refusal and "permitted roots" in refusal
+    assert str(outside) in refusal
+    assert "/new" in refusal
+    # The lock was released (not held) — the chat is usable, not wedged.
+    assert session.is_busy(1) is False
+
+
+async def test_turn_allowed_when_cwd_inside_roots(tmp_path):
+    # The companion happy case: an in-roots cwd (allow_any_path=False) re-validates fine,
+    # so the turn runs normally — proves the SB2 gate is not over-broad.
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"  # INSIDE the permitted root
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)
+
+    engine = FakeEngine(
+        [ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")]
+    )
+    session = StreamingSession(
+        make_roots_config(tmp_path, root=root),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
+        clock=lambda: 0.0,
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert engine.started is True  # the turn ran (cwd permitted)
+    assert any("ok" in s["text"] for s in rec.sends)
+    # No SB2 refusal text leaked into the happy path.
+    assert not any("permitted roots" in s["text"] for s in rec.sends)
+
+
+async def test_resume_failure_sends_operator_notice_and_completes(tmp_path):
+    # RB3 (T7): a persisted session_id whose engine.resume() raises → the driver sends the
+    # one-line "couldn't resume… started fresh" notice (BEFORE the turn content), falls
+    # back to a fresh start(), and the turn COMPLETES (never hangs).
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)
+    store.update(1, session_id="dead-sess", cwd=None)  # a persisted (now-dead) session
+
+    class ResumeBoomEngine(FakeEngine):
+        async def resume(self, session_id):
+            raise RuntimeError("torn transcript")
+
+    engine = ResumeBoomEngine(
+        [ResultEvent(session_id="fresh", is_error=False, subtype="success", result_text="done")]
+    )
+    session = StreamingSession(
+        make_roots_config(tmp_path, root=root),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
+        clock=lambda: 0.0,
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # Fell back to a fresh start despite the resume boom, and the turn completed.
+    assert engine.started is True
+    assert any("done" in s["text"] for s in rec.sends)
+    # The operator was notified, and the notice preceded the turn's real content.
+    notice_idx = next(
+        (i for i, s in enumerate(rec.sends) if "Couldn't resume" in s["text"]), None
+    )
+    assert notice_idx is not None, "the resume-failure notice must be sent"
+    done_idx = next(i for i, s in enumerate(rec.sends) if "done" in s["text"])
+    assert notice_idx < done_idx  # notice BEFORE the content
+
+
+async def test_clean_resume_sends_no_notice(tmp_path):
+    # Inverse of the RB3 notice: a session that resumes cleanly must NOT emit the
+    # "couldn't resume" notice (false-pass guard — the notice is gated on a real failure).
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)
+    store.update(1, session_id="live-sess", cwd=None)
+
+    engine = FakeEngine(
+        [ResultEvent(session_id="live-sess", is_error=False, subtype="success", result_text="ok")]
+    )
+    session = StreamingSession(
+        make_roots_config(tmp_path, root=root),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
+        clock=lambda: 0.0,
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert engine.resumed == "live-sess"  # clean resume
+    assert not any("Couldn't resume" in s["text"] for s in rec.sends)
+
+
+async def test_interrupted_turn_comes_back_idle_and_recovers_on_restart(tmp_path):
+    # RB3 (T7): an interrupted (in-flight-at-crash) turn persists NO new session_id, so on
+    # restart the project comes back IDLE — a fresh StreamingSession over the same store
+    # (in-memory runtime gone) does NOT auto-replay the lost turn, and the NEXT message
+    # resumes the last GOOD session and completes. No hang.
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "api", str(proj), make_active=True)
+    store.update(1, session_id="good-sess", cwd=None)  # the last GOOD persisted session
+
+    # --- process 1: a turn is interrupted mid-flight (parked at HOLD, never finishes) ---
+    eng1 = FakeEngine([HOLD, ResultEvent(session_id="never", is_error=False, subtype="success")])
+    s1 = StreamingSession(
+        make_roots_config(tmp_path, root=root),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng1,
+        clock=lambda: 0.0,
+    )
+    rec1 = Recorder()
+    turn = asyncio.create_task(s1.handle_message(1, "interrupted", send=rec1.send, edit=rec1.edit))
+    for _ in range(200):
+        if s1.is_busy(1):
+            break
+        await asyncio.sleep(0)
+    assert s1.is_busy(1)  # the turn is in flight (parked at HOLD)
+    # Simulate a crash: drop process 1 without letting the turn finish. The task is left
+    # pending; we cancel it to avoid a leaked task (a real crash would just lose it).
+    turn.cancel()
+    try:
+        await turn
+    except asyncio.CancelledError:
+        pass
+    # The interrupted turn persisted NO new session_id — the store still holds the GOOD one.
+    assert store.get_project(1, "api")["session_id"] == "good-sess"
+
+    # --- process 2: a FRESH StreamingSession over the SAME store (in-memory state gone) ---
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="good-sess", is_error=False, subtype="success", result_text="back")],
+        session_id="good-sess",
+    )
+    s2 = StreamingSession(
+        make_roots_config(tmp_path, root=root),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng2,
+        clock=lambda: 0.0,
+    )
+    # The restarted process comes back IDLE (no turn auto-running from the prior crash).
+    assert s2.is_busy(1) is False
+    # The NEXT message resumes the last GOOD session and completes — no auto-replay of the
+    # lost "interrupted" turn (eng2 only ever sees the new "recover" prompt).
+    rec2 = Recorder()
+    await asyncio.wait_for(
+        s2.handle_message(1, "recover", send=rec2.send, edit=rec2.edit), timeout=2.0
+    )
+    assert eng2.resumed == "good-sess" and eng2.started is True
+    assert any("back" in s["text"] for s in rec2.sends)

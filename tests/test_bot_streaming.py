@@ -452,10 +452,19 @@ class HoldEngine:
 
 
 def make_streaming(store, *, script=None, workdir="/work"):
-    """A real StreamingSession over ``store`` whose factory returns a HoldEngine."""
+    """A real StreamingSession over ``store`` whose factory returns a HoldEngine.
+
+    NOTE (T7): the session's Config is built with ``allow_any_path=True`` so that the
+    driver's SB2 cwd re-validation (added in T7) NO-OPS for these bot-command tests —
+    they exercise navigation/busy-guard behavior, not turn-path confinement, and their
+    project cwds (``/work/alpha`` etc.) are not real dirs. This is independent of the
+    *bot's* Config (the T6 ``/new`` tests construct their own ``make_config`` with real
+    ``allowed_roots`` to exercise SB2 on the path-input command); the driver's turn path
+    reads THIS session config, so a parked real turn is not blocked by SB2 here.
+    """
     engine = HoldEngine(script if script is not None else [])
     session = StreamingSession(
-        make_config(engine_mode="streaming", workdir=workdir),
+        make_config(engine_mode="streaming", workdir=workdir, allow_any_path=True),
         session_store=store,
         engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
         clock=lambda: 0.0,

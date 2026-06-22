@@ -74,6 +74,7 @@ from .engine import (
     SubstrateDecision,
 )
 from .engine.adapter_sdk import SdkSubstrate
+from .paths import PathNotAllowed, resolve_within_roots
 from .permissions import PermissionPolicy
 from .render import (
     Callback,
@@ -392,12 +393,25 @@ class StreamingSession:
 
     # -- engine lifecycle ----------------------------------------------------
 
-    async def _ensure_engine(self, chat_id: int) -> Engine:
+    async def _ensure_engine(self, chat_id: int) -> tuple[Engine, bool]:
         """Lazily start (or resume) the ACTIVE project's engine. Idempotent per project.
+
+        Returns ``(engine, resume_failed)`` — ``resume_failed`` is True iff a persisted
+        ``session_id`` was present but ``resume`` raised and we fell back to a fresh
+        ``start`` THIS call (so the caller can post the RB3 operator notice). It is False
+        for a fresh start, a clean resume, and the already-started fast path.
 
         Resolves the chat's active project (auto-creating ``default`` if none — a turn
         always has a project), then:
 
+        * **SB2 cwd re-validation (the authoritative gate, T7).** Re-validate the stored
+          cwd against the permitted roots via :func:`resolve_within_roots` BEFORE building
+          or resuming the engine. A project whose cwd was in-roots at ``/new`` can later
+          drift out (config narrowed, or a path component became an out-of-root symlink);
+          if so this raises :class:`~claude_tg.paths.PathNotAllowed` and the engine is
+          **never** built/resumed — :meth:`handle_message` catches it and refuses the turn
+          fail-closed (SB6/RB1). ``ALLOW_ANY_PATH=true`` no-ops the check (the resolver
+          returns the canonical path), as on ``/new``.
         * **Single-active-run (D2).** If a DIFFERENT project's engine is currently
           started for this chat (the operator switched), ``stop()`` it first — at most
           one engine is live per chat.
@@ -405,14 +419,23 @@ class StreamingSession:
           ``resume`` the project's persisted ``session_id`` (cwd-scoped — C6) if one
           exists, else ``start`` fresh. A resume failure falls back to a fresh ``start``
           (the dead id is dropped) so the project is never wedged on a stale session —
-          harvested from the runner's resume-failure recovery. (cwd re-validation +
-          richer crash handling are T7, deliberately NOT here.)
+          harvested from the runner's resume-failure recovery — and is signalled back to
+          the caller (RB3) so the operator learns the previous session could not resume.
         """
         name, rt = self._active_runtime(chat_id, create_default=True)
         assert name is not None and rt is not None  # create_default guarantees both
+        # SB2 (T7): re-validate the stored cwd BEFORE building/resuming the engine. A
+        # PathNotAllowed propagates out of _ensure_engine (the engine is NOT started) and
+        # is caught by handle_message, which refuses the turn fail-closed.
+        resolve_within_roots(
+            rt.cwd,
+            cwd=rt.cwd,
+            allowed_roots=self.config.allowed_roots,
+            allow_any=self.config.allow_any_path,
+        )
         await self._stop_other_started(chat_id, keep=name)
         if rt.engine is not None and rt.started:
-            return rt.engine
+            return rt.engine, False
         engine = rt.engine or self._engine_factory(
             cwd=rt.cwd,
             backstop_seconds=float(self.config.answer_backstop_seconds),
@@ -420,6 +443,7 @@ class StreamingSession:
         )
         rt.engine = engine
         resume_id = self._resume_id(chat_id, name)
+        resume_failed = False
         if resume_id:
             try:
                 await engine.resume(resume_id)
@@ -430,10 +454,11 @@ class StreamingSession:
                     name,
                 )
                 await engine.start()
+                resume_failed = True
         else:
             await engine.start()
         rt.started = True
-        return engine
+        return engine, resume_failed
 
     def _resume_id(self, chat_id: int, name: str) -> Optional[str]:
         """The active project's persisted ``session_id`` to resume from, if any."""
@@ -542,6 +567,14 @@ class StreamingSession:
         "still working"), never two interleaved turns. The lock does NOT cover a
         free-text resolve targeting an *already running* turn — that path must run
         concurrently with the held turn, so it is handled before acquiring the lock.
+
+        **SB2 fail-closed (T7).** If the active project's stored cwd is no longer within
+        the permitted roots, :meth:`_ensure_engine` raises
+        :class:`~claude_tg.paths.PathNotAllowed`; the engine is never started, this
+        replies a clear refusal via ``send`` and RETURNS cleanly (the lock is released —
+        no hang, RB1/SB6). **RB3 resume notice.** If a persisted session could not be
+        resumed and a fresh one was started instead, a one-line notice is sent via
+        ``send`` BEFORE the turn is driven (the turn still completes — never hangs, RB2).
         """
         state = self._chat(chat_id)
 
@@ -557,7 +590,31 @@ class StreamingSession:
             raise StreamingBusy()
 
         async with state.lock:
-            engine = await self._ensure_engine(chat_id)
+            try:
+                engine, resume_failed = await self._ensure_engine(chat_id)
+            except PathNotAllowed:
+                # SB2 (T7): the active project's stored cwd drifted out of the permitted
+                # roots (config narrowed, or a path component became an out-of-root
+                # symlink). Refuse the turn fail-closed WITHOUT starting the engine; the
+                # lock releases on return (no hang).
+                await send(
+                    text=(
+                        f"❌ This project's directory {self.get_cwd(chat_id)} is no longer "
+                        "within the permitted roots — use /new <name> <path> to create one "
+                        "inside them."
+                    ),
+                    reply_markup=None,
+                    parse_mode=None,
+                )
+                return
+            if resume_failed:
+                # RB3: the persisted session could not be resumed; a fresh one was started.
+                # Tell the operator BEFORE driving the turn (the turn still completes).
+                await send(
+                    text="⚠️ Couldn't resume this project's previous session; started a fresh one.",
+                    reply_markup=None,
+                    parse_mode=None,
+                )
             await self._drive_turn(
                 state, chat_id, engine, text, send=send, edit=edit, delete=delete
             )
