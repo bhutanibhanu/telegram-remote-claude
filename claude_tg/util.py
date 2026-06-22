@@ -39,6 +39,11 @@ def split_message(text: str, limit: int = TELEGRAM_MAX) -> list[str]:
                 break
             width += w
             idx += 1
+        if idx == 0:
+            # A single char wider than `limit` (an astral-plane emoji with a pathological
+            # tiny limit): emit it anyway so we ALWAYS make progress — never an empty chunk
+            # or an infinite loop.
+            idx = 1
         window = remaining[:idx]
         cut = window.rfind("\n")
         if cut <= 0:

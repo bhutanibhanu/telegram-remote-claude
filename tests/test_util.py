@@ -46,3 +46,13 @@ def test_utf16_aware_chunking():
         assert len(c.encode("utf-16-le")) // 2 <= 4096  # Telegram's real limit
     assert len(chunks) >= 2
 
+
+def test_astral_char_wider_than_tiny_limit_makes_progress():
+    """A single astral-plane char (2 UTF-16 units) with a pathological limit < 2 must still
+    emit the char (forced progress) rather than loop forever on empty chunks."""
+    text = "😀😀😀"
+    chunks = split_message(text, limit=1)  # each emoji is wider than the limit
+    assert "".join(chunks) == text  # lossless
+    assert all(c for c in chunks)  # no empty chunks
+    assert len(chunks) == 3  # one emoji per chunk
+
