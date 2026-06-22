@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 .env
+*.env
 *.tmp
+.DS_Store
 .pytest_cache/
 .claude_tg_sessions.json
