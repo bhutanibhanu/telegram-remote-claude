@@ -19,7 +19,7 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 - [x] T4 — StreamingSession per-project rework (637eaef)
 - [x] T5 — Bot navigation commands (/projects, /switch, /rm, /pwd, /cd-removed) (0502c7c)
 - [x] T6 — Bot /new command (SB2 path-input) (c0bc0fa)
-- [ ] T7 — Resume hardening: cwd re-validation (SB2) + RB3 crash recovery
+- [x] T7 — Resume hardening: cwd re-validation (SB2) + RB3 crash recovery (e068a37)
 - [ ] T8 — Integration / SB·RB acceptance matrix
 - [ ] T9 — Live verify + verify.md phone-checklist
 
@@ -110,7 +110,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the bot restarts after an interrupted (in-flight-at-crash) turn, the affected project SHALL come back **idle** (no auto-replay of the torn turn); the next message SHALL resume-or-fresh per above (D7/RB3).
   - **(Defense-in-depth, from T4 review)** `_drive_turn`'s result-persist SHALL write the `session_id` to the project **captured at turn start** (not "whatever is active now"). Harmless today (busy-guard keeps active stable), but explicit capture removes the reliance. Consider also cancelling pending holds inside `reset()` so a `/reset` during a held turn doesn't strand the parked turn (a **pre-existing** HEAD bug, not a T4 regression; `/cancel` is today's escape hatch — fix here only if cheap).
 - **Tests:** cwd-no-longer-permitted → refused (SB2); resume-failure → fresh+notice, no hang; interrupted-turn → idle on restart, next msg recovers.
-- **Status:** todo
+- **Status:** done (e068a37) — reviewer AGREE; mutation-probe confirmed the SB2 gate has teeth; `allow_any_path=True` turn-fixture flip verified NOT to weaken `/new` SB2 coverage (those use the bot's own config). **Flagged for owner:** auto-created `default` (cwd=`config.workdir`) is refused on first turn if `workdir`∉`ALLOWED_ROOTS` — arguably SB2-correct; `from_env` defaults `workdir` into roots so the common case is fine. **Deferred to T8:** (a) persist-to-turn-captured-project-name (defense-in-depth; busy-guard makes it harmless today); (b) tighten the interrupted-turn test comment (FakeEngine.send ignores prompt — property proven structurally); (c) a `send`-raises-on-refusal no-wedge test.
 
 ### T8 — Integration / SB·RB acceptance matrix
 - **Goal:** Prove the design's cross-task acceptance criteria end-to-end (no single task owns these).
