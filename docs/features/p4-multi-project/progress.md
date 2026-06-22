@@ -26,8 +26,10 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 - [x] QF2 — fix B2: `/switch` re-validates stored cwd before activating (SB2 conformance) — Codex blocker (613ba17)
 - [x] QF3 — fix B3: streaming resume-failure-on-result fallback (port `_is_resume_failure`) — Codex NO_SHIP blocker (d6ba25a)
 
-### QA-fix follow-ups (non-blocking, from the QF3 review — surfaced, not yet done)
-- `_recover_failed_resume` drops `rt.engine` without `await engine.stop()` → leaks the connected SDK client on a B3 recovery (rare, bounded, restart-cleared; same pattern as `reset()`). Cheap best-effort `stop()` would close it.
+- [x] QF4 — fix B3′ (Codex re-QA NO_SHIP): resume()-raises fallback wedge — discard the partial engine + clear the dead id (before fresh start) + start a FRESH instance; never re-resume the dead id (507e6f6)
+
+### QA-fix follow-ups (from the QF3 review)
+- ✅ CLOSED by QF4: `_recover_failed_resume` now best-effort `stop()`s the connected-but-dead engine before dropping it (no orphaned SDK client); same stop() added to the resume-raises path.
 - Resume-failure detection is a text heuristic (shared verbatim with one-shot `_is_resume_failure`); a torn-transcript error lacking session-gone phrasing would be missed → stuck re-resume. Confirm the real SDK exception text against a live SDK (ties to the owner phone-verify / a P5 hardening).
 - `_recover_failed_resume`/result-persist clear the store via the *active* project, not the pinned `turn_name` (harmless under the busy-guard; the deferred persist-to-captured-name defense-in-depth).
 
