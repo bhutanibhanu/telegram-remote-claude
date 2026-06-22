@@ -13,7 +13,7 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 > **no Co-Authored-By trailer**.
 
 ## Task list
-- [ ] T1 — ADR-004: multi-project session model & persistence schema
+- [x] T1 — ADR-004: multi-project session model & persistence schema (1ab4560)
 - [ ] T2 — Versioned store + v1→v2 migration + flat (one-shot) view
 - [ ] T3 — Registry accessors + SB4 name validation
 - [ ] T4 — StreamingSession per-project rework
@@ -35,7 +35,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN ADR-004 is written, it SHALL record: the per-chat registry entity + **schema v2** shape; the **v1→v2 migration**; the **dual flat/registry view** rationale (why one-shot keeps a flat view over the active project, D8); the **single-active-run invariant** and **why the session/run correlation envelope is deferred to P5** (D2); **crash recovery = abandon + lazy-resume** (RB3, D7); **SB2 on `/new` + cwd re-validation**; **RB6** guarantees.
   - It SHALL cite ADR-001 (the `(session_id, cwd)` coupling, normalized-interface gaps, RB3/RB6 carry-ins) and SHALL NOT contradict ADR-001/002/003.
 - **Tests:** none — decision record only.
-- **Status:** todo
+- **Status:** done (1ab4560)
 
 ### T2 — Versioned store + v1→v2 migration + flat (one-shot) view
 - **Goal:** Evolve `JsonSessionStore` to schema v2 with migrate-on-load and a flat accessor that preserves one-shot behavior. **The one-shot-risk task (D8).**
