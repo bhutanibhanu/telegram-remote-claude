@@ -1730,6 +1730,9 @@ async def test_resume_failure_on_first_turn_clears_id_recovers_and_notifies(tmp_
     rt = session._chat(1).runtimes["api"]
     assert rt.engine is None and rt.started is False
     assert rt.resumed_unverified is False
+    # QF4 bonus: the connected-but-dead engine was stop()'d before being dropped (its SDK
+    # client is closed, not orphaned). A stop failure would be swallowed, but here it succeeds.
+    assert eng1.stopped is True
     # No hang — the chat is idle (lock released).
     assert session.is_busy(1) is False
 
@@ -1901,3 +1904,164 @@ async def test_ordinary_tool_error_on_resumed_turn_is_not_a_resume_failure(tmp_p
     rt = session._chat(1).runtimes["api"]
     assert rt.resumed_unverified is False  # turn completed → confirmed good
     assert rt.engine is engine
+
+
+# ===========================================================================
+# QF4 (Codex re-QA B3′ / RB3): resume() RAISES (it does not connect) AND the
+# SDK adapter assigns its client BEFORE connect(), so the FAILED engine is left
+# with a partial, non-None client. The pre-QF4 fallback called start() on that
+# SAME engine → the adapter's "session already started" guard re-raised → the
+# turn failed and the dead session_id was NEVER cleared → every future turn
+# re-resumed the same dead id → the project was permanently WEDGED. QF4 recovers
+# onto a FRESH engine: stop the failed one (best-effort), clear the dead id,
+# build + start a fresh engine, and signal resume_failed for the T7 notice.
+#
+# REAL JsonSessionStore (so the persisted-id clear is observable) + a sequential
+# factory (a FRESH engine per build) so a buggy fallback that reuses the failed
+# instance fails fast. Bounded by asyncio.wait_for so a wiring bug fails fast.
+# ===========================================================================
+
+
+class ResumeRaisesThenStartRaisesEngine(FakeEngine):
+    """resume() RAISES, and start() on this SAME instance ALSO raises — the adapter shape.
+
+    Mirrors ``adapter_sdk.py``: resume() assigns ``self._client`` BEFORE ``connect()``, so
+    a connect failure leaves ``_client`` non-None; a subsequent start() then hits the
+    "session already started" guard and raises. This fake reproduces that coupling so the
+    QF4 mutation probe has teeth: a buggy fallback that reuses THIS instance (calls its
+    start()) blows up here → the turn fails / the dead id is never cleared. A FRESH engine
+    (the correct fix) has ``started=False`` and starts cleanly.
+    """
+
+    async def resume(self, session_id):
+        # Record the attempt (the bug is the post-RAISE handling), then fail like a dead
+        # session's connect(), leaving the (simulated) partial client attached.
+        self.resumed = session_id
+        self.started = True  # simulate adapter's client-assigned-before-connect coupling
+        raise RuntimeError("connect failed: no conversation found with session id")
+
+    async def start(self):
+        # The adapter's guard: a non-None client (here: this same already-touched engine)
+        # makes start() raise. Reusing the failed instance must hit this.
+        if self.started:
+            raise RuntimeError("session already started; call stop() first")
+        self.started = True
+
+
+async def test_resume_raises_recovers_on_fresh_engine_clears_id_and_notifies(tmp_path):
+    # B3′ core: resume() RAISES on an engine that mimics the adapter (start() on the same
+    # instance ALSO raises). The QF4 fallback must NOT reuse it — it must (a) clear the
+    # persisted dead id, (b) build a SECOND, FRESH engine and start() it successfully,
+    # (c) complete the turn + post the T7 "couldn't resume… started fresh" notice, (d) NOT
+    # hang (is_busy False), and (e) a SUBSEQUENT turn must NOT re-resume the dead id.
+    #
+    # Mutation probe: if the fix reused the failed engine (called its start()), eng1.start()
+    # raises "already started" → the turn would fail / the id would be left set → the
+    # fresh-engine + cleared-id assertions below would fail.
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)
+    store.update(1, session_id="dead-sess", cwd=None)  # the (dead) persisted session
+
+    # Engine 1: resume() raises AND start() on it raises (adapter coupling) — the failed one.
+    eng1 = ResumeRaisesThenStartRaisesEngine([], session_id="dead-sess")
+    # Engine 2: the FRESH engine the fallback must build + start() instead.
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="fresh-sess", is_error=False, subtype="success", result_text="ok")],
+        session_id="fresh-sess",
+    )
+    session = make_sequential_session(
+        {str(proj): [eng1, eng2]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+    )
+
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+
+    # resume() WAS attempted on the dead id (the bug is the post-raise handling).
+    assert eng1.resumed == "dead-sess"
+    # (a) The dead id is GONE — recovery cleared it, then the fresh turn persisted the
+    # fresh session's id. What matters for the wedge fix is that "dead-sess" is no longer
+    # the persisted id (so it can never be re-resumed); it has been replaced by the fresh
+    # session's id, exactly as a normal completed turn persists its result.
+    persisted = store.get_project(1, "api")["session_id"]
+    assert persisted != "dead-sess"
+    assert persisted == "fresh-sess"
+    # (a′) Best-effort stop() of the failed engine was attempted (free its partial client).
+    assert eng1.stopped is True
+    # (b) A SECOND, FRESH engine was built and started (NOT eng1, which would have raised).
+    assert eng2.started is True
+    assert eng2.resumed is None  # the fresh engine never resumed anything
+    rt = session._chat(1).runtimes["api"]
+    assert rt.engine is eng2 and rt.started is True
+    # A fresh start is NOT resumed_unverified (a fresh-session error ≠ a resume failure).
+    assert rt.resumed_unverified is False
+    # (c) The turn completed AND the operator got the T7 resume-failure notice.
+    assert any("ok" in s["text"] for s in rec.sends)
+    notice_idx = next(
+        (i for i, s in enumerate(rec.sends) if "Couldn't resume" in s["text"]), None
+    )
+    assert notice_idx is not None, "the resume-failure notice must be sent"
+    done_idx = next(i for i, s in enumerate(rec.sends) if "ok" in s["text"])
+    assert notice_idx < done_idx  # notice BEFORE the turn content (T7 ordering)
+    # (d) No hang — the chat is idle (lock released).
+    assert session.is_busy(1) is False
+
+    # (e) A SUBSEQUENT turn does NOT re-resume the dead id — it reuses the now-warm fresh
+    # engine (already started), so no new build/resume happens and the dead id is never
+    # seen again. The persisted id is the FRESH one (never reverts to "dead-sess").
+    await asyncio.wait_for(
+        session.handle_message(1, "again", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng2.resumed is None  # still never resumed (the dead id was cleared)
+    assert store.get_project(1, "api")["session_id"] == "fresh-sess"  # never "dead-sess"
+
+
+async def test_resume_raises_then_fresh_start_failure_still_cleared_the_dead_id(tmp_path):
+    # QF4 ordering guarantee: the dead id is cleared BEFORE the fresh start, so even if the
+    # FRESH engine's start() also raises (a doubly-bad moment), the dead id is already gone
+    # → the next turn starts fresh, never re-resuming the wedge. The first turn surfaces the
+    # fresh-start error (it propagates), but the project is NOT left wedged.
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)
+    store.update(1, session_id="dead-sess", cwd=None)
+
+    eng1 = ResumeRaisesThenStartRaisesEngine([], session_id="dead-sess")
+
+    class FreshStartBoomEngine(FakeEngine):
+        async def start(self):
+            raise RuntimeError("fresh start also failed")
+
+    eng2 = FreshStartBoomEngine([], session_id="never")
+    session = make_sequential_session(
+        {str(proj): [eng1, eng2]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+    )
+    rec = Recorder()
+    # The fresh start raises → it propagates out of the turn (nothing left to recover to).
+    with pytest.raises(RuntimeError, match="fresh start also failed"):
+        await asyncio.wait_for(
+            session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+        )
+    # But the dead id was ALREADY cleared (step b runs before the fresh start in step d), so
+    # the project is not wedged re-resuming it — the next turn would start fresh.
+    assert store.get_project(1, "api")["session_id"] is None
+    # The lock released despite the raise (no wedge-busy).
+    assert session.is_busy(1) is False

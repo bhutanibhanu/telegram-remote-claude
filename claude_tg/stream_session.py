@@ -460,12 +460,50 @@ class StreamingSession:
             try:
                 await engine.resume(resume_id)
             except Exception:
+                # QF4 (B3′/RB3): resume() RAISED — e.g. the SDK adapter assigns its
+                # client BEFORE connect(), so a connect failure (dead/aged session)
+                # leaves the FAILED engine with a partial, non-None client. We CANNOT
+                # reuse it: start() on that same instance hits the adapter's
+                # "session already started" guard and would re-raise → the turn fails
+                # AND the dead id is never cleared → the project is permanently wedged
+                # re-resuming the same dead id. So recover onto a FRESH engine instead.
                 log.info(
                     "resume failed for chat %s project %s; starting a fresh session",
                     chat_id,
                     name,
                 )
+                # (a) Best-effort stop the FAILED engine to free its partial SDK client.
+                #     A stop failure must not break recovery (the partial client is the
+                #     adapter's problem; we proceed regardless).
+                try:
+                    await engine.stop()
+                except Exception:
+                    log.debug(
+                        "stop of failed-resume engine raised for chat %s project %s "
+                        "(ignored — recovering fresh)",
+                        chat_id,
+                        name,
+                        exc_info=True,
+                    )
+                # (b) Clear the persisted dead id so it is NOT re-resumed on any future
+                #     turn (the wedge fix). Done BEFORE the fresh start so even if the
+                #     fresh start were to raise, the dead id is already gone.
+                self._persist(chat_id, session_id=None)
+                # (c) Build a FRESH engine instance (its _client is None, so its start()
+                #     cannot hit the "already started" guard) and adopt it as the runtime
+                #     engine, replacing the failed one.
+                engine = self._engine_factory(
+                    cwd=rt.cwd,
+                    backstop_seconds=float(self.config.answer_backstop_seconds),
+                    permission_policy=rt.policy,
+                )
+                rt.engine = engine
+                # (d) Start the FRESH engine — a clean fresh session (the dead id is gone).
                 await engine.start()
+                # (e) Signal the caller so handle_message posts the T7 "couldn't resume,
+                #     started fresh" notice. The session is fresh (start, not resume), so
+                #     it is NOT resumed_unverified — a fresh-session error is an ordinary
+                #     turn error, never mistaken for a resume failure.
                 resume_failed = True
             else:
                 # Resume CONNECTED. It is not yet CONFIRMED good — a stale/aged/torn
@@ -782,8 +820,23 @@ class StreamingSession:
         # 1) Clear the persisted dead id FIRST so even if the notice send fails the stale
         #    session is gone (the next turn will start fresh, not re-resume it).
         self._persist(chat_id, session_id=None)
-        # 2) Drop the in-memory engine so the next turn rebuilds + starts fresh.
+        # 2) Drop the in-memory engine so the next turn rebuilds + starts fresh. Best-effort
+        #    stop() the connected-but-dead engine BEFORE dropping the reference so its SDK
+        #    client is closed rather than orphaned (QF3-review non-blocker, same pattern as
+        #    the resume-raises path). A stop failure must NOT re-wedge — the dead id is
+        #    already cleared above, so even if stop() raises the next turn starts fresh.
         if rt is not None:
+            if rt.engine is not None:
+                try:
+                    await rt.engine.stop()
+                except Exception:
+                    log.debug(
+                        "stop of dead-resumed engine raised for chat %s project %s "
+                        "(ignored — id already cleared, recovering fresh)",
+                        chat_id,
+                        name,
+                        exc_info=True,
+                    )
             rt.engine = None
             rt.started = False
             rt.resumed_unverified = False
