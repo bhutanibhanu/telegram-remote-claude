@@ -1106,6 +1106,65 @@ async def test_cmd_new_no_args_usage(tmp_path):
     assert store.list_projects(1) == {}
 
 
+# ---- /new relative-path resolution (deferred from T6 / T8 item 10) --------
+
+
+async def test_cmd_new_relative_path_inside_root_resolves_against_active_cwd(tmp_path):
+    # SB2 (T6 deferred): a RELATIVE <path> resolves against the ACTIVE project's cwd
+    # (bot.get_cwd) and, if the result lands inside a permitted root, the project is
+    # created with the RESOLVED (canonical) cwd — not the raw relative arg. Here the
+    # active project sits at <root>/api; `/new sub child` must resolve to <root>/api/child.
+    root = tmp_path / "root"
+    root.mkdir()
+    api = root / "api"
+    api.mkdir()
+    child = api / "child"
+    child.mkdir()  # the relative target, INSIDE the root, must exist (is-a-dir check)
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(api), make_active=True)  # active project's cwd = <root>/api
+    # allow_any_path=False so SB2 actually confines (the resolve base is the active cwd).
+    session, _ = make_streaming(store, workdir=str(root))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new sub child")
+    await bot.cmd_new(upd, make_cmd_ctx(args=["sub", "child"]))  # relative "child"
+    # Created, and the stored cwd is the RESOLVED path under the active project's cwd.
+    assert store.get_active(1) == "sub"
+    assert store.get_project(1, "sub")["cwd"] == str(child.resolve())
+    assert str(child.resolve()) in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_new_relative_dotdot_escape_refused(tmp_path):
+    # SB2 (T6 deferred): a relative `..`-escape that resolves OUTSIDE the permitted root
+    # (against the active project's cwd) is refused and the project is NOT created — the
+    # confinement holds for relative inputs, not just absolute ones.
+    root = tmp_path / "root"
+    root.mkdir()
+    api = root / "api"
+    api.mkdir()
+    outside = tmp_path / "outside"  # a real dir, OUTSIDE root, reachable via ../../outside
+    outside.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(api), make_active=True)  # resolve base = <root>/api
+    session, _ = make_streaming(store, workdir=str(root))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    # ../../outside from <root>/api == <tmp_path>/outside → escapes the root → refused.
+    upd = make_update(1, "/new escape ../../outside")
+    await bot.cmd_new(upd, make_cmd_ctx(args=["escape", "../../outside"]))
+    assert "not allowed" in upd.message.reply_text.await_args.args[0].lower()
+    assert "escape" not in store.list_projects(1)  # NOT created
+    assert set(store.list_projects(1)) == {"api"}  # only the pre-existing active project
+
+
 def test_build_application_registers_new_before_skill_passthrough():
     # /new is a specific CommandHandler wired BEFORE the on_skill_command COMMAND
     # passthrough — first-match-wins keeps it from being forwarded as a skill.

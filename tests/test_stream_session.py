@@ -1441,7 +1441,20 @@ async def test_interrupted_turn_comes_back_idle_and_recovers_on_restart(tmp_path
     assert store.get_project(1, "api")["session_id"] == "good-sess"
 
     # --- process 2: a FRESH StreamingSession over the SAME store (in-memory state gone) ---
-    eng2 = FakeEngine(
+    # A prompt-RECORDING engine so the "no auto-replay" claim is an ASSERTION, not just a
+    # comment: the base FakeEngine.send ignores its prompt, so we capture prompts here and
+    # prove eng2 only ever saw the NEW "recover" prompt — never the lost "interrupted" one.
+    class PromptRecordingEngine(FakeEngine):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.prompts: list[str] = []
+
+        async def send(self, prompt, *, timeout=None):
+            self.prompts.append(prompt)
+            async for ev in super().send(prompt, timeout=timeout):
+                yield ev
+
+    eng2 = PromptRecordingEngine(
         [ResultEvent(session_id="good-sess", is_error=False, subtype="success", result_text="back")],
         session_id="good-sess",
     )
@@ -1453,11 +1466,165 @@ async def test_interrupted_turn_comes_back_idle_and_recovers_on_restart(tmp_path
     )
     # The restarted process comes back IDLE (no turn auto-running from the prior crash).
     assert s2.is_busy(1) is False
-    # The NEXT message resumes the last GOOD session and completes — no auto-replay of the
-    # lost "interrupted" turn (eng2 only ever sees the new "recover" prompt).
+    # The NEXT message resumes the last GOOD session and completes.
     rec2 = Recorder()
     await asyncio.wait_for(
         s2.handle_message(1, "recover", send=rec2.send, edit=rec2.edit), timeout=2.0
     )
     assert eng2.resumed == "good-sess" and eng2.started is True
     assert any("back" in s["text"] for s in rec2.sends)
+    # No auto-replay of the lost "interrupted" turn — eng2 was driven with ONLY "recover".
+    assert eng2.prompts == ["recover"]
+
+
+# ===========================================================================
+# P4 (T8) — deferred defensive-branch tests (from T6/T7 review):
+#   * send-raises-on-refusal no-wedge (T7): if the SB2-refusal send() itself raises,
+#     the turn lock still releases (is_busy False after) — no wedge.
+#   * _stop_other_started stop-failure: switching when the old project's engine.stop()
+#     raises → the new turn still runs and the old runtime is cleared.
+#   * _resume_id defensive branches: a non-str / empty session_id → no-resume (fresh start).
+#
+# REAL JsonSessionStore + REAL allowed_roots (so the SB2 gate has teeth); scripted engines.
+# ===========================================================================
+
+
+async def test_sb2_refusal_send_raising_does_not_wedge_the_lock(tmp_path):
+    # T7 deferred: the SB2 refusal path sends a "no longer within roots" message; if THAT
+    # send raises (Telegram hiccup at the worst moment), the exception propagates but the
+    # turn lock must still RELEASE (the `async with state.lock` unwinds) — the chat is not
+    # wedged busy forever. False-pass guard: if the refusal ran OUTSIDE the lock or swallowed
+    # into a hang, is_busy would stay True.
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"  # real dir, OUTSIDE the permitted root
+    outside.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "drifted", str(outside), make_active=True)  # cwd out-of-roots → SB2 refuses
+
+    def boom_factory(*, cwd, backstop_seconds, permission_policy):
+        raise AssertionError("engine must not be built when cwd is out-of-roots")
+
+    session = StreamingSession(
+        make_roots_config(tmp_path, root=root),
+        session_store=store,
+        engine_factory=boom_factory,
+        clock=lambda: 0.0,
+    )
+
+    async def boom_send(*, text, reply_markup=None, parse_mode=None):
+        raise RuntimeError("telegram down during the refusal")
+
+    async def edit(*, message_id, text, parse_mode=None):
+        return None
+
+    # The refusal send raises; the exception surfaces (nothing left to fall back to), but
+    # the lock must be released by the time we observe it.
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(
+            session.handle_message(1, "go", send=boom_send, edit=edit), timeout=2.0
+        )
+    assert session.is_busy(1) is False  # lock released — NOT wedged busy
+
+
+async def test_stop_failure_on_switch_still_runs_new_turn_and_clears_old(tmp_path):
+    # T8 (12a): single-active-run switch stops the previously-started engine; if that
+    # stop() RAISES, _stop_other_started logs + proceeds (marks the old runtime stopped /
+    # engine None) so a wedged old engine never blocks the new active turn. The new turn
+    # must still run, and the old runtime must be cleared.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+
+    class StopBoomEngine(FakeEngine):
+        async def stop(self):
+            self.stopped = True
+            raise RuntimeError("stop blew up")
+
+    eng_alpha = StopBoomEngine(
+        [ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="a")],
+        session_id="alpha-sess",
+    )
+    eng_beta = FakeEngine(
+        [ResultEvent(session_id="beta-sess", is_error=False, subtype="success", result_text="b")],
+        session_id="beta-sess",
+    )
+    session = make_multi_session(
+        {"/work/alpha": eng_alpha, "/work/beta": eng_beta}, store=store
+    )
+    rec = Recorder()
+
+    # Turn 1 on alpha → alpha started.
+    await asyncio.wait_for(
+        session.handle_message(1, "go alpha", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng_alpha.started is True
+
+    # Switch to beta; turn 2 must stop alpha (which raises) yet still run beta.
+    store.switch(1, "beta")
+    await asyncio.wait_for(
+        session.handle_message(1, "go beta", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng_alpha.stopped is True  # stop() was attempted (and raised, swallowed)
+    assert eng_beta.started is True  # the new turn ran despite the stop failure
+    assert any("b" == s["text"] for s in rec.sends)
+    # The old (alpha) runtime was cleared so a wedged engine can't block future turns.
+    alpha_rt = session._chat(1).runtimes["alpha"]
+    assert alpha_rt.started is False and alpha_rt.engine is None
+
+
+async def test_resume_id_empty_string_session_id_starts_fresh(tmp_path):
+    # T8 (12b): a persisted session_id that is an EMPTY string is falsy → _resume_id
+    # returns None → the engine starts FRESH (not resume). Guards the `and session_id`
+    # branch (an empty id must never be passed to resume()).
+    from claude_tg.session_store import JsonSessionStore
+
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "api", "/work/api", make_active=True)
+    # Hand-write an empty-string session_id (update() would store None for a fresh reset;
+    # an empty string is the on-disk edge we must treat as no-resume).
+    raw = store._load_raw()
+    raw["chats"]["1"]["projects"]["api"]["session_id"] = ""
+    store._save_raw(raw)
+
+    engine = FakeEngine(
+        [ResultEvent(session_id="fresh", is_error=False, subtype="success", result_text="ok")]
+    )
+    session = make_multi_session({"/work/api": engine}, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert engine.started is True  # fresh start
+    assert engine.resumed is None  # empty-string id was NOT passed to resume()
+
+
+async def test_resume_id_non_str_session_id_starts_fresh(tmp_path):
+    # T8 (12b): a NON-str session_id on disk (hand-edited junk) → _resume_id returns None
+    # → fresh start. Guards the `isinstance(session_id, str)` branch (a list/number id must
+    # never reach resume()).
+    from claude_tg.session_store import JsonSessionStore
+
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "api", "/work/api", make_active=True)
+    raw = store._load_raw()
+    raw["chats"]["1"]["projects"]["api"]["session_id"] = ["not", "a", "string"]
+    store._save_raw(raw)
+
+    engine = FakeEngine(
+        [ResultEvent(session_id="fresh", is_error=False, subtype="success", result_text="ok")]
+    )
+    session = make_multi_session({"/work/api": engine}, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert engine.started is True
+    assert engine.resumed is None  # non-str id was NOT passed to resume()
