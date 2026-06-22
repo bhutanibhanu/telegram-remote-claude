@@ -27,7 +27,7 @@ from claude_tg.engine.types import (
     TextEvent,
     ToolUseEvent,
 )
-from claude_tg.render import encode_callback
+from claude_tg.render import RenderAction, encode_callback
 from claude_tg.stream_session import StreamingBusy, StreamingSession
 
 
@@ -288,6 +288,165 @@ async def test_ask_other_then_free_text_resolves_with_answer():
     rec = Recorder()
     await session.handle_message(1, "Charlie", send=rec.send, edit=rec.edit)
     assert engine.resolve_calls == [("tid", QuestionAnswer(answers={"Name?": "Charlie"}))]
+
+
+# ---------------------------------------------------------------------------
+# Multi-question AskUserQuestion — one AskUserQuestion carries SEVERAL questions under a
+# single tool_use_id; the relay must accumulate per-question answers and resolve ONCE all
+# are answered. Regression for the live phone-verify bug where the first option tap
+# resolved the whole ask with a 1-of-N answer map, stranding the remaining questions and
+# making grill error out. (Neither the P1 nor P2 live probe caught this — both injected
+# answers via engine.resolve directly, bypassing the per-tap path.)
+# ---------------------------------------------------------------------------
+
+
+async def test_multi_question_ask_resolves_only_after_all_answered():
+    """A 3-question ask holds open until every question is answered, then resolves ONCE
+    with the full native map. The first two taps accumulate without resolving."""
+    ask = AskEvent(
+        questions=[
+            {"question": "Q1", "options": [{"label": "A1"}, {"label": "B1"}]},
+            {"question": "Q2", "options": [{"label": "A2"}, {"label": "B2"}]},
+            {"question": "Q3", "options": [{"label": "A3"}, {"label": "B3"}]},
+        ],
+        tool_use_id="multi",
+    )
+    engine = FakeEngine([])
+    session = make_session(engine)
+    await session._ensure_engine(session._chat(1), 1)
+    session._chat(1).pending_ask = ask
+
+    out0 = session.resolve_callback(1, encode_callback("a", "multi", question_index=0, option_index=0))
+    assert out0.handled is True  # accepted, but...
+    assert engine.resolve_calls == []  # ...NOT resolved yet
+    assert session._chat(1).pending_ask is ask  # the ask is still held
+
+    out1 = session.resolve_callback(1, encode_callback("a", "multi", question_index=1, option_index=1))
+    assert out1.handled is True
+    assert engine.resolve_calls == []  # still holding (2 of 3)
+
+    out2 = session.resolve_callback(1, encode_callback("a", "multi", question_index=2, option_index=0))
+    assert out2.handled is True
+    # Resolved exactly once, with ALL three answers keyed by question text.
+    assert engine.resolve_calls == [
+        ("multi", QuestionAnswer(answers={"Q1": "A1", "Q2": "B2", "Q3": "A3"}))
+    ]
+    assert session._chat(1).pending_ask is None  # cleared after the full resolve
+
+
+async def test_multi_question_ask_retap_overwrites_choice():
+    """Re-tapping a question before completion overwrites that answer (count unchanged),
+    so the operator can change a choice before the final tap resolves the ask."""
+    ask = AskEvent(
+        questions=[
+            {"question": "Q1", "options": [{"label": "A1"}, {"label": "B1"}]},
+            {"question": "Q2", "options": [{"label": "A2"}, {"label": "B2"}]},
+        ],
+        tool_use_id="multi2",
+    )
+    engine = FakeEngine([])
+    session = make_session(engine)
+    await session._ensure_engine(session._chat(1), 1)
+    session._chat(1).pending_ask = ask
+
+    session.resolve_callback(1, encode_callback("a", "multi2", question_index=0, option_index=0))  # Q1=A1
+    session.resolve_callback(1, encode_callback("a", "multi2", question_index=0, option_index=1))  # Q1=B1 (overwrite)
+    assert engine.resolve_calls == []  # only ONE distinct question answered so far
+    session.resolve_callback(1, encode_callback("a", "multi2", question_index=1, option_index=0))  # Q2=A2
+    assert engine.resolve_calls == [
+        ("multi2", QuestionAnswer(answers={"Q1": "B1", "Q2": "A2"}))  # the overwrite stuck
+    ]
+
+
+async def test_multi_question_ask_mixed_option_and_free_text():
+    """A multi-question ask can be completed by mixing an option tap and an "Other"
+    free-text answer; it resolves only when the LAST question is answered."""
+    ask = AskEvent(
+        questions=[
+            {"question": "Q1", "options": [{"label": "A1"}, {"label": "B1"}]},
+            {"question": "Q2", "options": [{"label": "A2"}]},
+        ],
+        tool_use_id="multi3",
+    )
+    engine = FakeEngine([])
+    session = make_session(engine)
+    await session._ensure_engine(session._chat(1), 1)
+    session._chat(1).pending_ask = ask
+
+    # Answer Q2 by tapping its option — not complete yet (Q1 still open).
+    session.resolve_callback(1, encode_callback("a", "multi3", question_index=1, option_index=0))  # Q2=A2
+    assert engine.resolve_calls == []
+    # Answer Q1 via "Other" → free text; the typed answer completes the ask → one resolve.
+    out = session.resolve_callback(1, encode_callback("o", "multi3", question_index=0))
+    assert out.expects_text is True
+    assert engine.resolve_calls == []
+    rec = Recorder()
+    await session.handle_message(1, "custom answer", send=rec.send, edit=rec.edit)
+    assert engine.resolve_calls == [
+        ("multi3", QuestionAnswer(answers={"Q2": "A2", "Q1": "custom answer"}))
+    ]
+    assert session._chat(1).pending_ask is None
+
+
+async def test_multi_question_ask_renders_one_message_per_question():
+    """A multi-question ask is sent as ONE message per question, each with its OWN keyboard
+    — not a single stacked wall of buttons (the live phone-verify UX complaint)."""
+    ask = AskEvent(
+        questions=[
+            {"question": "Storage?", "options": [{"label": "JSON"}, {"label": "SQLite"}]},
+            {"question": "CLI?", "options": [{"label": "argparse"}, {"label": "Typer"}]},
+        ],
+        tool_use_id="tid-multi",
+    )
+    engine = FakeEngine(
+        [ask, HOLD, ResultEvent(session_id="s", is_error=False, subtype="success", result_text="done")]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+
+    async def drive():
+        await session.handle_message(1, "go", send=rec.send, edit=rec.edit)
+
+    turn = asyncio.create_task(drive())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # Two keyboarded messages — one per question — each numbered, each carrying ONLY its options.
+    keyboarded = [s for s in rec.sends if s["reply_markup"] is not None]
+    assert len(keyboarded) == 2
+    assert "(1/2)" in keyboarded[0]["text"] and "Storage?" in keyboarded[0]["text"]
+    assert "(2/2)" in keyboarded[1]["text"] and "CLI?" in keyboarded[1]["text"]
+    labels_q1 = [b.text for row in keyboarded[1]["reply_markup"].inline_keyboard for b in row]
+    assert "argparse" in labels_q1 and "JSON" not in labels_q1  # only Q1's own options
+
+    # Answering one question does NOT resolve; the second (final) tap resolves the whole ask.
+    session.resolve_callback(1, encode_callback("a", "tid-multi", question_index=0, option_index=0))
+    assert engine.resolve_calls == []
+    session.resolve_callback(1, encode_callback("a", "tid-multi", question_index=1, option_index=1))
+    assert engine.resolve_calls == [
+        ("tid-multi", QuestionAnswer(answers={"Storage?": "JSON", "CLI?": "Typer"}))
+    ]
+    await asyncio.wait_for(turn, timeout=2.0)
+
+
+async def test_identical_status_line_is_not_resent():
+    """An unchanged status line is skipped — editing a Telegram message to identical text
+    errors, and the old fallback re-sent a duplicate message (the status-line spam)."""
+    engine = FakeEngine([])
+    session = make_session(engine)
+    state = session._chat(1)
+    rec = Recorder()
+    thinking = RenderAction(op="edit_status", chunks=("💭 Claude is thinking…",))
+    await session._perform(state, thinking, send=rec.send, edit=rec.edit)  # first → one send
+    await session._perform(state, thinking, send=rec.send, edit=rec.edit)  # identical → skip
+    await session._perform(state, thinking, send=rec.send, edit=rec.edit)  # identical → skip
+    assert len(rec.sends) == 1  # ONE status message, not three
+    assert rec.edits == []  # no edit attempted for identical text
+    # A CHANGED line edits the existing message in place (no new message).
+    await session._perform(
+        state, RenderAction(op="edit_status", chunks=("⏳ rate limited",)), send=rec.send, edit=rec.edit
+    )
+    assert len(rec.sends) == 1 and len(rec.edits) == 1
 
 
 # ---------------------------------------------------------------------------

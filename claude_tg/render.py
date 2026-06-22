@@ -422,6 +422,64 @@ def ask_keyboard(ask: AskEvent) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def ask_question_body(ask: AskEvent, question_index: int) -> str:
+    """Message body for ONE question of an ask (its header + text + multi-select hint).
+
+    Multi-question asks are rendered one message per question (paired with
+    :func:`ask_question_keyboard`) so each option set sits directly beneath its question —
+    a single stacked keyboard for several questions is an unreadable wall of buttons.
+    """
+    question = ask.questions[question_index]
+    header = question.get("header")
+    qtext = question.get("question", "")
+    total = len(ask.questions)
+    if total > 1:
+        prefix = f"❓ ({question_index + 1}/{total}) " + (f"{header}: " if header else "")
+    else:
+        prefix = f"❓ {header}: " if header else "❓ "
+    body = f"{prefix}{qtext}"
+    if question.get("multiSelect"):
+        body += "\n  (you may pick more than one)"
+    return body
+
+
+def ask_question_keyboard(ask: AskEvent, question_index: int) -> InlineKeyboardMarkup:
+    """Inline keyboard for ONE question of an ask — its options (one per row) + an
+    "Other" free-text button.
+
+    callback_data carries ``(question_index, option_index)`` so the relay records the
+    answer against the right question and resolves the whole ask once every question has
+    an answer. ``tool_use_id`` must be present (the engine sets it on the event).
+    """
+    tool_use_id = ask.tool_use_id
+    if not tool_use_id:
+        raise ValueError("AskEvent.tool_use_id is required to build an ask keyboard")
+    question = ask.questions[question_index]
+    options = question.get("options") or []
+    rows: list[list[InlineKeyboardButton]] = []
+    for o_idx, option in enumerate(options):
+        label = str(option.get("label", f"Option {o_idx + 1}"))
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=encode_callback(
+                        KIND_ASK, tool_use_id, question_index=question_index, option_index=o_idx
+                    ),
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="✏️ Other (free text)",
+                callback_data=encode_callback(KIND_OTHER, tool_use_id, question_index=question_index),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
 def plan_keyboard(plan: PlanEvent) -> InlineKeyboardMarkup:
     """Build the ``[Approve]`` / ``[Reject + feedback]`` keyboard for an ``ExitPlanMode``.
 
@@ -560,12 +618,32 @@ def tool_use_line(event: ToolUseEvent) -> str:
     return f"▶️ {event.tool_input_summary}"
 
 
+#: Friendly, STABLE text for the noisy activity phases. Stability matters: consecutive
+#: "still working" statuses render identical, so the coalescer's in-place edit is skipped
+#: (no duplicate status messages) and the operator sees a calm "thinking…" line instead of
+#: raw "connected · thinking_tokens".
+_FRIENDLY_PHASE = {
+    "init": "💭 Claude is starting…",
+    "connected": "💭 Claude is thinking…",
+    "thinking": "💭 Claude is thinking…",
+    "disconnected": "🔌 Reconnecting…",
+}
+
+
 def status_line(event: StatusEvent) -> str:
-    """One-liner for a lifecycle/health status event (no secrets — phase + detail)."""
+    """One-liner for a lifecycle/health status event (no secrets).
+
+    The common activity phases (init/connected/thinking) render as a calm, STABLE
+    "Claude is thinking…" line so a burst of them coalesces to a single in-place line
+    instead of spamming the chat; phases that carry actionable detail (e.g. ``rate_limit``)
+    still surface it. The model name is intentionally dropped — it is noise to the operator
+    and its variation would defeat the identical-line dedupe.
+    """
+    friendly = _FRIENDLY_PHASE.get(event.phase)
+    if friendly is not None:
+        return friendly
     emoji = _PHASE_EMOJI.get(event.phase, "ℹ️")
     bits = [f"{emoji} {event.phase}"]
-    if event.model:
-        bits.append(event.model)
     if event.detail:
         bits.append(event.detail)
     return " · ".join(bits)

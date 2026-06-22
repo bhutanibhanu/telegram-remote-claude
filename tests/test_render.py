@@ -42,6 +42,8 @@ from claude_tg.render import (
     RenderAction,
     answers_from_ask,
     ask_keyboard,
+    ask_question_body,
+    ask_question_keyboard,
     coalesce_stream,
     decode_callback,
     encode_callback,
@@ -245,6 +247,59 @@ def test_status_is_one_liner_status():
     action = render_event(StatusEvent(phase="rate_limit", detail="retry in 5s"))
     assert action.op == "edit_status"
     assert "rate_limit" in action.text and "retry in 5s" in action.text
+
+
+def test_status_activity_phase_is_friendly_and_stable():
+    """The noisy activity phases render as a calm, STABLE 'thinking…' line — no raw phase
+    name, no per-event detail (whose variation would defeat the identical-line dedupe that
+    stops status-message spam)."""
+    text = render_event(StatusEvent(phase="connected", detail="thinking_tokens", model="x")).text
+    assert text == "💭 Claude is thinking…"
+    assert "connected" not in text and "thinking_tokens" not in text and "x" not in text
+    # init folds to the same calm family; identical text across a burst → dedupe to 1 line.
+    assert render_event(StatusEvent(phase="connected")).text == text
+
+
+def test_ask_question_keyboard_is_single_question_slice():
+    """A multi-question ask renders one keyboard PER question — each carries only that
+    question's options (+ an Other), so the buttons sit under their own question rather
+    than in one giant stacked wall."""
+    ask = AskEvent(
+        questions=[
+            {"question": "Storage?", "options": [{"label": "JSON"}, {"label": "SQLite"}]},
+            {"question": "CLI?", "options": [{"label": "argparse"}, {"label": "Typer"}, {"label": "Click"}]},
+        ],
+        tool_use_id="tid",
+    )
+    kb0 = ask_question_keyboard(ask, 0)
+    kb1 = ask_question_keyboard(ask, 1)
+    # Q0: 2 options + Other = 3 rows; Q1: 3 options + Other = 4 rows.
+    assert len(kb0.inline_keyboard) == 3
+    assert len(kb1.inline_keyboard) == 4
+    # Every option button on kb0 decodes to question_index 0; on kb1, question_index 1.
+    for row in kb0.inline_keyboard[:-1]:  # last row is Other
+        cb = decode_callback(row[0].callback_data)
+        assert cb.kind == "ask" and cb.question_index == 0
+    for row in kb1.inline_keyboard[:-1]:
+        cb = decode_callback(row[0].callback_data)
+        assert cb.kind == "ask" and cb.question_index == 1
+    # The trailing row is the per-question Other.
+    assert decode_callback(kb1.inline_keyboard[-1][0].callback_data).kind == "other"
+
+
+def test_ask_question_body_numbers_multi_questions():
+    ask = AskEvent(
+        questions=[
+            {"question": "Q one", "header": "Storage"},
+            {"question": "Q two", "header": "CLI"},
+            {"question": "Q three", "header": "Commands"},
+        ],
+        tool_use_id="tid",
+    )
+    assert ask_question_body(ask, 1) == "❓ (2/3) CLI: Q two"
+    # A single-question ask has no (k/N) counter.
+    single = AskEvent(questions=[{"question": "Just one"}], tool_use_id="tid")
+    assert ask_question_body(single, 0) == "❓ Just one"
 
 
 def test_renderaction_text_is_lossless_join():

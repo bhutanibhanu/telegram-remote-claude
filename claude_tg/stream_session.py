@@ -68,6 +68,8 @@ from .render import (
     Coalescer,
     RenderAction,
     answers_from_ask,
+    ask_question_body,
+    ask_question_keyboard,
     decode_callback,
     yolo_indicator,
 )
@@ -161,9 +163,20 @@ class _ChatState:
     lock: asyncio.Lock = None  # type: ignore[assignment]
     # The status-line message id for in-place coalesced edits (created on first edit).
     status_message_id: Optional[int] = None
+    # The text currently shown on that status line — used to SKIP an edit when the new
+    # status is identical. Editing a Telegram message to the same text raises "message is
+    # not modified", whose fallback used to send a fresh message → status-line spam.
+    status_text: Optional[str] = None
     # The most recent ask/plan awaiting an answer (so a tap reconstructs the answer).
     pending_ask: Optional[AskEvent] = None
     pending_plan: Optional[PlanEvent] = None
+    # Accumulated answers for a MULTI-question AskUserQuestion (question_index ->
+    # chosen option label / "Other" free-text). One AskUserQuestion carries ALL its
+    # questions under a single tool_use_id, so the native answers map must cover every
+    # question; the relay holds the ask open, recording each tap, and resolves ONCE all
+    # are answered (a partial map is rejected by the tool). Reset when a new ask arrives
+    # and on clear.
+    ask_answers: dict[int, str] = field(default_factory=dict)
     # Free-text capture: when set, the NEXT text message is the answer/feedback for
     # this tool_use_id, in this mode ("ask_other" -> QuestionAnswer; "plan_reject" ->
     # PlanVerdict(approve=False)). Question index is kept for an "Other" answer.
@@ -292,6 +305,7 @@ class StreamingSession:
             state.engine = None
             state.started = False
             state.status_message_id = None
+            state.status_text = None
             self._clear_pending(state)
             # D7: drop grants + yolo so the next session starts fail-closed.
             state.policy.clear()
@@ -366,13 +380,29 @@ class StreamingSession:
         coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
         # Status line for THIS turn starts unset; create on first edit_status.
         state.status_message_id = None
+        state.status_text = None
         if state.policy.yolo:
             await send(text=yolo_indicator(), reply_markup=None, parse_mode=None)
         async for event in engine.send(prompt):
             # Remember an ask/plan so a tap can reconstruct the native answer.
             if isinstance(event, AskEvent):
                 state.pending_ask = event
-            elif isinstance(event, PlanEvent):
+                state.ask_answers = {}  # fresh accumulator for this ask's questions
+                # Render each question as its OWN message + option keyboard so a question's
+                # choices sit directly beneath it. A single stacked keyboard for a
+                # multi-question ask is an unreadable wall of buttons (the operator can't
+                # tell which buttons belong to which question). Flush any buffered status
+                # first so the questions appear after it, in order.
+                for action in coalescer.flush().actions:
+                    await self._perform(state, action, send=send, edit=edit)
+                for q_idx in range(len(event.questions)):
+                    await send(
+                        text=ask_question_body(event, q_idx),
+                        reply_markup=ask_question_keyboard(event, q_idx),
+                        parse_mode=None,
+                    )
+                continue
+            if isinstance(event, PlanEvent):
                 state.pending_plan = event
             elif isinstance(event, ResultEvent):
                 self._persist(chat_id, session_id=event.session_id or engine.session_id)
@@ -416,18 +446,27 @@ class StreamingSession:
         body = action.text
         if not body.strip():
             return
+        if body == state.status_text:
+            # Identical to what's already shown — skip. Editing a Telegram message to the
+            # same text raises "message is not modified"; the old fallback then sent a fresh
+            # message, which is exactly the status-line spam we must avoid.
+            return
         if state.status_message_id is None:
             mid = await send(text=body, reply_markup=None, parse_mode=action.parse_mode)
             state.status_message_id = mid
+            state.status_text = body
             return
         try:
             await edit(message_id=state.status_message_id, text=body, parse_mode=action.parse_mode)
+            state.status_text = body
         except Exception:
-            # A failed edit (message gone / identical content) must never kill the turn
-            # (RB1/RB2). Fall back to a fresh status message so progress is not lost.
+            # A genuine edit failure (message gone / too old) must never kill the turn
+            # (RB1/RB2); fall back to a fresh status message. Identical-text edits are
+            # already skipped above, so this is a real failure, not a no-op edit.
             log.debug("status edit failed for chat; sending a fresh status line", exc_info=True)
             mid = await send(text=body, reply_markup=None, parse_mode=action.parse_mode)
             state.status_message_id = mid
+            state.status_text = body
 
     # -- the callback resolve path (LOCK-FREE: SB1 enforced at the bot) ------
 
@@ -482,19 +521,53 @@ class StreamingSession:
         if ask is None or ask.tool_use_id != decoded.tool_use_id:
             return CallbackOutcome(handled=False, note="no matching question")
         try:
-            answers = answers_from_ask(
-                ask,
-                int(decoded.question_index),  # type: ignore[arg-type]
-                int(decoded.option_index),  # type: ignore[arg-type]
-            )
+            q_idx = int(decoded.question_index)  # type: ignore[arg-type]
+            # answers_from_ask validates the indices and yields {question: label}; keep
+            # the label and record it against the question index (accumulate, below).
+            one = answers_from_ask(ask, q_idx, int(decoded.option_index))  # type: ignore[arg-type]
         except (IndexError, KeyError, TypeError):
             # Stale/forged indices for a now-different ask — ignore (RB1).
             return CallbackOutcome(handled=False, note="stale option")
-        resolved = engine.resolve(decoded.tool_use_id, QuestionAnswer(answers=answers))
+        return self._record_ask_answer(state, engine, ask, q_idx, next(iter(one.values()), ""))
+
+    def _record_ask_answer(
+        self, state: _ChatState, engine: Engine, ask: AskEvent, q_idx: int, answer: str
+    ) -> "CallbackOutcome":
+        """Record ONE question's answer; resolve the whole ask only once EVERY question
+        in it has an answer.
+
+        A single ``AskUserQuestion`` carries all its questions under one ``tool_use_id``
+        and the native ``answers`` map must cover them all — resolving on the first tap
+        (the original bug) sent a partial map the tool rejects, stranding a multi-question
+        ask. So we accumulate per-question answers in ``state.ask_answers`` and call
+        ``engine.resolve`` only when the count reaches ``len(ask.questions)``. Re-tapping
+        a question overwrites its answer (count unchanged), so the operator can change a
+        choice before the last one. A SINGLE-question ask resolves on the first tap,
+        exactly as before — no regression. Shared by the option-tap and "Other" free-text
+        paths.
+        """
+        state.ask_answers[q_idx] = answer
+        total = len(ask.questions)
+        answered = len(state.ask_answers)
+        if answered < total:
+            return CallbackOutcome(
+                handled=True,
+                note=f"Answered {answered}/{total} — {total - answered} to go",
+            )
+        # Every question answered → build the full native map and resolve once. Clear the
+        # held state first so a no-op resolve can't strand the chat in "answering" mode.
+        answers = {
+            str(ask.questions[i].get("question", "")): ans
+            for i, ans in state.ask_answers.items()
+        }
+        tuid = ask.tool_use_id
+        state.pending_ask = None
+        state.ask_answers = {}
+        if tuid is None:
+            return CallbackOutcome(handled=False, note="no question id")
+        resolved = engine.resolve(tuid, QuestionAnswer(answers=answers))
         if resolved:
-            state.pending_ask = None
-            label = next(iter(answers.values()), "")
-            return CallbackOutcome(handled=True, note=f"Answered: {label}")
+            return CallbackOutcome(handled=True, note=f"All {total} answered ✓")
         return CallbackOutcome(handled=False, note="already answered")
 
     def _arm_ask_other(self, state: _ChatState, decoded: Callback) -> "CallbackOutcome":
@@ -568,11 +641,12 @@ class StreamingSession:
             return
         if mode == "ask_other":
             ask = state.pending_ask
-            question_text = ""
             if ask is not None and q_idx is not None and 0 <= q_idx < len(ask.questions):
-                question_text = str(ask.questions[q_idx].get("question", ""))
-            engine.resolve(tool_use_id, QuestionAnswer(answers={question_text: text}))
-            state.pending_ask = None
+                # Record this question's free-text answer; resolve only once every
+                # question in the ask is answered (mirrors the option-tap path so a
+                # multi-question ask is not stranded by a single "Other" reply).
+                self._record_ask_answer(state, engine, ask, q_idx, text)
+            # else: the ask is gone / index stale — harmless no-op (marker already cleared).
         elif mode == "plan_reject":
             engine.resolve(tool_use_id, PlanVerdict(approve=False, feedback=text))
             state.pending_plan = None
@@ -616,6 +690,7 @@ class StreamingSession:
         self._clear_pending_text(state)
         state.pending_ask = None
         state.pending_plan = None
+        state.ask_answers = {}
 
 
 @dataclass(frozen=True)
