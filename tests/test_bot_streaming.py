@@ -89,6 +89,11 @@ class FakeStreaming:
         self.cancel_calls.append(chat_id)
         return 1
 
+    def is_busy(self, chat_id):
+        # Mirror StreamingSession.is_busy so the bot's busy-guards (/switch, /new, /reset)
+        # can be exercised against this lightweight stand-in.
+        return self._busy
+
     def reset(self, chat_id):
         self.reset_calls.append(chat_id)
 
@@ -1589,3 +1594,43 @@ def test_build_application_registers_new_before_skill_passthrough():
     assert new_idx is not None, "/new must be a registered CommandHandler"
     assert skill_passthrough_idx is not None
     assert new_idx < skill_passthrough_idx
+
+
+async def test_cmd_reset_while_busy_refused_then_cancel_recovers(tmp_path):
+    """B5: /reset during a held turn must be REFUSED. reset() drops the active engine, which
+    would orphan a parked answer-hold — neither a tap nor /cancel could then reach it
+    (handle_cancel finds no active engine), wedging the turn until the 60-min backstop. While
+    busy the engine is still live, so the operator's recovery is /cancel (which works), then
+    /reset. Mirrors the /switch and /new busy-guards."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, engine = make_streaming(store, script=[HOLD])  # the turn parks holding the lock
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    turn = asyncio.create_task(bot.on_message(make_update(1, "go"), rec))
+    for _ in range(200):
+        if session.is_busy(1):
+            break
+        await asyncio.sleep(0)
+    assert session.is_busy(1), "the held turn should hold the lock"
+
+    # /reset is REFUSED while busy — spy streaming.reset to prove it is NOT called (so the
+    # engine is never nulled / the held turn never orphaned).
+    reset_calls: list = []
+    orig_reset = session.reset
+    session.reset = lambda *a, **k: reset_calls.append((a, k))  # type: ignore[assignment]
+    up_reset = make_update(1, "/reset")
+    await bot.cmd_reset(up_reset, make_cmd_ctx())
+    session.reset = orig_reset  # type: ignore[assignment]
+    assert "/cancel" in up_reset.message.reply_text.await_args.args[0]
+    assert reset_calls == [], "streaming.reset must NOT be called while a turn is in flight"
+    assert session.is_busy(1), "the held turn must still be live (not orphaned) after the refusal"
+
+    # The engine is still live (reset was refused) → /cancel genuinely recovers the held turn
+    # (the recovery path B5 flagged as broken when reset nulled the engine first).
+    await bot.cmd_cancel(make_update(1, "/cancel"), make_ctx())
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert session.is_busy(1) is False, "/cancel must release the held turn (recovery works)"

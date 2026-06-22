@@ -99,6 +99,18 @@ class TelegramClaudeBot:
         # runner's stale value (corrupting D4/D5). Branch on streaming vs one-shot so each
         # mode resets only its own state; the reply is unchanged.
         if self.streaming is not None:
+            # B5: refuse /reset while a turn is in flight (consistent with /switch and
+            # /new). reset() drops the active project's engine; doing that mid-turn would
+            # ORPHAN a parked answer-hold — the engine reference is gone, so neither a tap
+            # nor /cancel can reach it (handle_cancel finds no active engine), wedging the
+            # turn until the 60-min backstop. While busy the engine is still live, so
+            # /cancel genuinely recovers — tell the operator to use it first. (Refusing
+            # while busy also means reset never races an in-flight turn's result-persist.)
+            if self.streaming.is_busy(chat_id):
+                await update.message.reply_text(
+                    "⏳ A turn is in flight — /cancel it first, then /reset."
+                )
+                return
             self.streaming.reset(chat_id)
         else:
             self.runner.reset(chat_id)
