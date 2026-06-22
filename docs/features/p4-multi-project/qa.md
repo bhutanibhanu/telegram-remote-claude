@@ -59,7 +59,27 @@ retained; the structured verdict is below, plus my verification of each claim.)
   **Fix (cheap):** re-validate the stored cwd in `cmd_switch` before activating; refuse + leave active
   unchanged if out-of-root.
 
-## Status
-**Phase = qa. Awaiting owner decision (fix / ship anyway / stop).** Recommendation: **fix** — B1 and B3
-are genuine ship-stoppers; B2 is a cheap conformance fix. All three have clear, localized fixes + the
-Codex-suggested tests. Then re-run gates + re-verify, and the owner phone-verify (`verify.md`).
+## Status — RESOLVED: both reviewers SHIP
+
+Owner chose to fix. Over 5 Codex rounds the cross-model review found **7 real bugs** (all missed by the
+same-model Verifier), each verified + fixed + mutation-probed:
+
+| Fix | Bug | Class |
+|---|---|---|
+| QF1 (613ba17) | B1 — `/reset` wrote the runner's stale cwd onto the active project | data corruption (D4) |
+| QF2 (613ba17) | B2 — `/switch` didn't re-validate the target's stored cwd | SB2 conformance |
+| QF3 (d6ba25a) | B3 — resume-connects-then-errors-on-use left the dead id stuck | RB3 |
+| QF4 (507e6f6) | B3′ — resume()-raises fallback `start()`-on-same-engine wedge | RB3 |
+| QF5 (9483208) | B4 — `/rm` left a stale runtime → `/new`-same-name leaked cwd + `/yolo`/grants; + non-started-engine reuse | SB5/D4 |
+| QF6 (bfc445b) | B5 — `/reset` during a held turn orphaned it (`/cancel` couldn't recover) | RB4-class wedge |
+
+**Final verdicts:** Verifier subagent **SHIP** (no blockers); **Codex round 5 SHIP** (no blockers, no
+non-blocking). All four lifecycle commands (`/switch` `/new` `/rm` `/reset`) are now consistently
+busy-safe, and the runtime-cleanup class is closed. Gates: **596 tests green**, ruff/mypy/secret clean.
+
+**One optional follow-up (Codex non-blocking suggestion):** a companion test proving a *tap* (not just
+`/cancel`) still resolves the parked turn after a refused `/reset` — the B5 fix is already pinned via the
+`/cancel`-recovers test; the tap path is the same `_active_engine` mechanism.
+
+**Remaining gate:** the owner **phone-verify** (`verify.md`) — the authoritative live check — before
+merge to `main`.
