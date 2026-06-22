@@ -14,7 +14,7 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 
 ## Task list
 - [x] T1 — ADR-004: multi-project session model & persistence schema (1ab4560)
-- [ ] T2 — Versioned store + v1→v2 migration + flat (one-shot) view
+- [x] T2 — Versioned store + v1→v2 migration + flat (one-shot) view (0d7d4fe)
 - [ ] T3 — Registry accessors + SB4 name validation
 - [ ] T4 — StreamingSession per-project rework
 - [ ] T5 — Bot navigation commands (/projects, /switch, /rm, /pwd, /cd-removed)
@@ -47,7 +47,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the file is corrupt or an unknown `version`, load SHALL return empty and SHALL NOT raise.
   - Writes SHALL remain **atomic (temp+replace)** and **`0600`** (RB6).
 - **Tests:** v1→v2 migration (idempotent, preserves data); **flat-view round-trip == pre-P4 one-shot behavior** (the regression guard); corrupt + unknown-version → `{}`, no crash; atomic+0600 preserved.
-- **Status:** todo
+- **Status:** done (0d7d4fe) — reviewer AGREE; OLD-vs-NEW flat-view differential byte-identical across 14 caller-realistic sequences. Two reviewer nice-to-haves deferred to T8.
 
 ### T3 — Registry accessors + SB4 name validation
 - **Goal:** Add the streaming-only registry CRUD on top of T2, with strict project-name rules. Purely additive.
@@ -120,7 +120,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the bot restarts, **both** projects SHALL be present with correct cwd/session_id and each SHALL resume independently on its next message (**restart-resumes-both**).
   - The store SHALL survive a simulated **crash-during-write** without corruption (atomic replace leaves the prior good file) (**RB6**).
   - One-shot mode SHALL behave **exactly as pre-P4** against a v2 store (regression assertion; complements T2).
-- **Tests:** the above scenarios + full lifecycle `/new→/switch→/rm` via the session/registry layer.
+- **Tests:** the above scenarios + full lifecycle `/new→/switch→/rm` via the session/registry layer. Plus two deferred-from-T2 store contracts: (a) `update()` after an **unknown/future-version** load starts a clean v2 (does not preserve the future doc — locks the SB6 fail-safe-clobber contract); (b) an empty-string `session_id`/`cwd` on disk normalizes to **absent** in the flat view (documents the truthy-omit).
 - **Status:** todo
 
 ### T9 — Live verify + verify.md phone-checklist
