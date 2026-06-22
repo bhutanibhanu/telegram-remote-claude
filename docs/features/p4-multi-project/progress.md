@@ -27,6 +27,7 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 - [x] QF3 — fix B3: streaming resume-failure-on-result fallback (port `_is_resume_failure`) — Codex NO_SHIP blocker (d6ba25a)
 
 - [x] QF4 — fix B3′ (Codex re-QA NO_SHIP): resume()-raises fallback wedge — discard the partial engine + clear the dead id (before fresh start) + start a FRESH instance; never re-resume the dead id (507e6f6)
+- [x] QF5 — fix B4 (Codex round-3 NO_SHIP): purge the in-memory runtime on `/rm` (`forget_project`) + never reuse a non-started engine in `_ensure_engine` — closes the SB5 bypass-leak / D4 cwd-leak on `/rm`-then-`/new`-same-name (9483208)
 
 ### QA-fix follow-ups (from the QF3 review)
 - ✅ CLOSED by QF4: `_recover_failed_resume` now best-effort `stop()`s the connected-but-dead engine before dropping it (no orphaned SDK client); same stop() added to the resume-raises path.
