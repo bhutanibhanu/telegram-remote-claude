@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from claude_tg.bot import TelegramClaudeBot
-from claude_tg.claude_runner import ClaudeResult
+from claude_tg.claude_runner import ClaudeResult, ClaudeRunner
 from claude_tg.config import Config
 from claude_tg.session_store import JsonSessionStore
 from claude_tg.stream_session import CallbackOutcome, StreamingBusy, StreamingSession
@@ -313,6 +313,77 @@ async def test_cmd_reset_also_resets_streaming():
     assert streaming.reset_calls == [1]
 
 
+async def test_cmd_reset_streaming_preserves_active_cwd_after_switch(tmp_path):
+    """QF1 / B1 (D4): in streaming mode /reset must NOT corrupt the active project's cwd.
+
+    Reproduces the real bug with a REAL store + REAL ClaudeRunner sharing it. The runner
+    seeds its ``_cwds`` from the flat view (the ACTIVE project's cwd) at construction and
+    never tracks /switch — so after restart→/switch→/reset, calling ``runner.reset`` would
+    ``store.update(chat, None, <stale cwd>)`` and clobber the now-active project's cwd.
+
+    Setup mirrors that sequence: ``alpha`` (cwd ``/work/alpha``) is active when the runner
+    is built (so ``runner._cwds[chat] == "/work/alpha"`` — the stale value), then we switch
+    to ``beta`` (cwd inside roots). After ``/reset`` in streaming mode:
+      * beta's cwd is UNCHANGED (not clobbered with alpha's stale ``/work/alpha``),
+      * beta's session_id is cleared (fresh conversation),
+      * alpha is untouched.
+
+    Mutation check: if ``cmd_reset`` called ``runner.reset`` in streaming mode, beta's cwd
+    would become ``/work/alpha`` and this test would fail.
+    """
+    beta_cwd = str(tmp_path / "beta")
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", beta_cwd, make_active=False)
+    # Give beta a session_id so we can assert /reset clears it.
+    store.update(1, session_id="beta-session", cwd=None)  # writes the ACTIVE project (alpha)…
+    store.switch(1, "beta")
+    store.update(1, session_id="beta-session", cwd=None)  # …now beta is active → set beta's id
+    store.switch(1, "alpha")  # back to alpha so the runner seeds its stale cwd from alpha
+
+    # Build the runner WHILE alpha is active → runner._cwds[1] == "/work/alpha" (the stale
+    # value that the corruption would write onto whatever project is active at /reset time).
+    runner = ClaudeRunner(make_config(engine_mode="streaming"), session_store=store)
+    assert runner._cwds.get(1) == "/work/alpha"
+
+    # Simulate the operator's /switch to beta (the runner does NOT track this).
+    store.switch(1, "beta")
+
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), runner, streaming=session)
+    upd = make_update(1, "/reset")
+    await bot.cmd_reset(upd, make_ctx())
+
+    # beta (the active project) keeps its cwd; its session is cleared; alpha is untouched.
+    assert store.get_project(1, "beta")["cwd"] == beta_cwd  # NOT clobbered with /work/alpha
+    assert store.get_project(1, "beta")["session_id"] is None  # fresh conversation
+    assert store.get_project(1, "alpha")["cwd"] == "/work/alpha"  # untouched
+    assert store.get_active(1) == "beta"  # /reset keeps the active project
+    assert "fresh" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_reset_oneshot_calls_runner_reset(tmp_path):
+    """QF1: one-shot /reset is UNCHANGED — it clears the runner's session via runner.reset.
+
+    A real store + runner (no streaming). The runner's flat-view session is cleared and the
+    active project's cwd is preserved (one-shot writes its own cwd, which is correct here).
+    """
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.update(1, session_id="one-shot-session", cwd="/work/solo")
+    runner = ClaudeRunner(make_config(engine_mode="oneshot"), session_store=store)
+    assert runner._sessions.get(1) == "one-shot-session"
+
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    assert bot.streaming is None
+    upd = make_update(1, "/reset")
+    await bot.cmd_reset(upd, make_ctx())
+
+    assert runner._sessions.get(1) is None  # session cleared
+    assert store.load().get("1", {}).get("session_id") is None  # persisted clear
+    assert store.get_project(1, "default")["cwd"] == "/work/solo"  # cwd preserved
+    assert "fresh" in upd.message.reply_text.await_args.args[0].lower()
+
+
 # ---------------------------------------------------------------------------
 # /yolo + /unyolo wiring (P2, D6).
 # ---------------------------------------------------------------------------
@@ -532,12 +603,153 @@ async def test_cmd_switch_happy_sets_active(tmp_path):
     store.create(1, "alpha", "/work/alpha", make_active=True)
     store.create(1, "beta", "/work/beta", make_active=False)
     session, _ = make_streaming(store)
-    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    # allow_any_path=True so the QF2 SB2 cwd re-validation no-ops for these fake /work/*
+    # cwds (this test exercises plain switch behavior; the in-roots/out-of-root SB2 paths
+    # have their own dedicated tests above).
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
     upd = make_update(1, "/switch beta")
     await bot.cmd_switch(upd, make_cmd_ctx(args=["beta"]))
     assert store.get_active(1) == "beta"
     reply = upd.message.reply_text.await_args.args[0]
     assert "beta" in reply and "resume" in reply.lower()
+
+
+async def test_cmd_switch_in_roots_cwd_switches(tmp_path):
+    """QF2 / B2 (false-pass guard): /switch to a project whose stored cwd IS inside the
+    permitted roots still switches normally (the re-validation must not block valid cwds).
+
+    The bot's Config carries real ``allowed_roots`` + ``allow_any_path=False`` so the SB2
+    re-validation actually runs (the session's own config is independent, per make_streaming).
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    inside = root / "beta"
+    inside.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(root / "alpha"), make_active=True)
+    store.create(1, "beta", str(inside), make_active=False)
+    session, _ = make_streaming(store, workdir=str(root))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/switch beta")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["beta"]))
+    assert store.get_active(1) == "beta"  # in-roots cwd → switched
+    assert "beta" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_switch_out_of_root_cwd_refused_active_unchanged(tmp_path):
+    """QF2 / B2 (SB2 conformance): /switch to a project whose stored cwd is OUTSIDE the
+    permitted roots is refused; store.switch is NOT called and the active project is
+    unchanged. Mutation check: drop the re-validation and the active project would flip.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"  # a real dir, OUTSIDE the permitted root
+    outside.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(root / "alpha"), make_active=True)
+    store.create(1, "evil", str(outside), make_active=False)  # cwd escapes the root
+    session, _ = make_streaming(store, workdir=str(root))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        FakeRunner(),
+        streaming=session,
+    )
+
+    # Spy on store.switch to prove the refusal leaves the store untouched.
+    switch_calls = []
+    orig_switch = store.switch
+    store.switch = lambda *a, **k: switch_calls.append((a, k))  # type: ignore[assignment]
+    upd = make_update(1, "/switch evil")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["evil"]))
+    store.switch = orig_switch  # type: ignore[assignment]
+
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "permitted roots" in reply.lower() and "evil" in reply
+    assert switch_calls == [], "store.switch must NOT be called for an out-of-root target"
+    assert store.get_active(1) == "alpha"  # active project UNCHANGED
+
+
+async def test_cmd_switch_missing_cwd_refused_fail_closed(tmp_path):
+    """QF2 (fail-closed judgement call): a target project with a missing/empty stored cwd
+    is refused rather than crashing or switching — defensive against a hand-edited/sparse
+    record. The active project is left unchanged.
+    """
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "chats": {
+                    "1": {
+                        "active": "alpha",
+                        "projects": {
+                            "alpha": {"cwd": str(tmp_path / "alpha")},
+                            "nocwd": {},  # sparse record: no cwd key at all
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = JsonSessionStore(path)
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/switch nocwd")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["nocwd"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "no recorded directory" in reply.lower()
+    assert store.get_active(1) == "alpha"  # fail-closed: active unchanged
+
+
+async def test_cmd_switch_busy_guard_precedes_revalidation(tmp_path):
+    """QF2 ordering: the busy-guard still fires FIRST — a /switch (even to an out-of-root
+    target) while a turn is in flight is refused with the busy message, BEFORE the cwd
+    re-validation, and the store is never touched (busy-guard is load-bearing for relay
+    correctness, D2). Pins the QF2 restructure didn't reorder the guards.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(root / "alpha"), make_active=True)
+    store.create(1, "evil", str(outside), make_active=False)
+    session, engine = make_streaming(store, script=[HOLD], workdir=str(root))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        FakeRunner(),
+        streaming=session,
+    )
+
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    turn = asyncio.create_task(bot.on_message(make_update(1, "go"), rec))
+    for _ in range(200):
+        if session.is_busy(1):
+            break
+        await asyncio.sleep(0)
+    assert session.is_busy(1), "the held turn should hold the lock"
+
+    upd = make_update(1, "/switch evil")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["evil"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    # The BUSY message (not the out-of-root message) — the guard fired first.
+    assert "/cancel" in reply and ("flight" in reply.lower() or "finish" in reply.lower())
+    assert store.get_active(1) == "alpha"
+
+    engine.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
 
 
 async def test_cmd_switch_while_busy_refused_store_untouched(tmp_path):

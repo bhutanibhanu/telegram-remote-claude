@@ -388,7 +388,11 @@ async def test_busy_guard_false_pass_switch_succeeds_when_idle(tmp_path):
     store.create(1, "alpha", "/work/alpha", make_active=True)
     store.create(1, "beta", "/work/beta", make_active=False)
     session, _ = make_streaming(store)  # no turn driven → idle
-    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    # allow_any_path=True so the QF2 SB2 cwd re-validation no-ops for the fake /work/beta
+    # cwd — this guards the busy-gate false-pass (idle → switch succeeds), not SB2.
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
     assert session.is_busy(1) is False
     await bot.cmd_switch(make_update(1, "/switch beta"), make_cmd_ctx(args=["beta"]))
     assert store.get_active(1) == "beta"  # the switch went through when idle

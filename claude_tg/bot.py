@@ -91,9 +91,17 @@ class TelegramClaudeBot:
     async def cmd_reset(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
             return
-        self.runner.reset(update.effective_chat.id)
+        chat_id = update.effective_chat.id
+        # D4/B1: in streaming mode reset ONLY the streaming session. Do NOT also call
+        # runner.reset — the runner's _persist writes its flat-view cwd (seeded at
+        # startup, never updated by /switch) onto the chat's *active* project, so after
+        # restart→/switch→/reset it would clobber the active project's cwd with the
+        # runner's stale value (corrupting D4/D5). Branch on streaming vs one-shot so each
+        # mode resets only its own state; the reply is unchanged.
         if self.streaming is not None:
-            self.streaming.reset(update.effective_chat.id)
+            self.streaming.reset(chat_id)
+        else:
+            self.runner.reset(chat_id)
         await update.message.reply_text("🔄 Fresh Claude session started.")
 
     async def cmd_cancel(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -261,8 +269,11 @@ class TelegramClaudeBot:
         (``streaming.is_busy``) we refuse BEFORE touching the store: an answer-hold parks
         the turn with the lock held, so flipping ``store.active`` mid-hold would strand the
         parked turn against the wrong/absent engine — a relay DEADLOCK, not just bad UX.
-        No arg → usage. Unknown name → error listing the available names (RB1). On success
-        the active project changes and the next message resumes it.
+        No arg → usage. Unknown name → error listing the available names (RB1). Before
+        activating, the TARGET project's stored cwd is re-validated against the permitted
+        roots (SB2/B2) — an out-of-root (or missing) cwd is refused and the active project
+        is left unchanged. On success the active project changes and the next message
+        resumes it.
         """
         if not await self._ok(update) or update.message is None:
             return
@@ -289,14 +300,40 @@ class TelegramClaudeBot:
                 "No projects yet. Create one with /new <name> <path>."
             )
             return
-        try:
-            self.streaming.store.switch(chat_id, name)
-        except UnknownProject:
+        # Resolve the target record FIRST (case-insensitive). Unknown name → error listing
+        # the available names (replaces the old try/except UnknownProject).
+        record = self.streaming.store.get_project(chat_id, name)
+        if record is None:
             available = ", ".join(self.streaming.store.list_projects(chat_id)) or "(none)"
             await update.message.reply_text(
                 f"❌ No project named {name!r}. Available: {available}"
             )
             return
+        # SB2/B2: re-validate the TARGET project's stored cwd against the permitted roots
+        # BEFORE activating (the design says re-validate "on switch/resume"; the resume
+        # path is the authoritative gate, this closes the switch-time gap + improves UX).
+        # Fail-closed: a missing/empty stored cwd is refused rather than crashing, and the
+        # active project is left UNCHANGED (store.switch is never called) on any refusal.
+        cwd = record.get("cwd")
+        if not cwd:
+            await update.message.reply_text(
+                f"❌ {name} has no recorded directory — re-create it with /new <name> <path>."
+            )
+            return
+        try:
+            resolve_within_roots(
+                cwd,
+                cwd=cwd,
+                allowed_roots=self.config.allowed_roots,
+                allow_any=self.config.allow_any_path,
+            )
+        except PathNotAllowed:
+            await update.message.reply_text(
+                f"❌ {name}'s directory is no longer within the permitted roots — "
+                "not switching. Use /new <name> <path> to point it somewhere allowed."
+            )
+            return
+        self.streaming.store.switch(chat_id, name)
         await update.message.reply_text(
             f"✅ Switched to {name} — your next message resumes that project."
         )
