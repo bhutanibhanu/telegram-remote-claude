@@ -17,7 +17,7 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 - [x] T2 — Versioned store + v1→v2 migration + flat (one-shot) view (0d7d4fe)
 - [x] T3 — Registry accessors + SB4 name validation (1de9998)
 - [x] T4 — StreamingSession per-project rework (637eaef)
-- [ ] T5 — Bot navigation commands (/projects, /switch, /rm, /pwd, /cd-removed)
+- [x] T5 — Bot navigation commands (/projects, /switch, /rm, /pwd, /cd-removed) (0502c7c)
 - [ ] T6 — Bot /new command (SB2 path-input)
 - [ ] T7 — Resume hardening: cwd re-validation (SB2) + RB3 crash recovery
 - [ ] T8 — Integration / SB·RB acceptance matrix
@@ -85,7 +85,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN `/cd` is sent in **streaming** mode → reply that cwd is fixed per project (use `/new`); **one-shot `/cd` unchanged**.
   - All commands SHALL be allowlist-gated (**SB1**) and SHALL never crash on bad/missing args (RB1).
 - **Tests:** each command happy + error path; `/switch`-while-busy refusal; `/rm`-active refusal; SB1 (non-allowlisted ignored); `/cd`-in-streaming message; no-arg usage.
-- **Status:** todo
+- **Status:** done (0502c7c) — reviewer found + I fixed an **RB1 blocker** (`cmd_switch`/`cmd_rm` crashed on streaming+no-STATE_FILE `store=None`); now guarded + pinned (store-None graceful, `/rm` non-active case-insensitive, `/projects` sparse/dangling-active). Busy-guard false-pass-checked. 534 tests green.
 
 ### T6 — Bot /new command (SB2 path-input)
 - **Goal:** The one path-input command — create a project confined to the permitted roots. **The SB2-on-`/new` task.**
