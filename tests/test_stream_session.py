@@ -2065,3 +2065,135 @@ async def test_resume_raises_then_fresh_start_failure_still_cleared_the_dead_id(
     assert store.get_project(1, "api")["session_id"] is None
     # The lock released despite the raise (no wedge-busy).
     assert session.is_busy(1) is False
+
+
+# ===========================================================================
+# QF5 (Codex re-QA B4 + related edge): the "stale in-memory runtime reused on a
+# lifecycle transition" class.
+#
+#  (1) B4 — /rm purges the in-memory runtime (covered in test_bot_streaming.py:
+#      the recreated project must not leak the old cwd / yolo / grants).
+#  (2) Related edge — _ensure_engine must NEVER reuse a NON-started engine. Past the
+#      warm fast-path (`rt.engine is not None and rt.started`), a present engine is
+#      necessarily non-started (a prior start()/resume() that raised AFTER the adapter
+#      allocated its client). Reusing it → start()/resume() hits the "already started"
+#      guard → wedge. The fix discards it (best-effort stop) + builds fresh.
+#
+# REAL JsonSessionStore + a sequential factory (a FRESH engine per BUILD) so a buggy
+# reuse fails fast. Bounded by asyncio.wait_for so a wiring bug fails fast.
+# ===========================================================================
+
+
+async def test_ensure_engine_discards_non_started_engine_and_builds_fresh(tmp_path):
+    # The related edge: a runtime whose rt.engine is set but rt.started is False (a prior
+    # start() that raised after the adapter allocated its client) must NOT be reused — the
+    # next _ensure_engine best-effort stop()s the stale engine and builds a FRESH one.
+    #
+    # Mutation probe: reverting the fix to `engine = rt.engine or factory(...)` reuses the
+    # stale engine → the assertions that the FRESH (second) engine ran and the stale one
+    # was stopped + replaced would fail.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", "/work/api", make_active=True)  # NO session_id → start(), not resume
+
+    # eng_stale: simulate a prior start() that raised AFTER the client was allocated — the
+    # runtime is left with this non-None engine but started=False (the failed-start shape).
+    # It is PLANTED directly on the runtime (never handed out by the factory).
+    eng_stale = FakeEngine([], session_id="stale")
+    # eng_fresh: the engine the next _ensure_engine must BUILD + start (never eng_stale). It
+    # is the ONLY engine in the factory queue, so a buggy reuse of eng_stale would leave
+    # eng_fresh unbuilt (started False) and the assertions fail.
+    eng_fresh = FakeEngine(
+        [ResultEvent(session_id="fresh", is_error=False, subtype="success", result_text="ok")],
+        session_id="fresh",
+    )
+    session = make_sequential_session({"/work/api": [eng_fresh]}, store=store)
+
+    # Seed the runtime into the failed-prior-start state (engine set, started False). Use
+    # the same auto-create path a turn would, then plant the stale engine.
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng_stale
+    rt.started = False
+
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+
+    # The stale engine was best-effort stopped and DISCARDED; the FRESH one was built + started.
+    assert eng_stale.stopped is True, "the non-started engine must be stopped before discard"
+    assert eng_stale.started is False, "the stale engine was never (re)started — it was replaced"
+    assert eng_fresh.started is True, "a FRESH engine must be built + started, not the stale one"
+    assert rt.engine is eng_fresh and rt.started is True
+    assert any("ok" in s["text"] for s in rec.sends)
+    assert session.is_busy(1) is False
+
+
+async def test_ensure_engine_discard_swallows_stop_failure_and_builds_fresh(tmp_path):
+    # Best-effort: if the stale (non-started) engine's stop() RAISES while being discarded,
+    # _ensure_engine swallows it and still builds + starts the fresh engine (a wedged stale
+    # engine must never block the rebuild). Mirrors the _stop_other_started swallow.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", "/work/api", make_active=True)
+
+    class StopBoomEngine(FakeEngine):
+        async def stop(self):
+            self.stopped = True
+            raise RuntimeError("stop blew up")
+
+    eng_stale = StopBoomEngine([], session_id="stale")  # planted, not built
+    eng_fresh = FakeEngine(
+        [ResultEvent(session_id="fresh", is_error=False, subtype="success", result_text="ok")],
+        session_id="fresh",
+    )
+    session = make_sequential_session({"/work/api": [eng_fresh]}, store=store)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng_stale
+    rt.started = False
+
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng_stale.stopped is True  # stop() was attempted (and raised, swallowed)
+    assert eng_fresh.started is True  # the fresh engine still ran despite the stop failure
+    assert rt.engine is eng_fresh and rt.started is True
+
+
+async def test_ensure_engine_reuses_warm_started_engine(tmp_path):
+    # Regression / false-pass guard: the warm fast-path must STILL return the SAME started
+    # engine on a second turn — the discard-and-rebuild only fires for a NON-started engine.
+    # If the fix wrongly rebuilt every turn, the sequential factory would hand out a second
+    # engine on turn 2 (and run out / change identity) and this would fail.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", "/work/api", make_active=True)
+
+    # The FakeEngine replays its whole script on each send(), so one ResultEvent suffices
+    # for both turns. Only ONE engine is provided for the cwd: a second BUILD would
+    # IndexError on the empty queue, so a rebuild-every-turn regression fails loudly here.
+    eng = FakeEngine(
+        [ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")],
+        session_id="s",
+    )
+    session = make_sequential_session({"/work/api": [eng]}, store=store)
+    rec = Recorder()
+
+    eng1, _ = await session._ensure_engine(1)
+    assert eng1 is eng and eng.started is True
+    await asyncio.wait_for(
+        session.handle_message(1, "turn one", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # Second turn: the warm fast-path returns the SAME engine (no rebuild, no second pop).
+    eng2, resume_failed = await session._ensure_engine(1)
+    assert eng2 is eng, "a warm started engine must be reused, not rebuilt every turn"
+    assert resume_failed is False
+    assert eng.stopped is False  # the warm engine was never stopped/discarded
+    await asyncio.wait_for(
+        session.handle_message(1, "turn two", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert sum("ok" in s["text"] for s in rec.sends) >= 2  # both turns rendered a result

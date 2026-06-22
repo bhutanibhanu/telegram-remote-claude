@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 from claude_tg.bot import TelegramClaudeBot
 from claude_tg.claude_runner import ClaudeResult, ClaudeRunner
 from claude_tg.config import Config
+from claude_tg.engine.types import ResultEvent
 from claude_tg.session_store import JsonSessionStore
 from claude_tg.stream_session import CallbackOutcome, StreamingBusy, StreamingSession
 
@@ -1019,6 +1020,199 @@ async def test_cmd_rm_non_active_case_insensitive(tmp_path):
     assert "beta" not in store.list_projects(1)  # removed via case-insensitive resolve
     assert "alpha" in store.list_projects(1)  # active untouched
     assert "removed" in upd.message.reply_text.await_args.args[0].lower()
+
+
+# ---- /rm purges the in-memory runtime (QF5 / B4) --------------------------
+
+
+class _RecordingHoldEngine(HoldEngine):
+    """A HoldEngine that records the cwd + policy it was BUILT with (for B4 assertions)."""
+
+    def __init__(self, script, *, cwd, policy):
+        super().__init__(script)
+        self.built_cwd = cwd
+        self.built_policy = policy
+
+
+def _cwd_routing_session(store, *, root, scripts_by_cwd):
+    """A real StreamingSession whose factory builds a distinct _RecordingHoldEngine per cwd.
+
+    Each build records ``(cwd, policy)`` so a test can prove the recreated project ran in
+    the NEW cwd with a FRESH (fail-closed) policy. The bot + session share REAL
+    ``allowed_roots=(root,)`` (allow_any_path=False) so /new's SB2 confinement and the
+    turn-path cwd re-validation both have teeth on the real dirs. ``scripts_by_cwd`` maps a
+    cwd → the event script that cwd's engine yields (each build of a cwd reuses its script).
+    """
+    built: list[_RecordingHoldEngine] = []
+
+    def factory(*, cwd, backstop_seconds, permission_policy):
+        eng = _RecordingHoldEngine(
+            list(scripts_by_cwd.get(cwd, [])), cwd=cwd, policy=permission_policy
+        )
+        built.append(eng)
+        return eng
+
+    session = StreamingSession(
+        make_config(
+            engine_mode="streaming", workdir=str(root), allowed_roots=(root,)
+        ),
+        session_store=store,
+        engine_factory=factory,
+        clock=lambda: 0.0,
+    )
+    return session, built
+
+
+async def test_cmd_rm_purges_runtime_so_recreate_does_not_leak_cwd_or_yolo(tmp_path):
+    # B4 (QF5): /rm must purge the project's in-memory runtime. Otherwise re-creating the
+    # SAME name via /new reuses the stale runtime — running the recreated project in the OLD
+    # cwd and inheriting the OLD /yolo + allow-session grants (D4 cwd leak / SB5 bypass leak),
+    # because _runtime caches by name and ignores the new cwd on a hit.
+    #
+    # Mutation probe: if cmd_rm does NOT call forget_project, the recreated `work` reuses the
+    # old runtime → the final turn's engine is built with the OLD cwd / a dirty policy →
+    # the cwd + fail-closed assertions below fail.
+    root = tmp_path / "root"
+    root.mkdir()
+    work_old = root / "work_old"
+    work_old.mkdir()
+    work_new = root / "work_new"
+    work_new.mkdir()
+    other_dir = root / "other"
+    other_dir.mkdir()
+
+    ok = ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "work", str(work_old), make_active=True)
+    store.create(1, "other", str(other_dir), make_active=False)
+
+    session, built = _cwd_routing_session(
+        store,
+        root=root,
+        scripts_by_cwd={str(work_old): [ok], str(work_new): [ok], str(other_dir): [ok]},
+    )
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    rec_ctx = make_ctx()
+
+    # Turn 1 on `work` (active) → builds + starts work's engine in work_old.
+    await asyncio.wait_for(
+        session.handle_message(
+            1, "hi work", send=rec_ctx.bot.send_message, edit=rec_ctx.bot.edit_message_text
+        ),
+        timeout=2.0,
+    )
+    work_rt = session._chat(1).runtimes["work"]
+    assert work_rt.cwd == str(work_old) and work_rt.started is True
+    work_engine = work_rt.engine
+    assert work_engine is not None and work_engine.built_cwd == str(work_old)
+
+    # Dirty work's policy: /yolo ON + an allow-session grant (the bypass posture that must
+    # NOT survive a /rm + /new of the same name).
+    work_rt.policy.set_yolo(True)
+    work_rt.policy.grant_session("Bash")
+    assert work_rt.policy.yolo is True
+
+    # Switch active away to `other` so `work` is non-active (and therefore removable).
+    upd_sw = make_update(1, "/switch other")
+    await bot.cmd_switch(upd_sw, make_cmd_ctx(args=["other"]))
+    assert store.get_active(1) == "other"
+    # work's runtime is still cached (its engine still started — D2 stop happens on the next
+    # turn, not on the bot-level switch), so /rm has a real runtime to purge.
+    assert "work" in session._chat(1).runtimes
+
+    # /rm work → store-remove + forget_project: the runtime is dropped and its engine stopped.
+    upd_rm = make_update(1, "/rm work")
+    await bot.cmd_rm(upd_rm, make_cmd_ctx(args=["work"]))
+    assert "work" not in store.list_projects(1)  # gone from the registry
+    assert "work" not in session._chat(1).runtimes  # B4: in-memory runtime PURGED
+    assert work_engine.stopped is True  # its engine was best-effort stopped on purge
+    assert "removed" in upd_rm.message.reply_text.await_args.args[0].lower()
+
+    # Re-create `work` at a DIFFERENT (in-roots) cwd and switch to it.
+    upd_new = make_update(1, "/new work " + str(work_new))
+    await bot.cmd_new(upd_new, make_cmd_ctx(args=["work", str(work_new)]))
+    assert store.get_active(1) == "work"  # /new auto-switches
+    assert store.get_project(1, "work")["cwd"] == str(work_new)
+
+    # Run a turn on the recreated `work` → a FRESH runtime is built from the store record.
+    await asyncio.wait_for(
+        session.handle_message(
+            1, "hi new work", send=rec_ctx.bot.send_message, edit=rec_ctx.bot.edit_message_text
+        ),
+        timeout=2.0,
+    )
+    new_rt = session._chat(1).runtimes["work"]
+    # No cwd leak: the recreated project runs in the NEW cwd, not the old one.
+    assert new_rt.cwd == str(work_new)
+    assert new_rt.engine is not None and new_rt.engine.built_cwd == str(work_new)
+    assert new_rt.engine is not work_engine  # a brand-new engine, not the stale one
+    # No yolo / grant leak: the fresh runtime's policy is fail-closed (the engine was built
+    # with this same fresh policy object — SB5).
+    assert new_rt.policy.yolo is False
+    assert new_rt.policy.granted_tools() == frozenset()
+    assert new_rt.engine.built_policy.yolo is False
+    assert new_rt.engine.built_policy.granted_tools() == frozenset()
+
+
+async def test_cmd_rm_with_no_in_memory_runtime_is_clean_noop(tmp_path):
+    # Regression: /rm of a project that has NO in-memory runtime (never run this process) is
+    # a clean no-op for forget_project — it still removes the store record and replies, never
+    # crashing on the absent runtime.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)  # never used → no runtime
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    # Sanity: beta has no in-memory runtime.
+    assert "beta" not in session._chat(1).runtimes
+    upd = make_update(1, "/rm beta")
+    await bot.cmd_rm(upd, make_cmd_ctx(args=["beta"]))
+    assert "beta" not in store.list_projects(1)
+    assert "removed" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_rm_purges_runtime_case_insensitively(tmp_path):
+    # forget_project resolves the runtime key case-insensitively (mirroring the store match):
+    # /rm WORK purges the runtime stored under "work". Without the case-insensitive match the
+    # stale runtime would survive and leak on a later /new.
+    root = tmp_path / "root"
+    root.mkdir()
+    work_dir = root / "work"
+    work_dir.mkdir()
+    other_dir = root / "other"
+    other_dir.mkdir()
+
+    ok = ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "work", str(work_dir), make_active=True)
+    store.create(1, "other", str(other_dir), make_active=False)
+    session, _ = _cwd_routing_session(
+        store, root=root, scripts_by_cwd={str(work_dir): [ok], str(other_dir): [ok]}
+    )
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    rec_ctx = make_ctx()
+    # Build work's runtime (turn while active).
+    await asyncio.wait_for(
+        session.handle_message(
+            1, "hi", send=rec_ctx.bot.send_message, edit=rec_ctx.bot.edit_message_text
+        ),
+        timeout=2.0,
+    )
+    assert "work" in session._chat(1).runtimes
+    work_engine = session._chat(1).runtimes["work"].engine
+    # Switch away, then /rm with DIFFERENT casing than the stored "work".
+    await bot.cmd_switch(make_update(1, "/switch other"), make_cmd_ctx(args=["other"]))
+    await bot.cmd_rm(make_update(1, "/rm WORK"), make_cmd_ctx(args=["WORK"]))
+    assert "work" not in session._chat(1).runtimes  # purged despite the case mismatch
+    assert work_engine.stopped is True
 
 
 async def test_cmd_projects_survives_sparse_and_dangling_active(tmp_path):

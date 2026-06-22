@@ -448,7 +448,26 @@ class StreamingSession:
         await self._stop_other_started(chat_id, keep=name)
         if rt.engine is not None and rt.started:
             return rt.engine, False
-        engine = rt.engine or self._engine_factory(
+        # Past the warm fast-path: rt is either fresh (engine None) OR holds a NON-started
+        # engine — a prior start()/resume() that raised AFTER the adapter allocated its
+        # client (so the engine is non-None but unusable). Never REUSE such an engine: a
+        # start()/resume() on it hits the adapter's "already started" guard → the turn
+        # wedges (the same coupling the QF4 resume-raises path recovers from). So if a
+        # non-started engine is present, best-effort stop() it (free its partial client,
+        # like _stop_other_started) and build a FRESH one — a non-started engine is always
+        # discarded + replaced, never reused.
+        if rt.engine is not None:
+            try:
+                await rt.engine.stop()
+            except Exception:
+                log.debug(
+                    "stop of non-started engine raised for chat %s project %s "
+                    "(ignored — building fresh)",
+                    chat_id,
+                    name,
+                    exc_info=True,
+                )
+        engine = self._engine_factory(
             cwd=rt.cwd,
             backstop_seconds=float(self.config.answer_backstop_seconds),
             permission_policy=rt.policy,
@@ -546,6 +565,65 @@ class StreamingSession:
                     )
                 other_rt.started = False
                 other_rt.engine = None
+
+    async def forget_project(self, chat_id: int, name: str) -> None:
+        """Drop a project's in-memory runtime (B4 — purge on ``/rm``). No-op if absent.
+
+        ``/rm <name>`` removes a project from the persisted registry, but its transient
+        :class:`_ProjectRuntime` (cached engine + cwd + :class:`PermissionPolicy`) lives in
+        ``state.runtimes`` keyed by the stored name. ``_runtime`` caches by name and
+        deliberately ignores the passed cwd on a hit (a project's cwd is fixed for the life
+        of its session — D4), so a stale runtime left here would be reused if the SAME name
+        is re-created — running the recreated project in the OLD cwd and inheriting the OLD
+        ``/yolo`` + allow-session grants (the SB5 bypass leak / D4 cwd leak). So after the
+        store-remove, the runtime must be purged: find it by **case-insensitive** name
+        (mirroring the store's case-insensitive match — ``/rm WORK`` must purge the runtime
+        stored as ``work``), best-effort ``stop()`` its engine to free any live SDK client
+        (try/except, the ``_stop_other_started`` pattern — a stop failure must not break the
+        purge), then drop it from ``state.runtimes``. A subsequent ``/new <name>`` then
+        builds a FRESH runtime from the store's record (new cwd, fail-closed policy) — no
+        leak. ``cmd_rm`` already refuses the ACTIVE project, so the purged runtime is never
+        the live one.
+        """
+        state = self._chats.get(chat_id)
+        if state is None:
+            return
+        key = self._resolve_runtime_key(state.runtimes, name)
+        if key is None:
+            return  # no in-memory runtime for that name — clean no-op.
+        rt = state.runtimes[key]
+        if rt.engine is not None:
+            try:
+                await rt.engine.stop()
+            except Exception:
+                log.debug(
+                    "stop of engine raised while forgetting chat %s project %s "
+                    "(ignored — dropping the runtime regardless)",
+                    chat_id,
+                    key,
+                    exc_info=True,
+                )
+        del state.runtimes[key]
+
+    @staticmethod
+    def _resolve_runtime_key(
+        runtimes: dict[str, "_ProjectRuntime"], name: str
+    ) -> Optional[str]:
+        """The actual ``runtimes`` key whose casefold matches ``name``, or ``None``.
+
+        Mirrors the store's :func:`~claude_tg.session_store._resolve_name`: runtimes are
+        keyed by the project's STORED (as-created) name, and the store matches names
+        case-insensitively, so a lookup against the in-memory runtimes must too (else a
+        casing variant — ``/rm WORK`` for a ``work`` project — would leave the stale runtime
+        behind). Defensive against a non-``str`` ``name``.
+        """
+        if not isinstance(name, str):
+            return None
+        target = name.casefold()
+        for key in runtimes:
+            if isinstance(key, str) and key.casefold() == target:
+                return key
+        return None
 
     def reset(self, chat_id: int) -> None:
         """Reset the ACTIVE project to a fresh conversation (harvested /reset, D3/D7).

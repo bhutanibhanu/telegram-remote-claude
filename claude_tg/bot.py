@@ -375,6 +375,14 @@ class TelegramClaudeBot:
         except UnknownProject:
             await update.message.reply_text(f"❌ No project named {name!r}.")
             return
+        # B4: purge the project's in-memory runtime too. store.remove only drops the
+        # persisted record; the cached _ProjectRuntime (engine + fixed cwd + policy) would
+        # otherwise survive and be REUSED if the same name is re-created via /new, running
+        # the recreated project in the OLD cwd and inheriting the OLD /yolo + grants (the
+        # SB5 bypass leak / D4 cwd leak). forget_project stops its engine (best-effort) and
+        # drops it, so a later /new <name> builds a fresh runtime. The active project is
+        # already refused above, so the purged runtime is never the live one.
+        await self.streaming.forget_project(chat_id, name)
         await update.message.reply_text(
             f"🗑️ Removed {name} (its Claude transcript is left on disk)."
         )
