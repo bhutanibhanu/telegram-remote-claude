@@ -289,8 +289,15 @@ class TelegramClaudeBot:
                 chat_id=chat_id, message_id=message_id, text=text, parse_mode=parse_mode
             )
 
+        async def delete(*, message_id: int) -> None:
+            # Clear the transient "💭 Claude is thinking…" status line at turn end so a
+            # stale one does not linger (best-effort; the session swallows failures).
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+
         try:
-            await self.streaming.handle_message(chat_id, text, send=send, edit=edit)
+            await self.streaming.handle_message(
+                chat_id, text, send=send, edit=edit, delete=delete
+            )
         except StreamingBusy:
             await update.message.reply_text(
                 "⏳ Still working on your previous message — it'll reply when done. "

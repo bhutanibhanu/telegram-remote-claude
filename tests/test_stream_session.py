@@ -100,20 +100,32 @@ class FakeEngine:
 
 
 class Recorder:
-    """Captures the send/edit calls the driver performs."""
+    """Captures the send/edit/delete calls the driver performs.
 
-    def __init__(self):
+    ``fail_html`` (default off) makes ``send`` raise on a ``parse_mode=="HTML"`` call —
+    simulating Telegram rejecting a bad HTML entity — so the driver's plain-text fallback
+    can be exercised. The raising send is still recorded (so the attempt is observable).
+    """
+
+    def __init__(self, *, fail_html: bool = False):
         self.sends: list[dict] = []
         self.edits: list[dict] = []
+        self.deletes: list[dict] = []
         self._next_id = 100
+        self._fail_html = fail_html
 
     async def send(self, *, text, reply_markup=None, parse_mode=None) -> int:
         self.sends.append({"text": text, "reply_markup": reply_markup, "parse_mode": parse_mode})
+        if self._fail_html and parse_mode == "HTML":
+            raise RuntimeError("Telegram BadRequest: can't parse entities")
         self._next_id += 1
         return self._next_id
 
     async def edit(self, *, message_id, text, parse_mode=None) -> None:
         self.edits.append({"message_id": message_id, "text": text, "parse_mode": parse_mode})
+
+    async def delete(self, *, message_id) -> None:
+        self.deletes.append({"message_id": message_id})
 
 
 def make_session(engine: FakeEngine, *, config=None, store=None, clock=None) -> StreamingSession:
@@ -701,3 +713,232 @@ async def test_resume_uses_persisted_session_id(tmp_path):
     )
     assert engine.resumed == "prev-sess"  # resumed, not started fresh
     assert engine.started is True
+
+
+# ---------------------------------------------------------------------------
+# CommonMark -> HTML rendering of prose + the HTML->plain send fallback.
+# ---------------------------------------------------------------------------
+
+
+async def test_prose_is_sent_as_html():
+    # An assembled Claude reply with markdown is sent with parse_mode="HTML" and the
+    # markdown is converted (**x** -> <b>x</b>).
+    engine = FakeEngine(
+        [
+            TextEvent(text="A **bold** answer.", incremental=False),
+            ResultEvent(session_id="s", is_error=False, subtype="success"),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    prose = next(s for s in rec.sends if "bold" in s["text"])
+    assert prose["parse_mode"] == "HTML"
+    assert "<b>bold</b>" in prose["text"]
+
+
+async def test_html_send_failure_falls_back_to_raw_markdown():
+    # CRITICAL: if Telegram rejects the HTML chunk, the driver resends the ORIGINAL raw
+    # markdown for that chunk with parse_mode=None — never a dropped message, worst case
+    # equals today's behavior (raw markdown).
+    engine = FakeEngine(
+        [
+            TextEvent(text="A **bold** answer.", incremental=False),
+            ResultEvent(session_id="s", is_error=False, subtype="success"),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder(fail_html=True)  # every HTML send raises
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The HTML attempt was made AND a plain resend followed with the RAW markdown.
+    html_attempt = next(s for s in rec.sends if s["parse_mode"] == "HTML" and "bold" in s["text"])
+    assert "<b>bold</b>" in html_attempt["text"]
+    plain_resend = next(
+        s for s in rec.sends if s["parse_mode"] is None and "**bold**" in s["text"]
+    )
+    assert plain_resend["text"] == "A **bold** answer."  # raw, NOT the HTML
+
+
+async def test_html_fallback_preserves_keyboard_on_first_chunk():
+    # The plan keyboard must still ride the (plain) fallback message when HTML is rejected.
+    engine = FakeEngine(
+        [
+            PlanEvent(plan="Do **step one**", tool_use_id="pid"),
+            HOLD,
+            ResultEvent(session_id="s", is_error=False, subtype="success"),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder(fail_html=True)
+
+    turn = asyncio.create_task(session.handle_message(1, "go", send=rec.send, edit=rec.edit))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    # The plan was attempted as HTML (failed) then resent plain — WITH the keyboard.
+    plain_plan = next(
+        s for s in rec.sends if s["parse_mode"] is None and "step one" in s["text"]
+    )
+    assert plain_plan["reply_markup"] is not None
+    assert "**step one**" in plain_plan["text"]  # raw markdown
+    engine.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+
+
+async def test_plain_send_failure_is_not_swallowed():
+    # A genuine plain-text send failure (parse_mode=None) has nothing left to fall back
+    # to, so it must propagate (not be silently swallowed by the HTML-fallback path).
+    engine = FakeEngine(
+        [ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=1)]
+    )
+    session = make_session(engine)
+
+    class BoomRecorder(Recorder):
+        async def send(self, *, text, reply_markup=None, parse_mode=None):
+            raise RuntimeError("network down")
+
+    rec = BoomRecorder()
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(
+            session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+        )
+
+
+async def test_ask_question_sent_as_html_with_keyboard():
+    ask = AskEvent(
+        questions=[{"question": "Pick **A** or B?", "options": [{"label": "A"}, {"label": "B"}]}],
+        tool_use_id="tid",
+    )
+    engine = FakeEngine([ask, HOLD, ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = make_session(engine)
+    rec = Recorder()
+    turn = asyncio.create_task(session.handle_message(1, "go", send=rec.send, edit=rec.edit))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    q = next(s for s in rec.sends if s["reply_markup"] is not None)
+    assert q["parse_mode"] == "HTML"
+    assert "<b>A</b>" in q["text"]
+    engine.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+
+
+async def test_ask_question_html_failure_falls_back_to_plain():
+    ask = AskEvent(
+        questions=[{"question": "Pick **A**?", "options": [{"label": "A"}]}],
+        tool_use_id="tid",
+    )
+    engine = FakeEngine([ask, HOLD, ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = make_session(engine)
+    rec = Recorder(fail_html=True)
+    turn = asyncio.create_task(session.handle_message(1, "go", send=rec.send, edit=rec.edit))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    # HTML attempt failed -> plain resend carrying the raw question + the keyboard.
+    plain_q = next(
+        s for s in rec.sends if s["parse_mode"] is None and s["reply_markup"] is not None
+    )
+    assert "**A**" in plain_q["text"]  # raw markdown question
+    engine.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Status-line cleanup at turn end (delete the transient "thinking…" message).
+# ---------------------------------------------------------------------------
+
+
+async def test_status_message_deleted_at_turn_end():
+    # After a turn completes, the transient status line is deleted (delete closure called
+    # with its id) and status_message_id is reset to None.
+    engine = FakeEngine(
+        [
+            TextEvent(text="thinking", incremental=True),  # creates the status line
+            ResultEvent(session_id="s", is_error=False, subtype="success", result_text="done"),
+        ]
+    )
+    session = make_session(engine)  # frozen clock => the status edit is "due"
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit, delete=rec.delete),
+        timeout=2.0,
+    )
+    # A status line was created, then deleted at the end of the turn.
+    assert rec.deletes, "the transient status line must be deleted at turn end"
+    assert session._chat(1).status_message_id is None
+    assert session._chat(1).status_text is None
+
+
+async def test_no_status_message_means_no_delete():
+    # A turn with no status line (no incremental/tool_use noise) has nothing to delete.
+    engine = FakeEngine(
+        [ResultEvent(session_id="s", is_error=False, subtype="success", result_text="done")]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit, delete=rec.delete),
+        timeout=2.0,
+    )
+    assert rec.deletes == []
+
+
+async def test_status_delete_is_optional():
+    # Existing callers that do NOT pass a delete closure still work (the status line just
+    # stays, as before) — no crash, no requirement.
+    engine = FakeEngine(
+        [
+            TextEvent(text="thinking", incremental=True),
+            ResultEvent(session_id="s", is_error=False, subtype="success", result_text="done"),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    # No delete= passed.
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert any("done" in s["text"] for s in rec.sends)
+
+
+async def test_status_delete_failure_does_not_kill_turn():
+    # RB1: a failing delete (message gone / too old) must never kill the turn — the real
+    # content is already sent. The status id is still reset.
+    engine = FakeEngine(
+        [
+            TextEvent(text="thinking", incremental=True),
+            ResultEvent(session_id="s", is_error=False, subtype="success", result_text="done"),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+
+    async def boom_delete(*, message_id):
+        raise RuntimeError("message to delete not found")
+
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit, delete=boom_delete),
+        timeout=2.0,
+    )
+    assert any("done" in s["text"] for s in rec.sends)  # turn completed cleanly
+    assert session._chat(1).status_message_id is None  # still reset
+
+
+async def test_keyboard_attaches_to_first_non_empty_chunk():
+    """If the head chunk is whitespace-only it's skipped — but the keyboard must still ride
+    the first REAL chunk, else an ask/plan whose body chunked with a blank head would lose
+    its buttons entirely (audit P0)."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    engine = FakeEngine([])
+    session = make_session(engine)
+    state = session._chat(1)
+    rec = Recorder()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Yes", callback_data="x")]])
+    action = RenderAction(op="new", chunks=("   ", "real content"), reply_markup=kb)
+    await session._perform(state, action, send=rec.send, edit=rec.edit)
+    # Only the non-empty chunk is sent, and it carries the keyboard.
+    assert [s["text"] for s in rec.sends] == ["real content"]
+    assert rec.sends[0]["reply_markup"] is kb

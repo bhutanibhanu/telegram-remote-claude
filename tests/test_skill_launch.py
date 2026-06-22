@@ -73,7 +73,7 @@ class FakeStreaming:
     def __init__(self):
         self.handle_message_calls: list[tuple[int, str]] = []
 
-    async def handle_message(self, chat_id, text, *, send, edit):
+    async def handle_message(self, chat_id, text, *, send, edit, delete=None):
         self.handle_message_calls.append((chat_id, text))
 
     def reset(self, chat_id):

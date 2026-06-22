@@ -69,8 +69,10 @@ from .render import (
     RenderAction,
     answers_from_ask,
     ask_question_body,
+    ask_question_body_html,
     ask_question_keyboard,
     decode_callback,
+    strip_telegram_html,
     yolo_indicator,
 )
 
@@ -81,6 +83,9 @@ log = logging.getLogger(__name__)
 SendFn = Callable[..., Awaitable[Optional[int]]]
 #: A coroutine that edits an existing message's text in place (best-effort).
 EditFn = Callable[..., Awaitable[None]]
+#: A coroutine that deletes a message by id (best-effort; used to clear the transient
+#: "💭 Claude is thinking…" status line at the end of a turn so it does not linger).
+DeleteFn = Callable[..., Awaitable[None]]
 
 #: The three operator verdicts the engine understands (mirrors PermissionDecision.verdict).
 PermissionVerdictName = Literal["allow_once", "allow_session", "deny"]
@@ -330,6 +335,7 @@ class StreamingSession:
         *,
         send: SendFn,
         edit: EditFn,
+        delete: Optional[DeleteFn] = None,
     ) -> None:
         """Drive ONE operator turn (or capture a free-text answer) for ``chat_id``.
 
@@ -357,7 +363,9 @@ class StreamingSession:
 
         async with state.lock:
             engine = await self._ensure_engine(state, chat_id)
-            await self._drive_turn(state, chat_id, engine, text, send=send, edit=edit)
+            await self._drive_turn(
+                state, chat_id, engine, text, send=send, edit=edit, delete=delete
+            )
 
     async def _drive_turn(
         self,
@@ -368,6 +376,7 @@ class StreamingSession:
         *,
         send: SendFn,
         edit: EditFn,
+        delete: Optional[DeleteFn] = None,
     ) -> None:
         """Iterate ``engine.send`` → render → Telegram send/edit (coalesced).
 
@@ -396,11 +405,23 @@ class StreamingSession:
                 for action in coalescer.flush().actions:
                     await self._perform(state, action, send=send, edit=edit)
                 for q_idx in range(len(event.questions)):
-                    await send(
-                        text=ask_question_body(event, q_idx),
-                        reply_markup=ask_question_keyboard(event, q_idx),
-                        parse_mode=None,
-                    )
+                    keyboard = ask_question_keyboard(event, q_idx)
+                    # The question text is Claude-authored CommonMark -> render as HTML so
+                    # **bold** etc. show and a stray < / & can't break the message; on a
+                    # Telegram HTML rejection, resend the plain body (raw fallback — never
+                    # a dropped question).
+                    try:
+                        await send(
+                            text=ask_question_body_html(event, q_idx),
+                            reply_markup=keyboard,
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        await send(
+                            text=ask_question_body(event, q_idx),
+                            reply_markup=keyboard,
+                            parse_mode=None,
+                        )
                 continue
             if isinstance(event, PlanEvent):
                 state.pending_plan = event
@@ -408,9 +429,20 @@ class StreamingSession:
                 self._persist(chat_id, session_id=event.session_id or engine.session_id)
             for action in coalescer.offer(event).actions:
                 await self._perform(state, action, send=send, edit=edit)
-        # End of turn: flush any trailing coalesced status line.
+        # End of turn: flush any trailing coalesced status line, then DELETE the transient
+        # status message ("💭 Claude is thinking…") so a stale thinking-line never lingers
+        # after the turn's real content. Best-effort (RB1): a failed delete must never kill
+        # the turn — the content is already sent. Optional `delete` so existing callers that
+        # don't pass one keep working (the status line just stays, as before).
         for action in coalescer.flush().actions:
             await self._perform(state, action, send=send, edit=edit)
+        if delete is not None and state.status_message_id is not None:
+            try:
+                await delete(message_id=state.status_message_id)
+            except Exception:
+                log.debug("status-line delete failed at turn end", exc_info=True)
+            state.status_message_id = None
+            state.status_text = None
 
     async def _perform(
         self,
@@ -426,13 +458,39 @@ class StreamingSession:
         if action.op == "edit_status":
             await self._edit_status(state, action, send=send, edit=edit)
             return
-        # op == "new": one message per chunk. The keyboard rides the FIRST chunk only
-        # (a multi-chunk verbatim ask/plan is rare; the buttons attach to its head).
+        # op == "new": one message per chunk. The keyboard rides the FIRST NON-EMPTY chunk —
+        # whitespace-only chunks are skipped, so if the head chunk is whitespace the buttons
+        # must still attach to the first real one (else an ask/plan would lose its keyboard).
+        first = True
         for i, chunk in enumerate(action.chunks):
             if not chunk.strip():
                 continue
-            markup = action.reply_markup if i == 0 else None
-            await send(text=chunk, reply_markup=markup, parse_mode=action.parse_mode)
+            markup = action.reply_markup if first else None
+            first = False
+            try:
+                await send(text=chunk, reply_markup=markup, parse_mode=action.parse_mode)
+            except Exception:
+                # HTML render fallback (CRITICAL): a chunk Telegram rejects as HTML (a bad
+                # entity from a converter edge case) must NEVER drop the message. Resend the
+                # ORIGINAL raw markdown for this chunk as plain text — worst case equals
+                # today's behavior (raw markdown), never a lost message. Only HTML sends can
+                # raise this way; a plain send that fails re-raises (nothing left to try).
+                if action.parse_mode is None:
+                    raise
+                plain = self._plain_fallback(action, i, chunk)
+                await send(text=plain, reply_markup=markup, parse_mode=None)
+
+    @staticmethod
+    def _plain_fallback(action: RenderAction, i: int, html_chunk: str) -> str:
+        """The plain-text fallback for ``action.chunks[i]`` (an HTML chunk Telegram rejected).
+
+        Prefer the parallel RAW chunk the render layer carried (the exact original
+        markdown — what the bot showed before HTML rendering); if absent, strip the tags
+        from the HTML as a last resort so the operator still sees readable text.
+        """
+        if action.plain_chunks and i < len(action.plain_chunks):
+            return action.plain_chunks[i]
+        return strip_telegram_html(html_chunk)
 
     async def _edit_status(
         self,
@@ -714,4 +772,7 @@ __all__ = [
     "StreamingBusy",
     "CallbackOutcome",
     "EngineFactory",
+    "SendFn",
+    "EditFn",
+    "DeleteFn",
 ]

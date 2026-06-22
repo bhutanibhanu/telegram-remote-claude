@@ -135,7 +135,7 @@ class FakeStreaming:
         self.handle_message_calls: list[tuple[int, str]] = []
         self.resolve_calls: list[tuple[int, object]] = []
 
-    async def handle_message(self, chat_id, text, *, send, edit):
+    async def handle_message(self, chat_id, text, *, send, edit, delete=None):
         self.handle_message_calls.append((chat_id, text))
 
     def resolve_callback(self, chat_id, data):

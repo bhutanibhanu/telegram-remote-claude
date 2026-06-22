@@ -62,7 +62,7 @@ class FakeStreaming:
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
         self._busy = busy
 
-    async def handle_message(self, chat_id, text, *, send, edit):
+    async def handle_message(self, chat_id, text, *, send, edit, delete=None):
         self.handle_message_calls.append((chat_id, text))
         if self._busy:
             raise StreamingBusy()
@@ -163,6 +163,27 @@ async def test_streaming_busy_replies_still_working():
     upd = make_update(1, "again")
     await bot.on_message(upd, make_ctx())
     assert "still working" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_streaming_passes_working_delete_closure():
+    # The bot binds a `delete` closure (Task 2) and hands it to handle_message; invoking
+    # it deletes the message via ctx.bot.delete_message(chat_id, message_id).
+    captured: dict = {}
+
+    class CapturingStreaming(FakeStreaming):
+        async def handle_message(self, chat_id, text, *, send, edit, delete=None):
+            self.handle_message_calls.append((chat_id, text))
+            captured["delete"] = delete
+
+    streaming = CapturingStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    ctx = make_ctx()
+    ctx.bot.delete_message = AsyncMock()
+    await bot.on_message(make_update(1, "go"), ctx)
+    assert callable(captured["delete"]), "bot must pass a delete closure to handle_message"
+    # Invoking the closure deletes the message via the bot API for this chat.
+    await captured["delete"](message_id=42)
+    ctx.bot.delete_message.assert_awaited_once_with(chat_id=1, message_id=42)
 
 
 # ---------------------------------------------------------------------------

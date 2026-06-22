@@ -53,6 +53,8 @@ not be logged (the bot's logger, T7, applies the SB3 scrubber to anything it log
 
 from __future__ import annotations
 
+import html
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Literal, Optional
@@ -70,6 +72,7 @@ from .engine.types import (
     TextEvent,
     ToolUseEvent,
 )
+from .tg_html import strip_telegram_html, to_telegram_html
 from .util import TELEGRAM_MAX, split_message
 
 # ---------------------------------------------------------------------------
@@ -101,6 +104,15 @@ class RenderAction:
     fold it into the edit-in-place status line, or do nothing. ``reply_markup`` is the
     inline keyboard for ``ask``/``plan`` (``None`` otherwise). ``parse_mode`` is a hint.
 
+    For Claude-authored **prose** (assembled text / result / plan / ask question text)
+    ``chunks`` carries **Telegram HTML** and ``parse_mode == "HTML"``, while
+    ``plain_chunks`` carries the parallel **raw** (un-converted) text for the same chunk
+    positions. T7's send path tries the HTML chunk first and, on ANY Telegram error,
+    resends the parallel raw chunk with ``parse_mode=None`` (so a malformed-entity
+    rejection degrades to today's plain-markdown behavior, never a dropped message). For
+    bot scaffolding (status lines, the done-footer, error blocks) ``plain_chunks`` is
+    empty and the chunk is plain text already.
+
     This object never touches Telegram — it is the contract between the (pure) render
     layer and T7's transport code.
     """
@@ -112,6 +124,11 @@ class RenderAction:
     #: True for the verbatim kinds (ask/plan/error/result) — T7 flushes these
     #: immediately as their own message(s), bypassing the status-line coalescer.
     verbatim: bool = False
+    #: Parallel RAW (un-converted) text for each entry in ``chunks`` — the plain-text
+    #: fallback T7 resends if the HTML chunk is rejected by Telegram. Empty when the
+    #: chunk is already plain (no HTML conversion happened); then T7 strips tags as a
+    #: last resort. Length, when present, MUST equal ``len(chunks)``.
+    plain_chunks: tuple[str, ...] = ()
 
     @property
     def text(self) -> str:
@@ -443,6 +460,31 @@ def ask_question_body(ask: AskEvent, question_index: int) -> str:
     return body
 
 
+def ask_question_body_html(ask: AskEvent, question_index: int) -> str:
+    """HTML version of :func:`ask_question_body` (the live per-question send path).
+
+    The ``❓ (k/N) Header:`` prefix is bot scaffolding so it is HTML-escaped (not
+    Markdown-converted); the **question text** is Claude-authored CommonMark so it is run
+    through :func:`to_telegram_html` (so a stray ``<`` / ``&`` from Claude can't break the
+    message, and ``**bold**`` etc. render). The plain :func:`ask_question_body` remains
+    the parallel raw fallback T7 resends on a Telegram HTML rejection.
+    """
+    question = ask.questions[question_index]
+    header = question.get("header")
+    qtext = question.get("question", "")
+    total = len(ask.questions)
+    if total > 1:
+        prefix = "❓ (" + f"{question_index + 1}/{total}" + ") " + (
+            f"{_escape_html(str(header))}: " if header else ""
+        )
+    else:
+        prefix = f"❓ {_escape_html(str(header))}: " if header else "❓ "
+    body = f"{prefix}{to_telegram_html(str(qtext))}"
+    if question.get("multiSelect"):
+        body += "\n  (you may pick more than one)"
+    return body
+
+
 def ask_question_keyboard(ask: AskEvent, question_index: int) -> InlineKeyboardMarkup:
     """Inline keyboard for ONE question of an ask — its options (one per row) + an
     "Other" free-text button.
@@ -608,9 +650,133 @@ _PHASE_EMOJI = {
 }
 
 
+def _escape_html(text: str) -> str:
+    """HTML-escape ``&`` / ``<`` / ``>`` for bot-scaffolding text in an HTML message.
+
+    Used for the fixed bot-authored bits (e.g. an ask ``Header:`` label) that sit inside
+    a ``parse_mode="HTML"`` message: they are NOT Markdown-converted, but a stray ``<`` /
+    ``&`` would still break the message, so they are escaped. (Claude-authored prose goes
+    through :func:`to_telegram_html` instead, which both escapes AND converts.)
+    """
+    return html.escape(text, quote=False)
+
+
 def _chunk(text: str, limit: int = TELEGRAM_MAX) -> tuple[str, ...]:
     """Split to Telegram-safe UTF-16 chunks (reuses :func:`split_message`)."""
     return tuple(split_message(text, limit=limit))
+
+
+#: Starting budget for RAW prose chunks BEFORE HTML conversion. We chunk the raw markdown
+#: under Telegram's 4096-UTF-16 limit first (at line boundaries, so a fenced code block is
+#: not split mid-fence), THEN convert each chunk to HTML. HTML tags only ADD characters, so
+#: a converted chunk can be larger than its raw source; ``_html_chunks`` re-splits (at a
+#: smaller raw budget) any chunk that still overflows after conversion, so the final HTML
+#: is always under 4096 while tags stay intact (we only ever re-split the RAW, never the
+#: emitted HTML). ~3000 is a sensible first cut for ordinary prose.
+_HTML_CHUNK_BUDGET = 3000
+
+#: Floor for the raw budget while re-splitting an over-expanding chunk. Below this we stop
+#: shrinking and accept the (still individually-sent) chunk — a pathological all-inline-code
+#: paragraph would otherwise fragment endlessly. The send-path plain fallback (RB) is the
+#: final backstop if such a rare chunk is still rejected.
+_HTML_CHUNK_FLOOR = 256
+
+
+#: A fenced code block in the RAW text (open fence + optional info line, body, close).
+#: Mirrors ``tg_html._FENCE_RE`` but used here to pre-split an OVER-budget fence into
+#: several complete fences so each survives chunking as its own valid ``<pre>``.
+_RAW_FENCE_RE = re.compile(
+    r"(?P<fence>```+|~~~+)[ \t]*(?P<lang>[^\n`~]*)\n(?P<body>.*?)\n?(?P=fence)",
+    re.DOTALL,
+)
+
+
+def _presplit_big_fences(text: str, budget: int) -> str:
+    """Rewrite any fenced block bigger than ``budget`` into several COMPLETE fences.
+
+    A single huge ```` ```code``` ```` block (e.g. a large file dump) would otherwise be
+    cut mid-fence by :func:`split_message`, leaving body fragments that convert to plain
+    prose (or stray ``<code>``) instead of ``<pre>``. So before chunking we split such a
+    block's BODY at line boundaries and re-wrap each piece in its own
+    ```` ```lang\n<piece>\n``` ```` — the chunker then sees small *complete* fences, each
+    of which converts to a proper, individually-valid ``<pre>``. Blocks already within
+    budget are left untouched. Best-effort + pure (never raises).
+    """
+
+    def repl(match: re.Match[str]) -> str:
+        whole = match.group(0)
+        if _utf16(whole) <= budget:
+            return whole
+        fence = match.group("fence")
+        lang = match.group("lang").strip()
+        open_line = f"{fence}{lang}" if lang else fence
+        # Reserve room for the open/close fence lines around each body piece.
+        frame = _utf16(open_line) + 1 + _utf16(fence) + 1
+        body_budget = max(_HTML_CHUNK_FLOOR, budget - frame)
+        pieces = split_message(match.group("body"), limit=body_budget)
+        return "\n".join(f"{open_line}\n{piece}\n{fence}" for piece in pieces)
+
+    try:
+        return _RAW_FENCE_RE.sub(repl, text)
+    except Exception:
+        return text
+
+
+def _html_chunks(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Chunk RAW ``text``, then HTML-convert each chunk -> (html_chunks, plain_chunks).
+
+    Order matters (per the task): split the *raw* markdown at line boundaries FIRST
+    (reusing :func:`split_message`), THEN run each raw chunk through
+    :func:`to_telegram_html`. This avoids splitting a fenced code block mid-block
+    (``split_message`` breaks on newlines). An over-budget single fence is first
+    re-written into several COMPLETE fences (:func:`_presplit_big_fences`) so each piece
+    stays a valid ``<pre>``. Because conversion can still EXPAND a chunk past 4096 (e.g.
+    many ``<code>`` spans), any converted chunk over the limit is re-split by halving its
+    raw budget and re-converting — recursively, down to :data:`_HTML_CHUNK_FLOOR` — so
+    every emitted HTML chunk is individually under Telegram's limit while its tags stay
+    intact (we re-split the RAW, never the HTML).
+
+    The two returned tuples are positionally parallel — ``plain_chunks[i]`` is the raw
+    fallback for ``chunks[i]`` (T7 resends it with ``parse_mode=None`` if the HTML is
+    rejected).
+    """
+    prepared = _presplit_big_fences(text, _HTML_CHUNK_BUDGET)
+    html_out: list[str] = []
+    plain_out: list[str] = []
+    for raw in _chunk(prepared, limit=_HTML_CHUNK_BUDGET):
+        _split_chunk(raw, _HTML_CHUNK_BUDGET, html_out, plain_out)
+    return tuple(html_out), tuple(plain_out)
+
+
+def _split_chunk(
+    raw: str, budget: int, html_out: list[str], plain_out: list[str]
+) -> None:
+    """Convert ``raw`` to HTML; if the result overflows, re-split RAW at a smaller budget.
+
+    Appends parallel (html, plain) pairs to the output lists. Recurses by halving
+    ``budget`` until the converted chunk fits :data:`~claude_tg.util.TELEGRAM_MAX` or the
+    budget hits :data:`_HTML_CHUNK_FLOOR` (then it is emitted as-is — the send-path plain
+    fallback is the last resort for a pathological chunk).
+    """
+    converted = to_telegram_html(raw)
+    if _utf16(converted) <= TELEGRAM_MAX or budget <= _HTML_CHUNK_FLOOR:
+        html_out.append(converted)
+        plain_out.append(raw)
+        return
+    smaller = max(_HTML_CHUNK_FLOOR, budget // 2)
+    pieces = _chunk(raw, limit=smaller)
+    if len(pieces) <= 1:
+        # split_message could not break it further (one unbroken run) — emit as-is.
+        html_out.append(converted)
+        plain_out.append(raw)
+        return
+    for piece in pieces:
+        _split_chunk(piece, smaller, html_out, plain_out)
+
+
+def _utf16(text: str) -> int:
+    """UTF-16 code-unit length — what Telegram counts against its 4096 limit."""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
 
 
 def tool_use_line(event: ToolUseEvent) -> str:
@@ -655,17 +821,24 @@ def _render_error(event: ErrorEvent) -> RenderAction:
 
 
 def _render_result(event: ResultEvent) -> RenderAction:
-    # Terminal per-turn frame. The result_text (if any) is the final answer — show it
-    # verbatim; otherwise a compact status footer. Errors come via ErrorEvent.
+    # Terminal per-turn frame. The result_text (if any) is the final answer — it is
+    # Claude-authored CommonMark, so render it as Telegram HTML (with a raw fallback);
+    # otherwise a compact, bot-generated status footer stays plain text.
     if event.result_text:
-        body = event.result_text
-    else:
-        bits = [f"✅ done ({event.subtype})"]
-        if event.num_turns is not None:
-            bits.append(f"{event.num_turns} turns")
-        if event.total_cost_usd is not None:
-            bits.append(f"${event.total_cost_usd:.4f}")
-        body = " · ".join(bits)
+        html_chunks, plain = _html_chunks(event.result_text)
+        return RenderAction(
+            op="new",
+            chunks=html_chunks,
+            plain_chunks=plain,
+            parse_mode="HTML",
+            verbatim=True,
+        )
+    bits = [f"✅ done ({event.subtype})"]
+    if event.num_turns is not None:
+        bits.append(f"{event.num_turns} turns")
+    if event.total_cost_usd is not None:
+        bits.append(f"${event.total_cost_usd:.4f}")
+    body = " · ".join(bits)
     return RenderAction(op="new", chunks=_chunk(body), verbatim=True)
 
 
@@ -698,10 +871,17 @@ def render_event(event: Event) -> RenderAction:
         )
 
     if isinstance(event, PlanEvent):
+        # Bot-scaffolding header (kept verbatim) + Claude-authored plan body (HTML). The
+        # header stays as-is but is HTML-escaped so it is valid inside the HTML message;
+        # the plan text is CommonMark-converted. Chunk the RAW header+plan first, then
+        # convert, so the keyboard rides the first chunk and a long plan stays valid HTML.
         header = "📋 Proposed plan — Approve or Reject with feedback:\n\n"
+        html_chunks, plain = _html_chunks(header + event.plan)
         return RenderAction(
             op="new",
-            chunks=_chunk(header + event.plan),
+            chunks=html_chunks,
+            plain_chunks=plain,
+            parse_mode="HTML",
             reply_markup=plan_keyboard(event),
             verbatim=True,
         )
@@ -726,10 +906,18 @@ def render_event(event: Event) -> RenderAction:
             if not event.text:
                 return RenderAction.none()
             return RenderAction(op="edit_status", chunks=(event.text,))
-        # Assembled assistant prose is real content -> its own message, chunked.
+        # Assembled assistant prose is real content -> its own message, chunked. It is
+        # Claude-authored CommonMark, so render as Telegram HTML with a raw fallback.
         if not event.text:
             return RenderAction.none()
-        return RenderAction(op="new", chunks=_chunk(event.text), verbatim=True)
+        html_chunks, plain = _html_chunks(event.text)
+        return RenderAction(
+            op="new",
+            chunks=html_chunks,
+            plain_chunks=plain,
+            parse_mode="HTML",
+            verbatim=True,
+        )
 
     if isinstance(event, ToolUseEvent):
         return RenderAction(op="edit_status", chunks=(tool_use_line(event),))
@@ -969,12 +1157,17 @@ __all__ = [
     "render_event",
     # keyboards + codec
     "ask_keyboard",
+    "ask_question_body",
+    "ask_question_body_html",
+    "ask_question_keyboard",
     "plan_keyboard",
     "permission_keyboard",
     "encode_callback",
     "decode_callback",
     "Callback",
     "answers_from_ask",
+    "strip_telegram_html",
+    "to_telegram_html",
     "CALLBACK_LIMIT",
     "KIND_ASK",
     "KIND_OTHER",

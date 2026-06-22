@@ -760,3 +760,121 @@ def test_emoji_heavy_text_chunked_under_utf16_limit():
     for chunk in action.chunks:
         assert len(chunk.encode("utf-16-le")) // 2 <= 4096
     assert action.text == text
+
+
+# ============================================================================
+# CommonMark -> Telegram HTML wiring (the prose render paths) + raw fallback.
+# ============================================================================
+
+
+def test_assembled_text_renders_as_html_with_raw_fallback():
+    # An assembled TextEvent with markdown -> parse_mode=="HTML", **x** became <b>x</b>,
+    # and the ORIGINAL raw markdown is preserved in plain_chunks for the send fallback.
+    action = render_event(
+        TextEvent(text="A **bold** word and `code`.", incremental=False)
+    )
+    assert action.parse_mode == "HTML"
+    assert "<b>bold</b>" in action.text
+    assert "<code>code</code>" in action.text
+    # Raw fallback parallels chunks and is the un-converted markdown.
+    assert len(action.plain_chunks) == len(action.chunks)
+    assert "".join(action.plain_chunks) == "A **bold** word and `code`."
+    assert "**bold**" in action.plain_chunks[0]  # raw, NOT the HTML
+
+
+def test_result_text_renders_as_html_with_raw_fallback():
+    res = ResultEvent(
+        session_id="s1",
+        is_error=False,
+        subtype="success",
+        result_text="Done. See `file.py` and **note** this.",
+    )
+    action = render_event(res)
+    assert action.parse_mode == "HTML"
+    assert "<code>file.py</code>" in action.text
+    assert "<b>note</b>" in action.text
+    assert len(action.plain_chunks) == len(action.chunks)
+    assert "".join(action.plain_chunks) == "Done. See `file.py` and **note** this."
+
+
+def test_plan_body_renders_as_html_with_header_and_keyboard():
+    plan = PlanEvent(plan="Step **one**\nStep two", tool_use_id=REAL_TOOL_USE_ID)
+    action = render_event(plan)
+    assert action.parse_mode == "HTML"
+    # The bot-scaffolding header is preserved; the Claude plan body is HTML-converted.
+    assert "Proposed plan" in action.text
+    assert "<b>one</b>" in action.text
+    assert isinstance(action.reply_markup, InlineKeyboardMarkup)
+    # Raw fallback carries the original markdown (header + un-converted plan).
+    assert len(action.plain_chunks) == len(action.chunks)
+    assert "Step **one**" in "".join(action.plain_chunks)
+
+
+def test_prose_html_escapes_stray_angle_brackets_from_claude():
+    # A stray < / & from Claude must be escaped in the HTML chunk (so it can't break the
+    # message) while the raw fallback keeps the literal characters.
+    action = render_event(TextEvent(text="compare a < b && c", incremental=False))
+    assert "&lt;" in action.text and "&amp;&amp;" in action.text
+    assert "a < b && c" in "".join(action.plain_chunks)  # raw preserved verbatim
+
+
+def test_done_footer_stays_plain_text_no_html():
+    # The bot-generated done-footer (no result_text) is NOT prose -> plain, no parse_mode.
+    res = ResultEvent(
+        session_id="s1", is_error=False, subtype="success", num_turns=3, total_cost_usd=0.0123
+    )
+    action = render_event(res)
+    assert action.parse_mode is None
+    assert action.plain_chunks == ()
+    assert "done" in action.text and "3 turns" in action.text
+
+
+def test_error_block_stays_plain_text():
+    # Error blocks are bot scaffolding, shown exactly -> plain text (no HTML conversion).
+    action = render_event(ErrorEvent(kind_of_error="tool_error", message="boom <x>"))
+    assert action.parse_mode is None
+    assert action.plain_chunks == ()
+    assert "boom <x>" in action.text  # verbatim, not escaped
+
+
+def test_long_prose_html_chunks_each_under_4096_and_raw_parallel():
+    # A long markdown reply: chunk RAW first (sub-limit) then convert each -> every HTML
+    # chunk stays under Telegram's 4096 UTF-16 limit, and plain_chunks parallels it.
+    text = ("This is **paragraph** number with `code`.\n" * 400)
+    action = render_event(TextEvent(text=text, incremental=False))
+    assert len(action.chunks) > 1
+    assert len(action.plain_chunks) == len(action.chunks)
+    for chunk in action.chunks:
+        assert len(chunk.encode("utf-16-le")) // 2 <= 4096
+        assert "<b>paragraph</b>" in chunk  # each chunk is independently valid HTML
+    # The raw fallback rejoins to the original markdown (lossless).
+    assert "".join(action.plain_chunks) == text
+
+
+def test_oversized_fenced_block_splits_into_valid_pre_pieces():
+    # A single huge ```code``` block (a big file dump) is split into multiple COMPLETE
+    # fences so each emitted HTML piece is an individually valid <pre> under the limit —
+    # never a mid-fence cut that would render as plain prose.
+    big = "```python\n" + ("x = 1\n" * 1500) + "```"
+    action = render_event(TextEvent(text=big, incremental=False))
+    assert len(action.chunks) > 1
+    for chunk in action.chunks:
+        assert len(chunk.encode("utf-16-le")) // 2 <= 4096
+        assert "<pre>" in chunk and chunk.rstrip().endswith("</pre>")
+    assert len(action.plain_chunks) == len(action.chunks)
+
+
+def test_ask_question_body_html_escapes_question_and_converts_markdown():
+    from claude_tg.render import ask_question_body, ask_question_body_html
+
+    ask = AskEvent(
+        questions=[{"question": "Use **JSON** or <raw> ?", "header": "Storage"}],
+        tool_use_id="tid",
+    )
+    html_body = ask_question_body_html(ask, 0)
+    # The Claude question text is HTML-converted (**JSON** -> bold) and escaped (<raw>).
+    assert "<b>JSON</b>" in html_body
+    assert "&lt;raw&gt;" in html_body
+    assert "Storage" in html_body  # the scaffolding header label survives
+    # The plain variant is unchanged (the raw fallback the send path resends on rejection).
+    assert ask_question_body(ask, 0) == "❓ Storage: Use **JSON** or <raw> ?"
