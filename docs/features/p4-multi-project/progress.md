@@ -22,6 +22,9 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 - [x] T7 — Resume hardening: cwd re-validation (SB2) + RB3 crash recovery (e068a37)
 - [x] T8 — Integration / SB·RB acceptance matrix (0d721cd)
 - [x] T9 — Live verify + verify.md phone-checklist (verify.md written; live run = owner's phone-verify at the Verify+QA gate)
+- [ ] QF1 — fix B1: `/reset` cwd corruption (gate `runner.reset()` to one-shot) — Codex NO_SHIP blocker
+- [ ] QF2 — fix B2: `/switch` re-validates stored cwd before activating (SB2 conformance) — Codex blocker
+- [ ] QF3 — fix B3: streaming resume-failure-on-result fallback (port `_is_resume_failure`) — Codex NO_SHIP blocker
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
 
@@ -134,3 +137,26 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - `verify.md` SHALL enumerate the manual owner phone-checklist mirroring the above.
 - **Tests:** this IS the live verification (manual/real-Claude; not in CI).
 - **Status:** verify.md written (covers (a)–(j) + acceptance). **Live execution is the owner's phone-verify** at the Verify+QA gate — per the `relay-needs-concurrent-updates-and-phone-verify` memory, engine/unit probes bypass the real PTB callback path, so the phone-verify is the authoritative live check. (A contained programmatic engine live-verify can also be run on request, but is not a substitute.)
+
+## QA fix tasks (post-Codex NO_SHIP — owner chose "fix all three")
+
+### QF1 — B1: `/reset` must not corrupt the active project's cwd (D4)
+- **Goal:** Stop `cmd_reset` writing the one-shot runner's stale cwd onto the active project in streaming mode.
+- **Files:** `claude_tg/bot.py` (`cmd_reset`), `tests/test_bot_streaming.py`
+- **Acceptance:** WHEN `ENGINE_MODE=streaming`, `/reset` SHALL call ONLY `streaming.reset(chat_id)` (NOT `runner.reset`), so the active project's cwd is preserved and only its session cleared; one-shot `/reset` unchanged.
+- **Tests:** real store + runner; active `alpha`, `/switch beta`, `/reset` → `beta.cwd` unchanged, beta session cleared, `alpha` untouched. (Codex-suggested.)
+- **Status:** todo
+
+### QF2 — B2: `/switch` re-validates the target's stored cwd (SB2 conformance)
+- **Goal:** Refuse activating a project whose stored cwd is now outside `ALLOWED_ROOTS` (close the design-doc "on switch" gap; resume path already enforces it).
+- **Files:** `claude_tg/bot.py` (`cmd_switch`), `tests/test_bot_streaming.py`
+- **Acceptance:** WHEN `/switch <name>` targets a project whose stored cwd fails `resolve_within_roots` (and `ALLOW_ANY_PATH` false), the system SHALL refuse and leave the active project unchanged; valid target switches as before; busy-guard ordering preserved.
+- **Tests:** `/switch` to an out-of-root-cwd project → refused, active unchanged; in-roots target → switches. (Codex-suggested.)
+- **Status:** todo
+
+### QF3 — B3: streaming resume-failure-on-result fallback (RB3)
+- **Goal:** A resumed session that connects then ERRORS on first use must not stay stuck — clear the persisted id, recover fresh, notify (port the one-shot `_is_resume_failure` heuristic to streaming).
+- **Files:** `claude_tg/stream_session.py`, `tests/test_stream_session.py`
+- **Acceptance:** WHEN the FIRST turn on a just-resumed session yields a resume-failure-shaped error/result (`_is_resume_failure`), the system SHALL clear the persisted `session_id`, recover (fresh — auto-retry once if clean to implement, else a clear "couldn't resume; started fresh — resend" notice), and NEVER hang (RB2); the stale id SHALL NOT remain persisted.
+- **Tests:** resume() connects but first send yields a resume/session-not-found error → persisted id cleared, fresh recovery, notice, no hang. (Codex-suggested.)
+- **Status:** todo
