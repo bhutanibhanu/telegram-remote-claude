@@ -10,6 +10,18 @@ _Plan generated 2026-06-21 from design.md · 2 tasks · autonomous supervised bu
 > relay + P2's gating **compose** under the P3 launch path. Remaining before cutover: owner phone-verify per
 > [`verify.md`](verify.md), then flip `ENGINE_MODE=streaming` (default stays `oneshot` — the safe live path).
 
+> **🔧 Owner phone-verify (2026-06-21) surfaced + fixed real relay bugs** — none caught by the programmatic
+> probes (T2/P1-T9), which all drove `engine.resolve` directly and bypassed the real Telegram
+> update/callback path. **(1) Deadlock:** the answer-hold parks a turn handler awaiting the operator's tap,
+> but PTB processed updates **sequentially**, so the tap queued behind the parked turn → neither progressed.
+> Fixed: `concurrent_updates(True)` in `build_application`. **(2) Multi-question asks:** a single
+> `AskUserQuestion` carries several questions under one `tool_use_id`; the first tap resolved the whole ask
+> with a 1-of-N answer map (stranding the rest). Fixed: answers **accumulate** and resolve once all are
+> answered, and each question renders as its **own message + keyboard** (not one stacked wall of buttons).
+> **(3) Status spam:** identical status edits hit Telegram "message not modified" → the fallback re-sent a
+> fresh message every interval. Fixed: skip identical edits; calm stable wording ("💭 Claude is thinking…").
+> All three with regression tests (relay end-to-end via real PTB is otherwise untested); full suite green.
+
 > **P3 — interactive prompts / run skills from the phone.** The headline workflow: type `/grill` (or
 > `/pipeline`, `/scaffold`, …) in Telegram and the bot runs that skill **in the live Claude session**. P1
 > already shipped the interactive-tool relay (AskUserQuestion → buttons + "Other"; ExitPlanMode →
