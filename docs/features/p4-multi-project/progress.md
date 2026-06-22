@@ -18,7 +18,7 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 - [x] T3 — Registry accessors + SB4 name validation (1de9998)
 - [x] T4 — StreamingSession per-project rework (637eaef)
 - [x] T5 — Bot navigation commands (/projects, /switch, /rm, /pwd, /cd-removed) (0502c7c)
-- [ ] T6 — Bot /new command (SB2 path-input)
+- [x] T6 — Bot /new command (SB2 path-input) (c0bc0fa)
 - [ ] T7 — Resume hardening: cwd re-validation (SB2) + RB3 crash recovery
 - [ ] T8 — Integration / SB·RB acceptance matrix
 - [ ] T9 — Live verify + verify.md phone-checklist
@@ -98,7 +98,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the name is **invalid (SB4)** or **duplicate** → refuse with a clear message.
   - `/new` SHALL be allowlist-gated (**SB1**) and SHALL never crash on missing args (RB1).
 - **Tests:** happy create+autoswitch; SB2 out-of-root refusal; traversal/symlink-escape refusal; not-a-dir; invalid/dup name; busy refusal; missing-args usage; `ALLOW_ANY_PATH` opt-out.
-- **Status:** todo
+- **Status:** done (c0bc0fa) — reviewer AGREE; 3 mutation-probes confirmed SB2 + busy-guard tests have teeth (resolved-contained cwd stored, not raw arg). Relative-path/`~` `/new` test deferred to T8 (resolver itself is unit-tested; confinement holds regardless of base).
 
 ### T7 — Resume hardening: cwd re-validation (SB2) + RB3 crash recovery
 - **Goal:** Put the authoritative SB2 gate on the resume path and make an interrupted run fail clean (the genuine new reliability behavior).
@@ -121,7 +121,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the bot restarts, **both** projects SHALL be present with correct cwd/session_id and each SHALL resume independently on its next message (**restart-resumes-both**).
   - The store SHALL survive a simulated **crash-during-write** without corruption (atomic replace leaves the prior good file) (**RB6**).
   - One-shot mode SHALL behave **exactly as pre-P4** against a v2 store (regression assertion; complements T2).
-  - **⭐ Busy-guard invariant (highest-value test, from T4 review):** WHEN a turn is parked awaiting an answer (`is_busy` true), `/switch` and `/new` SHALL be refused — verified end-to-end so that if T5/T6 ever drop the guard, this **fails loudly** (a mid-hold active-project change deadlocks the relay). Also cover `_stop_other_started`'s stop-failure path (old engine `stop()` raises → new turn still runs) and `_resume_id` defensive branches (non-str/empty `session_id` → fresh start).
+  - **⭐ Busy-guard invariant (highest-value test, from T4 review):** WHEN a turn is parked awaiting an answer (`is_busy` true), `/switch` and `/new` SHALL be refused — verified end-to-end so that if T5/T6 ever drop the guard, this **fails loudly** (a mid-hold active-project change deadlocks the relay). Also cover `_stop_other_started`'s stop-failure path (old engine `stop()` raises → new turn still runs) and `_resume_id` defensive branches (non-str/empty `session_id` → fresh start). Plus deferred-from-T6: a **relative-path `/new`** resolves against the active project's cwd and stays SB2-confined (in-roots relative → created; `..`-escape relative → refused).
 - **Tests:** the above scenarios + full lifecycle `/new→/switch→/rm` via the session/registry layer. Plus two deferred-from-T2 store contracts: (a) `update()` after an **unknown/future-version** load starts a clean v2 (does not preserve the future doc — locks the SB6 fail-safe-clobber contract); (b) an empty-string `session_id`/`cwd` on disk normalizes to **absent** in the flat view (documents the truthy-omit). Plus deferred-from-T3 **SB6 never-crash** tests: registry accessors against a hand-edited/malformed doc (non-dict `chats`/`projects`, non-str keys, **dangling `active`** pointing at a missing project) degrade to None/`UnknownProject` without raising.
 - **Status:** todo
 
