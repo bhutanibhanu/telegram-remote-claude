@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +42,39 @@ SCHEMA_VERSION = 2
 
 #: The project name a migrated v1 entry (and a fresh one-shot chat) is filed under.
 DEFAULT_PROJECT = "default"
+
+#: SB4 project-name rule (ADR-004): non-empty, ≤32 chars, ASCII letters/digits/
+#: underscore/hyphen only — no spaces, slashes, dots, ``..``, or unicode.
+_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+# ---- registry errors (raised by the typed CRUD API, T3) --------------------
+
+
+class InvalidProjectName(ValueError):
+    """A project name fails the SB4 rule (``^[A-Za-z0-9_-]{1,32}$``)."""
+
+
+class DuplicateProject(ValueError):
+    """A project with that name already exists (case-insensitive) for the chat."""
+
+
+class UnknownProject(KeyError):
+    """No project with that name (case-insensitive) exists for the chat."""
+
+
+def validate_project_name(name: str) -> None:
+    """Raise :class:`InvalidProjectName` unless ``name`` satisfies SB4.
+
+    A valid name is non-empty, at most 32 characters, and composed only of ASCII
+    letters, digits, ``_`` and ``-`` (no spaces, slashes, dots, ``..``, or
+    unicode). Pure + side-effect free, so it is reusable by the bot commands
+    (T5/T6) and unit-testable on its own.
+    """
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+        raise InvalidProjectName(
+            f"invalid project name {name!r}: must match {_NAME_RE.pattern}"
+        )
 
 
 def _now() -> str:
@@ -196,6 +230,184 @@ class JsonSessionStore:
         project["last_active"] = _now()
 
         self._save_raw(raw)
+
+    # ---- registry view (streaming) — typed CRUD over the v2 doc (T3) -------
+
+    def get_active(self, chat_id: int) -> str | None:
+        """The chat's active project name, or ``None`` if no chat/active project.
+
+        Returns the stored (as-created) name. Never raises.
+        """
+        chat = self._chat(self._load_raw(), chat_id)
+        active = chat.get("active") if chat is not None else None
+        return active if isinstance(active, str) else None
+
+    def list_projects(self, chat_id: int) -> dict[str, dict]:
+        """``{name: record}`` for the chat — empty if the chat has no projects.
+
+        Each record is the stored ``{cwd, session_id, created_at, last_active}``
+        dict (as-created name keys, original case). The returned mapping is a
+        shallow copy, so mutating it does not disturb on-disk state (the inner
+        records are read-only by contract — callers should not mutate them).
+        Never raises.
+        """
+        chat = self._chat(self._load_raw(), chat_id)
+        if chat is None:
+            return {}
+        projects = chat.get("projects")
+        if not isinstance(projects, dict):
+            return {}
+        return {
+            name: record
+            for name, record in projects.items()
+            if isinstance(name, str) and isinstance(record, dict)
+        }
+
+    def get_project(self, chat_id: int, name: str) -> dict | None:
+        """The record for ``name`` (matched case-insensitively), or ``None``.
+
+        Returns the stored record dict; never raises.
+        """
+        chat = self._chat(self._load_raw(), chat_id)
+        if chat is None:
+            return None
+        projects = chat.get("projects")
+        if not isinstance(projects, dict):
+            return None
+        key = _resolve_name(projects, name)
+        if key is None:
+            return None
+        record = projects[key]
+        return record if isinstance(record, dict) else None
+
+    def create(
+        self, chat_id: int, name: str, cwd: str, *, make_active: bool = True
+    ) -> None:
+        """Add a fresh project ``name`` (cwd ``cwd``) to the chat's registry.
+
+        Validates the name first (SB4) — raises :class:`InvalidProjectName` on a
+        bad name **before** any write. Raises :class:`DuplicateProject` if a
+        project with that name already exists (case-insensitive) for the chat;
+        the as-given case is what gets stored/displayed. Creates the chat
+        container if absent. When ``make_active`` (the default), the chat's
+        ``active`` becomes this project. Persists.
+        """
+        validate_project_name(name)
+        raw = self._load_raw()
+        chat = self._ensure_chat(raw, chat_id)
+        projects = chat.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            projects = {}
+            chat["projects"] = projects
+        if _resolve_name(projects, name) is not None:
+            raise DuplicateProject(f"project {name!r} already exists")
+        projects[name] = _new_project(cwd)
+        if make_active:
+            chat["active"] = name
+        self._save_raw(raw)
+
+    def switch(self, chat_id: int, name: str) -> None:
+        """Make ``name`` the chat's active project (matched case-insensitively).
+
+        Raises :class:`UnknownProject` if no such project exists. The stored
+        (as-created) key is what becomes ``active``. Persists.
+        """
+        raw = self._load_raw()
+        chat, _projects, key = self._resolve(raw, chat_id, name)
+        chat["active"] = key
+        self._save_raw(raw)
+
+    def remove(self, chat_id: int, name: str) -> None:
+        """Delete the project ``name`` (matched case-insensitively).
+
+        Raises :class:`UnknownProject` if no such project exists. If the removed
+        project was the active one, the chat's ``active`` is set to ``None`` (the
+        store stays policy-free and merely consistent — the bot enforces the
+        "don't remove the active project" UX). Persists.
+        """
+        raw = self._load_raw()
+        chat, projects, key = self._resolve(raw, chat_id, name)
+        del projects[key]
+        if chat.get("active") == key:
+            chat["active"] = None
+        self._save_raw(raw)
+
+    def touch(self, chat_id: int, name: str) -> None:
+        """Set the project ``name``'s ``last_active`` to now (case-insensitive).
+
+        Raises :class:`UnknownProject` if no such project exists (so a caller can
+        rely on the project being present after a successful call). Persists.
+        """
+        raw = self._load_raw()
+        _chat, projects, key = self._resolve(raw, chat_id, name)
+        record = projects[key]
+        if not isinstance(record, dict):
+            raise UnknownProject(name)
+        record["last_active"] = _now()
+        self._save_raw(raw)
+
+    # ---- registry internals -----------------------------------------------
+
+    @staticmethod
+    def _chat(raw: dict, chat_id: int) -> dict | None:
+        """The chat container for ``chat_id`` in ``raw``, or ``None`` if absent."""
+        chats = raw.get("chats")
+        if not isinstance(chats, dict):
+            return None
+        chat = chats.get(str(chat_id))
+        return chat if isinstance(chat, dict) else None
+
+    @classmethod
+    def _resolve(
+        cls, raw: dict, chat_id: int, name: str
+    ) -> tuple[dict, dict, str]:
+        """Resolve ``(chat, projects, stored_key)`` for ``name`` in ``raw``.
+
+        Matches ``name`` case-insensitively against the chat's projects and
+        returns the chat container, its projects dict, and the **stored** key.
+        Raises :class:`UnknownProject` if the chat, its projects map, or a
+        matching project is absent — the shared lookup for ``switch`` /
+        ``remove`` / ``touch``.
+        """
+        chat = cls._chat(raw, chat_id)
+        projects = chat.get("projects") if chat is not None else None
+        if chat is None or not isinstance(projects, dict):
+            raise UnknownProject(name)
+        key = _resolve_name(projects, name)
+        if key is None:
+            raise UnknownProject(name)
+        return chat, projects, key
+
+    @staticmethod
+    def _ensure_chat(raw: dict, chat_id: int) -> dict:
+        """The chat container for ``chat_id``, creating an empty one if absent."""
+        chats = raw.setdefault("chats", {})
+        if not isinstance(chats, dict):
+            chats = {}
+            raw["chats"] = chats
+        key = str(chat_id)
+        chat = chats.get(key)
+        if not isinstance(chat, dict):
+            chat = {"active": None, "projects": {}}
+            chats[key] = chat
+        return chat
+
+
+def _resolve_name(projects: dict, name: str) -> str | None:
+    """Resolve ``name`` to its actual stored key, case-insensitively.
+
+    Returns the real (as-created) key whose casefold matches ``name`` — so all
+    registry operations match case-insensitively while storage/display keep the
+    original case — or ``None`` if no project matches. Defensive against a
+    hand-edited file with non-``str`` keys.
+    """
+    if not isinstance(name, str):
+        return None
+    target = name.casefold()
+    for key in projects:
+        if isinstance(key, str) and key.casefold() == target:
+            return key
+    return None
 
 
 def _active_project(chat: dict) -> dict | None:
