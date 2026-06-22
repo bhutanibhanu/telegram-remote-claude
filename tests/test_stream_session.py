@@ -27,6 +27,7 @@ from claude_tg.engine.types import (
     TextEvent,
     ToolUseEvent,
 )
+from claude_tg.permissions import PermissionPolicy
 from claude_tg.render import RenderAction, encode_callback
 from claude_tg.stream_session import StreamingBusy, StreamingSession
 
@@ -133,12 +134,25 @@ def make_session(engine: FakeEngine, *, config=None, store=None, clock=None) -> 
     return StreamingSession(
         config or make_config(),
         session_store=store,
-        # The factory accepts the chat's shared permission_policy (P2) but the scripted
-        # FakeEngine ignores it — the policy mutations under test act on state.policy
-        # directly (the SAME object the real engine would receive).
+        # The factory accepts the project's shared permission_policy (P2) but the scripted
+        # FakeEngine ignores it — the policy mutations under test act on the active
+        # project's runtime policy (the SAME object the real engine would receive). See
+        # `active_policy()` below.
         engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
         clock=clock or (lambda: 0.0),  # frozen clock: every status edit is "due"
     )
+
+
+def active_policy(session: StreamingSession, chat_id: int = 1) -> PermissionPolicy:
+    """The ACTIVE project's :class:`PermissionPolicy` (P4: policy moved chat→project).
+
+    The live-turn state (pending ask/plan, free-text marker, status line) still lives on
+    ``session._chat(chat_id)``; the engine + cwd + policy moved to the per-project
+    ``_ProjectRuntime``. This resolves the active project (auto-creating ``default`` like
+    a real turn) and returns its policy — the object ``/yolo`` and ``/reset`` mutate."""
+    _name, rt = session._active_runtime(chat_id, create_default=True)
+    assert rt is not None
+    return rt.policy
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +253,7 @@ async def test_resolve_ask_option_maps_to_question_answer():
     engine = FakeEngine([])
     session = make_session(engine)
     # Prime the engine + the held ask (as a live turn would).
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     session._chat(1).pending_ask = ask
 
     outcome = session.resolve_callback(1, encode_callback("a", "tid", question_index=0, option_index=1))
@@ -251,7 +265,7 @@ async def test_plan_approve_maps_to_plan_verdict():
     plan = PlanEvent(plan="the plan", tool_use_id="pid")
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     session._chat(1).pending_plan = plan
 
     outcome = session.resolve_callback(1, encode_callback("p", "pid", plan_action="a"))
@@ -263,7 +277,7 @@ async def test_plan_reject_then_free_text_resolves_with_feedback():
     plan = PlanEvent(plan="the plan", tool_use_id="pid")
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     session._chat(1).pending_plan = plan
 
     # Reject arms free-text capture (no resolve yet).
@@ -290,7 +304,7 @@ async def test_ask_other_then_free_text_resolves_with_answer():
     )
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     session._chat(1).pending_ask = ask
 
     outcome = session.resolve_callback(1, encode_callback("o", "tid", question_index=0))
@@ -325,7 +339,7 @@ async def test_multi_question_ask_resolves_only_after_all_answered():
     )
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     session._chat(1).pending_ask = ask
 
     out0 = session.resolve_callback(1, encode_callback("a", "multi", question_index=0, option_index=0))
@@ -358,7 +372,7 @@ async def test_multi_question_ask_retap_overwrites_choice():
     )
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     session._chat(1).pending_ask = ask
 
     session.resolve_callback(1, encode_callback("a", "multi2", question_index=0, option_index=0))  # Q1=A1
@@ -382,7 +396,7 @@ async def test_multi_question_ask_mixed_option_and_free_text():
     )
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     session._chat(1).pending_ask = ask
 
     # Answer Q2 by tapping its option — not complete yet (Q1 still open).
@@ -469,7 +483,7 @@ async def test_identical_status_line_is_not_resent():
 async def test_permission_allow_once_maps_to_decision():
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
 
     outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="o"))
     assert outcome.handled is True
@@ -482,20 +496,20 @@ async def test_permission_allow_session_maps_to_decision():
     # resolve (T3 _verdict_for), so the session must NOT touch the policy here.
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
 
     outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="s"))
     assert outcome.handled is True
     assert outcome.note == "Allowed for session"
     assert engine.resolve_calls == [("tid", PermissionDecision(verdict="allow_session"))]
     # No grant recorded by the session itself (the engine owns that — fake doesn't).
-    assert session._chat(1).policy.granted_tools() == frozenset()
+    assert active_policy(session).granted_tools() == frozenset()
 
 
 async def test_permission_deny_maps_to_decision():
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
 
     outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="d"))
     assert outcome.handled is True
@@ -516,7 +530,7 @@ async def test_permission_tap_for_stale_request_returns_not_handled():
     # backstopped): the engine's resolve() returns False -> handled=False, benign note.
     engine = FakeEngine([], resolve_result=False)
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     outcome = session.resolve_callback(1, encode_callback("m", "gone", payload="o"))
     assert outcome.handled is False
     assert outcome.note == "no pending request"
@@ -525,18 +539,18 @@ async def test_permission_tap_for_stale_request_returns_not_handled():
 
 
 # ---------------------------------------------------------------------------
-# /yolo + /reset policy state (P2, D6/D7) on the shared per-chat policy.
+# /yolo + /reset policy state (P2, D6/D7) on the ACTIVE PROJECT's policy (P4).
 # ---------------------------------------------------------------------------
 
 
-async def test_set_yolo_flips_chat_policy():
+async def test_set_yolo_flips_active_project_policy():
     engine = FakeEngine([])
     session = make_session(engine)
-    assert session._chat(1).policy.yolo is False
+    assert active_policy(session).yolo is False
     session.set_yolo(1, True)
-    assert session._chat(1).policy.yolo is True
+    assert active_policy(session).yolo is True
     session.set_yolo(1, False)
-    assert session._chat(1).policy.yolo is False
+    assert active_policy(session).yolo is False
 
 
 async def test_reset_clears_policy_grants_and_yolo():
@@ -544,14 +558,14 @@ async def test_reset_clears_policy_grants_and_yolo():
     # starts fail-closed. False-pass guard: if reset() skipped policy.clear() this fails.
     engine = FakeEngine([])
     session = make_session(engine)
-    state = session._chat(1)
-    state.policy.set_yolo(True)
-    state.policy.grant_session("Bash")
-    assert state.policy.yolo is True and state.policy.granted_tools() == frozenset({"Bash"})
+    policy = active_policy(session)  # the ACTIVE project's policy (P4)
+    policy.set_yolo(True)
+    policy.grant_session("Bash")
+    assert policy.yolo is True and policy.granted_tools() == frozenset({"Bash"})
 
     session.reset(1)
-    assert state.policy.yolo is False
-    assert state.policy.granted_tools() == frozenset()
+    assert policy.yolo is False
+    assert policy.granted_tools() == frozenset()
 
 
 async def test_driven_turn_shows_loud_yolo_indicator():
@@ -590,7 +604,7 @@ async def test_driven_turn_has_no_yolo_indicator_when_off():
 async def test_malformed_callback_never_resolves():
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     session._chat(1).pending_ask = AskEvent(
         questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="tid"
     )
@@ -604,7 +618,7 @@ async def test_callback_for_unknown_id_does_not_resolve():
     # A well-formed callback whose tool_use_id does not match the held ask is ignored.
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     session._chat(1).pending_ask = AskEvent(
         questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="held-id"
     )
@@ -624,7 +638,7 @@ async def test_callback_with_no_active_engine_is_ignored():
 async def test_stale_option_index_does_not_crash_or_resolve():
     engine = FakeEngine([])
     session = make_session(engine)
-    await session._ensure_engine(session._chat(1), 1)
+    await session._ensure_engine(1)
     # Held ask has a single option; a tap for option 9 is stale -> ignored, no crash.
     session._chat(1).pending_ask = AskEvent(
         questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="tid"
@@ -942,3 +956,255 @@ async def test_keyboard_attaches_to_first_non_empty_chunk():
     # Only the non-empty chunk is sent, and it carries the keyboard.
     assert [s["text"] for s in rec.sends] == ["real content"]
     assert rec.sends[0]["reply_markup"] is kb
+
+
+# ===========================================================================
+# P4 (T4): per-active-project rework — the store is the source of truth for the
+# active project + its (session_id, cwd); the engine is built/resumed per project;
+# session_id persists per project; restart resets the transient bypass (D3); /reset
+# targets the active project but keeps it; is_busy reflects the turn lock.
+#
+# These use a REAL JsonSessionStore (the registry CRUD under test) but the engine is
+# still the scripted FakeEngine (no SDK / no network). Where two projects are exercised
+# the factory hands out a DISTINCT engine per cwd so we can assert which one ran/stopped.
+# ===========================================================================
+
+
+def make_multi_session(engines_by_cwd: dict, *, store, config=None) -> StreamingSession:
+    """A session whose factory returns a DISTINCT engine per cwd (for two-project tests).
+
+    ``engines_by_cwd`` maps a project's cwd → its :class:`FakeEngine`. The default
+    production factory builds one engine per call; here we route by cwd so a test can
+    assert per-project resume/stop. The same cwd always yields the same engine (a
+    project's runtime is built once and reused within the process)."""
+    return StreamingSession(
+        config or make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engines_by_cwd[cwd],
+        clock=lambda: 0.0,
+    )
+
+
+async def test_first_turn_with_no_active_project_auto_creates_default(tmp_path):
+    # ADR-004 D6: a turn with NO active project auto-creates `default` at config.workdir
+    # and runs; get_active is then "default" with the workdir as its cwd.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    assert store.get_active(1) is None  # nothing yet
+    engine = FakeEngine(
+        [ResultEvent(session_id="s1", is_error=False, subtype="success", result_text="ok")]
+    )
+    session = make_session(engine, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The turn ran (engine started) and `default` is now the active project at workdir.
+    assert engine.started is True
+    assert store.get_active(1) == "default"
+    assert store.get_project(1, "default")["cwd"] == "/work"
+    assert any("ok" in s["text"] for s in rec.sends)
+
+
+async def test_get_cwd_does_not_create_a_project(tmp_path):
+    # Read-only: get_cwd on a chat with no active project returns the default workdir and
+    # creates NOTHING (no `default` project written) — only a turn/set_yolo auto-creates.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    session = make_session(FakeEngine([]), store=store)
+    assert session.get_cwd(1) == "/work"  # falls back to config.workdir
+    assert store.get_active(1) is None  # NOT created by a read-only query
+    assert store.list_projects(1) == {}
+
+
+async def test_get_cwd_returns_active_project_cwd(tmp_path):
+    # With an active project, get_cwd reports THAT project's cwd (not the default workdir).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", "/work/api", make_active=True)
+    session = make_session(FakeEngine([]), store=store)
+    assert session.get_cwd(1) == "/work/api"
+
+
+async def test_per_project_resume_uses_each_projects_own_session_and_cwd(tmp_path):
+    # Two projects with different cwds + session_ids: a turn resumes from the ACTIVE
+    # project's own (session_id, cwd). Switching the active project makes the NEXT turn
+    # build/resume the OTHER project — and stops the previously-started engine (D2).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    store.update(1, session_id="alpha-sess", cwd=None)  # alpha is active → gets the id
+    store.switch(1, "beta")
+    store.update(1, session_id="beta-sess", cwd=None)  # beta is active → gets the id
+    store.switch(1, "alpha")  # back to alpha for the first turn
+
+    eng_alpha = FakeEngine(
+        [ResultEvent(session_id="alpha-sess", is_error=False, subtype="success")],
+        session_id="alpha-sess",
+    )
+    eng_beta = FakeEngine(
+        [ResultEvent(session_id="beta-sess", is_error=False, subtype="success")],
+        session_id="beta-sess",
+    )
+    session = make_multi_session(
+        {"/work/alpha": eng_alpha, "/work/beta": eng_beta}, store=store
+    )
+    rec = Recorder()
+
+    # Turn 1 on alpha → resumes alpha's session in alpha's cwd; beta untouched.
+    await asyncio.wait_for(
+        session.handle_message(1, "hi alpha", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng_alpha.resumed == "alpha-sess" and eng_alpha.started is True
+    assert eng_beta.resumed is None and eng_beta.started is False  # never touched
+
+    # Operator switches active project to beta (registry op); next turn uses beta.
+    store.switch(1, "beta")
+    await asyncio.wait_for(
+        session.handle_message(1, "hi beta", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng_beta.resumed == "beta-sess" and eng_beta.started is True
+    # Single-active-run (D2): switching stopped alpha's previously-started engine.
+    assert eng_alpha.stopped is True
+
+
+async def test_per_project_session_id_persists_to_active_only(tmp_path):
+    # After a turn, the result's session_id is written to the ACTIVE project; the OTHER
+    # project's record is untouched (per-project persistence, not a chat-global slot).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)  # no session_id yet
+
+    eng_alpha = FakeEngine(
+        [ResultEvent(session_id="alpha-new", is_error=False, subtype="success")],
+        session_id="alpha-new",
+    )
+    session = make_multi_session({"/work/alpha": eng_alpha}, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # alpha (active) got the new id; beta's record is still pristine (session_id None).
+    assert store.get_project(1, "alpha")["session_id"] == "alpha-new"
+    assert store.get_project(1, "beta")["session_id"] is None
+    assert store.get_project(1, "beta")["cwd"] == "/work/beta"  # fixed cwd untouched
+
+
+async def test_reset_clears_active_project_session_but_keeps_project(tmp_path):
+    # /reset clears the ACTIVE project's persisted session_id (a fresh conversation) but
+    # KEEPS the project in the registry (reset ≠ delete), and clears its policy (D3/D7).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", "/work/api", make_active=True)
+    store.update(1, session_id="live-sess", cwd=None)
+    session = make_session(FakeEngine([]), store=store)
+    pol = active_policy(session)
+    pol.set_yolo(True)
+    pol.grant_session("Bash")
+
+    session.reset(1)
+
+    assert store.get_project(1, "api")["session_id"] is None  # session cleared
+    assert store.get_active(1) == "api"  # project KEPT + still active
+    assert store.get_project(1, "api")["cwd"] == "/work/api"  # cwd preserved (D4)
+    assert pol.yolo is False and pol.granted_tools() == frozenset()  # D7 fail-closed
+
+
+async def test_reset_with_no_active_project_is_noop(tmp_path):
+    # Reset on a chat that never ran a turn (no active project) must not crash or create
+    # anything (RB1).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    session = make_session(FakeEngine([]), store=store)
+    session.reset(1)  # no raise
+    assert store.get_active(1) is None
+    assert store.list_projects(1) == {}
+
+
+async def test_restart_resets_yolo_and_grants_then_resumes_persisted_session(tmp_path):
+    # D3/SB5: a NEW StreamingSession over the SAME store starts the active project with
+    # yolo OFF / no grants (the transient bypass is in-memory only — reset for free on a
+    # fresh process), and resumes its PERSISTED session_id on the next turn.
+    from claude_tg.session_store import JsonSessionStore
+
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "api", "/work/api", make_active=True)
+    store.update(1, session_id="persisted-sess", cwd=None)
+
+    # --- process 1: turn on, then flip yolo + grant a tool (in-memory state) ---
+    eng1 = FakeEngine([ResultEvent(session_id="persisted-sess", is_error=False, subtype="success")])
+    s1 = make_multi_session({"/work/api": eng1}, store=store)
+    s1.set_yolo(1, True)
+    active_policy(s1).grant_session("Bash")
+    assert active_policy(s1).yolo is True
+
+    # --- process 2: fresh StreamingSession over the SAME store (simulated restart) ---
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="persisted-sess", is_error=False, subtype="success")],
+        session_id="persisted-sess",
+    )
+    s2 = make_multi_session({"/work/api": eng2}, store=store)
+    # Transient bypass did NOT survive the restart: fresh policy, yolo off, no grants.
+    assert active_policy(s2).yolo is False
+    assert active_policy(s2).granted_tools() == frozenset()
+    # Identity reloaded from the registry → the next turn RESUMES the persisted session.
+    rec = Recorder()
+    await asyncio.wait_for(
+        s2.handle_message(1, "back", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng2.resumed == "persisted-sess" and eng2.started is True
+
+
+async def test_is_busy_reflects_turn_lock():
+    # is_busy() is True exactly while a turn holds the per-chat lock (the D2 busy-guard
+    # surface), and False before/after. A chat with no state is never busy.
+    engine = FakeEngine([HOLD, ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = make_session(engine)
+    assert session.is_busy(1) is False  # nothing started
+
+    turn = asyncio.create_task(
+        session.handle_message(1, "go", send=Recorder().send, edit=Recorder().edit)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert session.is_busy(1) is True  # turn holds the lock (parked at HOLD)
+
+    engine.cancel()  # release the hold
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert session.is_busy(1) is False  # lock released at turn end
+
+
+async def test_resume_failure_falls_back_to_fresh_start(tmp_path):
+    # The harvested resume-failure recovery survives the per-project rework: a project
+    # whose resume() raises falls back to a fresh start() (the turn is never wedged on a
+    # stale/torn session). T7 adds the operator notice + cwd re-validation; here we only
+    # assert the fallback shape is preserved.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", "/work/api", make_active=True)
+    store.update(1, session_id="dead-sess", cwd=None)
+
+    class ResumeBoomEngine(FakeEngine):
+        async def resume(self, session_id):
+            raise RuntimeError("torn transcript")
+
+    engine = ResumeBoomEngine(
+        [ResultEvent(session_id="fresh", is_error=False, subtype="success")]
+    )
+    session = make_multi_session({"/work/api": engine}, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert engine.started is True  # fell back to a fresh start despite the resume boom

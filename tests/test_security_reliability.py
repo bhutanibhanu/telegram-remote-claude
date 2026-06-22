@@ -525,7 +525,7 @@ async def test_rb1_garbage_callback_data_does_not_raise():
     """
     engine = FakeEngine([])
     session = make_streaming_session(engine)
-    await session._ensure_engine(session._chat(1), 1)  # start the engine for chat 1
+    await session._ensure_engine(1)  # start the active project's engine for chat 1
     for bad in ["garbage", "a|tid", "x|tid|0.0", "a|tid|x.y", 12345, None, b"a|x|0.0", "", "a||0.0"]:
         outcome = session.resolve_callback(1, bad)  # must not raise
         assert outcome.handled is False

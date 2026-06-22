@@ -1,21 +1,26 @@
-"""Streaming-mode driver (T7) — the collaborator ``bot.py`` delegates to when
+"""Streaming-mode driver — the collaborator ``bot.py`` delegates to when
 ``ENGINE_MODE=streaming``.
 
 The one-shot path (``claude_runner.ClaudeRunner``) is untouched; this module is the
 *parallel* streaming runner gated behind the S4 flag. It owns everything the live
-engine needs that the pure layers (``engine``/``render``) deliberately left to T7:
+engine needs that the pure layers (``engine``/``render``) deliberately left to T7,
+now **per active project** (P4 / ADR-004):
 
-* **Per-chat :class:`~claude_tg.engine.engine.Engine` lifecycle.** One engine per chat,
-  started lazily on the first turn (or resumed from the persisted ``(session_id, cwd)``
-  — the cwd-scoped-resume coupling, ADR-001 / C6). Harvested from
-  ``claude_runner``: the ``(session_id, cwd)`` persistence, ``--resume``, and the
-  per-chat single-active-turn lock (we do NOT rebuild those concepts).
+* **Per-project :class:`~claude_tg.engine.engine.Engine` lifecycle.** One engine per
+  *active project* (D2 single-active-run: at most one started engine per chat), started
+  lazily on the first turn (or resumed from that project's persisted ``(session_id,
+  cwd)`` — the cwd-scoped-resume coupling, ADR-001 / C6). The project runtime
+  (``cwd``/``engine``/``started``/``policy``) lives on a :class:`_ProjectRuntime` held
+  in a per-project dict on :class:`_ChatState`; the **active** project is resolved from
+  the **store** (the source of truth), and a project's ``(session_id, cwd)`` is
+  read/written via the registry CRUD.
 
 * **The turn lock (harvested ``ClaudeBusy`` invariant).** A per-chat
   :class:`asyncio.Lock` guards the **turn driver** (``handle_message`` /
   ``handle_cancel``-as-turn) so a chat runs one turn at a time — exactly the
-  single-active-run invariant ``ClaudeRunner`` enforces. **It deliberately does NOT
-  guard :meth:`resolve_callback`**: a button tap / "Other" reply resolves a pending
+  single-active-run invariant ``ClaudeRunner`` enforces (one active turn per chat —
+  hence the live-turn state stays on the chat, not the project). **It deliberately does
+  NOT guard :meth:`resolve_callback`**: a button tap / "Other" reply resolves a pending
   decision that the *currently running* turn is awaiting, so it MUST run concurrently
   with the held turn (the turn loop is parked inside ``engine.send`` awaiting the
   operator; the callback handler calls ``engine.resolve`` on the same loop to unblock
@@ -26,12 +31,19 @@ engine needs that the pure layers (``engine``/``render``) deliberately left to T
   :class:`~claude_tg.render.Coalescer`, and performs the actual Telegram send / edit
   the render layer deferred — batching incremental/status edits at the min interval,
   flushing verbatim ask/plan/error/result as their own messages, attaching the
-  ask/plan inline keyboard. Persists ``session_id`` from the ``result`` event.
+  ask/plan inline keyboard. Persists ``session_id`` from the ``result`` event to the
+  **active project** (per-project, not a chat-global slot).
 
 * **The free-text "Other" / plan-reject state machine.** A per-chat pending-input
   marker: when the operator taps "Other" on an ask or "Reject + feedback" on a plan,
   the NEXT text message is captured as the free-text answer / reject feedback and
   routed via ``engine.resolve`` instead of opening a new turn.
+
+* **Transient bypass reset on restart (D3/SB5).** The :class:`_ProjectRuntime` (and its
+  :class:`~claude_tg.permissions.PermissionPolicy`) is in-memory only — a fresh process
+  starts every project with a new policy (``/yolo`` OFF, no allow-session grants).
+  Identity (name, cwd, ``session_id``) reloads from the persisted registry at
+  :meth:`_ensure_engine` time; the bypass posture never persists.
 
 **SB1 is enforced at the bot** (``filters.Chat(allowed)`` + an explicit
 ``_authorized`` recheck in the handler) — this module is only reached for an
@@ -75,6 +87,7 @@ from .render import (
     strip_telegram_html,
     yolo_indicator,
 )
+from .session_store import DEFAULT_PROJECT
 
 log = logging.getLogger(__name__)
 
@@ -106,11 +119,11 @@ _PERMISSION_NOTES: dict[PermissionVerdictName, str] = {
 
 
 class EngineFactory(Protocol):
-    """Builds an :class:`Engine` for a chat (injected so tests pass a mock).
+    """Builds an :class:`Engine` for a project (injected so tests pass a mock).
 
     The default production factory wires an :class:`SdkSubstrate` (Substrate A) with
     the engine's decision callback; tests pass a factory returning a scripted fake.
-    ``permission_policy`` is the chat's single per-session :class:`PermissionPolicy`
+    ``permission_policy`` is the project's single per-session :class:`PermissionPolicy`
     (P2, ADR-003): the SAME object the session mutates via ``/yolo`` and clears on
     ``/reset``, handed in so the engine's gate and the session act on one policy.
     """
@@ -129,9 +142,9 @@ def _default_engine_factory(
     (the async answer-hold + the P2 permission gate). No bypass / skip-permissions flag
     is set (SB5): the engine consults the injected ``permission_policy`` and is
     fail-closed by default — risky tools are held for approval unless a grant or
-    ``/yolo`` allows them. ``permission_policy`` is the chat's shared policy (the one the
-    session mutates), so ``/yolo``, allow-session grants, and ``/reset``-clear all act on
-    a single object.
+    ``/yolo`` allows them. ``permission_policy`` is the project's shared policy (the one
+    the session mutates), so ``/yolo``, allow-session grants, and ``/reset``-clear all
+    act on a single object.
     """
     engine: Engine
 
@@ -154,18 +167,40 @@ def _default_engine_factory(
 
 
 @dataclass
-class _ChatState:
-    """Per-chat streaming state (engine + turn lock + ask/plan + free-text marker)."""
+class _ProjectRuntime:
+    """In-memory runtime for ONE project (engine + cwd + its permission policy).
+
+    Per ADR-004: the durable identity (name, cwd, ``session_id``, timestamps) lives in
+    the persisted registry; **this** is the transient runtime — created lazily in memory
+    when a project is first used, dropped on a restart (so ``/yolo`` and allow-session
+    grants never survive a restart, D3/SB5). ``cwd`` is the project's fixed cwd (D4),
+    seeded from the registry record (falling back to ``config.workdir`` only if the
+    record's cwd is missing). ``policy`` is a FRESH :class:`PermissionPolicy` per project
+    (fail-closed: no grants, yolo off) — the SAME object handed to that project's engine
+    and mutated by the session (``/yolo`` via :meth:`set_yolo`, dropped by ``policy.clear()``
+    on ``/reset``).
+    """
 
     cwd: str
     engine: Optional[Engine] = None
     started: bool = False
-    # The chat's single per-session permission policy (P2, ADR-003). A FRESH one per
-    # chat (fail-closed: no grants, yolo off). The SAME object is handed to the engine
-    # (so the engine's gate + allow-session grants act on it) and mutated by the session
-    # (/yolo via set_yolo, dropped by clear() on /reset).
     policy: PermissionPolicy = field(default_factory=PermissionPolicy)
+
+
+@dataclass
+class _ChatState:
+    """Per-chat LIVE-TURN state (turn lock + ask/plan + free-text marker) + project runtimes.
+
+    There is exactly ONE active turn per chat (the turn lock enforces it), so the
+    live-turn fields (status line, pending ask/plan, free-text capture) belong to the
+    **chat**. The per-**project** runtime (engine/cwd/policy) lives in :attr:`runtimes`,
+    keyed by the stored project name; the *active* project is resolved from the store.
+    """
+
     lock: asyncio.Lock = None  # type: ignore[assignment]
+    # Per-project in-memory runtimes, keyed by the project's STORED (as-created) name.
+    # Created lazily by _active_runtime; never persisted (D3 — transient bypass).
+    runtimes: dict[str, _ProjectRuntime] = field(default_factory=dict)
     # The status-line message id for in-place coalesced edits (created on first edit).
     status_message_id: Optional[int] = None
     # The text currently shown on that status line — used to SKIP an edit when the new
@@ -205,6 +240,12 @@ class StreamingSession:
     loop). The turn lock guards :meth:`handle_message` (one turn per chat at a time —
     the harvested ``ClaudeBusy`` invariant); :meth:`resolve_callback` is intentionally
     lock-free so it can resolve the pending decision the held turn is awaiting.
+
+    **Per active project (P4).** The chat's active project (and its cwd) is resolved
+    from the store on each turn; the engine is built/resumed from that project's
+    ``(session_id, cwd)`` and persists its ``session_id`` back to that project. At most
+    one engine is started per chat at a time (D2): switching the active project stops the
+    previously-started one before starting/resuming the new active one.
     """
 
     def __init__(
@@ -222,109 +263,260 @@ class StreamingSession:
         self._clock = clock
         self._min_edit_interval = min_edit_interval
         self._chats: dict[int, _ChatState] = {}
-        # Harvest persisted (session_id, cwd) so a streaming turn can resume.
-        self._resume_ids: dict[int, str] = {}
-        if self.store is not None:
-            data = self.store.load()
-            for key, entry in data.items():
-                if not isinstance(entry, dict):
-                    continue
-                try:
-                    cid = int(key)
-                except (TypeError, ValueError):
-                    continue
-                if entry.get("session_id"):
-                    self._resume_ids[cid] = entry["session_id"]
-                if entry.get("cwd"):
-                    self._chat(cid).cwd = entry["cwd"]
+        # NOTE (P4 / D3): no __init__ harvest of persisted (session_id, cwd). Resume now
+        # resolves PER ACTIVE PROJECT from the registry at _ensure_engine time, and the
+        # in-memory _ProjectRuntime starts fresh every process (transient bypass reset).
 
     # -- per-chat state ------------------------------------------------------
 
     def _chat(self, chat_id: int) -> _ChatState:
         state = self._chats.get(chat_id)
         if state is None:
-            state = _ChatState(cwd=str(self.config.workdir))
+            state = _ChatState()
             self._chats[chat_id] = state
         return state
 
+    # -- active-project resolution (the store is the source of truth) --------
+
+    def _active_runtime(
+        self, chat_id: int, *, create_default: bool
+    ) -> tuple[Optional[str], Optional[_ProjectRuntime]]:
+        """Resolve the chat's ACTIVE project + its in-memory :class:`_ProjectRuntime`.
+
+        The **store** owns which project is active and its cwd. Returns ``(name,
+        runtime)`` for the active project, lazily creating the runtime in memory (cwd
+        from the registry record, falling back to ``config.workdir`` if the record's cwd
+        is missing). When the chat has **no active project**:
+
+        * ``create_default=True`` (a turn / ``set_yolo`` — anything that runs the engine):
+          auto-create a ``default`` project at ``config.workdir`` and make it active
+          (ADR-004 D6 symmetry — preserves the pre-P4 "just send a message and it works"
+          UX), then resolve it. If a ``default`` exists but isn't active, switch to it.
+        * ``create_default=False`` (a read-only query like :meth:`get_cwd`): no side
+          effects — return ``(None, None)``.
+
+        With no store at all (tests that pass ``session_store=None``), fall back to a
+        single implicit ``default`` runtime at ``config.workdir`` so the driver still
+        works without persistence.
+        """
+        if self.store is None:
+            # No persistence: a single implicit project so the engine still runs.
+            if not create_default:
+                # Mirror the with-store read-only contract: no runtime unless one exists.
+                rt = self._chat(chat_id).runtimes.get(DEFAULT_PROJECT)
+                return (DEFAULT_PROJECT, rt) if rt is not None else (None, None)
+            return DEFAULT_PROJECT, self._runtime(chat_id, DEFAULT_PROJECT, None)
+
+        active = self.store.get_active(chat_id)
+        if active is None:
+            if not create_default:
+                return None, None
+            active = self._ensure_default_active(chat_id)
+        record = self.store.get_project(chat_id, active)
+        cwd = (record or {}).get("cwd")
+        return active, self._runtime(chat_id, active, cwd)
+
+    def _ensure_default_active(self, chat_id: int) -> str:
+        """Auto-create (or switch to) a ``default`` project for a chat with no active one.
+
+        ADR-004 D6: a fresh streaming chat with no active project gets a ``default`` at
+        ``config.workdir`` (symmetric with the v1→v2 migration) so the operator can just
+        send a message. If ``default`` already exists but isn't active, switch to it
+        rather than failing on the duplicate. Returns the now-active project name.
+        """
+        from .session_store import DuplicateProject
+
+        workdir = str(self.config.workdir)
+        try:
+            self.store.create(chat_id, DEFAULT_PROJECT, workdir, make_active=True)
+        except DuplicateProject:
+            # A default already exists (e.g. from a prior reset that kept it) but is not
+            # active — make it active rather than creating a second.
+            self.store.switch(chat_id, DEFAULT_PROJECT)
+        return DEFAULT_PROJECT
+
+    def _runtime(
+        self, chat_id: int, name: str, cwd: Optional[str]
+    ) -> _ProjectRuntime:
+        """The in-memory :class:`_ProjectRuntime` for ``name`` (create lazily).
+
+        ``cwd`` is the registry record's cwd; an absent cwd falls back to
+        ``config.workdir`` (a project record should always carry a cwd, but a
+        hand-edited / partially-written record must not wedge the turn — fail to the
+        default workdir). The runtime is created ONCE and reused (so its engine + policy
+        persist across turns within the process); a subsequent call ignores ``cwd`` (a
+        project's cwd is fixed for the life of its session — D4).
+        """
+        runtimes = self._chat(chat_id).runtimes
+        rt = runtimes.get(name)
+        if rt is None:
+            rt = _ProjectRuntime(cwd=cwd or str(self.config.workdir))
+            runtimes[name] = rt
+        return rt
+
     def get_cwd(self, chat_id: int) -> str:
-        return self._chat(chat_id).cwd
+        """The active project's cwd, or ``config.workdir`` if there is no active project.
+
+        Read-only (RB1): never creates a project or a runtime — a chat that has never run
+        a turn simply reports the default workdir.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=False)
+        if rt is not None:
+            return rt.cwd
+        # No active project (or no store): fall back to the default workdir without
+        # mutating anything.
+        if self.store is not None:
+            active = self.store.get_active(chat_id)
+            if active is not None:
+                record = self.store.get_project(chat_id, active)
+                cwd = (record or {}).get("cwd")
+                if cwd:
+                    return cwd
+        return str(self.config.workdir)
 
     def set_yolo(self, chat_id: int, on: bool) -> None:
-        """Flip the chat's ``/yolo`` allow-all bit on its shared policy (P2, D6).
+        """Flip the ``/yolo`` allow-all bit on the ACTIVE project's policy (P2, D6).
 
         ``/yolo`` -> ``True`` (every tool runs with NO approval prompt this session);
         ``/unyolo`` -> ``False`` (the fail-closed gate is restored). Mutates the SAME
-        :class:`PermissionPolicy` object the engine's gate consults, so the bypass takes
-        effect immediately for in-flight and subsequent turns. The bot makes the toggle
-        loud (the enable banner); :meth:`_drive_turn` keeps it loud throughout (the
-        persistent ``⚠️`` turn marker). Cleared by :meth:`reset` (D7).
+        :class:`PermissionPolicy` object the active project's engine gate consults, so
+        the bypass takes effect immediately for in-flight and subsequent turns of that
+        project. Auto-creates ``default`` if there is no active project (consistent with
+        starting a turn). The bot makes the toggle loud (the enable banner);
+        :meth:`_drive_turn` keeps it loud throughout (the persistent ``⚠️`` turn marker).
+        Cleared by :meth:`reset` (D7).
         """
-        self._chat(chat_id).policy.set_yolo(on)
+        _name, rt = self._active_runtime(chat_id, create_default=True)
+        if rt is not None:
+            rt.policy.set_yolo(on)
 
     # -- engine lifecycle ----------------------------------------------------
 
-    async def _ensure_engine(self, state: _ChatState, chat_id: int) -> Engine:
-        """Lazily start (or resume) the chat's engine. Idempotent within a chat.
+    async def _ensure_engine(self, chat_id: int) -> Engine:
+        """Lazily start (or resume) the ACTIVE project's engine. Idempotent per project.
 
-        On first use: build the engine for the chat's cwd, then ``resume`` the persisted
-        ``(session_id, cwd)`` if one exists (cwd-scoped — C6), else ``start`` fresh. A
-        resume failure falls back to a fresh ``start`` (the dead id is dropped) so the
-        chat is never wedged on a stale session — harvested from the runner's
-        resume-failure recovery.
+        Resolves the chat's active project (auto-creating ``default`` if none — a turn
+        always has a project), then:
+
+        * **Single-active-run (D2).** If a DIFFERENT project's engine is currently
+          started for this chat (the operator switched), ``stop()`` it first — at most
+          one engine is live per chat.
+        * Build the engine for the active project's cwd + **its** ``policy``, then
+          ``resume`` the project's persisted ``session_id`` (cwd-scoped — C6) if one
+          exists, else ``start`` fresh. A resume failure falls back to a fresh ``start``
+          (the dead id is dropped) so the project is never wedged on a stale session —
+          harvested from the runner's resume-failure recovery. (cwd re-validation +
+          richer crash handling are T7, deliberately NOT here.)
         """
-        if state.engine is not None and state.started:
-            return state.engine
-        engine = state.engine or self._engine_factory(
-            cwd=state.cwd,
+        name, rt = self._active_runtime(chat_id, create_default=True)
+        assert name is not None and rt is not None  # create_default guarantees both
+        await self._stop_other_started(chat_id, keep=name)
+        if rt.engine is not None and rt.started:
+            return rt.engine
+        engine = rt.engine or self._engine_factory(
+            cwd=rt.cwd,
             backstop_seconds=float(self.config.answer_backstop_seconds),
-            permission_policy=state.policy,
+            permission_policy=rt.policy,
         )
-        state.engine = engine
-        resume_id = self._resume_ids.get(chat_id)
+        rt.engine = engine
+        resume_id = self._resume_id(chat_id, name)
         if resume_id:
             try:
                 await engine.resume(resume_id)
             except Exception:
-                log.info("resume failed for chat %s; starting a fresh session", chat_id)
-                self._resume_ids.pop(chat_id, None)
+                log.info(
+                    "resume failed for chat %s project %s; starting a fresh session",
+                    chat_id,
+                    name,
+                )
                 await engine.start()
         else:
             await engine.start()
-        state.started = True
+        rt.started = True
         return engine
 
-    def reset(self, chat_id: int) -> None:
-        """Drop the chat's session so the next turn starts fresh (harvested /reset).
+    def _resume_id(self, chat_id: int, name: str) -> Optional[str]:
+        """The active project's persisted ``session_id`` to resume from, if any."""
+        if self.store is None:
+            return None
+        record = self.store.get_project(chat_id, name)
+        session_id = (record or {}).get("session_id")
+        return session_id if isinstance(session_id, str) and session_id else None
 
-        Clears the persisted resume id and any in-memory engine + pending state, AND
-        wipes the chat's :class:`PermissionPolicy` (drops every allow-session grant and
-        turns ``/yolo`` off — D7) so a reset/new session always restarts **fail-closed**:
-        no inherited grants, no silently-resumed allow-all posture. A running turn
-        (holding the lock) is not force-killed here; ``/cancel`` aborts a live turn. This
-        mirrors the one-shot runner's ``reset``.
+    async def _stop_other_started(self, chat_id: int, *, keep: str) -> None:
+        """Stop any STARTED engine for a project other than ``keep`` (D2 single-active-run).
+
+        The operator can only drive one active project at a time; when they switch, the
+        previously-started engine must be stopped so we never hold two live engines for
+        one chat. Best-effort: a stop failure is logged, the runtime is marked stopped,
+        and we proceed (a wedged old engine must not block the new active turn).
         """
-        self._resume_ids.pop(chat_id, None)
+        for other_name, other_rt in self._chat(chat_id).runtimes.items():
+            if other_name == keep:
+                continue
+            if other_rt.started and other_rt.engine is not None:
+                try:
+                    await other_rt.engine.stop()
+                except Exception:
+                    log.exception(
+                        "error stopping engine for chat %s project %s on switch",
+                        chat_id,
+                        other_name,
+                    )
+                other_rt.started = False
+                other_rt.engine = None
+
+    def reset(self, chat_id: int) -> None:
+        """Reset the ACTIVE project to a fresh conversation (harvested /reset, D3/D7).
+
+        Clears the active project's persisted ``session_id`` (a fresh conversation — the
+        project is KEPT in the registry, not deleted), drops its in-memory engine +
+        pending state, and wipes its :class:`PermissionPolicy` (drops every allow-session
+        grant and turns ``/yolo`` off — D7) so the next session restarts **fail-closed**.
+        A running turn (holding the lock) is not force-killed here; ``/cancel`` aborts a
+        live turn. With no active project there is nothing to reset (no side effects).
+        """
+        # Live-turn state is per-chat → always cleared.
         state = self._chats.get(chat_id)
         if state is not None:
-            state.engine = None
-            state.started = False
             state.status_message_id = None
             state.status_text = None
             self._clear_pending(state)
-            # D7: drop grants + yolo so the next session starts fail-closed.
-            state.policy.clear()
-        self._persist(chat_id, session_id=None)
+        # Resolve the active project WITHOUT creating one (reset is not a turn): if there
+        # is no active project there is no session to clear.
+        name, rt = self._active_runtime(chat_id, create_default=False)
+        if rt is not None:
+            rt.engine = None
+            rt.started = False
+            rt.policy.clear()  # D7: drop grants + yolo so the next session is fail-closed.
+        if name is not None:
+            # Clear the persisted session_id for the active project (keep cwd — D4 — and
+            # the project record itself). update() writes the active project's fields.
+            self._persist(chat_id, session_id=None)
 
     def _persist(self, chat_id: int, *, session_id: Optional[str]) -> None:
+        """Write ``session_id`` to the chat's ACTIVE project (flat update, cwd untouched).
+
+        The flat :meth:`~JsonSessionStore.update` writes the active project's fields;
+        ``cwd=None`` leaves the project's fixed cwd untouched (D4). ``session_id=None``
+        clears it (a reset / fresh conversation).
+        """
         if self.store is None:
             return
-        state = self._chats.get(chat_id)
-        cwd = state.cwd if state is not None else None
         try:
-            self.store.update(chat_id, session_id=session_id, cwd=cwd)
+            self.store.update(chat_id, session_id=session_id, cwd=None)
         except Exception:
             log.exception("failed to persist streaming session state for chat %s", chat_id)
+
+    def is_busy(self, chat_id: int) -> bool:
+        """Whether a turn is in flight for ``chat_id`` (the turn lock is held).
+
+        The D2 busy-guard surface: ``/switch`` and ``/new`` (T5/T6) refuse while a turn
+        is running so the active project can't change mid-turn. A chat with no state yet
+        is never busy.
+        """
+        state = self._chats.get(chat_id)
+        return state is not None and state.lock.locked()
 
     # -- the turn driver (LOCK-GUARDED: one turn per chat) -------------------
 
@@ -342,7 +534,8 @@ class StreamingSession:
         Free-text capture takes precedence: if the chat is awaiting an "Other" answer /
         plan-reject feedback, this text is routed to ``engine.resolve`` (NOT a new turn)
         and the held turn — still inside ``engine.send`` — continues. Otherwise it opens
-        a new turn via ``engine.send`` and renders the event stream.
+        a new turn via ``engine.send`` and renders the event stream against the **active
+        project's** engine (auto-creating ``default`` on the first turn — ADR-004 D6).
 
         Guarded by the per-chat turn lock (the harvested single-active-turn invariant):
         a second concurrent message raises :class:`StreamingBusy` (the bot replies
@@ -353,16 +546,18 @@ class StreamingSession:
         state = self._chat(chat_id)
 
         # Free-text capture for a prior "Other"/reject tap routes to resolve(), not a
-        # new turn — and must NOT take the turn lock (the awaiting turn holds it).
+        # new turn — and must NOT take the turn lock (the awaiting turn holds it). It
+        # resolves against the engine of whatever project is active (the same one the
+        # held turn is running on).
         if state.awaiting_text_for is not None:
-            self._resolve_free_text(state, text)
+            self._resolve_free_text(state, chat_id, text)
             return
 
         if state.lock.locked():
             raise StreamingBusy()
 
         async with state.lock:
-            engine = await self._ensure_engine(state, chat_id)
+            engine = await self._ensure_engine(chat_id)
             await self._drive_turn(
                 state, chat_id, engine, text, send=send, edit=edit, delete=delete
             )
@@ -380,17 +575,18 @@ class StreamingSession:
     ) -> None:
         """Iterate ``engine.send`` → render → Telegram send/edit (coalesced).
 
-        D6 "loud throughout": if the chat's policy has ``/yolo`` on, lead the turn with a
-        persistent ``⚠️`` marker (its OWN message, before any event renders) so an
-        in-progress allow-all session is never silent — the bypass shows on every turn,
-        not just at the ``/yolo`` toggle. A plain ``send`` (no coalescer / no status-line
-        edit) so it cannot be overwritten by the in-place status edits that follow.
+        D6 "loud throughout": if the active project's policy has ``/yolo`` on, lead the
+        turn with a persistent ``⚠️`` marker (its OWN message, before any event renders)
+        so an in-progress allow-all session is never silent — the bypass shows on every
+        turn, not just at the ``/yolo`` toggle. A plain ``send`` (no coalescer / no
+        status-line edit) so it cannot be overwritten by the in-place status edits that
+        follow.
         """
         coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
         # Status line for THIS turn starts unset; create on first edit_status.
         state.status_message_id = None
         state.status_text = None
-        if state.policy.yolo:
+        if self._active_policy(chat_id).yolo:
             await send(text=yolo_indicator(), reply_markup=None, parse_mode=None)
         async for event in engine.send(prompt):
             # Remember an ask/plan so a tap can reconstruct the native answer.
@@ -443,6 +639,15 @@ class StreamingSession:
                 log.debug("status-line delete failed at turn end", exc_info=True)
             state.status_message_id = None
             state.status_text = None
+
+    def _active_policy(self, chat_id: int) -> PermissionPolicy:
+        """The active project's :class:`PermissionPolicy` (auto-create ``default`` if needed).
+
+        Used by :meth:`_drive_turn` for the loud-yolo marker; a turn always has an active
+        project (``_ensure_engine`` created one), so this resolves the same runtime.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=True)
+        return rt.policy if rt is not None else PermissionPolicy()
 
     async def _perform(
         self,
@@ -539,6 +744,9 @@ class StreamingSession:
         the pending decision the currently-running turn is awaiting (the turn loop is
         parked inside ``engine.send``), so it must run concurrently with the held turn.
 
+        The decision resolves against the **active project's** engine — the same engine
+        the held turn is running on (one active run per chat, D2).
+
         Mapping:
 
         * ask option tap (``a``)   → :class:`QuestionAnswer` (native answers map) →
@@ -557,9 +765,9 @@ class StreamingSession:
         if decoded is None:
             return CallbackOutcome(handled=False, note="ignored")
         state = self._chat(chat_id)
-        engine = state.engine
+        engine = self._active_engine(chat_id)
         if engine is None:
-            # No live engine for this chat → nothing to resolve (stale button).
+            # No live engine for the active project → nothing to resolve (stale button).
             return CallbackOutcome(handled=False, note="no active session")
 
         if decoded.kind == "ask":
@@ -571,6 +779,16 @@ class StreamingSession:
         if decoded.kind == "permission":
             return self._resolve_permission(engine, decoded)
         return CallbackOutcome(handled=False, note="ignored")
+
+    def _active_engine(self, chat_id: int) -> Optional[Engine]:
+        """The active project's engine, or ``None`` (read-only — no project creation).
+
+        A callback / cancel only makes sense against a live turn, which runs on the
+        active project's engine. Resolves WITHOUT creating a default (a tap with no
+        active project / no started engine is a stale button → no-op).
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=False)
+        return rt.engine if rt is not None else None
 
     def _resolve_ask_option(
         self, state: _ChatState, engine: Engine, decoded: Callback
@@ -680,16 +898,17 @@ class StreamingSession:
         # Nothing pending for this id — already decided / backstopped / cancelled.
         return CallbackOutcome(handled=False, note="no pending request")
 
-    def _resolve_free_text(self, state: _ChatState, text: str) -> None:
+    def _resolve_free_text(self, state: _ChatState, chat_id: int, text: str) -> None:
         """Resolve a pending "Other"/reject with the just-typed ``text``; clear the marker.
 
         Routed from :meth:`handle_message` (free-text capture takes precedence over a new
         turn). An "Other" answer becomes a :class:`QuestionAnswer` keyed by the held
         question text; reject feedback becomes :class:`PlanVerdict` ``approve=False`` with
-        the feedback on the deny channel. If the engine has nothing pending for the id
+        the feedback on the deny channel. Resolves against the active project's engine (the
+        one the held turn is running on). If the engine has nothing pending for the id
         (already resolved / cancelled), this is a harmless no-op.
         """
-        engine = state.engine
+        engine = self._active_engine(chat_id)
         tool_use_id = state.awaiting_text_for
         mode = state.awaiting_text_mode
         q_idx = state.awaiting_text_question_index
@@ -714,27 +933,32 @@ class StreamingSession:
     def handle_cancel(self, chat_id: int) -> int:
         """Abort the chat's in-flight turn cleanly (RB4); clear any free-text capture.
 
-        Delegates to ``engine.cancel()`` (cancels every pending interactive request as a
-        clean deny, so a held turn unblocks and the session stays usable). Lock-free for
-        the same reason as :meth:`resolve_callback` — the turn being cancelled holds the
-        lock. Returns the number of pending requests aborted (0 if the engine is idle).
+        Delegates to ``engine.cancel()`` on the ACTIVE project's engine (cancels every
+        pending interactive request as a clean deny, so a held turn unblocks and the
+        session stays usable). Lock-free for the same reason as :meth:`resolve_callback`
+        — the turn being cancelled holds the lock. Returns the number of pending requests
+        aborted (0 if there is no active engine / it is idle).
         """
         state = self._chats.get(chat_id)
-        if state is None or state.engine is None:
+        if state is None:
+            return 0
+        engine = self._active_engine(chat_id)
+        if engine is None:
             return 0
         self._clear_pending(state)
-        return state.engine.cancel()
+        return engine.cancel()
 
     # -- shutdown ------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Stop every chat's engine (idempotent). For a clean process exit."""
+        """Stop every project's engine across every chat (idempotent). For a clean exit."""
         for state in self._chats.values():
-            if state.engine is not None:
-                try:
-                    await state.engine.stop()
-                except Exception:
-                    log.exception("error stopping engine during shutdown")
+            for rt in state.runtimes.values():
+                if rt.engine is not None:
+                    try:
+                        await rt.engine.stop()
+                    except Exception:
+                        log.exception("error stopping engine during shutdown")
 
     # -- internals -----------------------------------------------------------
 
