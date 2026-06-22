@@ -115,6 +115,16 @@ def make_ctx():
 # ---------------------------------------------------------------------------
 
 
+def test_build_application_enables_concurrent_updates():
+    """The answer-hold parks a turn handler INSIDE engine.send awaiting the operator's tap,
+    and that tap arrives as a SEPARATE update. Without concurrent update processing, PTB
+    would queue the tap behind the parked turn handler — a deadlock (the turn waits for the
+    tap; the tap waits for the turn to return). Guard that build_application enables it."""
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    app = bot.build_application()
+    assert app.concurrent_updates  # a positive max, not 0/disabled
+
+
 async def test_oneshot_is_default_and_uses_runner():
     runner = FakeRunner(ClaudeResult(ok=True, text="the answer"))
     # No streaming passed AND default config => oneshot.

@@ -357,7 +357,15 @@ class TelegramClaudeBot:
 
     # ---- wiring -------------------------------------------------------------
     def build_application(self) -> Application:
-        app = ApplicationBuilder().token(self.config.bot_token).build()
+        # concurrent_updates(True) is REQUIRED by the answer-hold design: a streaming turn
+        # parks its handler *inside* engine.send awaiting the operator's answer, and the
+        # inline-keyboard tap that supplies that answer arrives as a SEPARATE update. With
+        # PTB's default sequential processing the tap would queue behind the parked turn
+        # handler — a deadlock (the turn waits for the tap; the tap waits for the turn to
+        # return). Concurrent dispatch lets the callback handler run while the turn is held
+        # (resolve_callback is intentionally lock-free for exactly this). One turn per chat
+        # is still enforced by the StreamingBusy guard.
+        app = ApplicationBuilder().token(self.config.bot_token).concurrent_updates(True).build()
         allowed = filters.Chat(chat_id=list(self.config.allowed_chat_ids))
         app.add_handler(CommandHandler(["start", "help"], self.cmd_help, filters=allowed))
         app.add_handler(CommandHandler("reset", self.cmd_reset, filters=allowed))
