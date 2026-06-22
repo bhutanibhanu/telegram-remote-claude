@@ -20,7 +20,13 @@ _Plan generated 2026-06-21 from design.md · 2 tasks · autonomous supervised bu
 > answered, and each question renders as its **own message + keyboard** (not one stacked wall of buttons).
 > **(3) Status spam:** identical status edits hit Telegram "message not modified" → the fallback re-sent a
 > fresh message every interval. Fixed: skip identical edits; calm stable wording ("💭 Claude is thinking…").
-> All three with regression tests (relay end-to-end via real PTB is otherwise untested); full suite green.
+> **(4) Raw Markdown + status clutter:** Claude's CommonMark rendered literally (`**`/`##`/`` ` ``) and the
+> transient "thinking…" line lingered. Fixed: a `claude_tg/tg_html.py` CommonMark→Telegram-HTML converter
+> (HTML send with a **plain-text fallback** so a malformed entity can never drop a message) + delete the
+> status line at turn end. Audit-found extras: the inline keyboard now attaches to the first **non-empty**
+> chunk (it was lost if the head chunk was whitespace), and `split_message` always makes progress (no
+> infinite loop at sub-2 limits). All with regression tests + an independent adversarial review; full suite
+> green. (The relay-through-real-PTB path is otherwise untested by the engine probes — phone-verify is the gate.)
 
 > **P3 — interactive prompts / run skills from the phone.** The headline workflow: type `/grill` (or
 > `/pipeline`, `/scaffold`, …) in Telegram and the bot runs that skill **in the live Claude session**. P1
