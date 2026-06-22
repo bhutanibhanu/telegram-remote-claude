@@ -62,10 +62,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Protocol
 
+from .claude_runner import ClaudeResult, ClaudeRunner
 from .config import Config
 from .engine import (
     AskEvent,
     Engine,
+    ErrorEvent,
+    Event,
     PermissionDecision,
     PlanEvent,
     PlanVerdict,
@@ -186,6 +189,15 @@ class _ProjectRuntime:
     engine: Optional[Engine] = None
     started: bool = False
     policy: PermissionPolicy = field(default_factory=PermissionPolicy)
+    # QF3 (B3/RB3): True from the moment ``engine.resume()`` SUCCEEDS until the first
+    # turn on that resumed session completes WITHOUT a resume-failure-shaped error. A
+    # stale/aged/torn session can resume "successfully" (connect) and then error on the
+    # FIRST ``send`` — this flag tells :meth:`_drive_turn` the current turn is that first,
+    # unconfirmed use of a resumed session, so it (and ONLY it) applies the
+    # ``_is_resume_failure`` heuristic. A FRESH-started session never sets this, so a fresh
+    # session erroring is never mistaken for a resume failure. Reset on the in-memory
+    # runtime only (never persisted).
+    resumed_unverified: bool = False
 
 
 @dataclass
@@ -455,6 +467,12 @@ class StreamingSession:
                 )
                 await engine.start()
                 resume_failed = True
+            else:
+                # Resume CONNECTED. It is not yet CONFIRMED good — a stale/aged/torn
+                # session can connect and then error on the first turn (B3). Mark the
+                # runtime so _drive_turn applies the resume-failure heuristic to this
+                # first turn only (cleared once a turn completes clean — QF3/RB3).
+                rt.resumed_unverified = True
         else:
             await engine.start()
         rt.started = True
@@ -638,7 +656,30 @@ class StreamingSession:
         turn, not just at the ``/yolo`` toggle. A plain ``send`` (no coalescer / no
         status-line edit) so it cannot be overwritten by the in-place status edits that
         follow.
+
+        **QF3 (B3/RB3): recover from a resume that connects then errors on first use.**
+        If this is the FIRST turn on a freshly-resumed session (the runtime's
+        ``resumed_unverified`` flag), every ``error``/``result`` event is checked with the
+        ported ``_is_resume_failure`` heuristic. On a resume-failure-shaped event the dead
+        ``session_id`` is NOT persisted; instead, AFTER the stream drains, the persisted id
+        is cleared, the engine is dropped (so the next turn starts fresh — never re-resumes
+        the dead id), and the operator is told to resend. If the turn instead completes
+        cleanly, the flag is cleared (the resume is confirmed good). A FRESH session is
+        never ``resumed_unverified``, so an unrelated fresh-turn error is never mistaken for
+        a resume failure. The check happens INLINE while iterating and recovery happens
+        AFTER the loop ends naturally (the substrate stream always terminates — RB2), so we
+        never re-drive a turn mid-stream (no double-render / re-entrancy).
         """
+        # Capture the project this turn is running on AT TURN START (defense-in-depth, T7
+        # review): the busy-guard keeps the active project stable for the turn, but pinning
+        # the name/runtime here means the result-persist and any QF3 recovery act on THIS
+        # turn's project, not "whatever is active when the turn ends".
+        turn_name, turn_rt = self._active_runtime(chat_id, create_default=True)
+        # This first turn applies the resume-failure heuristic iff the session was resumed
+        # (not freshly started) and is not yet confirmed good.
+        check_resume = turn_rt is not None and turn_rt.resumed_unverified
+        resume_failure_detected = False
+
         coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
         # Status line for THIS turn starts unset; create on first edit_status.
         state.status_message_id = None
@@ -646,6 +687,10 @@ class StreamingSession:
         if self._active_policy(chat_id).yolo:
             await send(text=yolo_indicator(), reply_markup=None, parse_mode=None)
         async for event in engine.send(prompt):
+            # QF3: on the first turn of a resumed session, flag a resume-failure-shaped
+            # error/result. Latch on the first hit (the dead id is the same all turn).
+            if check_resume and not resume_failure_detected and _is_resume_failure_event(event):
+                resume_failure_detected = True
             # Remember an ask/plan so a tap can reconstruct the native answer.
             if isinstance(event, AskEvent):
                 state.pending_ask = event
@@ -679,7 +724,10 @@ class StreamingSession:
             if isinstance(event, PlanEvent):
                 state.pending_plan = event
             elif isinstance(event, ResultEvent):
-                self._persist(chat_id, session_id=event.session_id or engine.session_id)
+                # QF3: do NOT re-persist the dead session_id on a resume-failure result —
+                # it would just re-arm the same broken resume. The recovery below clears it.
+                if not resume_failure_detected:
+                    self._persist(chat_id, session_id=event.session_id or engine.session_id)
             for action in coalescer.offer(event).actions:
                 await self._perform(state, action, send=send, edit=edit)
         # End of turn: flush any trailing coalesced status line, then DELETE the transient
@@ -696,6 +744,58 @@ class StreamingSession:
                 log.debug("status-line delete failed at turn end", exc_info=True)
             state.status_message_id = None
             state.status_text = None
+
+        # QF3 (B3/RB3): finalize the resume verification AFTER the stream has fully drained
+        # (so we never re-enter the render loop mid-turn). Either recover from a detected
+        # resume failure, or confirm the resume good by clearing the flag.
+        if check_resume:
+            if resume_failure_detected:
+                await self._recover_failed_resume(chat_id, turn_name, turn_rt, send=send)
+            elif turn_rt is not None:
+                # The first resumed turn completed without a resume failure → confirmed good.
+                turn_rt.resumed_unverified = False
+
+    async def _recover_failed_resume(
+        self,
+        chat_id: int,
+        name: Optional[str],
+        rt: Optional[_ProjectRuntime],
+        *,
+        send: SendFn,
+    ) -> None:
+        """Recover when a resumed session errored on its first turn (QF3 / B3 / RB3).
+
+        Fail clean, never hang: clear the active project's persisted ``session_id`` so the
+        dead id is NOT retried, drop the runtime's engine/started so the NEXT turn starts
+        fresh, and notify the operator to resend (a clean-fail-then-fresh-next-turn rather
+        than an in-loop auto-re-send, which would risk double-render / re-entrancy). The
+        notice send is best-effort the same as the rest of the turn; if it raises it
+        propagates, but the persisted id is ALREADY cleared and the engine dropped first, so
+        the project is never left wedged on the dead session.
+        """
+        log.info(
+            "resume connected but first turn failed for chat %s project %s; "
+            "clearing the persisted session and recovering fresh",
+            chat_id,
+            name,
+        )
+        # 1) Clear the persisted dead id FIRST so even if the notice send fails the stale
+        #    session is gone (the next turn will start fresh, not re-resume it).
+        self._persist(chat_id, session_id=None)
+        # 2) Drop the in-memory engine so the next turn rebuilds + starts fresh.
+        if rt is not None:
+            rt.engine = None
+            rt.started = False
+            rt.resumed_unverified = False
+        # 3) Tell the operator (the turn already rendered the underlying error).
+        await send(
+            text=(
+                "⚠️ Couldn't resume this project's previous session (it may be expired) — "
+                "cleared it. Send your message again to start fresh."
+            ),
+            reply_markup=None,
+            parse_mode=None,
+        )
 
     def _active_policy(self, chat_id: int) -> PermissionPolicy:
         """The active project's :class:`PermissionPolicy` (auto-create ``default`` if needed).
@@ -1030,6 +1130,49 @@ class StreamingSession:
         state.pending_ask = None
         state.pending_plan = None
         state.ask_answers = {}
+
+
+def _resume_failure_text(event: Event) -> Optional[str]:
+    """The error text of ``event`` IF it is an error-shaped turn/result frame, else None.
+
+    Only an :class:`ErrorEvent` or an ``is_error`` :class:`ResultEvent` can carry a
+    resume failure — every other event (text/tool_use/ask/plan/permission/status, or a
+    CLEAN result) is not an error and returns None so the heuristic is never even
+    consulted for it. The text mirrors what the one-shot runner puts in
+    ``ClaudeResult.error``: an ``ErrorEvent`` carries its ``message`` (this is where the
+    SDK adapter surfaces a torn/aged-transcript ``turn_error`` or a ``driver_error``
+    exception string); an ``is_error`` ``ResultEvent`` carries its ``result_text`` /
+    ``subtype``.
+    """
+    if isinstance(event, ErrorEvent) and event.is_error:
+        return event.message or ""
+    if isinstance(event, ResultEvent) and event.is_error:
+        return event.result_text or event.subtype or ""
+    return None
+
+
+def _is_resume_failure_event(event: Event) -> bool:
+    """Reuse the one-shot ``_is_resume_failure`` heuristic on a streaming event (QF3/B3).
+
+    The streaming turn surfaces a failed resume as an error/result EVENT (not a returned
+    ``ClaudeResult`` like the one-shot path), so we extract that event's error text and
+    feed it through the EXACT same heuristic by wrapping it in a ``ClaudeResult`` — no
+    forked or re-implemented matching logic. Importing and reusing
+    :meth:`ClaudeRunner._is_resume_failure` means a future tightening of the heuristic
+    applies to BOTH runners. A non-error event has no error text → never a resume failure.
+
+    Detection signal (judgement call): the heuristic keys on session-gone phrasing —
+    "no conversation found", or "session" + ("not found" | "invalid" | "expired") — and
+    explicitly excludes "timed out" / "binary not found". So an ORDINARY tool/turn error
+    (e.g. "Bash: command not found", a tool stack trace) does NOT match; only a
+    resume/session-not-found-shaped message does. This is necessarily a text heuristic
+    (the normalized event shape has no dedicated "resume failed" discriminator), shared
+    verbatim with the proven one-shot path so the two stay consistent.
+    """
+    text = _resume_failure_text(event)
+    if text is None:
+        return False
+    return ClaudeRunner._is_resume_failure(ClaudeResult(ok=False, text="", error=text))
 
 
 @dataclass(frozen=True)

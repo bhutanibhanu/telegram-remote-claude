@@ -1628,3 +1628,276 @@ async def test_resume_id_non_str_session_id_starts_fresh(tmp_path):
     )
     assert engine.started is True
     assert engine.resumed is None  # non-str id was NOT passed to resume()
+
+
+# ===========================================================================
+# QF3 (Codex B3 / RB3): resume CONNECTS but the FIRST turn errors with a
+# resume-failure-shaped event. T7 covered resume() RAISING; this is the
+# complementary case the one-shot runner handles via _is_resume_failure but that
+# was never ported to streaming. On detection the persisted session_id MUST be
+# cleared (so it is never retried), the engine dropped (next turn fresh), the
+# operator notified, and the turn MUST NOT hang. False-pass guards: a CLEAN
+# resumed turn keeps its id + emits no notice; a FRESH session erroring for an
+# unrelated reason is NOT treated as a resume failure.
+#
+# REAL JsonSessionStore (so the persisted-id clear is observable on disk);
+# scripted FakeEngine whose resume() SUCCEEDS but whose first send yields the
+# resume-failure event. Bounded by asyncio.wait_for so a wiring bug fails fast.
+# ===========================================================================
+
+
+def make_sequential_session(engines_by_cwd: dict, *, store, config=None) -> StreamingSession:
+    """A session whose factory hands out the NEXT engine for a cwd on each BUILD.
+
+    ``engines_by_cwd`` maps a cwd → a LIST of engines; successive builds for that cwd
+    pop the next one. Used by the QF3 recovery tests where the first engine resumes
+    (and fails) and the engine is then DROPPED, so the next turn must BUILD a SECOND,
+    fresh engine — letting us assert the dead id is never re-resumed.
+    """
+    queues = {cwd: list(engines) for cwd, engines in engines_by_cwd.items()}
+
+    def factory(*, cwd, backstop_seconds, permission_policy):
+        return queues[cwd].pop(0)
+
+    return StreamingSession(
+        config or make_config(),
+        session_store=store,
+        engine_factory=factory,
+        clock=lambda: 0.0,
+    )
+
+
+class ResumeOkButFirstTurnFailsEngine(FakeEngine):
+    """resume() SUCCEEDS (connects), but the first send() yields a resume-failure event.
+
+    Mirrors the live B3 shape: a stale/aged/torn session id re-attaches "successfully"
+    and only errors on the first turn. ``resumed`` records the id resume() was called
+    with so a test can prove a SECOND engine never re-resumes the dead id.
+    """
+
+
+async def test_resume_failure_on_first_turn_clears_id_recovers_and_notifies(tmp_path):
+    # B3 core (ErrorEvent path): resume() connects, the first turn yields a
+    # resume-failure-shaped ErrorEvent → the persisted id is CLEARED, the operator is
+    # notified, the engine is dropped, the turn does NOT hang, and a SUBSEQUENT turn
+    # starts FRESH (a brand-new engine that never re-resumes the dead id).
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)
+    store.update(1, session_id="dead-sess", cwd=None)  # the (stale) persisted session
+
+    # Engine 1: resume() succeeds, first send yields a resume-failure error then a result.
+    eng1 = ResumeOkButFirstTurnFailsEngine(
+        [
+            ErrorEvent(
+                kind_of_error="turn_error",
+                message="No conversation found with session id dead-sess",
+            ),
+            ResultEvent(session_id="dead-sess", is_error=True, subtype="error_during_execution"),
+        ],
+        session_id="dead-sess",
+    )
+    # Engine 2: the fresh engine the NEXT turn builds after the dead one is dropped.
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="fresh-sess", is_error=False, subtype="success", result_text="ok")],
+        session_id="fresh-sess",
+    )
+    session = make_sequential_session(
+        {str(proj): [eng1, eng2]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+    )
+
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+
+    # Resume WAS attempted on the dead id (the bug is post-connect), then recovery fired.
+    assert eng1.resumed == "dead-sess"
+    # The persisted id is CLEARED on disk — the dead session is NOT retried next time.
+    assert store.get_project(1, "api")["session_id"] is None
+    # The operator got the recovery notice telling them to resend.
+    assert any("Couldn't resume" in s["text"] for s in rec.sends), "operator must be notified"
+    assert any("again to start fresh" in s["text"] for s in rec.sends)
+    # The engine was dropped (next turn rebuilds fresh) and the flag cleared.
+    rt = session._chat(1).runtimes["api"]
+    assert rt.engine is None and rt.started is False
+    assert rt.resumed_unverified is False
+    # No hang — the chat is idle (lock released).
+    assert session.is_busy(1) is False
+
+    # A SUBSEQUENT turn starts FRESH: it builds eng2, which is started (NOT resumed) — the
+    # dead id is gone, so it is never re-resumed. (Mutation probe: if recovery had NOT
+    # cleared the persisted id, this turn would resume "dead-sess" and eng2.resumed would
+    # be set / eng2.started False — this assertion would fail.)
+    await asyncio.wait_for(
+        session.handle_message(1, "again", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng2.started is True
+    assert eng2.resumed is None  # fresh start — the dead id was never re-resumed
+    assert any("ok" in s["text"] for s in rec.sends)
+
+
+async def test_resume_failure_signalled_via_is_error_result_event(tmp_path):
+    # B3 variant (ResultEvent path): the resume failure is carried on an is_error
+    # ResultEvent (its result_text matches the heuristic) rather than a separate
+    # ErrorEvent → same recovery: id cleared, notice, dead id NOT re-persisted.
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)
+    store.update(1, session_id="dead-sess", cwd=None)
+
+    eng1 = ResumeOkButFirstTurnFailsEngine(
+        [
+            ResultEvent(
+                session_id="dead-sess",
+                is_error=True,
+                subtype="error",
+                result_text="session not found or invalid",
+            )
+        ],
+        session_id="dead-sess",
+    )
+    session = make_sequential_session(
+        {str(proj): [eng1]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The dead id was cleared (NOT re-persisted from the is_error result's session_id).
+    assert store.get_project(1, "api")["session_id"] is None
+    assert any("Couldn't resume" in s["text"] for s in rec.sends)
+
+
+async def test_clean_resumed_turn_keeps_id_and_no_notice(tmp_path):
+    # False-pass guard (a): a resumed session whose FIRST turn is CLEAN must keep its
+    # persisted session_id, emit NO recovery notice, and clear resumed_unverified (the
+    # resume is confirmed good). If detection were over-broad this would spuriously clear.
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)
+    store.update(1, session_id="live-sess", cwd=None)
+
+    engine = ResumeOkButFirstTurnFailsEngine(
+        [ResultEvent(session_id="live-sess", is_error=False, subtype="success", result_text="ok")],
+        session_id="live-sess",
+    )
+    session = make_sequential_session(
+        {str(proj): [engine]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert engine.resumed == "live-sess"  # it really did resume
+    # Clean turn → id retained, no notice, runtime confirmed (flag cleared, engine kept).
+    assert store.get_project(1, "api")["session_id"] == "live-sess"
+    assert not any("Couldn't resume" in s["text"] for s in rec.sends)
+    rt = session._chat(1).runtimes["api"]
+    assert rt.resumed_unverified is False
+    assert rt.engine is engine and rt.started is True
+
+
+async def test_fresh_session_error_is_not_treated_as_resume_failure(tmp_path):
+    # False-pass guard (b): a FRESH session (no persisted id → start(), not resume())
+    # whose first turn errors — even with text that LOOKS like a session error — must NOT
+    # be treated as a resume failure: nothing to clear, no notice, engine NOT dropped.
+    # (resumed_unverified is only set on a real resume, so the heuristic never runs here.)
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)  # NO session_id → fresh start
+
+    engine = FakeEngine(
+        [
+            # An error whose text would TRIP the heuristic IF it were checked — but this is
+            # a fresh session, so it must be ignored as an ordinary turn error.
+            ErrorEvent(kind_of_error="turn_error", message="No conversation found / session expired"),
+            ResultEvent(session_id="brand-new", is_error=True, subtype="error"),
+        ],
+        session_id="brand-new",
+    )
+    session = make_sequential_session(
+        {str(proj): [engine]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert engine.started is True and engine.resumed is None  # fresh start, never resumed
+    # NOT a resume failure: no spurious clear, no notice, engine retained.
+    assert not any("Couldn't resume" in s["text"] for s in rec.sends)
+    rt = session._chat(1).runtimes["api"]
+    assert rt.engine is engine and rt.started is True
+    assert rt.resumed_unverified is False  # was never set (fresh start)
+
+
+async def test_ordinary_tool_error_on_resumed_turn_is_not_a_resume_failure(tmp_path):
+    # False-pass guard (c): a resumed session whose first turn errors for an UNRELATED
+    # reason (an ordinary tool error, not session-gone) must NOT trip recovery — the id is
+    # kept and no notice is sent. Mirrors the one-shot heuristic excluding non-resume
+    # errors; confirms the streaming reuse inherits that discrimination.
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(proj), make_active=True)
+    store.update(1, session_id="live-sess", cwd=None)
+
+    engine = ResumeOkButFirstTurnFailsEngine(
+        [
+            ErrorEvent(kind_of_error="tool_error", message="Bash: command not found: frobnicate"),
+            ResultEvent(session_id="live-sess", is_error=False, subtype="success", result_text="recovered"),
+        ],
+        session_id="live-sess",
+    )
+    session = make_sequential_session(
+        {str(proj): [engine]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # An ordinary tool error is NOT session-gone → id kept, no recovery notice.
+    assert store.get_project(1, "api")["session_id"] == "live-sess"
+    assert not any("Couldn't resume" in s["text"] for s in rec.sends)
+    rt = session._chat(1).runtimes["api"]
+    assert rt.resumed_unverified is False  # turn completed → confirmed good
+    assert rt.engine is engine
