@@ -16,7 +16,7 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 - [x] T1 — ADR-004: multi-project session model & persistence schema (1ab4560)
 - [x] T2 — Versioned store + v1→v2 migration + flat (one-shot) view (0d7d4fe)
 - [x] T3 — Registry accessors + SB4 name validation (1de9998)
-- [ ] T4 — StreamingSession per-project rework
+- [x] T4 — StreamingSession per-project rework (637eaef)
 - [ ] T5 — Bot navigation commands (/projects, /switch, /rm, /pwd, /cd-removed)
 - [ ] T6 — Bot /new command (SB2 path-input)
 - [ ] T7 — Resume hardening: cwd re-validation (SB2) + RB3 crash recovery
@@ -71,7 +71,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - `/reset` SHALL clear the **active** project's `session_id` (fresh conversation), keep the project, and clear that project's transient grants/yolo.
   - The session SHALL expose **is-a-turn-in-flight** for a chat (for the D2 busy-guard) and SHALL keep the one-active-turn-per-chat invariant (`StreamingBusy`).
 - **Tests:** active-project resolution + per-project resume (mock substrate); per-project `session_id` persist; no-active-project → prompt; restart resets yolo/grants; `/reset` targets active; is-busy exposure.
-- **Status:** todo
+- **Status:** done (637eaef) — reviewer AGREE (live held-turn+concurrent-resolve probe confirmed the relay unblocks against the active-project engine); 507 tests green. **As-built refinement:** no-active-project AUTO-CREATES a `default` project at `config.workdir` (backward-compat with P1–P3 UX, symmetric with migration) rather than prompting `/new` — flagged for owner review. **⚠️ LOAD-BEARING INVARIANT surfaced:** `_active_engine` returns the held turn's engine *only because* the turn lock is held throughout an answer-hold (so `is_busy` is true) and the active project therefore cannot change mid-hold. A mid-hold `store.switch()` **deadlocks** the parked turn (reviewer Scenario-B). ⇒ T5/T6's busy-guard is mandatory for *relay correctness*, not just UX (see T5/T6/T8).
 
 ### T5 — Bot navigation commands (/projects, /switch, /rm, /pwd, /cd-removed)
 - **Goal:** The registry-navigation command surface (no path input). SB1-gated, busy-guarded, text-only (no new callbacks).
@@ -79,7 +79,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Files (expected):** `claude_tg/bot.py`, `tests/test_bot.py` (and/or `test_bot_streaming.py`)
 - **Acceptance:**
   - WHEN `/projects` is sent, the system SHALL list each project (name, cwd, active marker, last_active), or prompt `/new` if none.
-  - WHEN `/switch <name>` is sent AND a turn is in flight, the system SHALL **refuse** with a "finish or `/cancel` first" message (D2) and NOT change the active project; WHEN idle and the name exists → set active; WHEN unknown → error **listing available names**.
+  - WHEN `/switch <name>` is sent AND `streaming.is_busy(chat_id)` is true, the system SHALL **refuse** with a "finish or `/cancel` first" message (D2) and NOT change the active project; WHEN idle and the name exists → set active; WHEN unknown → error **listing available names**. **⚠️ This busy-guard is load-bearing for RELAY CORRECTNESS, not just UX** (T4 reviewer): an answer-hold parks the turn with the lock held (`is_busy` true), so changing `store.active` mid-hold would make the held turn's callback resolve the *wrong/absent* engine → **deadlock**. The guard MUST gate `store.switch`.
   - WHEN `/rm <name>` targets the **active** project → refuse (switch away first); unknown → error; else delete (registry only; transcript left on disk).
   - WHEN `/pwd` is sent → show the active project's cwd (or no-active-project message).
   - WHEN `/cd` is sent in **streaming** mode → reply that cwd is fixed per project (use `/new`); **one-shot `/cd` unchanged**.
@@ -92,7 +92,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
 - **Depends on:** T3, T4
 - **Files (expected):** `claude_tg/bot.py`, `tests/test_bot.py`
 - **Acceptance:**
-  - WHEN `/new <name> <path>` is sent with a valid name and an **in-roots existing directory**, the system SHALL create the project with the **resolved** cwd, set it active, and confirm; WHEN busy → refuse (D2).
+  - WHEN `/new <name> <path>` is sent with a valid name and an **in-roots existing directory**, the system SHALL create the project with the **resolved** cwd, set it active, and confirm; WHEN `streaming.is_busy(chat_id)` is true → refuse (D2). **⚠️ `/new` also flips `store.active` (it auto-switches), so the same load-bearing busy-guard as `/switch` applies — a mid-hold `/new` would deadlock the parked turn.**
   - WHEN the path resolves **outside `ALLOWED_ROOTS`** (and `ALLOW_ANY_PATH` unset), the system SHALL refuse via `PathNotAllowed` (**SB2**) and NOT create the project.
   - WHEN the path is **not an existing directory** → refuse (not-a-directory), no create.
   - WHEN the name is **invalid (SB4)** or **duplicate** → refuse with a clear message.
@@ -108,6 +108,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN a turn starts/resumes a project, the system SHALL **re-validate the stored cwd** via `resolve_within_roots` and, if no longer permitted, **refuse the turn** with a clear message (SB2 fail-closed) WITHOUT starting the engine.
   - WHEN a resume fails (torn/aged/upgraded transcript — `_is_resume_failure`), the system SHALL fall back to a **fresh** session for that project, **notify** the operator, and complete **without hanging** (RB2/RB3).
   - WHEN the bot restarts after an interrupted (in-flight-at-crash) turn, the affected project SHALL come back **idle** (no auto-replay of the torn turn); the next message SHALL resume-or-fresh per above (D7/RB3).
+  - **(Defense-in-depth, from T4 review)** `_drive_turn`'s result-persist SHALL write the `session_id` to the project **captured at turn start** (not "whatever is active now"). Harmless today (busy-guard keeps active stable), but explicit capture removes the reliance. Consider also cancelling pending holds inside `reset()` so a `/reset` during a held turn doesn't strand the parked turn (a **pre-existing** HEAD bug, not a T4 regression; `/cancel` is today's escape hatch — fix here only if cheap).
 - **Tests:** cwd-no-longer-permitted → refused (SB2); resume-failure → fresh+notice, no hang; interrupted-turn → idle on restart, next msg recovers.
 - **Status:** todo
 
@@ -120,6 +121,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the bot restarts, **both** projects SHALL be present with correct cwd/session_id and each SHALL resume independently on its next message (**restart-resumes-both**).
   - The store SHALL survive a simulated **crash-during-write** without corruption (atomic replace leaves the prior good file) (**RB6**).
   - One-shot mode SHALL behave **exactly as pre-P4** against a v2 store (regression assertion; complements T2).
+  - **⭐ Busy-guard invariant (highest-value test, from T4 review):** WHEN a turn is parked awaiting an answer (`is_busy` true), `/switch` and `/new` SHALL be refused — verified end-to-end so that if T5/T6 ever drop the guard, this **fails loudly** (a mid-hold active-project change deadlocks the relay). Also cover `_stop_other_started`'s stop-failure path (old engine `stop()` raises → new turn still runs) and `_resume_id` defensive branches (non-str/empty `session_id` → fresh start).
 - **Tests:** the above scenarios + full lifecycle `/new→/switch→/rm` via the session/registry layer. Plus two deferred-from-T2 store contracts: (a) `update()` after an **unknown/future-version** load starts a clean v2 (does not preserve the future doc — locks the SB6 fail-safe-clobber contract); (b) an empty-string `session_id`/`cwd` on disk normalizes to **absent** in the flat view (documents the truthy-omit). Plus deferred-from-T3 **SB6 never-crash** tests: registry accessors against a hand-edited/malformed doc (non-dict `chats`/`projects`, non-str keys, **dangling `active`** pointing at a missing project) degrade to None/`UnknownProject` without raising.
 - **Status:** todo
 
