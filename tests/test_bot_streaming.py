@@ -8,26 +8,30 @@ so a NON-allowlisted callback never routes a decision. No live Telegram / Claude
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from claude_tg.bot import TelegramClaudeBot
 from claude_tg.claude_runner import ClaudeResult
 from claude_tg.config import Config
-from claude_tg.stream_session import CallbackOutcome, StreamingBusy
+from claude_tg.session_store import JsonSessionStore
+from claude_tg.stream_session import CallbackOutcome, StreamingBusy, StreamingSession
 
 
-def make_config(allowed=(1,), engine_mode="oneshot"):
+def make_config(allowed=(1,), engine_mode="oneshot", workdir="/work"):
     return Config(
         bot_token="t",
         allowed_chat_ids=frozenset(allowed),
-        workdir=Path("/work"),
+        workdir=Path(workdir),
         claude_bin="claude",
         model=None,
         timeout_seconds=5,
         skip_permissions=True,
         state_file=None,
         engine_mode=engine_mode,
+        answer_backstop_seconds=3600,
     )
 
 
@@ -358,3 +362,449 @@ def test_build_application_registers_callback_handler():
 
     handlers = [h for group in app.handlers.values() for h in group]
     assert any(isinstance(h, CallbackQueryHandler) for h in handlers)
+
+
+def test_build_application_registers_multi_project_handlers_before_skill_passthrough():
+    # P4/T5: /projects, /switch, /rm are specific CommandHandlers wired BEFORE the
+    # on_skill_command COMMAND passthrough — first-match-wins keeps them from being
+    # forwarded as skills. Assert each is a registered command and precedes the
+    # catch-all COMMAND MessageHandler in handler order.
+    from telegram.ext import CommandHandler, MessageHandler
+
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    app = bot.build_application()
+    ordered = [h for group in app.handlers.values() for h in group]
+    cmd_names: set[str] = set()
+    skill_passthrough_idx = None
+    for i, h in enumerate(ordered):
+        if isinstance(h, CommandHandler):
+            cmd_names |= {c.lstrip("/").lower() for c in h.commands}
+        # The skill passthrough is the COMMAND MessageHandler bound to on_skill_command.
+        if isinstance(h, MessageHandler) and getattr(h.callback, "__name__", "") == "on_skill_command":
+            skill_passthrough_idx = i
+    assert {"projects", "switch", "rm"} <= cmd_names
+    # Every multi-project CommandHandler comes before the skill passthrough.
+    assert skill_passthrough_idx is not None
+    for i, h in enumerate(ordered):
+        if isinstance(h, CommandHandler) and (
+            {"projects", "switch", "rm"} & {c.lstrip("/").lower() for c in h.commands}
+        ):
+            assert i < skill_passthrough_idx
+
+
+# ===========================================================================
+# P4 / T5 — multi-project navigation commands (/projects · /switch · /rm · /pwd · /cd).
+#
+# These wire a REAL StreamingSession over a REAL JsonSessionStore (the registry CRUD
+# under test) + a scripted FakeEngine factory (no SDK / no network), so the bot's
+# store/is_busy/get_cwd facades are exercised for real. The HOLD-parked engine lets a
+# turn hold the lock so the load-bearing /switch busy-guard can be asserted.
+# ===========================================================================
+
+HOLD = object()  # sentinel: park engine.send() here until resolve()/cancel() fires
+
+
+class HoldEngine:
+    """Minimal scripted engine: yields its script; a HOLD parks send() until released."""
+
+    def __init__(self, script):
+        self._script = script
+        self.session_id = "sess-mp"
+        self.started = False
+        self.resumed = None
+        self.stopped = False
+        self._gate = asyncio.Event()
+
+    async def start(self):
+        self.started = True
+
+    async def resume(self, session_id):
+        self.resumed = session_id
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+    async def send(self, prompt, *, timeout=None):
+        for item in self._script:
+            if item is HOLD:
+                await self._gate.wait()
+                self._gate.clear()
+                continue
+            yield item
+
+    def resolve(self, tool_use_id, decision):
+        self._gate.set()
+        return True
+
+    def cancel(self, tool_use_id=None):
+        self._gate.set()
+        return 1
+
+
+def make_streaming(store, *, script=None, workdir="/work"):
+    """A real StreamingSession over ``store`` whose factory returns a HoldEngine."""
+    engine = HoldEngine(script if script is not None else [])
+    session = StreamingSession(
+        make_config(engine_mode="streaming", workdir=workdir),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
+        clock=lambda: 0.0,
+    )
+    return session, engine
+
+
+def make_cmd_ctx(args=None):
+    ctx = make_ctx()
+    ctx.args = list(args or [])
+    return ctx
+
+
+# ---- /projects ------------------------------------------------------------
+
+
+async def test_cmd_projects_lists_with_active_marker(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/projects")
+    await bot.cmd_projects(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "alpha" in reply and "beta" in reply
+    assert "/work/alpha" in reply and "/work/beta" in reply
+    # The active project (alpha) carries the marker; beta does not.
+    alpha_line = next(line for line in reply.splitlines() if "alpha" in line)
+    beta_line = next(line for line in reply.splitlines() if "beta" in line)
+    assert "→" in alpha_line and "→" not in beta_line
+
+
+async def test_cmd_projects_empty_hints_new(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/projects")
+    await bot.cmd_projects(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "/new" in reply and "no project" in reply.lower()
+
+
+async def test_cmd_projects_oneshot_streaming_only_notice():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/projects")
+    await bot.cmd_projects(upd, make_cmd_ctx())
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_projects_unauthorized_ignored(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(999, "/projects")
+    await bot.cmd_projects(upd, make_cmd_ctx())
+    upd.message.reply_text.assert_not_awaited()
+
+
+# ---- /switch --------------------------------------------------------------
+
+
+async def test_cmd_switch_happy_sets_active(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/switch beta")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["beta"]))
+    assert store.get_active(1) == "beta"
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "beta" in reply and "resume" in reply.lower()
+
+
+async def test_cmd_switch_while_busy_refused_store_untouched(tmp_path):
+    # LOAD-BEARING busy-guard (D2): while a turn holds the lock, /switch must refuse and
+    # NOT call store.switch — a mid-hold active-project change deadlocks the parked turn.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session, engine = make_streaming(store, script=[HOLD])  # the turn parks holding the lock
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+
+    # Drive a turn that parks on HOLD (acquires + holds the per-chat turn lock).
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    turn = asyncio.create_task(bot.on_message(make_update(1, "go"), rec))
+    # Wait until the turn is actually in flight (lock held).
+    for _ in range(200):
+        if session.is_busy(1):
+            break
+        await asyncio.sleep(0)
+    assert session.is_busy(1), "the held turn should hold the lock"
+
+    # Spy on store.switch to prove it is NOT called while busy.
+    switch_calls = []
+    orig_switch = store.switch
+    store.switch = lambda *a, **k: switch_calls.append((a, k))  # type: ignore[assignment]
+    upd = make_update(1, "/switch beta")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["beta"]))
+    store.switch = orig_switch  # type: ignore[assignment]
+
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "/cancel" in reply and ("flight" in reply.lower() or "finish" in reply.lower())
+    assert switch_calls == [], "store.switch must NOT be called while a turn is in flight"
+    assert store.get_active(1) == "alpha"  # active unchanged
+
+    # Release the held turn so the task completes cleanly (no leaked task).
+    engine.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+
+
+async def test_cmd_switch_unknown_name_lists_available(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/switch nope")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["nope"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "nope" in reply
+    # The error lists the available names so the operator can pick a real one.
+    assert "alpha" in reply and "beta" in reply
+    assert store.get_active(1) == "alpha"  # unchanged
+
+
+async def test_cmd_switch_no_arg_usage(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/switch")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=[]))
+    assert "usage" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_switch_oneshot_streaming_only_notice():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/switch beta")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["beta"]))
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_switch_unauthorized_ignored(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(999, "/switch alpha")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["alpha"]))
+    upd.message.reply_text.assert_not_awaited()
+
+
+# ---- /rm ------------------------------------------------------------------
+
+
+async def test_cmd_rm_happy_non_active(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/rm beta")
+    await bot.cmd_rm(upd, make_cmd_ctx(args=["beta"]))
+    assert "beta" not in store.list_projects(1)
+    assert "alpha" in store.list_projects(1)  # active project survives
+    assert "removed" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_rm_active_refused(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/rm alpha")
+    await bot.cmd_rm(upd, make_cmd_ctx(args=["alpha"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "active" in reply.lower() and "/switch" in reply
+    assert "alpha" in store.list_projects(1)  # NOT removed
+
+
+async def test_cmd_rm_active_refused_case_insensitive(tmp_path):
+    # The store matches names case-insensitively, so the active-guard must too: /rm ALPHA
+    # when the active project is "alpha" must be refused (else a casing trick would let the
+    # store remove the active project via its case-insensitive resolve).
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/rm ALPHA")
+    await bot.cmd_rm(upd, make_cmd_ctx(args=["ALPHA"]))
+    assert "active" in upd.message.reply_text.await_args.args[0].lower()
+    assert "alpha" in store.list_projects(1)  # NOT removed
+
+
+async def test_cmd_rm_unknown_name_errors(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/rm ghost")
+    await bot.cmd_rm(upd, make_cmd_ctx(args=["ghost"]))
+    assert "ghost" in upd.message.reply_text.await_args.args[0]
+    assert "alpha" in store.list_projects(1)
+
+
+async def test_cmd_rm_no_arg_usage(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/rm")
+    await bot.cmd_rm(upd, make_cmd_ctx(args=[]))
+    assert "usage" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_rm_oneshot_streaming_only_notice():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/rm beta")
+    await bot.cmd_rm(upd, make_cmd_ctx(args=["beta"]))
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_rm_unauthorized_ignored(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(999, "/rm beta")
+    await bot.cmd_rm(upd, make_cmd_ctx(args=["beta"]))
+    upd.message.reply_text.assert_not_awaited()
+    assert "beta" in store.list_projects(1)  # untouched
+
+
+# ---- /pwd (streaming shows the active project; one-shot unchanged) ---------
+
+
+async def test_cmd_pwd_streaming_shows_active_project(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", "/work/api", make_active=True)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/pwd")
+    await bot.cmd_pwd(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "api" in reply and "/work/api" in reply
+
+
+async def test_cmd_pwd_streaming_no_active_project_hint(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/pwd")
+    await bot.cmd_pwd(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "no active project" in reply.lower()
+    # Read-only: /pwd must NOT auto-create a project.
+    assert store.get_active(1) is None
+
+
+async def test_cmd_pwd_oneshot_unchanged():
+    # One-shot mode keeps the runner.get_cwd behavior EXACTLY (no project surface).
+    runner = FakeRunner()
+    runner.get_cwd = lambda chat_id: "/some/dir"
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    upd = make_update(1, "/pwd")
+    await bot.cmd_pwd(upd, make_cmd_ctx())
+    assert "/some/dir" in upd.message.reply_text.await_args.args[0]
+
+
+# ---- /cd (streaming: fixed-per-project; one-shot unchanged) ---------------
+
+
+async def test_cmd_cd_streaming_says_fixed_per_project(tmp_path):
+    # D4: /cd in streaming mode replies that cwd is fixed per project and mutates NOTHING.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", "/work/api", make_active=True)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/cd /somewhere/else")
+    await bot.cmd_cd(upd, make_cmd_ctx(args=["/somewhere/else"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "fixed per project" in reply.lower() and "/new" in reply
+    # The active project's cwd is untouched (no store mutation).
+    assert store.get_project(1, "api")["cwd"] == "/work/api"
+    assert store.get_active(1) == "api"
+
+
+async def test_cmd_cd_oneshot_still_confines_and_sets(tmp_path):
+    # SB2 regression (mirrors test_bot.test_cmd_cd_happy): one-shot /cd still resolves
+    # within roots + calls set_cwd unchanged. Reuse the one-shot FakeRunner from
+    # test_bot.py (it implements set_cwd); allow_any_path keeps SB2 from short-circuiting
+    # so the happy set_cwd path runs (tmp_path is outside the /work workdir).
+    from tests.test_bot import FakeRunner as OneshotRunner
+    from tests.test_bot import make_config as oneshot_config
+    from tests.test_bot import make_update as oneshot_update
+
+    runner = OneshotRunner()
+    bot = TelegramClaudeBot(oneshot_config(allow_any_path=True), runner)
+    upd = oneshot_update(1, "")
+    await bot.cmd_cd(upd, make_cmd_ctx(args=[str(tmp_path)]))
+    assert runner.cwd == str(tmp_path.resolve())  # set_cwd ran with the canonical path
+    assert str(tmp_path.resolve()) in upd.message.reply_text.await_args.args[0]
+
+
+# ---- RB1: streaming + no STATE_FILE (store is None) must not crash ---------
+
+
+async def test_cmd_switch_no_store_is_graceful_not_crash():
+    """RB1 (T5 review): ENGINE_MODE=streaming with STATE_FILE unset → store is None.
+    /switch must reply gracefully, never AttributeError on a None store."""
+    session, _ = make_streaming(None)  # no persistence
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/switch alpha")
+    await bot.cmd_switch(upd, make_cmd_ctx(args=["alpha"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "/new" in reply  # graceful no-projects notice (no exception raised)
+
+
+async def test_cmd_rm_no_store_is_graceful_not_crash():
+    """RB1 (T5 review): /rm with a None store replies gracefully, never crashes."""
+    session, _ = make_streaming(None)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/rm alpha")
+    await bot.cmd_rm(upd, make_cmd_ctx(args=["alpha"]))
+    assert "remove" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_rm_non_active_case_insensitive(tmp_path):
+    """/rm of a NON-active project resolves case-insensitively (store._resolve_name) and
+    deletes it, leaving the active project untouched."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/rm BETA")  # different case than stored "beta"
+    await bot.cmd_rm(upd, make_cmd_ctx(args=["BETA"]))
+    assert "beta" not in store.list_projects(1)  # removed via case-insensitive resolve
+    assert "alpha" in store.list_projects(1)  # active untouched
+    assert "removed" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_projects_survives_sparse_and_dangling_active(tmp_path):
+    """RB1: a hand-edited/sparse on-disk doc (record missing cwd; active pointing at a
+    missing project) must not crash /projects — fall back to (no path), no marker."""
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {"version": 2, "chats": {"1": {"active": "ghost", "projects": {"alpha": {}}}}}
+        ),
+        encoding="utf-8",
+    )
+    store = JsonSessionStore(path)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/projects")
+    await bot.cmd_projects(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "alpha" in reply and "(no path)" in reply  # sparse record rendered, no crash

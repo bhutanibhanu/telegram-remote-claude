@@ -21,6 +21,7 @@ from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
 from .paths import PathNotAllowed, resolve_within_roots
 from .render import yolo_banner
+from .session_store import UnknownProject
 from .stream_session import StreamingBusy, StreamingSession
 from .util import split_message
 
@@ -35,8 +36,12 @@ HELP_TEXT = (
     "/cancel — abort the in-flight run (streaming mode)\n"
     "/yolo — run every tool with NO approval prompt this session (streaming mode)\n"
     "/unyolo — restore the per-tool permission gate (streaming mode)\n"
-    "/pwd — show the current working directory\n"
-    "/cd <path> — change the working directory (confined to the permitted roots)\n"
+    "/projects — list your projects and which one is active (streaming mode)\n"
+    "/switch <name> — switch the active project; the next message resumes it (streaming mode)\n"
+    "/rm <name> — drop a project from the registry, leaving its transcript on disk (streaming mode)\n"
+    "/pwd — show the active project's working directory\n"
+    "/cd <path> — change the working directory (one-shot mode only; in streaming mode "
+    "the cwd is fixed per project — use /new to work elsewhere)\n"
     "\nAny *other* slash-command (e.g. /grill, /pipeline, /scaffold) is forwarded "
     "verbatim and runs as a skill in the Claude session.\n"
 )
@@ -141,10 +146,33 @@ class TelegramClaudeBot:
     async def cmd_pwd(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
             return
+        if self.streaming is not None:
+            # Streaming mode: cwd is per-project (D4). Report the ACTIVE project's name +
+            # its fixed cwd, or a no-active-project hint. get_cwd is read-only (never
+            # creates a project), so we check the store for the active name alongside it.
+            chat_id = update.effective_chat.id
+            active = self.streaming.store.get_active(chat_id) if self.streaming.store else None
+            cwd = self.streaming.get_cwd(chat_id)
+            if active is None:
+                await update.message.reply_text(
+                    "No active project yet. Send a message to start one, or /new <name> <path>."
+                )
+            else:
+                await update.message.reply_text(f"📁 {active}\n{cwd}")
+            return
         await update.message.reply_text(f"📁 {self.runner.get_cwd(update.effective_chat.id)}")
 
     async def cmd_cd(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
+            return
+        if self.streaming is not None:
+            # D4: in streaming mode a project's cwd is bound to its session for the life of
+            # that session (the ADR-001 (session_id, cwd) resume coupling), so it is fixed —
+            # to work elsewhere, /new another project. Do NOT touch the runner/store here.
+            await update.message.reply_text(
+                "📁 The working directory is fixed per project in streaming mode. "
+                "Use /new <name> <path> to work in a different directory."
+            )
             return
         chat_id = update.effective_chat.id
         arg = " ".join(ctx.args).strip() if ctx.args else ""
@@ -153,8 +181,7 @@ class TelegramClaudeBot:
             return
         # SB2: canonicalize (resolves symlinks AND ..) and confine to ALLOWED_ROOTS
         # BEFORE touching the runner. A path that escapes the permitted roots is
-        # refused here and never reaches set_cwd — this guard holds for BOTH oneshot
-        # and streaming modes (cmd_cd is shared). ALLOW_ANY_PATH=true is the opt-out.
+        # refused here and never reaches set_cwd. ALLOW_ANY_PATH=true is the opt-out.
         try:
             target = resolve_within_roots(
                 arg,
@@ -173,6 +200,140 @@ class TelegramClaudeBot:
             await update.message.reply_text(f"❌ Not a directory: {arg}")
             return
         await update.message.reply_text(f"📁 Working directory set to:\n{new_cwd}")
+
+    # ---- multi-project navigation (streaming mode only, P4 / ADR-004) -------
+    async def _require_streaming(self, update: Update) -> bool:
+        """Reply the streaming-only notice and return False in one-shot mode.
+
+        The multi-project surface (``/projects`` / ``/switch`` / ``/rm``) is a
+        streaming-engine concept — one-shot keeps a single implicit session. Callers
+        have already done the ``_ok`` recheck; this is the second guard (mirrors
+        :meth:`cmd_yolo`'s one-shot notice). ``update.message`` is non-None here.
+        """
+        if self.streaming is None:
+            await update.message.reply_text(
+                "Projects apply to streaming mode only — one-shot mode runs each "
+                "message against a single session."
+            )
+            return False
+        return True
+
+    async def cmd_projects(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """List the chat's projects with an active marker (streaming mode only).
+
+        Each line shows the active marker, name, cwd, and last-active timestamp; the
+        active project (from ``store.get_active``) is flagged. No projects → tell the
+        operator to ``/new``. RB1: read-only, never crashes on a sparse/odd record.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_streaming(update):
+            return
+        assert self.streaming is not None
+        chat_id = update.effective_chat.id
+        projects = self.streaming.store.list_projects(chat_id) if self.streaming.store else {}
+        if not projects:
+            await update.message.reply_text(
+                "No projects yet. Create one with /new <name> <path>."
+            )
+            return
+        active = self.streaming.store.get_active(chat_id) if self.streaming.store else None
+        lines = ["📂 Projects:"]
+        for name, record in projects.items():
+            rec = record if isinstance(record, dict) else {}
+            marker = "→" if name == active else "  "
+            cwd = rec.get("cwd") or "(no path)"
+            last = rec.get("last_active") or "—"
+            lines.append(f"{marker} {name} — {cwd} (last active {last})")
+        await update.message.reply_text("\n".join(lines))
+
+    async def cmd_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Switch the chat's active project (streaming mode only).
+
+        **Busy-guard FIRST (load-bearing, D2 / ADR-004).** If a turn is in flight
+        (``streaming.is_busy``) we refuse BEFORE touching the store: an answer-hold parks
+        the turn with the lock held, so flipping ``store.active`` mid-hold would strand the
+        parked turn against the wrong/absent engine — a relay DEADLOCK, not just bad UX.
+        No arg → usage. Unknown name → error listing the available names (RB1). On success
+        the active project changes and the next message resumes it.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_streaming(update):
+            return
+        assert self.streaming is not None
+        chat_id = update.effective_chat.id
+        # Busy-guard BEFORE arg parsing / any store mutation (load-bearing for relay
+        # correctness — a mid-hold active-project change deadlocks the parked turn).
+        if self.streaming.is_busy(chat_id):
+            await update.message.reply_text(
+                "⏳ A turn is in flight — finish it or /cancel first, then /switch."
+            )
+            return
+        name = " ".join(ctx.args).strip() if ctx.args else ""
+        if not name:
+            await update.message.reply_text("Usage: /switch <name>")
+            return
+        if self.streaming.store is None:
+            # No STATE_FILE configured → no registry to switch within. RB1: never crash on
+            # a streaming + no-persistence deployment (store is None). Mirror the empty
+            # /projects notice rather than dereferencing a None store.
+            await update.message.reply_text(
+                "No projects yet. Create one with /new <name> <path>."
+            )
+            return
+        try:
+            self.streaming.store.switch(chat_id, name)
+        except UnknownProject:
+            available = ", ".join(self.streaming.store.list_projects(chat_id)) or "(none)"
+            await update.message.reply_text(
+                f"❌ No project named {name!r}. Available: {available}"
+            )
+            return
+        await update.message.reply_text(
+            f"✅ Switched to {name} — your next message resumes that project."
+        )
+
+    async def cmd_rm(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Remove a project from the registry (streaming mode only).
+
+        No arg → usage. **Refuse if ``name`` resolves to the ACTIVE project** (D5;
+        compared case-insensitively against ``store.get_active``) — the operator must
+        ``/switch`` away first. Unknown name → error. On success the project is dropped
+        from the registry; its Claude transcript is left on disk. Not busy-guarded: ``/rm``
+        of a NON-active project does not touch the held turn's active project (the active
+        case is already refused), so it is safe mid-turn.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_streaming(update):
+            return
+        assert self.streaming is not None
+        chat_id = update.effective_chat.id
+        name = " ".join(ctx.args).strip() if ctx.args else ""
+        if not name:
+            await update.message.reply_text("Usage: /rm <name>")
+            return
+        if self.streaming.store is None:
+            # No STATE_FILE → no registry to remove from (RB1: never crash, store is None).
+            await update.message.reply_text("No projects to remove.")
+            return
+        # D5: never remove the active project (case-insensitive — the store matches names
+        # case-insensitively, so the guard must too) — switch away first.
+        active = self.streaming.store.get_active(chat_id) if self.streaming.store else None
+        if active is not None and name.casefold() == active.casefold():
+            await update.message.reply_text(
+                f"❌ {name} is the active project — /switch to another project first."
+            )
+            return
+        try:
+            self.streaming.store.remove(chat_id, name)
+        except UnknownProject:
+            await update.message.reply_text(f"❌ No project named {name!r}.")
+            return
+        await update.message.reply_text(
+            f"🗑️ Removed {name} (its Claude transcript is left on disk)."
+        )
 
     # ---- messages -----------------------------------------------------------
     async def on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -381,6 +542,14 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("unyolo", self.cmd_unyolo, filters=allowed))
         app.add_handler(CommandHandler("pwd", self.cmd_pwd, filters=allowed))
         app.add_handler(CommandHandler("cd", self.cmd_cd, filters=allowed))
+        # P4 multi-project navigation (streaming mode only; the handlers reply a
+        # streaming-only notice in one-shot). Registered as specific CommandHandlers with
+        # the SAME `allowed` chat filter (SB1) and placed BEFORE the on_skill_command
+        # COMMAND passthrough below, so first-match-wins consumes them here rather than
+        # forwarding /projects · /switch · /rm to the session as skills. (/new is T6.)
+        app.add_handler(CommandHandler("projects", self.cmd_projects, filters=allowed))
+        app.add_handler(CommandHandler("switch", self.cmd_switch, filters=allowed))
+        app.add_handler(CommandHandler("rm", self.cmd_rm, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))
         # P3 skill-launch passthrough (D1): forward any *unregistered* slash-command verbatim
         # to the session. Registered AFTER the specific CommandHandlers above so PTB's
