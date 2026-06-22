@@ -20,8 +20,8 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 - [x] T5 — Bot navigation commands (/projects, /switch, /rm, /pwd, /cd-removed) (0502c7c)
 - [x] T6 — Bot /new command (SB2 path-input) (c0bc0fa)
 - [x] T7 — Resume hardening: cwd re-validation (SB2) + RB3 crash recovery (e068a37)
-- [ ] T8 — Integration / SB·RB acceptance matrix
-- [ ] T9 — Live verify + verify.md phone-checklist
+- [x] T8 — Integration / SB·RB acceptance matrix (0d721cd)
+- [x] T9 — Live verify + verify.md phone-checklist (verify.md written; live run = owner's phone-verify at the Verify+QA gate)
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
 
@@ -133,4 +133,4 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN run against a real streaming Claude session, the harness SHALL: `/new` two in-roots projects, `/switch` between them, show each resumes its **own** conversation, restart the process and **resume both**, and demonstrate RB3 (interrupted turn → clean recovery). Evidence contained to an **absolute temp dir** + **scrubbed** (SB3); UUID-grep before commit (per the live-verify memories).
   - `verify.md` SHALL enumerate the manual owner phone-checklist mirroring the above.
 - **Tests:** this IS the live verification (manual/real-Claude; not in CI).
-- **Status:** todo
+- **Status:** verify.md written (covers (a)–(j) + acceptance). **Live execution is the owner's phone-verify** at the Verify+QA gate — per the `relay-needs-concurrent-updates-and-phone-verify` memory, engine/unit probes bypass the real PTB callback path, so the phone-verify is the authoritative live check. (A contained programmatic engine live-verify can also be run on request, but is not a substitute.)
