@@ -20,7 +20,14 @@ from claude_tg.session_store import JsonSessionStore
 from claude_tg.stream_session import CallbackOutcome, StreamingBusy, StreamingSession
 
 
-def make_config(allowed=(1,), engine_mode="oneshot", workdir="/work"):
+def make_config(
+    allowed=(1,),
+    engine_mode="oneshot",
+    workdir="/work",
+    *,
+    allowed_roots=(),
+    allow_any_path=False,
+):
     return Config(
         bot_token="t",
         allowed_chat_ids=frozenset(allowed),
@@ -32,6 +39,8 @@ def make_config(allowed=(1,), engine_mode="oneshot", workdir="/work"):
         state_file=None,
         engine_mode=engine_mode,
         answer_backstop_seconds=3600,
+        allowed_roots=allowed_roots,
+        allow_any_path=allow_any_path,
     )
 
 
@@ -808,3 +817,301 @@ async def test_cmd_projects_survives_sparse_and_dangling_active(tmp_path):
     await bot.cmd_projects(upd, make_cmd_ctx())
     reply = upd.message.reply_text.await_args.args[0]
     assert "alpha" in reply and "(no path)" in reply  # sparse record rendered, no crash
+
+
+# ===========================================================================
+# P4 / T6 — /new <name> <path> (the SB2 path-input command).
+#
+# Wires a REAL StreamingSession over a REAL JsonSessionStore (so store.create is the
+# CRUD under test) + the bot's Config carrying allowed_roots / allow_any_path (the SB2
+# policy). The bot's resolve_within_roots reads the bot's config; in-roots existing
+# tmp dirs exercise the happy path, out-of-root / traversal / symlink the SB2 refusals.
+# ===========================================================================
+
+
+async def test_cmd_new_happy_creates_resolved_cwd_and_switches(tmp_path):
+    # In-roots existing dir → create with the RESOLVED cwd, make active, confirm.
+    proj = tmp_path / "work"
+    proj.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new work " + str(proj))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["work", str(proj)]))
+    assert store.get_active(1) == "work"
+    # The stored cwd is the RESOLVED (canonical) path, not the raw arg.
+    assert store.get_project(1, "work")["cwd"] == str(proj.resolve())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "work" in reply and str(proj.resolve()) in reply
+
+
+async def test_cmd_new_out_of_root_refused_not_created(tmp_path):
+    # SB2: a path OUTSIDE allowed_roots (and allow_any_path=False) is refused; the
+    # project is NOT created. allowed_roots is a sibling subdir, the target is elsewhere.
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(root))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new bad " + str(outside))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["bad", str(outside)]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "not allowed" in reply.lower()
+    assert store.list_projects(1) == {}  # NOT created
+
+
+async def test_cmd_new_symlink_escape_refused(tmp_path):
+    # SB2: a symlink that points OUTSIDE the roots is followed by resolve() and refused
+    # (one traversal/symlink case is enough — the resolver canonicalizes both). The link
+    # itself sits inside the root; its target escapes.
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = root / "escape"
+    link.symlink_to(outside, target_is_directory=True)
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(root))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new sneaky " + str(link))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["sneaky", str(link)]))
+    assert "not allowed" in upd.message.reply_text.await_args.args[0].lower()
+    assert store.list_projects(1) == {}  # NOT created
+
+
+async def test_cmd_new_allow_any_path_accepts_out_of_root(tmp_path):
+    # ALLOW_ANY_PATH opt-out: with allow_any_path=True an out-of-root existing dir is
+    # accepted (the explicit escape hatch — SB2 confinement disabled).
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(root))
+    bot = TelegramClaudeBot(
+        make_config(
+            engine_mode="streaming",
+            workdir=str(root),
+            allowed_roots=(root,),
+            allow_any_path=True,
+        ),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new anywhere " + str(outside))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["anywhere", str(outside)]))
+    assert store.get_active(1) == "anywhere"
+    assert store.get_project(1, "anywhere")["cwd"] == str(outside.resolve())
+
+
+async def test_cmd_new_not_a_directory_refused(tmp_path):
+    # An in-roots path that does not exist (or is a file) → "Not a directory", not created.
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    missing = tmp_path / "nope"  # in-roots but does not exist
+    upd = make_update(1, "/new ghost " + str(missing))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["ghost", str(missing)]))
+    assert "not a directory" in upd.message.reply_text.await_args.args[0].lower()
+    assert store.list_projects(1) == {}  # NOT created
+
+
+async def test_cmd_new_file_target_refused(tmp_path):
+    # An in-roots path that IS a file (not a dir) → "Not a directory", not created.
+    f = tmp_path / "afile.txt"
+    f.write_text("x", encoding="utf-8")
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new f " + str(f))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["f", str(f)]))
+    assert "not a directory" in upd.message.reply_text.await_args.args[0].lower()
+    assert store.list_projects(1) == {}
+
+
+async def test_cmd_new_invalid_name_refused_no_create(tmp_path):
+    # SB4: a bad name (slash) is refused BEFORE the filesystem is touched; not created.
+    proj = tmp_path / "work"
+    proj.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new bad/name " + str(proj))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["bad/name", str(proj)]))
+    assert "invalid project name" in upd.message.reply_text.await_args.args[0].lower()
+    assert store.list_projects(1) == {}  # NOT created
+
+
+async def test_cmd_new_duplicate_refused(tmp_path):
+    # Creating the same name twice → the second is refused (DuplicateProject).
+    proj = tmp_path / "work"
+    proj.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    await bot.cmd_new(make_update(1, "/new dup " + str(proj)), make_cmd_ctx(args=["dup", str(proj)]))
+    assert store.get_active(1) == "dup"
+    upd = make_update(1, "/new dup " + str(proj))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["dup", str(proj)]))
+    assert "already exists" in upd.message.reply_text.await_args.args[0].lower()
+    assert list(store.list_projects(1)) == ["dup"]  # still exactly one
+
+
+async def test_cmd_new_while_busy_refused_store_untouched(tmp_path):
+    # LOAD-BEARING busy-guard (D2): /new auto-switches the active project, so while a turn
+    # holds the lock it must refuse and NOT call store.create — a mid-hold active-project
+    # change deadlocks the parked turn (same invariant as /switch).
+    proj = tmp_path / "work"
+    proj.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, engine = make_streaming(store, script=[HOLD], workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+
+    # Drive a turn that parks on HOLD (acquires + holds the per-chat turn lock).
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    turn = asyncio.create_task(bot.on_message(make_update(1, "go"), rec))
+    for _ in range(200):
+        if session.is_busy(1):
+            break
+        await asyncio.sleep(0)
+    assert session.is_busy(1), "the held turn should hold the lock"
+
+    # Spy on store.create to prove it is NOT called while busy.
+    create_calls = []
+    orig_create = store.create
+    store.create = lambda *a, **k: create_calls.append((a, k))  # type: ignore[assignment]
+    upd = make_update(1, "/new work " + str(proj))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["work", str(proj)]))
+    store.create = orig_create  # type: ignore[assignment]
+
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "/cancel" in reply and ("flight" in reply.lower() or "finish" in reply.lower())
+    assert create_calls == [], "store.create must NOT be called while a turn is in flight"
+    assert list(store.list_projects(1)) == ["alpha"]  # registry unchanged
+
+    # Release the held turn so the task completes cleanly (no leaked task).
+    engine.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+
+
+async def test_cmd_new_no_store_is_graceful_not_crash(tmp_path):
+    # RB1: ENGINE_MODE=streaming with STATE_FILE unset → store is None. /new must reply
+    # gracefully, never AttributeError on a None store.
+    proj = tmp_path / "work"
+    proj.mkdir()
+    session, _ = make_streaming(None, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new work " + str(proj))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["work", str(proj)]))  # must not raise
+    assert "persistence" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_new_oneshot_streaming_only_notice():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/new work /tmp")
+    await bot.cmd_new(upd, make_cmd_ctx(args=["work", "/tmp"]))
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_new_unauthorized_ignored(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(999, "/new work " + str(tmp_path))
+    await bot.cmd_new(upd, make_cmd_ctx(args=["work", str(tmp_path)]))
+    upd.message.reply_text.assert_not_awaited()
+    assert store.list_projects(1) == {}  # nothing created for the real chat either
+
+
+async def test_cmd_new_missing_path_usage(tmp_path):
+    # RB1: only a name, no path → usage (handles the 1-arg case).
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new work")
+    await bot.cmd_new(upd, make_cmd_ctx(args=["work"]))
+    assert "usage" in upd.message.reply_text.await_args.args[0].lower()
+    assert store.list_projects(1) == {}
+
+
+async def test_cmd_new_no_args_usage(tmp_path):
+    # RB1: zero args → usage (handles the 0-arg case).
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    upd = make_update(1, "/new")
+    await bot.cmd_new(upd, make_cmd_ctx(args=[]))
+    assert "usage" in upd.message.reply_text.await_args.args[0].lower()
+    assert store.list_projects(1) == {}
+
+
+def test_build_application_registers_new_before_skill_passthrough():
+    # /new is a specific CommandHandler wired BEFORE the on_skill_command COMMAND
+    # passthrough — first-match-wins keeps it from being forwarded as a skill.
+    from telegram.ext import CommandHandler, MessageHandler
+
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    app = bot.build_application()
+    ordered = [h for group in app.handlers.values() for h in group]
+    skill_passthrough_idx = None
+    new_idx = None
+    for i, h in enumerate(ordered):
+        if isinstance(h, CommandHandler) and "new" in {c.lstrip("/").lower() for c in h.commands}:
+            new_idx = i
+        if isinstance(h, MessageHandler) and getattr(h.callback, "__name__", "") == "on_skill_command":
+            skill_passthrough_idx = i
+    assert new_idx is not None, "/new must be a registered CommandHandler"
+    assert skill_passthrough_idx is not None
+    assert new_idx < skill_passthrough_idx

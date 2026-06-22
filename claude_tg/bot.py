@@ -21,7 +21,12 @@ from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
 from .paths import PathNotAllowed, resolve_within_roots
 from .render import yolo_banner
-from .session_store import UnknownProject
+from .session_store import (
+    DuplicateProject,
+    InvalidProjectName,
+    UnknownProject,
+    validate_project_name,
+)
 from .stream_session import StreamingBusy, StreamingSession
 from .util import split_message
 
@@ -37,6 +42,8 @@ HELP_TEXT = (
     "/yolo — run every tool with NO approval prompt this session (streaming mode)\n"
     "/unyolo — restore the per-tool permission gate (streaming mode)\n"
     "/projects — list your projects and which one is active (streaming mode)\n"
+    "/new <name> <path> — create a project at <path> and switch to it; <path> must be an "
+    "existing directory inside the permitted roots (streaming mode)\n"
     "/switch <name> — switch the active project; the next message resumes it (streaming mode)\n"
     "/rm <name> — drop a project from the registry, leaving its transcript on disk (streaming mode)\n"
     "/pwd — show the active project's working directory\n"
@@ -335,6 +342,95 @@ class TelegramClaudeBot:
             f"🗑️ Removed {name} (its Claude transcript is left on disk)."
         )
 
+    async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Create a new project confined to the permitted roots, then switch to it.
+
+        **The one path-input command (SB2).** ``/new <name> <path>`` — streaming mode
+        only. Order of checks is fail-fast and secure:
+
+        1. ``_ok`` allowlist recheck (SB1) + ``_require_streaming`` one-shot notice.
+        2. **Busy-guard FIRST (load-bearing, D2):** ``/new`` auto-switches the active
+           project, so a mid-hold ``/new`` would strand the parked turn against the
+           wrong/absent engine — a relay DEADLOCK, exactly like ``/switch``. Refuse
+           BEFORE touching args, the filesystem, or the store.
+        3. store-None guard (RB1): no STATE_FILE → no registry to create in; reply and
+           return (never dereference a None store).
+        4. Parse ``name`` (first arg) + ``path`` (the rest, so a path may contain
+           spaces); missing either → usage (RB1: 0/1 args, whitespace).
+        5. SB4 name validation **before** any filesystem touch.
+        6. SB2 path confinement via ``resolve_within_roots`` (canonicalizes ``~``,
+           ``..``, and symlinks; relative paths resolve against the active project's
+           cwd) — an out-of-roots target is refused and the project is NOT created.
+        7. Existing-directory check (a project's cwd must be runnable).
+        8. ``store.create(..., make_active=True)`` — duplicate name → refuse. On success
+           confirm with the RESOLVED cwd.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_streaming(update):
+            return
+        assert self.streaming is not None
+        chat_id = update.effective_chat.id
+        # Busy-guard BEFORE arg parsing / filesystem / any store mutation (load-bearing
+        # for relay correctness — /new flips the active project, so a mid-hold /new
+        # deadlocks the parked turn, same invariant as /switch).
+        if self.streaming.is_busy(chat_id):
+            await update.message.reply_text(
+                "⏳ A turn is in flight — finish it or /cancel first, then /new."
+            )
+            return
+        if self.streaming.store is None:
+            # No STATE_FILE configured → no registry to create a project in. RB1: never
+            # crash on a streaming + no-persistence deployment (store is None).
+            await update.message.reply_text(
+                "Projects need persistence — set STATE_FILE to create one."
+            )
+            return
+        name = ctx.args[0] if ctx.args else ""
+        path = " ".join(ctx.args[1:]).strip() if ctx.args and len(ctx.args) > 1 else ""
+        if not name or not path:
+            await update.message.reply_text("Usage: /new <name> <path>")
+            return
+        # SB4: validate the name BEFORE touching the filesystem (a bad name never causes
+        # a resolve/stat on operator-supplied input).
+        try:
+            validate_project_name(name)
+        except InvalidProjectName:
+            await update.message.reply_text(
+                f"❌ Invalid project name {name!r} — use letters, digits, _ or - (≤32 chars)."
+            )
+            return
+        # SB2: canonicalize (resolves symlinks AND ..) and confine to ALLOWED_ROOTS
+        # BEFORE creating the project. A relative path resolves against the active
+        # project's cwd (get_cwd). A path that escapes the permitted roots is refused
+        # here and the project is never created. ALLOW_ANY_PATH=true is the opt-out.
+        try:
+            target = resolve_within_roots(
+                path,
+                cwd=self.streaming.get_cwd(chat_id),
+                allowed_roots=self.config.allowed_roots,
+                allow_any=self.config.allow_any_path,
+            )
+        except PathNotAllowed:
+            await update.message.reply_text(
+                f"❌ Path not allowed (outside the permitted roots): {path}"
+            )
+            return
+        # A project's cwd must be a runnable existing directory (the engine cds into it).
+        if not target.is_dir():
+            await update.message.reply_text(f"❌ Not a directory: {path}")
+            return
+        # Create + auto-switch. The resolved (contained) cwd is stored, never the raw arg.
+        try:
+            self.streaming.store.create(chat_id, name, str(target), make_active=True)
+        except DuplicateProject:
+            await update.message.reply_text(f"❌ A project named {name} already exists.")
+            return
+        await update.message.reply_text(
+            f"✅ Created {name} at {target} and switched to it — "
+            "your next message runs there."
+        )
+
     # ---- messages -----------------------------------------------------------
     async def on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
@@ -546,8 +642,9 @@ class TelegramClaudeBot:
         # streaming-only notice in one-shot). Registered as specific CommandHandlers with
         # the SAME `allowed` chat filter (SB1) and placed BEFORE the on_skill_command
         # COMMAND passthrough below, so first-match-wins consumes them here rather than
-        # forwarding /projects · /switch · /rm to the session as skills. (/new is T6.)
+        # forwarding /projects · /new · /switch · /rm to the session as skills.
         app.add_handler(CommandHandler("projects", self.cmd_projects, filters=allowed))
+        app.add_handler(CommandHandler("new", self.cmd_new, filters=allowed))
         app.add_handler(CommandHandler("switch", self.cmd_switch, filters=allowed))
         app.add_handler(CommandHandler("rm", self.cmd_rm, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))
