@@ -22,9 +22,14 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 - [x] T7 — Resume hardening: cwd re-validation (SB2) + RB3 crash recovery (e068a37)
 - [x] T8 — Integration / SB·RB acceptance matrix (0d721cd)
 - [x] T9 — Live verify + verify.md phone-checklist (verify.md written; live run = owner's phone-verify at the Verify+QA gate)
-- [ ] QF1 — fix B1: `/reset` cwd corruption (gate `runner.reset()` to one-shot) — Codex NO_SHIP blocker
-- [ ] QF2 — fix B2: `/switch` re-validates stored cwd before activating (SB2 conformance) — Codex blocker
-- [ ] QF3 — fix B3: streaming resume-failure-on-result fallback (port `_is_resume_failure`) — Codex NO_SHIP blocker
+- [x] QF1 — fix B1: `/reset` cwd corruption (gate `runner.reset()` to one-shot) — Codex NO_SHIP blocker (613ba17)
+- [x] QF2 — fix B2: `/switch` re-validates stored cwd before activating (SB2 conformance) — Codex blocker (613ba17)
+- [x] QF3 — fix B3: streaming resume-failure-on-result fallback (port `_is_resume_failure`) — Codex NO_SHIP blocker (d6ba25a)
+
+### QA-fix follow-ups (non-blocking, from the QF3 review — surfaced, not yet done)
+- `_recover_failed_resume` drops `rt.engine` without `await engine.stop()` → leaks the connected SDK client on a B3 recovery (rare, bounded, restart-cleared; same pattern as `reset()`). Cheap best-effort `stop()` would close it.
+- Resume-failure detection is a text heuristic (shared verbatim with one-shot `_is_resume_failure`); a torn-transcript error lacking session-gone phrasing would be missed → stuck re-resume. Confirm the real SDK exception text against a live SDK (ties to the owner phone-verify / a P5 hardening).
+- `_recover_failed_resume`/result-persist clear the store via the *active* project, not the pinned `turn_name` (harmless under the busy-guard; the deferred persist-to-captured-name defense-in-depth).
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked
 
