@@ -15,7 +15,7 @@ _Plan generated 2026-06-22 from design.md · 9 tasks · supervised build (autono
 ## Task list
 - [x] T1 — ADR-004: multi-project session model & persistence schema (1ab4560)
 - [x] T2 — Versioned store + v1→v2 migration + flat (one-shot) view (0d7d4fe)
-- [ ] T3 — Registry accessors + SB4 name validation
+- [x] T3 — Registry accessors + SB4 name validation (1de9998)
 - [ ] T4 — StreamingSession per-project rework
 - [ ] T5 — Bot navigation commands (/projects, /switch, /rm, /pwd, /cd-removed)
 - [ ] T6 — Bot /new command (SB2 path-input)
@@ -57,8 +57,8 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN `create(chat_id, name, cwd)` is called with a valid, unique name, the system SHALL add the project (and the caller MAY set it active); a **duplicate** name (case-insensitive) SHALL be rejected with a clear signal, no write.
   - WHEN a name fails `^[A-Za-z0-9_-]{1,32}$` (empty / >32 / bad chars / path-ish `../x`), `create` SHALL reject it (**SB4**) without writing.
   - `switch(chat_id, name)` SHALL set active iff the project exists else signal not-found; `remove(chat_id, name)` SHALL delete the project; `get_active` / `list` / `touch(last_active)` behave as specified.
-- **Tests:** create/list/switch/remove/get_active happy + error paths; **SB4 name matrix** (valid, empty, 33-char, spaces, unicode, `../x`, dup case-insensitive).
-- **Status:** todo
+- **Tests:** create/list/switch/remove/get_active happy + error paths; **SB4 name matrix** (valid, empty, 33-char, spaces, unicode, `../x`, dup case-insensitive) — incl. `fullmatch` anti-regression (newline/null/CRLF/tab/leading-trailing-whitespace rejected).
+- **Status:** done (1de9998) — reviewer AGREE; 50-trial OLD-vs-NEW flat-view differential clean; SB4 anti-regression cases added per review. Malformed-doc never-crash + dangling-active tests deferred to T8.
 
 ### T4 — StreamingSession per-project rework
 - **Goal:** Make the streaming session project-aware: resolve the active project and operate on its `(session_id, cwd)`; transient bypass reset on restart (D3).
@@ -120,7 +120,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - WHEN the bot restarts, **both** projects SHALL be present with correct cwd/session_id and each SHALL resume independently on its next message (**restart-resumes-both**).
   - The store SHALL survive a simulated **crash-during-write** without corruption (atomic replace leaves the prior good file) (**RB6**).
   - One-shot mode SHALL behave **exactly as pre-P4** against a v2 store (regression assertion; complements T2).
-- **Tests:** the above scenarios + full lifecycle `/new→/switch→/rm` via the session/registry layer. Plus two deferred-from-T2 store contracts: (a) `update()` after an **unknown/future-version** load starts a clean v2 (does not preserve the future doc — locks the SB6 fail-safe-clobber contract); (b) an empty-string `session_id`/`cwd` on disk normalizes to **absent** in the flat view (documents the truthy-omit).
+- **Tests:** the above scenarios + full lifecycle `/new→/switch→/rm` via the session/registry layer. Plus two deferred-from-T2 store contracts: (a) `update()` after an **unknown/future-version** load starts a clean v2 (does not preserve the future doc — locks the SB6 fail-safe-clobber contract); (b) an empty-string `session_id`/`cwd` on disk normalizes to **absent** in the flat view (documents the truthy-omit). Plus deferred-from-T3 **SB6 never-crash** tests: registry accessors against a hand-edited/malformed doc (non-dict `chats`/`projects`, non-str keys, **dangling `active`** pointing at a missing project) degrade to None/`UnknownProject` without raising.
 - **Status:** todo
 
 ### T9 — Live verify + verify.md phone-checklist
