@@ -19,9 +19,11 @@ Background concurrency + notifications for multi-project sessions: multiple proj
  tests/test_render.py                        |  244 +++
  tests/test_security_reliability.py          |    9 +-
  tests/test_session_store.py                 |   56 +
- tests/test_stream_session.py                | 2152 ++++++++++++++++++++++++++-
- 18 files changed, 7464 insertions(+), 586 deletions(-)  (merge-base b589527)
+ tests/test_skill_launch.py                  |    6 +-
+ tests/test_stream_session.py                | 3474 ++++++++++++++++++++++++++-
+ 19 files changed, 8457 insertions(+), 1071 deletions(-)  (merge-base b589527)
 ```
+_Includes the cross-model-QA fix round (`35285e2`): B1 background distinct-`tool_use_id` prompts no longer throttle-suppressed; B2 a project can't queue behind itself; NB1–3 queued-turn cancel/position/reset correctness._
 
 ## How to run
 ```bash
@@ -46,7 +48,7 @@ Exercise: `/new a /tmp/p5verify/a`, `/new b /tmp/p5verify/b`; start a long turn 
 - **RB3** On restart: no in-flight runs; queue/run-status/index are in-memory only; lazy per-project resume on next message. **One-shot mode behaves exactly as pre-P5.**
 
 ## Test plan
-- **729 automated** (baseline 712 + 17 matrix), `ruff`/`mypy`/`secret_scan` clean. Per-task independent reviewer on T1–T10 (each mutation-probed); `tests/test_concurrency_matrix.py` pins the cross-cutting acceptance end-to-end through the real `on_callback` path with mock engines.
+- **737 automated** (712 baseline + 17 matrix + 8 QA-fix regressions), `ruff`/`mypy`/`secret_scan` clean. Per-task independent reviewer on T1–T10 (each mutation-probed); `tests/test_concurrency_matrix.py` pins the cross-cutting acceptance end-to-end through the real `on_callback` path with mock engines. Phase-level Verifier subagent + cross-model Codex (Codex caught B1/B2; both fixed + re-reviewed AGREE).
 - **Needs live check (T11):** real Telegram→PTB→bot callback path + real-Claude **two-project-concurrent** holds — ADR-001's "SDK tolerates multiple concurrent open permission holds" assumption is only authoritatively provable live (engine.resolve probes bypass PTB; unit tests use mock engines). This is the remaining task.
 
 ## Known risks
