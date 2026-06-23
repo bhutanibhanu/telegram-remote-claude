@@ -11,6 +11,7 @@ wiring bug fails fast rather than hanging the suite.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from pathlib import Path
 
@@ -774,7 +775,12 @@ async def test_handle_cancel_idle_chat_is_noop():
     assert engine.cancel_calls == []
 
 
-async def test_error_event_renders_clean_message():
+async def test_error_event_renders_clean_message(caplog):
+    # P6/R3 (SB3/H1): a tool_error wraps RAW tool output → it renders BODY-FREE to the chat
+    # (a clean ⚠️ summary, the raw "it broke" absent), while the raw detail still reaches the
+    # LOCAL debug log so the operator can debug. This replaces the old assertion that the raw
+    # body appeared in the chat — the new body-free behavior is the SB3 fix.
+    caplog.set_level(logging.DEBUG)
     engine = FakeEngine(
         [
             ErrorEvent(kind_of_error="tool_error", message="it broke"),
@@ -786,9 +792,12 @@ async def test_error_event_renders_clean_message():
     await asyncio.wait_for(
         session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
     )
-    # The error is a clean verbatim message (no traceback), its own send.
-    err_send = next(s for s in rec.sends if "it broke" in s["text"])
-    assert err_send["text"].startswith("⚠️")
+    # A clean ⚠️ error block was sent, but it is BODY-FREE: the raw tool body never rides it.
+    err_send = next(s for s in rec.sends if s["text"].startswith("⚠️") and "tool_error" in s["text"])
+    assert "it broke" not in err_send["text"]
+    assert all("it broke" not in s["text"] for s in rec.sends)  # nowhere in the chat
+    # The raw detail DID reach the local debug log (so it is recoverable for debugging).
+    assert "it broke" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -1185,10 +1194,12 @@ async def test_transient_status_edit_failure_does_not_orphan_old_status_line():
 
 
 async def test_tool_error_then_terminal_turn_error_renders_error_once():
-    # #3: a failing tool renders a tool_error ErrorEvent verbatim, and the terminal
-    # ResultMessage(is_error) surfaces a near-identical turn_error ErrorEvent carrying the
-    # SAME message. The error block must render exactly ONCE — the duplicate terminal
-    # turn_error is suppressed.
+    # #3 (R5 dedup, preserved under R3 body-free): a failing tool renders a tool_error
+    # ErrorEvent, and the terminal ResultMessage(is_error) surfaces a near-identical
+    # turn_error ErrorEvent carrying the SAME raw message. R5's _TurnDedup compares the RAW
+    # .message (kept intact for exactly this reason) and suppresses the duplicate terminal
+    # turn_error → exactly ONE error block renders. Both kinds now render BODY-FREE, so we
+    # count the ⚠️ error blocks (the raw msg is absent from the chat — SB3).
     msg = "Command failed: exit code 2"
     engine = FakeEngine(
         [
@@ -1201,15 +1212,18 @@ async def test_tool_error_then_terminal_turn_error_renders_error_once():
     await asyncio.wait_for(
         session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
     )
-    error_bodies = [t for t in _send_texts(rec) if msg in t]
-    assert len(error_bodies) == 1, (
-        f"the error must render exactly once, got {len(error_bodies)}: {error_bodies!r}"
+    assert all(msg not in t for t in _send_texts(rec))  # body-free: raw body never sent
+    error_blocks = [t for t in _send_texts(rec) if t.startswith("⚠️")]
+    assert len(error_blocks) == 1, (
+        f"the error must render exactly once (R5 dedup), got {len(error_blocks)}: {error_blocks!r}"
     )
 
 
 async def test_distinct_terminal_error_still_renders():
-    # #3 guard (no over-suppression): a tool_error then a terminal turn_error with a DIFFERENT
-    # message → both errors still render.
+    # #3 guard (no over-suppression), preserved under R3 body-free: a tool_error then a
+    # terminal turn_error with a DIFFERENT raw message → R5 does NOT suppress (the raw
+    # .messages differ), so BOTH error blocks render. Both render body-free now, so we
+    # distinguish them by KIND (the raw bodies are absent from the chat — SB3).
     engine = FakeEngine(
         [
             ErrorEvent(kind_of_error="tool_error", message="tool blew up", is_error=True),
@@ -1222,8 +1236,11 @@ async def test_distinct_terminal_error_still_renders():
         session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
     )
     texts = _send_texts(rec)
-    assert any("tool blew up" in t for t in texts)
-    assert any("turn aborted for another reason" in t for t in texts), (
+    # Raw bodies never reach the chat (body-free); the two DISTINCT errors both still render,
+    # told apart by kind — proving the dedup did not over-suppress the distinct terminal one.
+    assert all("tool blew up" not in t and "turn aborted" not in t for t in texts)
+    assert any(t.startswith("⚠️") and "tool_error" in t for t in texts)
+    assert any(t.startswith("⚠️") and "turn_error" in t for t in texts), (
         "a distinct terminal error must NOT be suppressed"
     )
 

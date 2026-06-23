@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 from ..permissions import PermissionPolicy, path_needs_approval
+from ..util import _redact_sid
 from .pending import DEFAULT_BACKSTOP_SECONDS, PendingRegistry
 from .substrate import Substrate
 from .types import (
@@ -368,12 +369,14 @@ class Engine:
     async def start(self) -> None:
         """Establish a fresh session (host CLI auth; no API key)."""
         await self._substrate.start()
-        log.debug("engine started; session_id=%s", self.session_id)
+        # SB3/H1: log a redacted, correlatable tag — never the raw resumable session id.
+        log.debug("engine started; %s", _redact_sid(self.session_id))
 
     async def resume(self, session_id: str) -> None:
         """Re-attach to an existing session by id (cwd-scoped — engine-owned, C6)."""
         await self._substrate.resume(session_id)
-        log.debug("engine resumed session_id=%s", self.session_id)
+        # SB3/H1: redacted tag only (the raw id is a credential — see _redact_sid).
+        log.debug("engine resumed %s", _redact_sid(self.session_id))
 
     async def send(self, prompt: str, *, timeout: Optional[float] = None) -> AsyncIterator[Event]:
         """Send one operator turn; async-yield normalized events out.

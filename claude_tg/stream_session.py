@@ -97,6 +97,7 @@ from .render import (
     ask_question_body_html,
     ask_question_keyboard,
     decode_callback,
+    error_is_raw_external,
     notify_attention,
     notify_done,
     notify_error,
@@ -106,6 +107,7 @@ from .render import (
     yolo_indicator,
 )
 from .session_store import DEFAULT_PROJECT
+from .util import _redact_sid, _redact_sid_in_text
 
 log = logging.getLogger(__name__)
 
@@ -2000,6 +2002,20 @@ class StreamingSession:
                 # Remember this turn's verbatim bodies (assistant prose + tool_error messages)
                 # so a later twin (the result_text / terminal turn_error) can dedup against it.
                 dedup.record(event)
+                # SB3/H1 (body-free): a RAW EXTERNAL error (tool/SDK stderr) renders as a
+                # body-free summary to the chat (see render._render_error); its raw detail
+                # goes ONLY to the LOCAL debug log, SCRUBBED through _redact_sid (the body can
+                # carry a session id — the bot token is never logged anywhere). This is the
+                # single place the raw body is persisted, and only at DEBUG.
+                if isinstance(render_event_, ErrorEvent) and error_is_raw_external(render_event_):
+                    log.debug(
+                        "raw external error (%s) for chat %s project %s [%s]: %s",
+                        render_event_.kind_of_error,
+                        chat_id,
+                        turn_name,
+                        _redact_sid(render_event_.session_id),
+                        _redact_sid_in_text(render_event_.message),
+                    )
                 for action in coalescer.offer(render_event_).actions:
                     await self._perform(
                         state, turn_rt, action, send=send, edit=edit, delete=delete
@@ -2344,13 +2360,15 @@ class StreamingSession:
         held_session = getattr(ref.event, "session_id", None)
         if held_session is not None and rt.engine.session_id is not None:
             if held_session != rt.engine.session_id:
+                # SB3/H1: redact both ids — the comparison stays debuggable (two distinct
+                # tags ⇒ a genuine mismatch) without logging the raw resumable ids.
                 log.debug(
-                    "refusing to resolve id for chat %s project %s: held session %s != "
-                    "engine session %s (stale id after resume)",
+                    "refusing to resolve id for chat %s project %s: held %s != "
+                    "engine %s (stale id after resume)",
                     chat_id,
                     ref.project_name,
-                    held_session,
-                    rt.engine.session_id,
+                    _redact_sid(held_session),
+                    _redact_sid(rt.engine.session_id),
                 )
                 return None
         return rt.engine

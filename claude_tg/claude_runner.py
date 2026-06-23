@@ -19,6 +19,13 @@ class ClaudeResult:
     text: str
     session_id: str | None = None
     error: str | None = None
+    #: SB3/H1 (body-free): True iff ``error`` was derived from RAW EXTERNAL output (CLI
+    #: stderr / a raw parsed result), so it can carry file content or a secret. The reply
+    #: layer (``bot.py``) renders such an error BODY-FREE to the chat and logs the raw
+    #: detail only locally (scrubbed). The bot's OWN safe errors (timeout / bad-cwd /
+    #: binary-not-found / empty-prompt) leave this False → rendered readably. ``error``
+    #: still carries the raw text either way so ``_is_resume_failure`` can inspect it.
+    raw_external: bool = False
 
 
 class ClaudeBusy(Exception):
@@ -175,7 +182,10 @@ class ClaudeRunner:
                 return ClaudeResult(ok=True, text=fallback)
             return ClaudeResult(
                 ok=False, text="",
+                # err is RAW CLI stderr → carry it (resume-failure heuristic reads it) but
+                # flag it so the reply renders body-free (SB3/H1).
                 error=(err.strip() or f"Claude exited with code {code} and no parseable output.")[:1500],
+                raw_external=True,
             )
 
         session_id = data.get("session_id")
@@ -190,8 +200,13 @@ class ClaudeRunner:
         subtype = data.get("subtype")
         is_error = bool(data.get("is_error")) or (subtype is not None and subtype != "success")
         if is_error or code != 0:
+            # msg is RAW external output (the parsed result_text or CLI stderr) → carry it
+            # for the resume-failure heuristic, flag it so the reply renders body-free.
             msg = result_text or err.strip() or f"Claude reported an error (subtype={subtype})."
-            return ClaudeResult(ok=False, text=result_text, session_id=session_id, error=msg[:1500])
+            return ClaudeResult(
+                ok=False, text=result_text, session_id=session_id,
+                error=msg[:1500], raw_external=True,
+            )
 
         return ClaudeResult(ok=True, text=result_text, session_id=session_id)
 

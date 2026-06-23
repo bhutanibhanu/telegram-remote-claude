@@ -15,6 +15,7 @@ The decision -> substrate [FLAG] mapping lives in test_engine_types.py.
 """
 
 import asyncio
+import logging
 import os
 
 import claude_agent_sdk as sdk
@@ -39,6 +40,7 @@ from claude_tg.engine import (
     ToolUseEvent,
 )
 from claude_tg.engine.adapter_sdk import SdkSubstrate, normalize
+from claude_tg.util import _redact_sid
 
 # ---------------------------------------------------------------------------
 # A mock substrate: yields scripted events; records lifecycle + decisions.
@@ -122,6 +124,41 @@ async def test_resume_reattaches_and_carries_session_id():
 
     assert ("resume", "S-prev") in sub.calls
     assert out[0].text == "resumed"
+
+
+# A UUID-shaped session id (Claude's real format) so the redaction is unambiguous.
+_REAL_SID = "8f14e45f-ceea-467d-9f0a-1234567890ab"
+
+
+async def test_sb3_start_and_resume_logs_redact_the_session_id(caplog):
+    """SB3/H1: the engine's start/resume DEBUG logs carry a REDACTED tag, never the raw id.
+
+    The raw ``claude_session_id`` is a credential (``--resume <id>`` re-attaches a live
+    session), so it must never appear verbatim in a log line. We drive a real ``Engine``
+    over a fake substrate with a known UUID-shaped id and assert the captured log contains
+    the short ``sid:…`` tag and NOT the raw id.
+    """
+    caplog.set_level(logging.DEBUG)
+    sub = FakeSubstrate(script={"x": []})
+    eng = Engine(sub)
+
+    await eng.resume(_REAL_SID)  # logs "engine resumed sid:…"
+    await eng.start()  # also logs a redacted tag (no id yet on a fresh start)
+
+    assert _REAL_SID not in caplog.text  # the raw resumable id never lands in a log
+    assert "8f14e45f" not in caplog.text  # not even a leading chunk of it
+    assert _redact_sid(_REAL_SID) in caplog.text  # the correlatable short tag IS there
+
+
+def test_sb3_redactor_mutation_probe_raw_id_would_be_caught():
+    """Mutation-probe (highest-value: raw-id-in-log). If a refactor reverted a log site to
+    interpolate the RAW id, this pins that the redactor's output is DISTINCT from the raw id
+    (so the assertion ``raw not in log`` in the test above can actually fail on a regression).
+    A redactor that returned its input unchanged (the mutation) would make this fail.
+    """
+    redacted = _redact_sid(_REAL_SID)
+    assert _REAL_SID not in redacted  # the tag shares no full-id substring with the raw id
+    assert redacted != _REAL_SID
 
 
 async def test_send_passes_configured_timeout_through():

@@ -20,7 +20,12 @@ from telegram.ext import (
 from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
 from .paths import PathNotAllowed, resolve_within_roots
-from .render import free_text_prompt, project_status_label, yolo_banner
+from .render import (
+    BODY_FREE_ERROR_LINE,
+    free_text_prompt,
+    project_status_label,
+    yolo_banner,
+)
 from .session_store import (
     DuplicateProject,
     InvalidProjectName,
@@ -28,7 +33,7 @@ from .session_store import (
     validate_project_name,
 )
 from .stream_session import StreamingBusy, StreamingSession
-from .util import split_message
+from .util import _redact_sid_in_text, split_message
 
 log = logging.getLogger(__name__)
 
@@ -671,7 +676,20 @@ class TelegramClaudeBot:
         if result.ok:
             reply = result.text if (result.text and result.text.strip()) else "✅ (Claude returned no text.)"
             await self._reply_chunked(update, reply)
+        elif result.raw_external:
+            # SB3/H1 (body-free): the error was derived from RAW CLI stderr / a raw parsed
+            # result — it can carry file content or a secret, so render a body-free summary
+            # to the chat and write the raw detail only to the LOCAL debug log (scrubbed via
+            # _redact_sid_in_text; the bot token is never logged anywhere).
+            log.debug(
+                "raw external one-shot error for chat %s: %s",
+                chat_id,
+                _redact_sid_in_text(result.error),
+            )
+            await self._reply_chunked(update, f"⚠️ {BODY_FREE_ERROR_LINE}")
         else:
+            # Bot-AUTHORED safe error (timeout / bad cwd / binary-not-found / empty prompt) —
+            # helpful and secret-free, so render it readably.
             await self._reply_chunked(update, f"⚠️ {result.error or 'Something went wrong.'}")
 
     async def _keep_typing(self, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, stop: asyncio.Event) -> None:
