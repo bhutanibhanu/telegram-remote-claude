@@ -45,7 +45,7 @@ _Plan generated 2026-06-23 from design.md · 11 tasks · supervised build (auton
 
 ## Task list
 - [x] T1 — ADR-005: concurrency model + the session/run correlation envelope (93a352e)
-- [ ] T2 — Pending-request index + id-routed resolve/cancel (the core; retire `_active_engine`)
+- [x] T2 — Pending-request index + id-routed resolve/cancel (the core; retire `_active_engine`) (7ecb402)
 - [ ] T3 — Notification triggers: inline-vs-`🔔 name —` by foreground (D4; render strings + SB3)
 - [ ] T4 — Lift live-turn state `_ChatState`→`_ProjectRuntime` + per-project `status` (D7) ⚠️
 - [ ] T5 — Per-project turn lock + concurrent runs; `is_busy(chat_id, name)` (D1)
@@ -53,7 +53,7 @@ _Plan generated 2026-06-23 from design.md · 11 tasks · supervised build (auton
 - [ ] T7 — Relax the busy-guards: `/switch`/`/new` free; `/reset` per-project-guarded (D2) ⚠️
 - [ ] T8 — RB5 under concurrency: per-project coalescer + per-chat rate-gated sender (D8)
 - [ ] T9 — Free-text routing + `/cancel <name>|all`, `/rm`-running-refused, `/to` (D5/D9) ⚠️
-- [ ] T10 — Integration / SB·RB·regression matrix (RB7 + cross-project routing + RB6)
+- [ ] T10 — Integration / SB·RB·regression matrix (RB7 + cross-project routing + RB6)  [+T2-review gap: pin two CONCURRENT multi-question asks accumulate independently (per-id, no cross-contamination)]
 - [ ] T11 — Live verify: two-project-concurrent phone-verify + verify.md checklist
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked · ⚠️ owner-review decision baked in (D2/D5/D7)
