@@ -1041,6 +1041,193 @@ async def test_status_delete_failure_does_not_kill_turn():
     assert active_rt(session).status_message_id is None  # still reset (on the runtime, D7)
 
 
+# ---------------------------------------------------------------------------
+# P6/R5: duplicate-render dedup. Production builds the substrate with
+# include_partial_messages=False, so a normal answer turn yields the final prose
+# TWICE — once as an assembled TextEvent (op="new"), and again as the terminal
+# ResultEvent.result_text (op="new"). Nothing deduped result_text against the
+# assembled text, so the answer was sent twice (#1). Sibling cases: a transient
+# status-edit FAILURE left the old status line orphaned (#2); a failing tool's
+# tool_error ErrorEvent + the terminal turn_error ErrorEvent rendered the SAME
+# error twice (#3). These tests assert each duplicate is now sent exactly once.
+# ---------------------------------------------------------------------------
+
+
+def _send_texts(rec) -> list[str]:
+    """The plain text of every NEW message the driver sent (status edits excluded)."""
+    return [s["text"] for s in rec.sends]
+
+
+async def test_result_text_duplicating_assistant_prose_is_sent_once():
+    # #1 (PRIMARY): the assembled answer arrives as a TextEvent(incremental=False) AND the
+    # terminal ResultEvent.result_text carries the SAME string. The prose body must be sent
+    # exactly ONCE (the assistant TextEvent), and the terminal frame collapses to the compact
+    # ✅ done footer — never a verbatim re-send of the identical prose.
+    answer = "Here is the **final** answer with detail."
+    engine = FakeEngine(
+        [
+            TextEvent(text=answer, incremental=False),
+            ResultEvent(
+                session_id="s", is_error=False, subtype="success", result_text=answer
+            ),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The distinctive prose substring appears in exactly ONE sent message (the assistant
+    # TextEvent render); the ResultEvent did NOT re-send it.
+    bodies_with_answer = [t for t in _send_texts(rec) if "final" in t and "detail" in t]
+    assert len(bodies_with_answer) == 1, (
+        f"the answer prose must be sent exactly once, got {len(bodies_with_answer)}: "
+        f"{bodies_with_answer!r}"
+    )
+    # The "done" indicator still appears (the terminal frame rendered the compact footer).
+    assert any(t.startswith("✅ done") for t in _send_texts(rec)), (
+        "the compact done footer must still appear after the deduped result"
+    )
+
+
+async def test_distinct_result_text_still_renders_both_messages():
+    # #1 guard (no over-suppression): when the terminal ResultEvent.result_text DIFFERS from
+    # the assistant prose, BOTH bodies must still render — the dedup is exact-match only.
+    engine = FakeEngine(
+        [
+            TextEvent(text="Intermediate progress note.", incremental=False),
+            ResultEvent(
+                session_id="s",
+                is_error=False,
+                subtype="success",
+                result_text="The genuinely different final summary.",
+            ),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    texts = _send_texts(rec)
+    assert any("Intermediate progress note." in t for t in texts), "assistant prose dropped"
+    assert any("genuinely different final summary" in t for t in texts), (
+        "a distinct result_text must NOT be suppressed"
+    )
+
+
+async def test_multi_message_turn_with_distinct_prose_all_render():
+    # #1 guard: two DISTINCT assistant messages mid-turn, then a result whose text equals the
+    # SECOND. The first message and the second message both show (distinct), and the result
+    # does not duplicate the second — exactly one copy of each distinct body.
+    first = "First step done."
+    second = "Second step done — this is the final answer."
+    engine = FakeEngine(
+        [
+            TextEvent(text=first, incremental=False),
+            TextEvent(text=second, incremental=False),
+            ResultEvent(
+                session_id="s", is_error=False, subtype="success", result_text=second
+            ),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    texts = _send_texts(rec)
+    assert sum(1 for t in texts if "First step done." in t) == 1
+    assert sum(1 for t in texts if "Second step done" in t) == 1, (
+        "the second prose must appear once — not duplicated by the identical result_text"
+    )
+
+
+async def test_transient_status_edit_failure_does_not_orphan_old_status_line():
+    # #2: a status line is created, then a status EDIT fails (message gone / too old). The
+    # edit-failure fallback sends a BRAND-NEW status message — but turn-end cleanup deletes
+    # only the LATEST status_message_id, so before the fix the FIRST status line was orphaned
+    # and left visible. After the fix the edit-failure path best-effort DELETEs the old
+    # status id before sending the replacement, so the orphan id is cleaned up.
+    engine = FakeEngine(
+        [
+            ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)"),  # creates status #1
+            TextEvent(text="now editing", incremental=True),  # EDIT of #1 -> made to fail
+            ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok"),
+        ]
+    )
+    session = make_session(engine)  # frozen clock => every status update is "due"
+    rec = Recorder()
+
+    # The FIRST status edit fails (forces the fresh-status-message fallback).
+    fail_state = {"first": True}
+
+    async def flaky_edit(*, message_id, text, parse_mode=None):
+        if fail_state["first"]:
+            fail_state["first"] = False
+            raise RuntimeError("Telegram BadRequest: message to edit not found")
+        rec.edits.append({"message_id": message_id, "text": text, "parse_mode": parse_mode})
+
+    # The Recorder hands out ids 101, 102, … in send order. The first status line is the
+    # first send -> id 101; the edit-failure fallback then sends a replacement -> id 102.
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=flaky_edit, delete=rec.delete),
+        timeout=2.0,
+    )
+    deleted_ids = {d["message_id"] for d in rec.deletes}
+    # The ORPHANED first status line (id 101) must have been deleted — it was abandoned when
+    # the edit failed and a replacement was sent. Before the fix only the final id is deleted.
+    assert 101 in deleted_ids, (
+        f"the orphaned pre-failure status line (id 101) must be deleted, deletes={rec.deletes!r}"
+    )
+    # And the turn still ends cleanly with no lingering status id on the runtime.
+    assert active_rt(session).status_message_id is None
+
+
+async def test_tool_error_then_terminal_turn_error_renders_error_once():
+    # #3: a failing tool renders a tool_error ErrorEvent verbatim, and the terminal
+    # ResultMessage(is_error) surfaces a near-identical turn_error ErrorEvent carrying the
+    # SAME message. The error block must render exactly ONCE — the duplicate terminal
+    # turn_error is suppressed.
+    msg = "Command failed: exit code 2"
+    engine = FakeEngine(
+        [
+            ErrorEvent(kind_of_error="tool_error", message=msg, is_error=True),
+            ErrorEvent(kind_of_error="turn_error", message=msg, is_error=True),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    error_bodies = [t for t in _send_texts(rec) if msg in t]
+    assert len(error_bodies) == 1, (
+        f"the error must render exactly once, got {len(error_bodies)}: {error_bodies!r}"
+    )
+
+
+async def test_distinct_terminal_error_still_renders():
+    # #3 guard (no over-suppression): a tool_error then a terminal turn_error with a DIFFERENT
+    # message → both errors still render.
+    engine = FakeEngine(
+        [
+            ErrorEvent(kind_of_error="tool_error", message="tool blew up", is_error=True),
+            ErrorEvent(kind_of_error="turn_error", message="turn aborted for another reason", is_error=True),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    texts = _send_texts(rec)
+    assert any("tool blew up" in t for t in texts)
+    assert any("turn aborted for another reason" in t for t in texts), (
+        "a distinct terminal error must NOT be suppressed"
+    )
+
+
 async def test_keyboard_attaches_to_first_non_empty_chunk():
     """If the head chunk is whitespace-only it's skipped — but the keyboard must still ride
     the first REAL chunk, else an ask/plan whose body chunked with a blank head would lose

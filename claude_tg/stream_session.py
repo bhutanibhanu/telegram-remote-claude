@@ -81,6 +81,7 @@ from .engine import (
     QuestionAnswer,
     ResultEvent,
     SubstrateDecision,
+    TextEvent,
 )
 from .engine.adapter_sdk import SdkSubstrate
 from .paths import PathNotAllowed, resolve_within_roots
@@ -1866,6 +1867,13 @@ class StreamingSession:
         resume_failure_detected = False
 
         coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
+        # P6/R5: per-turn duplicate-render dedup (the single foreground policy point for the
+        # twin-render paths, alongside the ask/plan dedup the engine does in _drain_substrate).
+        # Remembers verbatim bodies emitted THIS turn so the terminal frame doesn't re-send the
+        # assistant prose (#1) or re-render a tool_error as a near-identical turn_error (#3).
+        # Foreground-only: the background branch pings ✅/🔔 and continues before the render
+        # section, so this never touches a backgrounded run.
+        dedup = _TurnDedup()
         # P5 / ADR-005 D7: THIS project's status line + status enum (per-project, not a
         # chat-global slot). Status line starts unset (create on first edit_status); the
         # status enum goes idle -> running at turn start, awaiting_<kind> on a hold, back to
@@ -1952,7 +1960,9 @@ class StreamingSession:
                     # can't tell which buttons belong to which question). Flush any buffered
                     # status first so the questions appear after it, in order.
                     for action in coalescer.flush().actions:
-                        await self._perform(state, turn_rt, action, send=send, edit=edit)
+                        await self._perform(
+                            state, turn_rt, action, send=send, edit=edit, delete=delete
+                        )
                     for q_idx in range(len(event.questions)):
                         keyboard = ask_question_keyboard(event, q_idx)
                         # The question text is Claude-authored CommonMark -> render as HTML
@@ -1974,15 +1984,35 @@ class StreamingSession:
                                 parse_mode=None,
                             )
                     continue
-                for action in coalescer.offer(event).actions:
-                    await self._perform(state, turn_rt, action, send=send, edit=edit)
+                # P6/R5 #3: a terminal turn_error that merely repeats a tool_error already
+                # shown this turn is a duplicate error block — drop it (the tool_error already
+                # rendered the failure verbatim). Done BEFORE record so we never compare an
+                # event against itself.
+                if dedup.suppresses(event):
+                    continue
+                # P6/R5 #1: when the terminal ResultEvent.result_text just repeats assistant
+                # prose already emitted this turn, render only the compact ✅ done footer rather
+                # than re-sending the identical answer. Swap in a footer-only result (keeps
+                # num_turns/cost) — the done indicator still appears, the prose is sent once.
+                render_event_ = event
+                if isinstance(event, ResultEvent) and dedup.result_is_duplicate_prose(event):
+                    render_event_ = _footer_only_result(event)
+                # Remember this turn's verbatim bodies (assistant prose + tool_error messages)
+                # so a later twin (the result_text / terminal turn_error) can dedup against it.
+                dedup.record(event)
+                for action in coalescer.offer(render_event_).actions:
+                    await self._perform(
+                        state, turn_rt, action, send=send, edit=edit, delete=delete
+                    )
             # End of turn: flush any trailing coalesced status line, then DELETE the
             # transient status message ("💭 Claude is thinking…") so a stale thinking-line
             # never lingers after the turn's real content. Best-effort (RB1): a failed delete
             # must never kill the turn — the content is already sent. Optional `delete` so
             # existing callers that don't pass one keep working (the status line just stays).
             for action in coalescer.flush().actions:
-                await self._perform(state, turn_rt, action, send=send, edit=edit)
+                await self._perform(
+                    state, turn_rt, action, send=send, edit=edit, delete=delete
+                )
         finally:
             # T4-review: ALWAYS clear this project's transient status line + set status idle,
             # even if the loop above raised mid-stream — so a concurrent project is never
@@ -2089,6 +2119,7 @@ class StreamingSession:
         *,
         send: SendFn,
         edit: EditFn,
+        delete: Optional[DeleteFn] = None,
     ) -> None:
         """Execute ONE :class:`RenderAction` against Telegram (the deferred I/O).
 
@@ -2098,11 +2129,16 @@ class StreamingSession:
         (``state`` carries it — ADR-005 D8): an ``op="new"`` (verbatim) send is PRIORITY,
         an ``op="edit_status"`` is the low-priority status line that yields to it (so a
         concurrent project's status churn never starves this verbatim message).
+
+        ``delete`` (optional) lets an ``edit_status`` whose in-place edit FAILS clean up the
+        orphaned old status line before sending its replacement (P6/R5 #2) — only one status
+        line ever lives. Absent (direct callers / tests that pass no ``delete``), the old line
+        is simply left as before — no crash.
         """
         if action.op == "none" or not action.chunks:
             return
         if action.op == "edit_status":
-            await self._edit_status(state, rt, action, send=send, edit=edit)
+            await self._edit_status(state, rt, action, send=send, edit=edit, delete=delete)
             return
         # op == "new": one message per chunk. The keyboard rides the FIRST NON-EMPTY chunk —
         # whitespace-only chunks are skipped, so if the head chunk is whitespace the buttons
@@ -2154,6 +2190,7 @@ class StreamingSession:
         *,
         send: SendFn,
         edit: EditFn,
+        delete: Optional[DeleteFn] = None,
     ) -> None:
         """Edit THIS project's coalesced status line in place (create on first use).
 
@@ -2162,6 +2199,13 @@ class StreamingSession:
         never touches another's. The actual create/edit funnels through the chat's
         send-rate gate as the **non-verbatim** (low-priority) kind (ADR-005 D8), so this
         status churn yields to verbatim and the combined cross-project rate stays bounded.
+
+        **P6/R5 #2 (orphaned status line):** when the in-place edit FAILS (message gone /
+        too old) the fallback sends a brand-new status message and re-points
+        ``status_message_id`` at it. But turn-end cleanup deletes only the LATEST id, so the
+        old line would be ORPHANED — left visible forever. So if a ``delete`` is available we
+        best-effort DELETE the stale id BEFORE sending the replacement; only one status line
+        ever exists. A failed delete is swallowed (RB1) — the replacement still goes out.
         """
         body = action.text
         if not body.strip():
@@ -2191,6 +2235,15 @@ class StreamingSession:
             # (RB1/RB2); fall back to a fresh status message. Identical-text edits are
             # already skipped above, so this is a real failure, not a no-op edit.
             log.debug("status edit failed for chat; sending a fresh status line", exc_info=True)
+            # P6/R5 #2: delete the soon-to-be-orphaned old status line first (best-effort)
+            # so the turn-end cleanup's single-id delete doesn't leave it behind. A failed
+            # delete is ignored — the replacement must still be sent (RB1).
+            if delete is not None:
+                stale_id = rt.status_message_id
+                try:
+                    await delete(message_id=stale_id)
+                except Exception:
+                    log.debug("orphaned status-line delete failed (ignored)", exc_info=True)
             mid = await self._gated_send(
                 state, send, verbatim=False,
                 text=body, reply_markup=None, parse_mode=action.parse_mode,
@@ -2956,6 +3009,83 @@ def _is_resume_failure_event(event: Event) -> bool:
     if text is None:
         return False
     return ClaudeRunner._is_resume_failure(ClaudeResult(ok=False, text="", error=text))
+
+
+class _TurnDedup:
+    """Per-turn dedup of the duplicate-render paths (P6/R5). Pure; no I/O.
+
+    Production builds the substrate with ``include_partial_messages=False``, so a normal
+    answer turn surfaces the SAME final text on TWO foreground paths and renders it twice:
+
+    * **#1 (every normal answer turn):** Claude's final answer arrives as an assembled
+      :class:`~claude_tg.engine.types.TextEvent` (``incremental=False``) → a verbatim
+      ``op="new"`` message, AND the terminal :class:`~claude_tg.engine.types.ResultEvent`
+      carries the SAME string in ``result_text`` → ANOTHER verbatim ``op="new"``. The
+      engine's ``_drain_substrate`` dedups only ask/plan, not this. Fix: when the
+      ``result_text`` duplicates assistant prose already emitted this turn, render only the
+      compact ``✅ done`` footer instead of re-sending the identical prose (see
+      :meth:`result_is_duplicate_prose`; the driver swaps in a footer-only ``ResultEvent``).
+
+    * **#3 (error turns):** a failing tool renders a ``tool_error``
+      :class:`~claude_tg.engine.types.ErrorEvent` verbatim, then the terminal
+      ``ResultMessage(is_error)`` surfaces a near-identical ``turn_error`` ``ErrorEvent``
+      carrying the same message → a SECOND error block. Fix: suppress a terminal
+      ``turn_error`` whose message duplicates a ``tool_error`` already rendered this turn
+      (see :meth:`suppresses`).
+
+    The comparison is on the **raw source** (the assistant ``TextEvent.text`` /
+    ``ErrorEvent.message``), not the rendered HTML, so it is exact-match and intent-clear:
+    a result_text or terminal error that DIFFERS from what was already shown is never
+    suppressed (the multi-message-turn + distinct-error guards). State is per-turn — one
+    instance lives on the stack of a single ``_drive_turn`` call, reset for the next turn.
+
+    Only foreground renders feed this (the driver's background branch pings ``✅``/``🔔``
+    and ``continue``s before the render section), so background turns are unaffected.
+    """
+
+    def __init__(self) -> None:
+        # Raw bodies actually rendered verbatim this turn (newest-last not needed — a set
+        # is enough since dedup is exact-match equality, not "immediately-preceding").
+        self._assistant_texts: set[str] = set()
+        self._tool_error_messages: set[str] = set()
+
+    def record(self, event: Event) -> None:
+        """Remember a verbatim body that was just rendered (so a later twin can dedup)."""
+        if isinstance(event, TextEvent) and not event.incremental and event.text:
+            self._assistant_texts.add(event.text)
+        elif (
+            isinstance(event, ErrorEvent)
+            and event.kind_of_error == "tool_error"
+            and event.message
+        ):
+            self._tool_error_messages.add(event.message)
+
+    def result_is_duplicate_prose(self, event: ResultEvent) -> bool:
+        """True iff this result's ``result_text`` repeats assistant prose already shown (#1)."""
+        return bool(event.result_text) and event.result_text in self._assistant_texts
+
+    def suppresses(self, event: Event) -> bool:
+        """True iff ``event`` is a terminal ``turn_error`` duplicating a shown ``tool_error`` (#3)."""
+        return (
+            isinstance(event, ErrorEvent)
+            and event.kind_of_error == "turn_error"
+            and bool(event.message)
+            and event.message in self._tool_error_messages
+        )
+
+
+def _footer_only_result(event: ResultEvent) -> ResultEvent:
+    """A copy of ``event`` with ``result_text`` dropped → renders the compact ``✅ done``
+    footer instead of the (duplicate) prose (#1). The footer still carries ``num_turns`` /
+    ``total_cost_usd`` so the done indicator stays informative."""
+    return ResultEvent(
+        session_id=event.session_id,
+        is_error=event.is_error,
+        subtype=event.subtype,
+        num_turns=event.num_turns,
+        total_cost_usd=event.total_cost_usd,
+        result_text=None,
+    )
 
 
 @dataclass(frozen=True)
