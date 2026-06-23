@@ -227,6 +227,20 @@ class _ProjectRuntime:
     # __post_init__ so a runtime constructed off the event loop (e.g. a test that builds a
     # bare _ProjectRuntime) still gets a real Lock.
     lock: asyncio.Lock = None  # type: ignore[assignment]
+    # P5 / ADR-005 D6 (round-2 cross-model-QA RACE): a per-project IN-FLIGHT marker that is
+    # True CONTINUOUSLY from the moment ``handle_message`` accepts a turn for this project
+    # (right after the busy-guard passes, BEFORE ``_acquire_slot``) until that turn's
+    # end-of-turn ``finally``. It is the single source of truth for the busy-guard so "this
+    # project has a turn in flight" stays true at EVERY lifecycle point — submission, queued,
+    # the pop→lock slot-transfer window, and running — closing the TOCTOU where ``_is_queued``
+    # (already popped) and ``lock.locked()`` (not yet acquired) are BOTH False for a beat and a
+    # same-project 2nd message would slip through to create a 2nd ``_QueuedTurn`` (two turns for
+    # one project, violating D6). ``is_busy`` and the pre-slot/post-wait guards consult it.
+    # Set/cleared ONLY by ``handle_message`` (set after the guard; cleared in its outer
+    # ``finally`` on every exit — normal end, mid-stream raise, /cancel of a running turn, a
+    # DRAIN-cancel of a queued waiter, resume-failure, the post-wait StreamingBusy re-raise).
+    # Transient in-memory like the rest of the runtime (RB3).
+    inflight: bool = False
     # QF3 (B3/RB3): True from the moment ``engine.resume()`` SUCCEEDS until the first
     # turn on that resumed session completes WITHOUT a resume-failure-shaped error. A
     # stale/aged/torn session can resume "successfully" (connect) and then error on the
@@ -702,23 +716,39 @@ class StreamingSession:
         """Background ask ping: the ``🔔 <name> — asks a question`` line + each question's
         keyboard (so a multi-question ask stays fully answerable while backgrounded, D4).
 
-        The first message carries the bell line (throttled per ``(project, "ask",
-        tool_use_id)`` — BLOCKER 1: a second DISTINCT background ask still pings + sends its
-        keyboards, while a re-emit of the SAME ask id is coalesced); every question's option
-        keyboard is then sent (each its own message) so the operator can answer each one via
-        the D3 index regardless of foreground. SB3: only the project name + the fixed "asks a
-        question" phrase are interpolated by ``notify_attention`` — the question TEXT rides
-        the keyboard's own (already-safe) body, exactly as inline.
+        The WHOLE ping (the bell line + every question's option keyboard) is gated by a
+        SINGLE ``_should_notify`` decision keyed per ``(project, "ask", tool_use_id)``, exactly
+        mirroring the permission/plan path in :meth:`_notify_background` (round-2 cross-model-QA
+        BLOCKER):
+
+        * A **distinct**-``tool_use_id`` ask within the throttle window always sends its full
+          keyboard set — each held request keeps its own answerable keyboards (the round-1
+          BLOCKER-1 distinct-id fix, preserved: a distinct id is a separate thing the operator
+          must act on).
+        * A re-emit of the **same** ``tool_use_id`` inside the window sends **nothing new** —
+          neither the bell NOR the question body/keyboards. The operator already has that exact
+          set, and the first ping's buttons still route the tap by the D3 index. The round-1 fix
+          only suppressed the bell while the per-question keyboard loop re-ran unconditionally,
+          which DUPLICATED the question keyboards for a same-id re-emit — this gates them
+          together so the same-id-coalesce contract matches permission/plan.
+
+        SB3: only the project name + the fixed "asks a question" phrase are interpolated by
+        ``notify_attention`` — the question TEXT rides the keyboard's own (already-safe) body,
+        exactly as inline.
         """
-        if self._should_notify(
+        # BLOCKER (round 2): one throttle decision gates the ENTIRE ask ping. A same-id re-emit
+        # short-circuits with nothing sent (mirrors the permission/plan path); a distinct id
+        # (or a re-emit after the window) sends the bell + every question keyboard.
+        if not self._should_notify(
             state, name, "ask", dedup_id=getattr(ask, "tool_use_id", None)
         ):
-            await self._gated_send(
-                state, send, verbatim=True,
-                text=notify_attention(name, "ask"),
-                reply_markup=None,
-                parse_mode=None,
-            )
+            return
+        await self._gated_send(
+            state, send, verbatim=True,
+            text=notify_attention(name, "ask"),
+            reply_markup=None,
+            parse_mode=None,
+        )
         for q_idx in range(len(ask.questions)):
             keyboard = ask_question_keyboard(ask, q_idx)
             try:
@@ -1382,79 +1412,103 @@ class StreamingSession:
 
         # A project is NEVER queued behind ITSELF (D6): a second message to the SAME project
         # is StreamingBusy, exactly as in T5 — checked BEFORE acquiring a slot so a busy
-        # project never consumes a queue entry. "Busy" here is the project RUNNING (its lock
-        # held) OR already having a turn WAITING in the run queue (queued-behind-the-cap, lock
-        # not yet held) — the cross-model-QA BLOCKER 2: a queued-not-started turn holds no
-        # lock, so a lock-only guard would append a SECOND _QueuedTurn for one project (two
-        # turns for one project, violating D6's one-turn-per-project). One pending turn per
-        # project, period.
-        if target_rt.lock.locked() or self._is_queued(state, target_rt):
+        # project never consumes a queue entry. "Busy" is the project's IN-FLIGHT marker
+        # (``inflight``) — True continuously from the instant a turn is accepted (just below)
+        # through queued / the pop→lock transfer window / running, until the end-of-turn
+        # finally. The round-2 cross-model-QA RACE: a lock+queue guard (``lock.locked() or
+        # _is_queued``) had a TOCTOU — after ``_pop_next_waiter`` pops a queued project's
+        # waiter (so ``_is_queued`` is False) but before the woken turn acquires its lock (so
+        # ``lock.locked()`` is False), a same-project 2nd message slipped through and appended a
+        # SECOND _QueuedTurn (two turns for one project). ``inflight`` has no such gap. (It
+        # subsumes the BLOCKER-2 ``_is_queued`` guard — a queued turn is in-flight — and the
+        # lock guard; both are kept as belt-and-braces but ``inflight`` alone is sufficient.)
+        if target_rt.inflight or target_rt.lock.locked() or self._is_queued(state, target_rt):
             raise StreamingBusy()
 
-        # P5 / ADR-005 D6 (T6): acquire a run SLOT before driving. Under the cap → run now
-        # (the counter is incremented). At the cap → enqueue (per-chat FIFO), set this
-        # project's status to "queued", send a one-time "queued behind N run(s)" notice, and
-        # park until a finishing run hands this turn the freed slot (SB6: queue, never drop /
-        # refuse). After this returns a slot is held and MUST be released exactly once below.
-        await self._acquire_slot(state, target_rt, send=send)
-        # SLOT-LEAK SAFETY (the flagged D6 hazard): from here the slot is HELD. The whole
-        # remainder — _ensure_engine, the SB2 refusal, the resume notice, AND _drive_turn —
-        # runs inside this try so the finally's _release_slot fires on EVERY exit path
-        # (normal end, mid-stream raise, cancel, resume-failure return, StreamingBusy below).
-        # _release_slot decrements the global counter and pops the next queued waiter exactly
-        # once, so a raised turn can never leak a slot (which would permanently shrink
-        # capacity) and a slot is never double-released. Mirrors T5's end-of-turn finally.
+        # Accept the turn for THIS project: mark it in-flight BEFORE acquiring a slot, so the
+        # busy-guard above rejects any same-project 2nd message at EVERY subsequent point
+        # (queued, the slot-transfer window, running). Cleared ONLY in the outer finally below,
+        # on every exit path — including a DRAIN-cancel of a queued waiter (which raises
+        # CancelledError out of _acquire_slot, BEFORE the slot-release try) — so a cancelled /
+        # drained / failed turn never leaves the project wedged as in-flight.
+        target_rt.inflight = True
         try:
-            # While this turn was parked in the queue, another message to the SAME project
-            # could have started running it (its lock would now be held). Re-check after the
-            # slot is granted so the per-project one-run invariant holds even across a queue
-            # wait; the finally still releases the slot this turn acquired.
-            if target_rt.lock.locked():
-                raise StreamingBusy()
-            async with target_rt.lock:
-                try:
-                    engine, resume_failed = await self._ensure_engine(
-                        chat_id, target=target
+            # P5 / ADR-005 D6 (T6): acquire a run SLOT before driving. Under the cap → run now
+            # (the counter is incremented). At the cap → enqueue (per-chat FIFO), set this
+            # project's status to "queued", send a one-time "queued behind N run(s)" notice, and
+            # park until a finishing run hands this turn the freed slot (SB6: queue, never drop /
+            # refuse). After this returns a slot is held and MUST be released exactly once below.
+            # A DRAIN-cancel of this project's waiter raises CancelledError here (its own handler
+            # in _acquire_slot does the slot bookkeeping); the outer finally still clears inflight.
+            await self._acquire_slot(state, target_rt, send=send)
+            # SLOT-LEAK SAFETY (the flagged D6 hazard): from here the slot is HELD. The whole
+            # remainder — _ensure_engine, the SB2 refusal, the resume notice, AND _drive_turn —
+            # runs inside this try so the finally's _release_slot fires on EVERY exit path
+            # (normal end, mid-stream raise, cancel, resume-failure return, StreamingBusy below).
+            # _release_slot decrements the global counter and pops the next queued waiter exactly
+            # once, so a raised turn can never leak a slot (which would permanently shrink
+            # capacity) and a slot is never double-released. Mirrors T5's end-of-turn finally.
+            try:
+                # While this turn was parked in the queue, another message to the SAME project
+                # could have started running it (its lock would now be held). Re-check after the
+                # slot is granted so the per-project one-run invariant holds even across a queue
+                # wait; the finally still releases the slot this turn acquired.
+                if target_rt.lock.locked():
+                    raise StreamingBusy()
+                async with target_rt.lock:
+                    try:
+                        engine, resume_failed = await self._ensure_engine(
+                            chat_id, target=target
+                        )
+                    except PathNotAllowed:
+                        # SB2 (T7): the active project's stored cwd drifted out of the permitted
+                        # roots (config narrowed, or a path component became an out-of-root
+                        # symlink). Refuse the turn fail-closed WITHOUT starting the engine; the
+                        # lock releases on return AND the finally releases the slot (no leak).
+                        # Operator-facing refusal → verbatim priority through the D8 gate.
+                        await self._gated_send(
+                            state, send, verbatim=True,
+                            text=(
+                                f"❌ This project's directory {self.get_cwd(chat_id)} is no "
+                                "longer within the permitted roots — use /new <name> <path> to "
+                                "create one inside them."
+                            ),
+                            reply_markup=None,
+                            parse_mode=None,
+                        )
+                        return
+                    if resume_failed:
+                        # RB3: the persisted session could not be resumed; a fresh one was
+                        # started. Tell the operator BEFORE driving the turn (it still completes).
+                        await self._gated_send(
+                            state, send, verbatim=True,
+                            text="⚠️ Couldn't resume this project's previous session; started a fresh one.",
+                            reply_markup=None,
+                            parse_mode=None,
+                        )
+                    await self._drive_turn(
+                        state, chat_id, engine, text,
+                        send=send, edit=edit, delete=delete, target=target,
                     )
-                except PathNotAllowed:
-                    # SB2 (T7): the active project's stored cwd drifted out of the permitted
-                    # roots (config narrowed, or a path component became an out-of-root
-                    # symlink). Refuse the turn fail-closed WITHOUT starting the engine; the
-                    # lock releases on return AND the finally releases the slot (no leak).
-                    # Operator-facing refusal → verbatim priority through the D8 gate.
-                    await self._gated_send(
-                        state, send, verbatim=True,
-                        text=(
-                            f"❌ This project's directory {self.get_cwd(chat_id)} is no "
-                            "longer within the permitted roots — use /new <name> <path> to "
-                            "create one inside them."
-                        ),
-                        reply_markup=None,
-                        parse_mode=None,
-                    )
-                    return
-                if resume_failed:
-                    # RB3: the persisted session could not be resumed; a fresh one was
-                    # started. Tell the operator BEFORE driving the turn (it still completes).
-                    await self._gated_send(
-                        state, send, verbatim=True,
-                        text="⚠️ Couldn't resume this project's previous session; started a fresh one.",
-                        reply_markup=None,
-                        parse_mode=None,
-                    )
-                await self._drive_turn(
-                    state, chat_id, engine, text,
-                    send=send, edit=edit, delete=delete, target=target,
-                )
+            finally:
+                # SLOT-LEAK SAFETY: release the slot this turn held — exactly once, on every
+                # exit path. _release_slot decrements the global counter and, if a turn is
+                # queued (this chat first, then any chat — FIFO), TRANSFERS the freed slot to
+                # the oldest waiter (re-incrementing + waking it) so the dequeue fires on every
+                # turn-exit too (normal / error / cancel / resume-failure). Pure bookkeeping +
+                # a Future.set_result — it never awaits and never raises, so it cannot itself
+                # leak or mask the turn's own exception (which propagates after the finally).
+                self._release_slot(state)
         finally:
-            # SLOT-LEAK SAFETY: release the slot this turn held — exactly once, on every
-            # exit path. _release_slot decrements the global counter and, if a turn is
-            # queued (this chat first, then any chat — FIFO), TRANSFERS the freed slot to
-            # the oldest waiter (re-incrementing + waking it) so the dequeue fires on every
-            # turn-exit too (normal / error / cancel / resume-failure). Pure bookkeeping +
-            # a Future.set_result — it never awaits and never raises, so it cannot itself
-            # leak or mask the turn's own exception (which propagates after the finally).
-            self._release_slot(state)
+            # RACE fix (D6 / round-2 cross-model QA): clear the in-flight marker on EVERY exit
+            # path of this turn — normal end, mid-stream raise, /cancel of a running turn, a
+            # DRAIN-cancel of a queued waiter (CancelledError from _acquire_slot, which the
+            # inner slot-release try does NOT cover), resume-failure, and the post-wait
+            # StreamingBusy re-raise. This OUTER finally wraps _acquire_slot too, so inflight is
+            # balanced even when the slot-release try is never entered (the drain-cancel path).
+            # Pure attribute write — never awaits, never raises — so it can't mask the turn's
+            # own exception. After this, the next same-project message is accepted again.
+            target_rt.inflight = False
 
     # -- the run scheduler: cap + per-chat FIFO queue (ADR-005 D6 / T6) -------
 

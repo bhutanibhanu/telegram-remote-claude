@@ -2161,6 +2161,186 @@ async def test_queue_preserves_fifo_order(tmp_path):
     assert session._running == 0
 
 
+# --- ROUND-2 RACE (cross-model QA, elevated from Codex suggested-test #2): the per-project
+#     busy-guard must hold CONTINUOUSLY across the slot-transfer window. After
+#     _pop_next_waiter pops a queued project's waiter (so _is_queued is False) but BEFORE the
+#     woken turn acquires its per-project lock (so lock.locked() is False), a same-project 2nd
+#     message slips the busy-guard and creates a SECOND _QueuedTurn for that project — two
+#     turns for one project, violating D6's single-turn-per-project. -----------------------
+
+
+def _step_to_busy_guard(coro):
+    """Drive ``coro`` (a ``handle_message`` coroutine) up to its FIRST await, returning the
+    kind of stop: ``"busy"`` if it raised :class:`StreamingBusy` at the synchronous pre-slot
+    busy-guard, or ``"await"`` if it reached its first await (the busy-guard PASSED — the bug).
+
+    ``handle_message`` runs synchronously from entry through the pre-slot busy-guard (free-text
+    routing, ``_active_runtime``, the ``lock.locked() or _is_queued`` check) with NO await
+    before it, so a single ``coro.send(None)`` evaluates that guard deterministically. This is
+    the faithful real-code probe of the guard at the exact transfer-window instant — no sleeps,
+    no timing. A coroutine that reaches its first await is closed (it must not actually run a
+    turn in this probe)."""
+    try:
+        coro.send(None)
+    except StreamingBusy:
+        return "busy"
+    except StopIteration:
+        return "stopped"
+    else:
+        # Reached the first await (i.e. _acquire_slot) → the busy-guard let it through. Close
+        # the coroutine so it never actually drives a turn / appends a real queue entry.
+        coro.close()
+        return "await"
+
+
+async def test_same_project_rejected_during_slot_transfer_window_toctou(tmp_path):
+    # ⭐ ROUND-2 RACE (TOCTOU). cap=1: alpha runs (holds the only slot, parked at HOLD); beta
+    # queues behind it. We complete alpha so _release_slot → _pop_next_waiter POPS beta's
+    # waiter (beta now absent from run_queue) and is about to set_result (the woken beta turn
+    # has NOT acquired its lock yet). DETERMINISTICALLY at that instant we evaluate a SECOND
+    # beta message's busy-guard: it must raise StreamingBusy (beta already has a turn in
+    # flight). With the bug — guard = lock.locked() or _is_queued — both are False in the
+    # window, so the 2nd beta message PASSES the guard (reaches _acquire_slot) and would append
+    # a 2nd _QueuedTurn for beta → two turns for one project. We also assert beta ends with
+    # exactly ONE turn ever run and the slot count returns to baseline.
+    store = _three_project_store(tmp_path)  # alpha (active), beta, gamma
+    eng_a, eng_b = _holding_engine("alpha"), _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+
+    # alpha takes the only slot and parks at its HOLD.
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    assert session._running == 1
+    # beta queues behind alpha (AT the cap) and parks on its waiter.
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if len(session._chat(1).run_queue) == 1:
+            break
+        await asyncio.sleep(0)
+    assert len(session._chat(1).run_queue) == 1 and session.is_busy(1, "beta") is False
+
+    # Inject the transfer window: wrap _pop_next_waiter so that AFTER the real pop (beta's
+    # entry removed from run_queue) but BEFORE its future is resolved + the woken beta turn
+    # acquires its lock, we evaluate a 2nd beta message's busy-guard. This is exactly the
+    # window: _is_queued(beta) is now False (popped) and beta.lock.locked() is False (the woken
+    # turn has not resumed yet).
+    state = session._chat(1)
+    beta_rt = state.runtimes["beta"]
+    real_pop = session._pop_next_waiter
+    probe = {"result": None, "queue_len_in_window": None, "fired": False}
+
+    def _pop_with_window_probe(st):
+        popped = real_pop(st)
+        # Only probe on the transfer that wakes BETA (its waiter), exactly once.
+        if not probe["fired"] and popped is not None and popped.runtime is beta_rt:
+            probe["fired"] = True
+            # In-window invariants the bug relies on: beta absent from the queue, lock unheld.
+            probe["queue_len_in_window"] = len(st.run_queue)
+            assert beta_rt.lock.locked() is False
+            second_beta = session.handle_message(1, "b-again", send=rec.send, edit=rec.edit)
+            probe["result"] = _step_to_busy_guard(second_beta)
+        return popped
+
+    session._pop_next_waiter = _pop_with_window_probe  # type: ignore[assignment]
+
+    # Complete alpha → its finally → _release_slot → the patched _pop fires the in-window probe.
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    # beta then runs (the freed slot transferred to it) — drain it cleanly.
+    await _wait_busy(session, 1, "beta", want=True)
+    eng_b.cancel()
+    await asyncio.wait_for(turn_b, timeout=2.0)
+
+    # The probe MUST have fired in the window, with beta genuinely popped (queue empty there).
+    assert probe["fired"] is True
+    assert probe["queue_len_in_window"] == 0, "beta must be popped from the queue in the window"
+    # ⭐ The core assertion: the 2nd beta message in the transfer window was REJECTED as busy.
+    assert probe["result"] == "busy", (
+        "a same-project 2nd message in the slot-transfer window must raise StreamingBusy "
+        f"(got {probe['result']!r}) — the busy-guard slipped (TOCTOU)"
+    )
+    # Exactly ONE beta turn ever ran (one start, no 2nd queue entry left behind) and the slot
+    # count is back to baseline (no leak).
+    assert eng_b.started is True
+    assert session._chat(1).run_queue == deque()
+    assert session._running == 0
+
+
+async def test_inflight_guard_is_per_project_distinct_project_still_concurrent(tmp_path):
+    # GUARD (don't over-tighten): the in-flight marker is PER PROJECT. While ALPHA is in
+    # flight (running, parked at HOLD), a DISTINCT idle project (beta) must still start
+    # concurrently — the in-flight guard must reject only a SAME-project 2nd message, never a
+    # different project (which is the whole point of P5 concurrency). This is the real
+    # (non-probe) companion to the TOCTOU test, pinning that inflight didn't become a global
+    # busy bit. cap=2 so both can run at once.
+    store = _three_project_store(tmp_path)
+    eng_a, eng_b = _holding_engine("alpha"), _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=2),
+    )
+    rec = Recorder()
+
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    assert session._chat(1).runtimes["alpha"].inflight is True
+    # A SAME-project 2nd alpha message is rejected (one turn per project) ...
+    with pytest.raises(StreamingBusy):
+        await session.handle_message(1, "a-again", send=rec.send, edit=rec.edit)
+    # ... but a DIFFERENT idle project (beta) starts concurrently (distinct-project guard).
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "beta", want=True)
+    assert session._running == 2  # both concurrent — inflight is per-project, not global
+    assert session._chat(1).runtimes["beta"].inflight is True
+
+    # Drain both; inflight clears on each turn's end.
+    eng_a.cancel()
+    eng_b.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    await asyncio.wait_for(turn_b, timeout=2.0)
+    assert session._running == 0
+    assert session._chat(1).runtimes["alpha"].inflight is False
+    assert session._chat(1).runtimes["beta"].inflight is False
+
+
+async def test_inflight_marker_cleared_after_turn_so_next_message_accepted(tmp_path):
+    # The in-flight marker must clear on turn-end so a LATER message for the same project is
+    # accepted (the guard rejects only WHILE a turn is in flight, not forever). Also pins the
+    # marker is set during the run and unset after — the clear-on-every-exit contract.
+    store = _three_project_store(tmp_path)
+    eng_a = FakeEngine(
+        [HOLD, ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="done-1")],
+        session_id="alpha-sess",
+    )
+    session = make_multi_session({"/work/alpha": eng_a}, store=store, config=make_config())
+    rec = Recorder()
+
+    turn1 = asyncio.create_task(session.handle_message(1, "first", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    rt = session._chat(1).runtimes["alpha"]
+    assert rt.inflight is True
+    eng_a.cancel()  # release the HOLD → turn 1 runs to its result
+    await asyncio.wait_for(turn1, timeout=2.0)
+    assert rt.inflight is False  # cleared on turn-end
+
+    # A SECOND message for the same project is now accepted (not wedged as busy).
+    eng_a._script = [ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="done-2")]
+    eng_a._gate = asyncio.Event()  # fresh gate (the prior cancel had set it)
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert any("done-2" in s["text"] for s in rec.sends)
+    assert rt.inflight is False
+
+
 async def test_slot_leak_safety_mid_stream_raise_frees_slot_and_dequeues(tmp_path):
     # ⚠️ THE FLAGGED SLOT-LEAK HAZARD. cap=1: alpha runs, beta is queued. alpha's engine
     # RAISES mid-stream — its slot MUST still be released AND the queued beta MUST start
@@ -3796,6 +3976,121 @@ async def test_background_same_permission_id_still_coalesced(tmp_path):
     assert sum(1 for s in rec.sends if s["text"] == "🔔 alpha — Claude needs approval") == 1
 
 
+# --- ROUND-2 BLOCKER (cross-model QA): a same-tool_use_id BACKGROUND ASK re-emit must
+#     coalesce FULLY — suppress the bell AND the question body/keyboards, exactly like the
+#     permission/plan path. The round-1 B1 fix only suppressed the bell line; the per-question
+#     keyboard loop still ran UNCONDITIONALLY, so a same-id ask re-emitted inside the throttle
+#     window DUPLICATED the question keyboards (the operator's chat fills with redundant
+#     answerable keyboards for the SAME question — contradicting the same-id-coalesce
+#     contract). A DISTINCT-id ask must still send its full keyboard set (round-1 fix kept).
+# ------------------------------------------------------------------------------------------
+
+
+async def test_background_same_ask_id_reemit_sends_nothing_new(tmp_path):
+    # ⭐ ROUND-2 BLOCKER: emit the SAME AskEvent(tool_use_id=X) twice inside an OPEN throttle
+    # window → exactly ONE bell + ONE set of question keyboards. With the bug, the bell is
+    # suppressed on the 2nd ping but the question keyboard(s) are re-sent → TWO keyboards for
+    # the SAME single question → this fails. The OPEN-window rig (frozen clock + real 5 s
+    # interval) makes the throttle genuinely active for the 2nd same-id ping (non-vacuous).
+    session, _store, _eng_alpha, _eng_beta = await _open_window_two_project_session(tmp_path, active="beta")
+    state = session._chat(1)
+    ask = AskEvent(
+        questions=[{"question": "Color?", "options": [{"label": "Red"}, {"label": "Blue"}]}],
+        tool_use_id="a-ask-same",
+        session_id="alpha-sid",
+    )
+    rec = Recorder()
+    session._register_pending(state, "alpha", ask)
+    await session._notify_background(state, 1, "alpha", ask, "ask", send=rec.send)
+    await session._notify_background(state, 1, "alpha", ask, "ask", send=rec.send)
+
+    # Exactly ONE bell line (the 2nd same-id ask is coalesced — bell suppressed).
+    bells = [s for s in rec.sends if s["text"] == "🔔 alpha — asks a question"]
+    assert len(bells) == 1, "a re-emit of the SAME ask id must not send a 2nd bell"
+    # Exactly ONE keyboard-bearing question message (one question, one keyboard) — NOT two.
+    # This is the load-bearing assertion: the question body/keyboards must be suppressed too,
+    # not just the bell. With the round-1 bug this is 2 (the keyboard loop re-ran).
+    keyboarded = [s for s in rec.sends if s["reply_markup"] is not None]
+    assert len(keyboarded) == 1, (
+        "a same-id ask re-emit must NOT re-send the question keyboard(s): "
+        f"got {len(keyboarded)} keyboard messages {[s['text'] for s in keyboarded]}"
+    )
+    # Belt-and-braces: the 2nd ping sent NOTHING new at all (mirrors the permission/plan path).
+    assert len(rec.sends) == 2, (
+        "a same-id ask re-emit must send nothing new (1 bell + 1 question only): "
+        f"{[s['text'] for s in rec.sends]}"
+    )
+
+
+async def test_background_same_multi_question_ask_id_reemit_sends_nothing_new(tmp_path):
+    # ROUND-2 BLOCKER (multi-question variant): a 2-question ask re-emitted under the SAME id
+    # must send its bell + TWO question keyboards ONCE, and the re-emit must add nothing —
+    # NOT a second pair of question keyboards. Pins that the whole ask body is gated by the
+    # single _should_notify decision (the worst-case duplication is per-question).
+    session, _store, _eng_alpha, _eng_beta = await _open_window_two_project_session(tmp_path, active="beta")
+    state = session._chat(1)
+    ask = AskEvent(
+        questions=[
+            {"question": "Storage?", "options": [{"label": "JSON"}, {"label": "SQLite"}]},
+            {"question": "CLI?", "options": [{"label": "argparse"}, {"label": "Typer"}]},
+        ],
+        tool_use_id="a-ask-multi-same",
+        session_id="alpha-sid",
+    )
+    rec = Recorder()
+    session._register_pending(state, "alpha", ask)
+    await session._notify_background(state, 1, "alpha", ask, "ask", send=rec.send)
+    await session._notify_background(state, 1, "alpha", ask, "ask", send=rec.send)
+
+    bells = [s for s in rec.sends if s["text"] == "🔔 alpha — asks a question"]
+    keyboarded = [s for s in rec.sends if s["reply_markup"] is not None]
+    assert len(bells) == 1, "a re-emit of the SAME multi-q ask id must not send a 2nd bell"
+    assert len(keyboarded) == 2, (
+        "a same-id multi-q ask re-emit must send each question keyboard exactly ONCE: "
+        f"got {len(keyboarded)} {[s['text'] for s in keyboarded]}"
+    )
+    # 1 bell + 2 questions, and nothing from the 2nd ping.
+    assert len(rec.sends) == 3, [s["text"] for s in rec.sends]
+
+
+async def test_background_distinct_ask_holds_each_send_keyboard(tmp_path):
+    # GUARD (round-1 behavior preserved): two DISTINCT-tool_use_id asks from a background
+    # project within the OPEN throttle window must EACH send their bell + question keyboard
+    # (the same-id coalesce must NOT regress the distinct-id BLOCKER-1 fix). And tapping each
+    # resolves the RIGHT ask via the index. Non-vacuous: the window is open, so a buggy
+    # "throttle by (project, kind)" would drop the 2nd ask entirely.
+    session, _store, eng_alpha, _eng_beta = await _open_window_two_project_session(tmp_path, active="beta")
+    state = session._chat(1)
+    ask1 = AskEvent(
+        questions=[{"question": "Q1?", "options": [{"label": "Yes"}, {"label": "No"}]}],
+        tool_use_id="a-ask-1",
+        session_id="alpha-sid",
+    )
+    ask2 = AskEvent(
+        questions=[{"question": "Q2?", "options": [{"label": "Up"}, {"label": "Down"}]}],
+        tool_use_id="a-ask-2",
+        session_id="alpha-sid",
+    )
+    rec = Recorder()
+    session._register_pending(state, "alpha", ask1)
+    await session._notify_background(state, 1, "alpha", ask1, "ask", send=rec.send)
+    session._register_pending(state, "alpha", ask2)
+    await session._notify_background(state, 1, "alpha", ask2, "ask", send=rec.send)
+
+    bells = [s for s in rec.sends if s["text"] == "🔔 alpha — asks a question"]
+    keyboarded = [s for s in rec.sends if s["reply_markup"] is not None]
+    assert len(bells) == 2, "a 2nd DISTINCT-id ask must NOT be throttle-suppressed (round-1)"
+    assert len(keyboarded) == 2, "each distinct-id ask must send its own question keyboard"
+    # Each distinct id is independently answerable via the index against alpha's engine.
+    out1 = session.resolve_callback(1, encode_callback("a", "a-ask-1", question_index=0, option_index=0))
+    out2 = session.resolve_callback(1, encode_callback("a", "a-ask-2", question_index=0, option_index=1))
+    assert out1.handled is True and out2.handled is True
+    assert eng_alpha.resolve_calls == [
+        ("a-ask-1", QuestionAnswer(answers={"Q1?": "Yes"})),
+        ("a-ask-2", QuestionAnswer(answers={"Q2?": "Down"})),
+    ]
+
+
 async def test_background_two_distinct_holds_end_to_end_via_drive_turn(tmp_path):
     # ⭐ BLOCKER 1 end-to-end through the REAL turn loop: a background project's stream emits
     # two DISTINCT-id permission holds (parking between them). The driver must register +
@@ -4292,6 +4587,10 @@ async def test_cancel_queued_project_drains_waiter_no_zombie_run(tmp_path):
         await asyncio.sleep(0)
     assert len(session._chat(1).run_queue) == 1
     assert session.project_status(1, "beta") == "queued"
+    # RACE fix: a QUEUED turn is in-flight (its busy-guard marker is set before _acquire_slot),
+    # so a same-project 2nd message would be rejected even while only queued.
+    beta_rt = session._chat(1).runtimes["beta"]
+    assert beta_rt.inflight is True
 
     # /cancel beta → drain its parked waiter (it never ran).
     aborted = session.handle_cancel(1, "beta")
@@ -4305,6 +4604,10 @@ async def test_cancel_queued_project_drains_waiter_no_zombie_run(tmp_path):
         await asyncio.wait_for(turn_b, timeout=2.0)
     assert session._chat(1).run_queue == deque()  # waiter removed from the queue
     assert eng_b.started is False  # beta NEVER started
+    # RACE fix: the drain-cancel raises CancelledError out of _acquire_slot (BEFORE the
+    # slot-release try), so the OUTER finally is what must clear inflight — proving the marker
+    # is balanced even on the drain path (no wedge: beta is acceptable again).
+    assert beta_rt.inflight is False
 
     # Now alpha finishes → its freed slot must NOT zombie-start beta.
     eng_a.cancel()
