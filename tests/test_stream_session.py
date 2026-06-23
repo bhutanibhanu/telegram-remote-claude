@@ -20,6 +20,7 @@ from claude_tg.engine.types import (
     AskEvent,
     ErrorEvent,
     PermissionDecision,
+    PermissionEvent,
     PlanEvent,
     PlanVerdict,
     QuestionAnswer,
@@ -160,6 +161,30 @@ def make_session(engine: FakeEngine, *, config=None, store=None, clock=None) -> 
     )
 
 
+def prime_pending(
+    session: StreamingSession,
+    event,
+    *,
+    chat_id: int = 1,
+    project: str | None = None,
+):
+    """Register ``event`` (ask/plan/permission) in the chat's pending index (P5 / ADR-005).
+
+    P4 primed a held request by setting the chat-global ``pending_ask``/``pending_plan``
+    slot directly; P5 routes every decision-in by ``tool_use_id`` through the per-chat
+    **pending-request index** to the owning project. This mirrors what ``_drive_turn`` does
+    when an engine injects an ask/plan/permission: it maps ``tool_use_id -> (project, kind,
+    event)``. ``project`` defaults to the chat's active project (auto-created like a real
+    turn) so a single-project test reads naturally; cross-project tests pass it explicitly.
+    Returns the resolved owning project name.
+    """
+    if project is None:
+        project, _rt = session._active_runtime(chat_id, create_default=True)
+        assert project is not None
+    session._register_pending(session._chat(chat_id), project, event)
+    return project
+
+
 def active_policy(session: StreamingSession, chat_id: int = 1) -> PermissionPolicy:
     """The ACTIVE project's :class:`PermissionPolicy` (P4: policy moved chat→project).
 
@@ -269,9 +294,9 @@ async def test_resolve_ask_option_maps_to_question_answer():
     )
     engine = FakeEngine([])
     session = make_session(engine)
-    # Prime the engine + the held ask (as a live turn would).
+    # Prime the engine + the held ask in the pending index (as a live turn would).
     await session._ensure_engine(1)
-    session._chat(1).pending_ask = ask
+    prime_pending(session, ask)
 
     outcome = session.resolve_callback(1, encode_callback("a", "tid", question_index=0, option_index=1))
     assert outcome.handled is True
@@ -283,7 +308,7 @@ async def test_plan_approve_maps_to_plan_verdict():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
-    session._chat(1).pending_plan = plan
+    prime_pending(session, plan)
 
     outcome = session.resolve_callback(1, encode_callback("p", "pid", plan_action="a"))
     assert outcome.handled is True
@@ -295,7 +320,7 @@ async def test_plan_reject_then_free_text_resolves_with_feedback():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
-    session._chat(1).pending_plan = plan
+    prime_pending(session, plan)
 
     # Reject arms free-text capture (no resolve yet).
     outcome = session.resolve_callback(1, encode_callback("p", "pid", plan_action="r"))
@@ -322,7 +347,7 @@ async def test_ask_other_then_free_text_resolves_with_answer():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
-    session._chat(1).pending_ask = ask
+    prime_pending(session, ask)
 
     outcome = session.resolve_callback(1, encode_callback("o", "tid", question_index=0))
     assert outcome.handled is True and outcome.expects_text is True
@@ -357,12 +382,12 @@ async def test_multi_question_ask_resolves_only_after_all_answered():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
-    session._chat(1).pending_ask = ask
+    prime_pending(session, ask)
 
     out0 = session.resolve_callback(1, encode_callback("a", "multi", question_index=0, option_index=0))
     assert out0.handled is True  # accepted, but...
     assert engine.resolve_calls == []  # ...NOT resolved yet
-    assert session._chat(1).pending_ask is ask  # the ask is still held
+    assert session._chat(1).pending_index["multi"].event is ask  # the ask is still held
 
     out1 = session.resolve_callback(1, encode_callback("a", "multi", question_index=1, option_index=1))
     assert out1.handled is True
@@ -374,7 +399,7 @@ async def test_multi_question_ask_resolves_only_after_all_answered():
     assert engine.resolve_calls == [
         ("multi", QuestionAnswer(answers={"Q1": "A1", "Q2": "B2", "Q3": "A3"}))
     ]
-    assert session._chat(1).pending_ask is None  # cleared after the full resolve
+    assert "multi" not in session._chat(1).pending_index  # cleared after the full resolve
 
 
 async def test_multi_question_ask_retap_overwrites_choice():
@@ -390,7 +415,7 @@ async def test_multi_question_ask_retap_overwrites_choice():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
-    session._chat(1).pending_ask = ask
+    prime_pending(session, ask)
 
     session.resolve_callback(1, encode_callback("a", "multi2", question_index=0, option_index=0))  # Q1=A1
     session.resolve_callback(1, encode_callback("a", "multi2", question_index=0, option_index=1))  # Q1=B1 (overwrite)
@@ -414,7 +439,7 @@ async def test_multi_question_ask_mixed_option_and_free_text():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
-    session._chat(1).pending_ask = ask
+    prime_pending(session, ask)
 
     # Answer Q2 by tapping its option — not complete yet (Q1 still open).
     session.resolve_callback(1, encode_callback("a", "multi3", question_index=1, option_index=0))  # Q2=A2
@@ -428,7 +453,7 @@ async def test_multi_question_ask_mixed_option_and_free_text():
     assert engine.resolve_calls == [
         ("multi3", QuestionAnswer(answers={"Q2": "A2", "Q1": "custom answer"}))
     ]
-    assert session._chat(1).pending_ask is None
+    assert "multi3" not in session._chat(1).pending_index
 
 
 async def test_multi_question_ask_renders_one_message_per_question():
@@ -497,10 +522,18 @@ async def test_identical_status_line_is_not_resent():
 # ---------------------------------------------------------------------------
 
 
+def permission_event(tool_use_id="tid", tool_name="Bash"):
+    """A held PermissionEvent to prime in the index (as the engine injects one)."""
+    return PermissionEvent(
+        tool_name=tool_name, tool_input_summary=f"{tool_name}(...)", tool_use_id=tool_use_id
+    )
+
+
 async def test_permission_allow_once_maps_to_decision():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
+    prime_pending(session, permission_event("tid"))
 
     outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="o"))
     assert outcome.handled is True
@@ -514,6 +547,7 @@ async def test_permission_allow_session_maps_to_decision():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
+    prime_pending(session, permission_event("tid"))
 
     outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="s"))
     assert outcome.handled is True
@@ -527,6 +561,7 @@ async def test_permission_deny_maps_to_decision():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
+    prime_pending(session, permission_event("tid"))
 
     outcome = session.resolve_callback(1, encode_callback("m", "tid", payload="d"))
     assert outcome.handled is True
@@ -542,16 +577,32 @@ async def test_permission_tap_with_no_active_engine_is_ignored():
     assert engine.resolve_calls == []
 
 
-async def test_permission_tap_for_stale_request_returns_not_handled():
-    # A well-formed permission tap whose id has nothing pending (already decided /
-    # backstopped): the engine's resolve() returns False -> handled=False, benign note.
-    engine = FakeEngine([], resolve_result=False)
+async def test_permission_tap_for_unknown_id_is_a_noop():
+    # P5 (ADR-005 D3): a well-formed permission tap whose id is NOT in the pending index
+    # resolves NOTHING — it never even reaches engine.resolve (the index has no owner for
+    # it). A stale/forged id is a benign no-op (RB1).
+    engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
     outcome = session.resolve_callback(1, encode_callback("m", "gone", payload="o"))
     assert outcome.handled is False
     assert outcome.note == "no pending request"
-    # resolve() WAS attempted (id alone routes a permission verdict) but found nothing.
+    assert engine.resolve_calls == []  # id not in the index → engine never consulted
+
+
+async def test_permission_tap_for_stale_request_returns_not_handled():
+    # A permission tap whose id IS in the index but whose engine has nothing pending for it
+    # (already decided / backstopped): engine.resolve() returns False -> handled=False, a
+    # benign note. The index entry is cleared only on a successful resolve, so the stale
+    # entry remains (a re-tap is still a clean no-op).
+    engine = FakeEngine([], resolve_result=False)
+    session = make_session(engine)
+    await session._ensure_engine(1)
+    prime_pending(session, permission_event("gone"))
+    outcome = session.resolve_callback(1, encode_callback("m", "gone", payload="o"))
+    assert outcome.handled is False
+    assert outcome.note == "no pending request"
+    # resolve() WAS attempted (the id routed to the owning engine) but found nothing.
     assert engine.resolve_calls == [("gone", PermissionDecision(verdict="allow_once"))]
 
 
@@ -622,8 +673,9 @@ async def test_malformed_callback_never_resolves():
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
-    session._chat(1).pending_ask = AskEvent(
-        questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="tid"
+    prime_pending(
+        session,
+        AskEvent(questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="tid"),
     )
     for bad in ["garbage", "a|tid", "x|tid|0.0", 12345, None, "a|other|0.0", ""]:
         outcome = session.resolve_callback(1, bad)
@@ -632,12 +684,16 @@ async def test_malformed_callback_never_resolves():
 
 
 async def test_callback_for_unknown_id_does_not_resolve():
-    # A well-formed callback whose tool_use_id does not match the held ask is ignored.
+    # A well-formed callback whose tool_use_id is NOT in the pending index is ignored
+    # (P5 / ADR-005 D3: an absent id resolves nothing — handled=False, RB1).
     engine = FakeEngine([])
     session = make_session(engine)
     await session._ensure_engine(1)
-    session._chat(1).pending_ask = AskEvent(
-        questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="held-id"
+    prime_pending(
+        session,
+        AskEvent(
+            questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="held-id"
+        ),
     )
     outcome = session.resolve_callback(1, encode_callback("a", "stale-id", question_index=0, option_index=0))
     assert outcome.handled is False
@@ -657,8 +713,9 @@ async def test_stale_option_index_does_not_crash_or_resolve():
     session = make_session(engine)
     await session._ensure_engine(1)
     # Held ask has a single option; a tap for option 9 is stale -> ignored, no crash.
-    session._chat(1).pending_ask = AskEvent(
-        questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="tid"
+    prime_pending(
+        session,
+        AskEvent(questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="tid"),
     )
     outcome = session.resolve_callback(1, encode_callback("a", "tid", question_index=0, option_index=9))
     assert outcome.handled is False
@@ -2197,3 +2254,220 @@ async def test_ensure_engine_reuses_warm_started_engine(tmp_path):
         session.handle_message(1, "turn two", send=rec.send, edit=rec.edit), timeout=2.0
     )
     assert sum("ok" in s["text"] for s in rec.sends) >= 2  # both turns rendered a result
+
+
+# ===========================================================================
+# P5 (T2): id-routed resolve/cancel/free-text via the per-chat PENDING INDEX
+# (ADR-005 D3). The relay must route every decision-in by tool_use_id to the
+# OWNING project's engine — NOT _active_engine — so a tap for project A resolves
+# A even while B is the active/foreground project. These wire TWO live engines
+# (one per project) and prime each project's held request in the index, then
+# assert the routing. _active_engine is retired from the resolve path; if any of
+# these regressed to "resolve the active project", they fail loudly.
+#
+# (Scope: T2 changes ROUTING only — at most one project runs until T5. Here we
+# seed two runtimes with live engines directly to exercise the routing in
+# isolation, which is exactly what the index must get right regardless of which
+# project is active in the store.)
+# ===========================================================================
+
+
+async def make_two_project_session(tmp_path, *, active: str):
+    """A session with two projects (alpha/beta), each with its OWN live FakeEngine.
+
+    Returns ``(session, store, eng_alpha, eng_beta)``. ``active`` is the store's active
+    project. Both runtimes are seeded with a started engine so a decision can route to
+    EITHER project's engine by id (the cross-project routing T2 must get right). The
+    engines carry distinct session_ids matching the events the tests prime.
+    """
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=(active == "alpha"))
+    store.create(1, "beta", "/work/beta", make_active=(active == "beta"))
+    eng_alpha = FakeEngine([], session_id="alpha-sid")
+    eng_beta = FakeEngine([], session_id="beta-sid")
+    session = make_multi_session(
+        {"/work/alpha": eng_alpha, "/work/beta": eng_beta}, store=store
+    )
+    # Seed both runtimes with a live (started) engine — two concurrent runs' worth of
+    # engines, so a decision can route to either by id (T5 starts them for real).
+    for name, eng in (("alpha", eng_alpha), ("beta", eng_beta)):
+        rt = session._runtime(1, name, f"/work/{name}")
+        rt.engine = eng
+        rt.started = True
+    return session, store, eng_alpha, eng_beta
+
+
+async def test_tap_routes_to_owning_project_not_active(tmp_path):
+    # A held ask belongs to ALPHA, but BETA is the active/foreground project. A tap on
+    # alpha's tool_use_id must resolve ALPHA's engine — never beta's. This is the core
+    # cross-project routing guarantee (the inverse of P4's _active_engine collapse).
+    session, _store, eng_alpha, eng_beta = await make_two_project_session(tmp_path, active="beta")
+    ask = AskEvent(
+        questions=[{"question": "Q", "options": [{"label": "Yes"}, {"label": "No"}]}],
+        tool_use_id="alpha-ask",
+        session_id="alpha-sid",
+    )
+    prime_pending(session, ask, project="alpha")
+
+    outcome = session.resolve_callback(
+        1, encode_callback("a", "alpha-ask", question_index=0, option_index=0)
+    )
+    assert outcome.handled is True
+    # Routed to ALPHA (the owner), NOT beta (the active project).
+    assert eng_alpha.resolve_calls == [("alpha-ask", QuestionAnswer(answers={"Q": "Yes"}))]
+    assert eng_beta.resolve_calls == []
+    # The index entry was cleared after the resolve.
+    assert "alpha-ask" not in session._chat(1).pending_index
+
+
+async def test_two_pending_taps_route_to_their_own_projects(tmp_path):
+    # BOTH projects hold a pending request at once (two entries in the index). A tap for
+    # alpha's id resolves ALPHA only; a tap for beta's id resolves BETA only — never the
+    # other. Proves id→one-owner routing with multiple concurrent holds.
+    session, _store, eng_alpha, eng_beta = await make_two_project_session(tmp_path, active="alpha")
+    perm_alpha = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(...)", tool_use_id="a-perm", session_id="alpha-sid"
+    )
+    plan_beta = PlanEvent(plan="beta plan", tool_use_id="b-plan", session_id="beta-sid")
+    prime_pending(session, perm_alpha, project="alpha")
+    prime_pending(session, plan_beta, project="beta")
+
+    # Tap beta's plan-approve while ALPHA is active → resolves BETA, not alpha.
+    out_b = session.resolve_callback(1, encode_callback("p", "b-plan", plan_action="a"))
+    assert out_b.handled is True
+    assert eng_beta.resolve_calls == [("b-plan", PlanVerdict(approve=True))]
+    assert eng_alpha.resolve_calls == []  # alpha untouched by beta's tap
+
+    # Tap alpha's permission-allow → resolves ALPHA only.
+    out_a = session.resolve_callback(1, encode_callback("m", "a-perm", payload="o"))
+    assert out_a.handled is True
+    assert eng_alpha.resolve_calls == [("a-perm", PermissionDecision(verdict="allow_once"))]
+    # beta still only has its own one resolve (alpha's tap did not touch it).
+    assert eng_beta.resolve_calls == [("b-plan", PlanVerdict(approve=True))]
+    # Both entries cleared after their resolves.
+    assert session._chat(1).pending_index == {}
+
+
+async def test_free_text_routes_to_owning_project_not_active(tmp_path):
+    # An "Other" tap on ALPHA's ask arms free-text capture; the next plain message must
+    # resolve ALPHA's engine even though BETA is the active project (free-text is id-routed
+    # via the index, not _active_engine).
+    session, _store, eng_alpha, eng_beta = await make_two_project_session(tmp_path, active="beta")
+    ask = AskEvent(
+        questions=[{"question": "Name?", "options": [{"label": "A"}]}],
+        tool_use_id="alpha-ask",
+        session_id="alpha-sid",
+    )
+    prime_pending(session, ask, project="alpha")
+
+    out = session.resolve_callback(1, encode_callback("o", "alpha-ask", question_index=0))
+    assert out.expects_text is True
+    assert session._chat(1).awaiting_text_for == "alpha-ask"
+
+    rec = Recorder()
+    await session.handle_message(1, "Charlie", send=rec.send, edit=rec.edit)
+    # Resolved ALPHA (the owner), not beta (the active project).
+    assert eng_alpha.resolve_calls == [("alpha-ask", QuestionAnswer(answers={"Name?": "Charlie"}))]
+    assert eng_beta.resolve_calls == []
+    assert rec.sends == []  # no new turn opened
+    assert "alpha-ask" not in session._chat(1).pending_index
+
+
+async def test_wrong_kind_callback_for_index_id_does_not_resolve(tmp_path):
+    # Defense-in-depth (RB1/SB6): a forged permission tap (m|…) whose id maps to an ASK
+    # entry must NOT resolve that ask with a permission verdict (a type confusion). The
+    # per-kind guard refuses it; the held ask is untouched.
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="alpha")
+    ask = AskEvent(
+        questions=[{"question": "Q", "options": [{"label": "Yes"}]}],
+        tool_use_id="alpha-ask",
+        session_id="alpha-sid",
+    )
+    prime_pending(session, ask, project="alpha")
+
+    outcome = session.resolve_callback(1, encode_callback("m", "alpha-ask", payload="o"))
+    assert outcome.handled is False
+    assert eng_alpha.resolve_calls == []  # the ask was NOT resolved by a permission verdict
+    assert "alpha-ask" in session._chat(1).pending_index  # ask still held
+
+
+async def test_session_id_mismatch_refuses_to_resolve(tmp_path):
+    # Defense-in-depth (ADR-005 D3): the held event's session_id must match the owning
+    # engine's current session_id. A stale id whose held event was injected under an OLD
+    # session (the engine since re-attached to a new one) must NOT resolve — no-op.
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="alpha")
+    # The held ask was injected under "old-sid", but alpha's engine is now on "alpha-sid".
+    ask = AskEvent(
+        questions=[{"question": "Q", "options": [{"label": "Yes"}]}],
+        tool_use_id="alpha-ask",
+        session_id="old-sid",
+    )
+    prime_pending(session, ask, project="alpha")
+
+    outcome = session.resolve_callback(
+        1, encode_callback("a", "alpha-ask", question_index=0, option_index=0)
+    )
+    assert outcome.handled is False  # session mismatch → refused
+    assert eng_alpha.resolve_calls == []  # never resolved the wrong session
+
+
+async def test_cancel_routes_to_active_and_clears_only_its_pending(tmp_path):
+    # handle_cancel aborts the ACTIVE project's engine (T2 scope) and clears ONLY that
+    # project's pending-index entries; a DIFFERENT project's held request survives (it is
+    # a separate concurrent run). Lock-free (no held turn here — pure routing).
+    session, _store, eng_alpha, eng_beta = await make_two_project_session(tmp_path, active="alpha")
+    prime_pending(
+        session,
+        PermissionEvent(tool_name="Bash", tool_input_summary="Bash(...)", tool_use_id="a-perm", session_id="alpha-sid"),
+        project="alpha",
+    )
+    prime_pending(
+        session,
+        PlanEvent(plan="beta plan", tool_use_id="b-plan", session_id="beta-sid"),
+        project="beta",
+    )
+
+    aborted = session.handle_cancel(1)  # active == alpha
+    assert aborted == 1  # FakeEngine.cancel() returns 1
+    assert eng_alpha.cancel_calls == [None]  # alpha's engine was cancelled
+    assert eng_beta.cancel_calls == []  # beta's concurrent run was NOT cancelled
+    # Alpha's pending entry is cleared; beta's survives (a separate run).
+    assert "a-perm" not in session._chat(1).pending_index
+    assert "b-plan" in session._chat(1).pending_index
+
+
+async def test_turn_end_clears_only_that_projects_pending(tmp_path):
+    # A driven turn that ends with an unanswered ask drops THAT project's index entry at
+    # turn-end (no leak across turns), but leaves a concurrent project's held request alone.
+    # Here: alpha runs a real turn (ask → result, no HOLD), beta has a pre-seeded held plan.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    # Alpha's turn injects an ask then completes WITHOUT the operator answering it.
+    alpha_ask = AskEvent(
+        questions=[{"question": "Q", "options": [{"label": "A"}]}], tool_use_id="alpha-ask"
+    )
+    eng_alpha = FakeEngine(
+        [alpha_ask, ResultEvent(session_id="alpha-sid", is_error=False, subtype="success", result_text="done")],
+        session_id="alpha-sid",
+    )
+    eng_beta = FakeEngine([], session_id="beta-sid")
+    session = make_multi_session({"/work/alpha": eng_alpha, "/work/beta": eng_beta}, store=store)
+    # Beta has a concurrent held plan in the index (a separate run).
+    prime_pending(
+        session,
+        PlanEvent(plan="beta plan", tool_use_id="b-plan", session_id="beta-sid"),
+        project="beta",
+    )
+
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # Alpha's unanswered ask was dropped at turn-end (no leak); beta's plan survives.
+    assert "alpha-ask" not in session._chat(1).pending_index
+    assert "b-plan" in session._chat(1).pending_index

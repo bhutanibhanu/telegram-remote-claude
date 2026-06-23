@@ -70,6 +70,7 @@ from .engine import (
     ErrorEvent,
     Event,
     PermissionDecision,
+    PermissionEvent,
     PlanEvent,
     PlanVerdict,
     QuestionAnswer,
@@ -200,14 +201,58 @@ class _ProjectRuntime:
     resumed_unverified: bool = False
 
 
+#: The kind of interactive request a pending-index entry holds open.
+PendingKind = Literal["ask", "plan", "permission"]
+
+
+@dataclass
+class _PendingRef:
+    """One entry in the per-chat pending-request index (P5 / ADR-005 D3).
+
+    Maps a ``tool_use_id`` to the project that owns the held request (so a decision-in
+    routes to **that** project's engine, not ``_active_engine``), the request ``kind``,
+    and the **held event** itself (the :class:`AskEvent`/:class:`PlanEvent`/
+    :class:`PermissionEvent` the engine injected) so a tap can reconstruct the native
+    answer/verdict. For an :class:`AskEvent` the per-question ``answers`` accumulator
+    rides here too (keyed by question index), so a MULTI-question ask resolves only once
+    every question is answered — now **per id** (the index entry), never a chat-global
+    slot that two concurrent asks would clobber.
+
+    ``project_name`` is the project's STORED (as-created) name (the same key the registry
+    and ``runtimes`` use); the engine is looked up by it at resolve time. The whole entry
+    is transient (in-memory on :class:`_ChatState`); it is torn down on
+    resolve/cancel/turn-end so an id never leaks across turns.
+    """
+
+    project_name: str
+    kind: PendingKind
+    event: Event
+    # Per-question answers for a MULTI-question AskUserQuestion (question_index ->
+    # chosen option label / "Other" free-text). One AskUserQuestion carries ALL its
+    # questions under a single tool_use_id, so the native answers map must cover every
+    # question; the relay records each tap here and resolves ONCE all are answered (a
+    # partial map is rejected by the tool). Empty for plan/permission. Keyed per id so
+    # two concurrent asks accumulate independently.
+    ask_answers: dict[int, str] = field(default_factory=dict)
+
+
 @dataclass
 class _ChatState:
-    """Per-chat LIVE-TURN state (turn lock + ask/plan + free-text marker) + project runtimes.
+    """Per-chat coordinator: turn lock + the pending-request index + free-text marker.
 
-    There is exactly ONE active turn per chat (the turn lock enforces it), so the
-    live-turn fields (status line, pending ask/plan, free-text capture) belong to the
-    **chat**. The per-**project** runtime (engine/cwd/policy) lives in :attr:`runtimes`,
-    keyed by the stored project name; the *active* project is resolved from the store.
+    The per-**project** runtime (engine/cwd/policy) lives in :attr:`runtimes`, keyed by
+    the stored project name; the *active* project is resolved from the store.
+
+    **P5 / ADR-005 D3 — the pending-request index.** P4 held the *single* most-recent
+    ask/plan on the chat (one ``pending_ask``/``pending_plan`` slot) and routed every
+    decision-in to ``_active_engine``, collapsing everything to the active project. P5
+    replaces those slots with a **pending-request index** ``{tool_use_id -> _PendingRef}``
+    so a button tap / free-text reply routes by its ``tool_use_id`` to the **owning
+    project's** engine regardless of which project is currently active — closing the
+    ADR-001 correlation-envelope gap at the relay. The index is populated when a project's
+    stream injects an ask/plan/permission (keyed off the project the turn runs on) and
+    cleared on resolve/cancel/turn-end. *(Scope, T2: the index lives HERE on the chat;
+    T4 later relocates live-turn state into ``_ProjectRuntime``.)*
     """
 
     lock: asyncio.Lock = None  # type: ignore[assignment]
@@ -220,19 +265,14 @@ class _ChatState:
     # status is identical. Editing a Telegram message to the same text raises "message is
     # not modified", whose fallback used to send a fresh message → status-line spam.
     status_text: Optional[str] = None
-    # The most recent ask/plan awaiting an answer (so a tap reconstructs the answer).
-    pending_ask: Optional[AskEvent] = None
-    pending_plan: Optional[PlanEvent] = None
-    # Accumulated answers for a MULTI-question AskUserQuestion (question_index ->
-    # chosen option label / "Other" free-text). One AskUserQuestion carries ALL its
-    # questions under a single tool_use_id, so the native answers map must cover every
-    # question; the relay holds the ask open, recording each tap, and resolves ONCE all
-    # are answered (a partial map is rejected by the tool). Reset when a new ask arrives
-    # and on clear.
-    ask_answers: dict[int, str] = field(default_factory=dict)
+    # The pending-request index (ADR-005 D3): tool_use_id -> the owning project + kind +
+    # held event (+ the per-id ask accumulator). Replaces P4's single pending_ask/
+    # pending_plan slots; every resolve/cancel/free-text routes through it by id.
+    pending_index: dict[str, _PendingRef] = field(default_factory=dict)
     # Free-text capture: when set, the NEXT text message is the answer/feedback for
     # this tool_use_id, in this mode ("ask_other" -> QuestionAnswer; "plan_reject" ->
-    # PlanVerdict(approve=False)). Question index is kept for an "Other" answer.
+    # PlanVerdict(approve=False)). Question index is kept for an "Other" answer. The
+    # owning project is found via pending_index[awaiting_text_for] (id-routed).
     awaiting_text_for: Optional[str] = None
     awaiting_text_mode: Optional[str] = None  # "ask_other" | "plan_reject"
     awaiting_text_question_index: Optional[int] = None
@@ -259,6 +299,16 @@ class StreamingSession:
     ``(session_id, cwd)`` and persists its ``session_id`` back to that project. At most
     one engine is started per chat at a time (D2): switching the active project stops the
     previously-started one before starting/resuming the new active one.
+
+    **Id-routed decisions (P5 / ADR-005 D3).** Every decision-in (button tap, free-text
+    reply, cancel) routes by its ``tool_use_id`` through the per-chat **pending-request
+    index** to the **owning project's** engine — **not** ``_active_engine`` (retired from
+    the resolve path). The index is keyed off the project a turn runs on, so a tap for
+    project A resolves A's request even while B is the active/foreground project; an id
+    absent from the index resolves nothing (a benign no-op, RB1). The held event's
+    ``session_id`` is checked against the owning engine's current ``session_id`` as
+    defense-in-depth (a stale id after a resume never resolves the wrong session). T2 only
+    changes ROUTING — at most one project runs until T5 enables concurrent runs.
     """
 
     def __init__(
@@ -788,9 +838,11 @@ class StreamingSession:
         """
         # Capture the project this turn is running on AT TURN START (defense-in-depth, T7
         # review): the busy-guard keeps the active project stable for the turn, but pinning
-        # the name/runtime here means the result-persist and any QF3 recovery act on THIS
+        # the name/runtime here means the result-persist, any QF3 recovery, AND the
+        # pending-index registration (ADR-005 D3 — id -> THIS turn's project) act on THIS
         # turn's project, not "whatever is active when the turn ends".
         turn_name, turn_rt = self._active_runtime(chat_id, create_default=True)
+        assert turn_name is not None  # create_default=True always yields a project name
         # This first turn applies the resume-failure heuristic iff the session was resumed
         # (not freshly started) and is not yet confirmed good.
         check_resume = turn_rt is not None and turn_rt.resumed_unverified
@@ -807,10 +859,15 @@ class StreamingSession:
             # error/result. Latch on the first hit (the dead id is the same all turn).
             if check_resume and not resume_failure_detected and _is_resume_failure_event(event):
                 resume_failure_detected = True
-            # Remember an ask/plan so a tap can reconstruct the native answer.
+            # ADR-005 D3: register an injected ask/plan/permission in the pending index,
+            # keyed by tool_use_id -> THIS turn's project, so a later tap / free-text reply
+            # routes to THIS project's engine (not _active_engine). Cleared on resolve /
+            # cancel / turn-end. Permission is registered too (P4 routed it id-only, but the
+            # index must own every held request so the foreground-vs-notify decision (T3) and
+            # the cross-project routing (this task) cover it).
+            self._register_pending(state, turn_name, event)
+            # Remember an ask so a tap can reconstruct the native answer.
             if isinstance(event, AskEvent):
-                state.pending_ask = event
-                state.ask_answers = {}  # fresh accumulator for this ask's questions
                 # Render each question as its OWN message + option keyboard so a question's
                 # choices sit directly beneath it. A single stacked keyboard for a
                 # multi-question ask is an unreadable wall of buttons (the operator can't
@@ -837,9 +894,7 @@ class StreamingSession:
                             parse_mode=None,
                         )
                 continue
-            if isinstance(event, PlanEvent):
-                state.pending_plan = event
-            elif isinstance(event, ResultEvent):
+            if isinstance(event, ResultEvent):
                 # QF3: do NOT re-persist the dead session_id on a resume-failure result —
                 # it would just re-arm the same broken resume. The recovery below clears it.
                 if not resume_failure_detected:
@@ -860,6 +915,13 @@ class StreamingSession:
                 log.debug("status-line delete failed at turn end", exc_info=True)
             state.status_message_id = None
             state.status_text = None
+
+        # ADR-005 D3: drop any pending-index entries this turn's project left open (an ask/
+        # plan/permission the operator never answered — the engine has stopped awaiting it
+        # now the stream drained, so a late tap on it is a stale-id no-op). Scoped to THIS
+        # turn's project so a concurrent project's still-open holds survive (T5). Any
+        # in-flight free-text capture aimed at one of them is cleared with it.
+        self._clear_project_pending(state, turn_name)
 
         # QF3 (B3/RB3): finalize the resume verification AFTER the stream has fully drained
         # (so we never re-enter the render loop mid-turn). Either recover from a detected
@@ -1022,18 +1084,25 @@ class StreamingSession:
     # -- the callback resolve path (LOCK-FREE: SB1 enforced at the bot) ------
 
     def resolve_callback(self, chat_id: int, data: object) -> "CallbackOutcome":
-        """Route a decoded inline-keyboard tap to the chat's pending request.
+        """Route a decoded inline-keyboard tap to its OWNING project's pending request.
 
         **The bot has already enforced SB1** (``filters.Chat(allowed)`` + an explicit
         ``_authorized`` recheck) before calling this; an unauthorized chat never reaches
         here. Defense in depth remains: a ``callback_data`` that ``decode_callback``
         rejects (foreign / stale / malformed → ``None``) is IGNORED — no decision is
         resolved, nothing raises (RB1). This is intentionally **lock-free**: it resolves
-        the pending decision the currently-running turn is awaiting (the turn loop is
-        parked inside ``engine.send``), so it must run concurrently with the held turn.
+        the pending decision a held turn is awaiting (the turn loop is parked inside
+        ``engine.send``), so it must run concurrently with the held turn — taking the turn
+        lock would deadlock the very turn it must unblock.
 
-        The decision resolves against the **active project's** engine — the same engine
-        the held turn is running on (one active run per chat, D2).
+        **Id-routed (ADR-005 D3).** The decoded ``tool_use_id`` is looked up in the per-chat
+        **pending-request index** → the owning project + held event; the decision resolves
+        against **THAT project's** engine — **not** ``_active_engine``. So a tap for project
+        A resolves A's request even while B is the active/foreground project. An id absent
+        from the index resolves nothing (``handled=False``, a benign no-op — a stale/forged
+        button, RB1). As defense-in-depth the held event's ``session_id`` is checked against
+        the owning engine's current ``session_id`` before resolving (a stale id colliding
+        after a resume never resolves the wrong session).
 
         Mapping:
 
@@ -1053,37 +1122,75 @@ class StreamingSession:
         if decoded is None:
             return CallbackOutcome(handled=False, note="ignored")
         state = self._chat(chat_id)
-        engine = self._active_engine(chat_id)
+        # Route by id: the pending index owns id -> (project, kind, held event). An "Other"
+        # tap arms free-text capture (no engine call), but it must still target a KNOWN
+        # pending ask, so it too looks the id up first.
+        ref = state.pending_index.get(decoded.tool_use_id)
+        if ref is None:
+            # Unknown / stale / forged id — nothing pending for it (RB1 benign no-op).
+            return CallbackOutcome(handled=False, note="no pending request")
+
+        if decoded.kind == "other":
+            return self._arm_ask_other(state, ref, decoded)
+
+        engine = self._engine_for_pending(chat_id, ref)
         if engine is None:
-            # No live engine for the active project → nothing to resolve (stale button).
-            return CallbackOutcome(handled=False, note="no active session")
+            # The owning project has no live engine, or its session no longer matches the
+            # held event (stale id after a resume — defense-in-depth) → resolve nothing.
+            return CallbackOutcome(handled=False, note="no pending request")
 
         if decoded.kind == "ask":
-            return self._resolve_ask_option(state, engine, decoded)
-        if decoded.kind == "other":
-            return self._arm_ask_other(state, decoded)
+            return self._resolve_ask_option(state, engine, ref, decoded)
         if decoded.kind == "plan":
-            return self._resolve_plan(state, engine, decoded)
+            return self._resolve_plan(state, engine, ref, decoded)
         if decoded.kind == "permission":
-            return self._resolve_permission(engine, decoded)
+            return self._resolve_permission(state, engine, ref, decoded)
         return CallbackOutcome(handled=False, note="ignored")
 
-    def _active_engine(self, chat_id: int) -> Optional[Engine]:
-        """The active project's engine, or ``None`` (read-only — no project creation).
+    def _engine_for_pending(
+        self, chat_id: int, ref: _PendingRef
+    ) -> Optional[Engine]:
+        """The live engine of the project that OWNS ``ref`` — or ``None`` (no-op).
 
-        A callback / cancel only makes sense against a live turn, which runs on the
-        active project's engine. Resolves WITHOUT creating a default (a tap with no
-        active project / no started engine is a stale button → no-op).
+        Routes by the index entry's ``project_name`` (ADR-005 D3) — **not**
+        ``_active_engine`` — so a decision resolves against whatever project's turn raised
+        the request, regardless of which project is active. Returns ``None`` (the caller
+        no-ops) when the owning project has no in-memory runtime / no live engine (a stale
+        button after the engine was dropped), **or** when the held event's ``session_id``
+        no longer matches the engine's current ``session_id`` (defense-in-depth: a stale id
+        that survived a resume must never resolve the wrong session).
         """
-        _name, rt = self._active_runtime(chat_id, create_default=False)
-        return rt.engine if rt is not None else None
+        state = self._chats.get(chat_id)
+        if state is None:
+            return None
+        rt = state.runtimes.get(ref.project_name)
+        if rt is None or rt.engine is None:
+            return None
+        # Defense-in-depth (ADR-005 D3): the held event's session must match the engine's
+        # current session. The event carries the session id it was injected under; if the
+        # engine has since re-attached to a different session (resume), refuse to resolve.
+        # A held event with no session id (engine had not reported one yet) is allowed —
+        # there is nothing to contradict, and the id alone is a globally-unique routing key.
+        held_session = getattr(ref.event, "session_id", None)
+        if held_session is not None and rt.engine.session_id is not None:
+            if held_session != rt.engine.session_id:
+                log.debug(
+                    "refusing to resolve id for chat %s project %s: held session %s != "
+                    "engine session %s (stale id after resume)",
+                    chat_id,
+                    ref.project_name,
+                    held_session,
+                    rt.engine.session_id,
+                )
+                return None
+        return rt.engine
 
     def _resolve_ask_option(
-        self, state: _ChatState, engine: Engine, decoded: Callback
+        self, state: _ChatState, engine: Engine, ref: _PendingRef, decoded: Callback
     ) -> "CallbackOutcome":
-        ask = state.pending_ask
-        if ask is None or ask.tool_use_id != decoded.tool_use_id:
+        if ref.kind != "ask" or not isinstance(ref.event, AskEvent):
             return CallbackOutcome(handled=False, note="no matching question")
+        ask = ref.event
         try:
             q_idx = int(decoded.question_index)  # type: ignore[arg-type]
             # answers_from_ask validates the indices and yields {question: label}; keep
@@ -1092,10 +1199,10 @@ class StreamingSession:
         except (IndexError, KeyError, TypeError):
             # Stale/forged indices for a now-different ask — ignore (RB1).
             return CallbackOutcome(handled=False, note="stale option")
-        return self._record_ask_answer(state, engine, ask, q_idx, next(iter(one.values()), ""))
+        return self._record_ask_answer(state, engine, ref, q_idx, next(iter(one.values()), ""))
 
     def _record_ask_answer(
-        self, state: _ChatState, engine: Engine, ask: AskEvent, q_idx: int, answer: str
+        self, state: _ChatState, engine: Engine, ref: _PendingRef, q_idx: int, answer: str
     ) -> "CallbackOutcome":
         """Record ONE question's answer; resolve the whole ask only once EVERY question
         in it has an answer.
@@ -1103,30 +1210,32 @@ class StreamingSession:
         A single ``AskUserQuestion`` carries all its questions under one ``tool_use_id``
         and the native ``answers`` map must cover them all — resolving on the first tap
         (the original bug) sent a partial map the tool rejects, stranding a multi-question
-        ask. So we accumulate per-question answers in ``state.ask_answers`` and call
-        ``engine.resolve`` only when the count reaches ``len(ask.questions)``. Re-tapping
-        a question overwrites its answer (count unchanged), so the operator can change a
-        choice before the last one. A SINGLE-question ask resolves on the first tap,
+        ask. So we accumulate per-question answers in **this id's** index entry
+        (``ref.ask_answers`` — keyed per id so two concurrent asks never clobber each other)
+        and call ``engine.resolve`` only when the count reaches ``len(ask.questions)``.
+        Re-tapping a question overwrites its answer (count unchanged), so the operator can
+        change a choice before the last one. A SINGLE-question ask resolves on the first tap,
         exactly as before — no regression. Shared by the option-tap and "Other" free-text
         paths.
         """
-        state.ask_answers[q_idx] = answer
+        ask = ref.event
+        assert isinstance(ask, AskEvent)  # guarded by the callers (kind == "ask")
+        ref.ask_answers[q_idx] = answer
         total = len(ask.questions)
-        answered = len(state.ask_answers)
+        answered = len(ref.ask_answers)
         if answered < total:
             return CallbackOutcome(
                 handled=True,
                 note=f"Answered {answered}/{total} — {total - answered} to go",
             )
-        # Every question answered → build the full native map and resolve once. Clear the
-        # held state first so a no-op resolve can't strand the chat in "answering" mode.
+        # Every question answered → build the full native map and resolve once. Drop the
+        # index entry FIRST so a no-op resolve can't strand the chat in "answering" mode.
         answers = {
             str(ask.questions[i].get("question", "")): ans
-            for i, ans in state.ask_answers.items()
+            for i, ans in ref.ask_answers.items()
         }
         tuid = ask.tool_use_id
-        state.pending_ask = None
-        state.ask_answers = {}
+        self._drop_pending(state, tuid)
         if tuid is None:
             return CallbackOutcome(handled=False, note="no question id")
         resolved = engine.resolve(tuid, QuestionAnswer(answers=answers))
@@ -1134,9 +1243,10 @@ class StreamingSession:
             return CallbackOutcome(handled=True, note=f"All {total} answered ✓")
         return CallbackOutcome(handled=False, note="already answered")
 
-    def _arm_ask_other(self, state: _ChatState, decoded: Callback) -> "CallbackOutcome":
-        ask = state.pending_ask
-        if ask is None or ask.tool_use_id != decoded.tool_use_id:
+    def _arm_ask_other(
+        self, state: _ChatState, ref: _PendingRef, decoded: Callback
+    ) -> "CallbackOutcome":
+        if ref.kind != "ask" or not isinstance(ref.event, AskEvent):
             return CallbackOutcome(handled=False, note="no matching question")
         state.awaiting_text_for = decoded.tool_use_id
         state.awaiting_text_mode = "ask_other"
@@ -1144,15 +1254,14 @@ class StreamingSession:
         return CallbackOutcome(handled=True, note="Type your answer", expects_text=True)
 
     def _resolve_plan(
-        self, state: _ChatState, engine: Engine, decoded: Callback
+        self, state: _ChatState, engine: Engine, ref: _PendingRef, decoded: Callback
     ) -> "CallbackOutcome":
-        plan = state.pending_plan
-        if plan is None or plan.tool_use_id != decoded.tool_use_id:
+        if ref.kind != "plan" or not isinstance(ref.event, PlanEvent):
             return CallbackOutcome(handled=False, note="no matching plan")
         if decoded.plan_action == "approve":
             resolved = engine.resolve(decoded.tool_use_id, PlanVerdict(approve=True))
             if resolved:
-                state.pending_plan = None
+                self._drop_pending(state, decoded.tool_use_id)
                 return CallbackOutcome(handled=True, note="Plan approved")
             return CallbackOutcome(handled=False, note="already decided")
         # reject → capture feedback as the next message.
@@ -1162,26 +1271,34 @@ class StreamingSession:
         return CallbackOutcome(handled=True, note="Type your feedback", expects_text=True)
 
     def _resolve_permission(
-        self, engine: Engine, decoded: Callback
+        self, state: _ChatState, engine: Engine, ref: _PendingRef, decoded: Callback
     ) -> "CallbackOutcome":
         """Route a permission tap to the held risky-tool request (P2, ADR-003 §2).
 
         Maps the decoded ``permission_action`` to the engine's three-way
         :class:`~claude_tg.engine.types.PermissionDecision` verdict and resolves the held
-        request by ``tool_use_id`` (no held-event lookup needed — the verdict needs no
-        indices, unlike ask/plan; the id alone routes it). Lock-free like the ask/plan
-        resolve: it unblocks the held turn parked inside ``engine.send``.
+        request by ``tool_use_id`` against the OWNING project's engine (ADR-005 D3 — the id
+        is looked up in the index, then routed to that project, not ``_active_engine``).
+        Lock-free like the ask/plan resolve: it unblocks the held turn parked inside
+        ``engine.send``.
 
         **The allow-session GRANT is recorded by the engine on resolve** (T3
         ``Engine._verdict_for``), NOT here — the session only translates the tap to a
-        verdict and routes it. A stale/forged tap that resolves nothing (no live engine,
-        already decided, backstopped) returns ``handled=False`` with a benign note.
+        verdict and routes it. A stale/forged tap that resolves nothing (already decided,
+        backstopped) returns ``handled=False`` with a benign note.
+
+        Defense-in-depth (RB1/SB6): the index entry must actually be a **permission** hold.
+        A forged ``m|<id>|…`` whose id maps to an ask/plan entry must NOT resolve that
+        request with a permission verdict (a type confusion) — refuse it.
         """
+        if ref.kind != "permission":
+            return CallbackOutcome(handled=False, note="no pending request")
         verdict = _PERMISSION_VERDICTS.get(decoded.permission_action or "")
         if verdict is None:  # unknown action (defensive; decode already validates)
             return CallbackOutcome(handled=False, note="ignored")
         resolved = engine.resolve(decoded.tool_use_id, PermissionDecision(verdict=verdict))
         if resolved:
+            self._drop_pending(state, decoded.tool_use_id)
             return CallbackOutcome(handled=True, note=_PERMISSION_NOTES[verdict])
         # Nothing pending for this id — already decided / backstopped / cancelled.
         return CallbackOutcome(handled=False, note="no pending request")
@@ -1192,48 +1309,69 @@ class StreamingSession:
         Routed from :meth:`handle_message` (free-text capture takes precedence over a new
         turn). An "Other" answer becomes a :class:`QuestionAnswer` keyed by the held
         question text; reject feedback becomes :class:`PlanVerdict` ``approve=False`` with
-        the feedback on the deny channel. Resolves against the active project's engine (the
-        one the held turn is running on). If the engine has nothing pending for the id
-        (already resolved / cancelled), this is a harmless no-op.
+        the feedback on the deny channel.
+
+        **Id-routed (ADR-005 D3).** The free-text TARGET id (set when the operator tapped
+        "Other"/"Reject") is looked up in the pending index → the owning project → THAT
+        project's engine — **not** ``_active_engine``. So a free-text reply resolves the
+        project that prompted it even while a different project is active. If the id is no
+        longer in the index (turn ended / cancelled), or the owning project has no live
+        engine / a mismatched session, this is a harmless no-op (the marker is cleared
+        first so the chat is never wedged in capture mode, RB1).
         """
-        engine = self._active_engine(chat_id)
         tool_use_id = state.awaiting_text_for
         mode = state.awaiting_text_mode
         q_idx = state.awaiting_text_question_index
-        # Clear FIRST so a failure can't wedge the chat in capture mode (RB1).
+        # Clear the capture marker FIRST so a failure can't wedge the chat (RB1). The index
+        # entry itself is dropped by _record_ask_answer (on full resolve) / below.
         self._clear_pending_text(state)
-        if engine is None or tool_use_id is None:
+        if tool_use_id is None:
             return
-        if mode == "ask_other":
-            ask = state.pending_ask
-            if ask is not None and q_idx is not None and 0 <= q_idx < len(ask.questions):
+        ref = state.pending_index.get(tool_use_id)
+        if ref is None:
+            return  # the held request is gone (turn ended / cancelled) — no-op.
+        engine = self._engine_for_pending(chat_id, ref)
+        if engine is None:
+            return  # owning project has no live engine / stale session — no-op.
+        if mode == "ask_other" and ref.kind == "ask" and isinstance(ref.event, AskEvent):
+            ask = ref.event
+            if q_idx is not None and 0 <= q_idx < len(ask.questions):
                 # Record this question's free-text answer; resolve only once every
                 # question in the ask is answered (mirrors the option-tap path so a
                 # multi-question ask is not stranded by a single "Other" reply).
-                self._record_ask_answer(state, engine, ask, q_idx, text)
-            # else: the ask is gone / index stale — harmless no-op (marker already cleared).
-        elif mode == "plan_reject":
+                self._record_ask_answer(state, engine, ref, q_idx, text)
+            # else: the index is stale for this question — harmless no-op (marker cleared).
+        elif mode == "plan_reject" and ref.kind == "plan":
+            self._drop_pending(state, tool_use_id)
             engine.resolve(tool_use_id, PlanVerdict(approve=False, feedback=text))
-            state.pending_plan = None
 
     # -- cancel --------------------------------------------------------------
 
     def handle_cancel(self, chat_id: int) -> int:
-        """Abort the chat's in-flight turn cleanly (RB4); clear any free-text capture.
+        """Abort the active project's in-flight turn cleanly (RB4); clear its pending state.
 
         Delegates to ``engine.cancel()`` on the ACTIVE project's engine (cancels every
         pending interactive request as a clean deny, so a held turn unblocks and the
-        session stays usable). Lock-free for the same reason as :meth:`resolve_callback`
-        — the turn being cancelled holds the lock. Returns the number of pending requests
-        aborted (0 if there is no active engine / it is idle).
+        session stays usable) and clears **that project's** pending-index entries + any
+        free-text capture aimed at them (ADR-005 D3). Lock-free for the same reason as
+        :meth:`resolve_callback` — the turn being cancelled holds the lock; taking it would
+        deadlock the very turn ``cancel()`` must unblock. Returns the number of pending
+        requests aborted (0 if there is no active engine / it is idle).
+
+        *(T2 scope: cancels the ACTIVE project. ``/cancel <name>`` / ``/cancel all`` —
+        per-project cancel under concurrency — is T9.)*
         """
         state = self._chats.get(chat_id)
         if state is None:
             return 0
-        engine = self._active_engine(chat_id)
-        if engine is None:
+        name, rt = self._active_runtime(chat_id, create_default=False)
+        engine = rt.engine if rt is not None else None
+        if engine is None or name is None:
             return 0
-        self._clear_pending(state)
+        # Drop the active project's pending-index entries (+ a free-text marker aimed at one
+        # of them) so a late tap on a cancelled request is a stale-id no-op. A concurrent
+        # project's still-open holds survive (scoped by project name, T5).
+        self._clear_project_pending(state, name)
         return engine.cancel()
 
     # -- shutdown ------------------------------------------------------------
@@ -1248,6 +1386,60 @@ class StreamingSession:
                     except Exception:
                         log.exception("error stopping engine during shutdown")
 
+    # -- internals: the pending-request index (ADR-005 D3) -------------------
+
+    @staticmethod
+    def _register_pending(state: _ChatState, project_name: str, event: Event) -> None:
+        """Register an injected ask/plan/permission in the index, keyed by its id.
+
+        Maps ``tool_use_id -> _PendingRef(project_name, kind, event)`` so a later tap /
+        free-text reply / cancel routes to **this** project's engine. Non-interactive
+        events (text/tool_use/status/error/result) carry no held request and are ignored.
+        A re-register for the same id replaces the entry (last writer wins; a fresh
+        accumulator), matching the per-turn ``pending_ask = event`` reset P4 did.
+        """
+        kind: Optional[PendingKind] = None
+        if isinstance(event, AskEvent):
+            kind = "ask"
+        elif isinstance(event, PlanEvent):
+            kind = "plan"
+        elif isinstance(event, PermissionEvent):
+            kind = "permission"
+        if kind is None:
+            return
+        tuid = getattr(event, "tool_use_id", None)
+        if not tuid:
+            return  # no id → not routable (defensive; the engine always sets one)
+        state.pending_index[tuid] = _PendingRef(
+            project_name=project_name, kind=kind, event=event
+        )
+
+    @staticmethod
+    def _drop_pending(state: _ChatState, tool_use_id: Optional[str]) -> None:
+        """Remove one index entry by id (on resolve); also clear a free-text marker on it."""
+        if tool_use_id is None:
+            return
+        state.pending_index.pop(tool_use_id, None)
+        if state.awaiting_text_for == tool_use_id:
+            StreamingSession._clear_pending_text(state)
+
+    @staticmethod
+    def _clear_project_pending(state: _ChatState, project_name: str) -> None:
+        """Drop every index entry OWNED by ``project_name`` (turn-end / cancel).
+
+        Scoped to one project so a concurrent project's still-open holds survive (T5); the
+        free-text marker is cleared iff it pointed at one of the dropped ids.
+        """
+        doomed = [
+            tuid
+            for tuid, ref in state.pending_index.items()
+            if ref.project_name == project_name
+        ]
+        for tuid in doomed:
+            del state.pending_index[tuid]
+        if state.awaiting_text_for in doomed:
+            StreamingSession._clear_pending_text(state)
+
     # -- internals -----------------------------------------------------------
 
     @staticmethod
@@ -1257,10 +1449,13 @@ class StreamingSession:
         state.awaiting_text_question_index = None
 
     def _clear_pending(self, state: _ChatState) -> None:
+        """Clear ALL pending state for the chat (the index + a free-text marker).
+
+        Used by :meth:`reset` (which, for the active project, drops its engine + session).
+        T2 scope: this clears the whole chat's index; T4 makes ``reset`` per-project.
+        """
         self._clear_pending_text(state)
-        state.pending_ask = None
-        state.pending_plan = None
-        state.ask_answers = {}
+        state.pending_index.clear()
 
 
 def _resume_failure_text(event: Event) -> Optional[str]:

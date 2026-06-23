@@ -338,8 +338,10 @@ async def test_busy_guard_holds_during_answer_hold_then_resolves(tmp_path):
             break
         await asyncio.sleep(0)
     assert session.is_busy(1), "the held turn must hold the lock during the answer-hold"
-    # The held turn rendered the ask (its tool_use_id is pending) — a real answer-hold.
-    assert session._chat(1).pending_ask is not None
+    # The held turn rendered the ask (its tool_use_id is in the pending index, routed to
+    # the owning project) — a real answer-hold (P5 / ADR-005 D3).
+    assert "hold-tid" in session._chat(1).pending_index
+    assert session._chat(1).pending_index["hold-tid"].project_name == "alpha"
 
     # Spy on BOTH store mutations to prove neither is called while busy.
     switch_calls: list = []
