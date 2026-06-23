@@ -610,10 +610,33 @@ async def test_cmd_projects_lists_with_active_marker(tmp_path):
     reply = upd.message.reply_text.await_args.args[0]
     assert "alpha" in reply and "beta" in reply
     assert "/work/alpha" in reply and "/work/beta" in reply
-    # The active project (alpha) carries the marker; beta does not.
-    alpha_line = next(line for line in reply.splitlines() if "alpha" in line)
-    beta_line = next(line for line in reply.splitlines() if "beta" in line)
+    # The active project (alpha) carries the marker; beta does not. R6: names are bolded.
+    alpha_line = next(line for line in reply.splitlines() if "<b>alpha</b>" in line)
+    beta_line = next(line for line in reply.splitlines() if "<b>beta</b>" in line)
     assert "→" in alpha_line and "→" not in beta_line
+
+
+async def test_cmd_projects_cwd_column_is_code_wrapped_not_bare(tmp_path):
+    """R6 (auto-linkify): the /projects cwd column was the worst offender — every project's
+    path rendered as a row of tappable fake "/segment" command-links. Each cwd MUST be
+    wrapped in <code>…</code> and the reply sent with parse_mode="HTML" so the paths are
+    inert monospace; a cwd must NOT appear bare (a bare copy would still linkify).
+    """
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/projects")
+    await bot.cmd_projects(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert kwargs.get("parse_mode") == "HTML"
+    assert "<code>/work/alpha</code>" in reply and "<code>/work/beta</code>" in reply
+    # Neither path appears bare (outside its <code> wrapper) — strip the wrapped copies and
+    # assert nothing is left to auto-linkify.
+    stripped = reply.replace("<code>/work/alpha</code>", "").replace("<code>/work/beta</code>", "")
+    assert "/work/alpha" not in stripped and "/work/beta" not in stripped
 
 
 async def test_cmd_projects_empty_hints_new(tmp_path):
@@ -1513,7 +1536,11 @@ async def test_cmd_new_while_busy_succeeds_prior_run_untouched(tmp_path):
     store.create = orig_create  # type: ignore[assignment]
 
     reply = upd.message.reply_text.await_args.args[0]
-    assert "created work" in reply.lower(), reply  # success, not a busy refusal
+    # R6: /new confirms in HTML (name in <b>…</b>, cwd in <code>…</code> so the path is
+    # inert monospace, not fake /segment command-links). The old "created work" substring
+    # no longer matches across the <b> tag — assert the success word + bolded name instead
+    # (still proves success, not a busy refusal).
+    assert "created" in reply.lower() and "<b>work</b>" in reply, reply  # success, not busy
     assert "/cancel" not in reply
     assert create_calls, "store.create MUST be called now that /new is free mid-run"
     assert set(store.list_projects(1)) == {"alpha", "work"}  # new project added

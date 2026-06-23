@@ -47,6 +47,7 @@ from claude_tg.render import (
     ask_question_body,
     ask_question_keyboard,
     coalesce_stream,
+    code_path,
     decode_callback,
     encode_callback,
     free_text_prompt,
@@ -701,6 +702,34 @@ def test_free_text_prompt_is_pure_and_body_free():
     # event body (SB3): there is nothing here from which a question/plan/tool body could leak.
     assert free_text_prompt("bot") == free_text_prompt("bot")
     assert free_text_prompt("a-b_C9") == "✏️ a-b_C9: reply with your answer…"
+
+
+# ============================================================================
+# code_path — path wrapped in <code> for the auto-linkify fix (R6)
+# ============================================================================
+
+
+def test_code_path_wraps_in_code_so_telegram_does_not_linkify():
+    # R6: an ordinary path is wrapped verbatim in <code>…</code> so Telegram renders it as
+    # inert monospace instead of auto-linkifying each "/segment" as a fake command-link.
+    assert code_path("/tmp/p5verify/a") == "<code>/tmp/p5verify/a</code>"
+
+
+def test_code_path_html_escapes_metacharacters_exactly_once():
+    # A path containing HTML metacharacters (& < >) is escaped EXACTLY once so it can't
+    # break the HTML message or inject a tag — and not double-escaped (no &amp;amp;).
+    assert code_path("/a&b/<x>/c") == "<code>/a&amp;b/&lt;x&gt;/c</code>"
+    # The "&" became "&amp;" (single escape), not "&amp;amp;".
+    assert "&amp;amp;" not in code_path("/a&b")
+
+
+def test_code_path_is_pure_and_accepts_non_str():
+    # Pure / deterministic; tolerates a non-str (e.g. a Path) via str() so callers need not
+    # pre-stringify. (The reply must still be sent with parse_mode="HTML".)
+    from pathlib import Path
+
+    assert code_path("/x") == code_path("/x")
+    assert code_path(Path("/x/y")) == "<code>/x/y</code>"
 
 
 # ============================================================================

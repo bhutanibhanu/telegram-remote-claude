@@ -839,6 +839,21 @@ def _escape_html(text: str) -> str:
     return html.escape(text, quote=False)
 
 
+def code_path(path: object) -> str:
+    """Wrap a filesystem path in ``<code>…</code>`` for a ``parse_mode="HTML"`` reply (R6).
+
+    Telegram auto-linkifies each ``/segment`` of a bare path in a bot message as a fake
+    command-link (a cwd ``/tmp/p5verify/a`` renders as tappable ``/tmp`` ``/p5verify``
+    ``/a`` "commands") — ugly and confusing. Wrapping the path in ``<code>`` makes Telegram
+    render it as inert monospace instead. The path is HTML-escaped EXACTLY once here
+    (``&`` ``<`` ``>``) so a path that contains those characters can't break the HTML
+    message or inject a tag, so callers must pass the RAW path (never a pre-escaped one).
+    The reply MUST be sent with ``parse_mode="HTML"`` or the literal ``<code>`` tags show.
+    Pure string; no I/O.
+    """
+    return f"<code>{html.escape(str(path), quote=False)}</code>"
+
+
 def _chunk(text: str, limit: int = TELEGRAM_MAX) -> tuple[str, ...]:
     """Split to Telegram-safe UTF-16 chunks (reuses :func:`split_message`)."""
     return tuple(split_message(text, limit=limit))

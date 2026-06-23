@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 
 from telegram import Update
@@ -22,6 +23,7 @@ from .config import Config
 from .paths import PathNotAllowed, resolve_within_roots
 from .render import (
     BODY_FREE_ERROR_LINE,
+    code_path,
     free_text_prompt,
     project_status_label,
     yolo_banner,
@@ -226,9 +228,18 @@ class TelegramClaudeBot:
                     "No active project yet. Send a message to start one, or /new <name> <path>."
                 )
             else:
-                await update.message.reply_text(f"📁 {active}\n{cwd}")
+                # R6: wrap the cwd in <code> so Telegram renders it as monospace, not as a
+                # row of tappable fake /segment command-links. The project name is
+                # SB4-validated (safe) but bolded for readability; HTML parse mode required.
+                await update.message.reply_text(
+                    f"📁 <b>{html.escape(active, quote=False)}</b>\n{code_path(cwd)}",
+                    parse_mode="HTML",
+                )
             return
-        await update.message.reply_text(f"📁 {self.runner.get_cwd(update.effective_chat.id)}")
+        await update.message.reply_text(
+            f"📁 {code_path(self.runner.get_cwd(update.effective_chat.id))}",
+            parse_mode="HTML",
+        )
 
     async def cmd_cd(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
@@ -258,16 +269,24 @@ class TelegramClaudeBot:
                 allow_any=self.config.allow_any_path,
             )
         except PathNotAllowed:
+            # R6: wrap the (operator-supplied) path in <code> so it renders as monospace,
+            # not as tappable fake command-links; escape it so a stray &/</> can't break
+            # the HTML message or inject a tag. HTML parse mode required.
             await update.message.reply_text(
-                f"❌ Path not allowed (outside the permitted roots): {arg}"
+                f"❌ Path not allowed (outside the permitted roots): {code_path(arg)}",
+                parse_mode="HTML",
             )
             return
         try:
             new_cwd = self.runner.set_cwd(chat_id, str(target))
         except NotADirectoryError:
-            await update.message.reply_text(f"❌ Not a directory: {arg}")
+            await update.message.reply_text(
+                f"❌ Not a directory: {code_path(arg)}", parse_mode="HTML"
+            )
             return
-        await update.message.reply_text(f"📁 Working directory set to:\n{new_cwd}")
+        await update.message.reply_text(
+            f"📁 Working directory set to:\n{code_path(new_cwd)}", parse_mode="HTML"
+        )
 
     # ---- multi-project navigation (streaming mode only, P4 / ADR-004) -------
     async def _require_streaming(self, update: Update) -> bool:
@@ -313,15 +332,23 @@ class TelegramClaudeBot:
             )
             return
         active = self.streaming.store.get_active(chat_id) if self.streaming.store else None
-        lines = ["📂 Projects:"]
+        lines = ["📂 <b>Projects</b>:"]
         for name, record in projects.items():
             rec = record if isinstance(record, dict) else {}
             marker = "→" if name == active else "  "
-            cwd = rec.get("cwd") or "(no path)"
+            cwd = rec.get("cwd")
+            # R6: the cwd column was the worst auto-linkify offender (every project's path
+            # rendered as a row of fake /segment "commands"). Wrap it in <code> (escaped) so
+            # it is inert monospace; the name is bolded + escaped (defensive — a hand-edited
+            # registry record could carry an odd name). A missing cwd reads "(no path)".
+            cwd_html = code_path(cwd) if cwd else "(no path)"
             last = rec.get("last_active") or "—"
             status = project_status_label(self.streaming.project_status(chat_id, name))
-            lines.append(f"{marker} {name} — {cwd} ({status}) (last active {last})")
-        await update.message.reply_text("\n".join(lines))
+            lines.append(
+                f"{marker} <b>{html.escape(str(name), quote=False)}</b> — "
+                f"{cwd_html} ({status}) (last active {html.escape(str(last), quote=False)})"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def cmd_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Switch the chat's active project (streaming mode only).
@@ -529,13 +556,18 @@ class TelegramClaudeBot:
                 allow_any=self.config.allow_any_path,
             )
         except PathNotAllowed:
+            # R6: wrap the (operator-supplied) path in <code> — inert monospace, not fake
+            # command-links — and escape it so a stray &/</> can't break the HTML message.
             await update.message.reply_text(
-                f"❌ Path not allowed (outside the permitted roots): {path}"
+                f"❌ Path not allowed (outside the permitted roots): {code_path(path)}",
+                parse_mode="HTML",
             )
             return
         # A project's cwd must be a runnable existing directory (the engine cds into it).
         if not target.is_dir():
-            await update.message.reply_text(f"❌ Not a directory: {path}")
+            await update.message.reply_text(
+                f"❌ Not a directory: {code_path(path)}", parse_mode="HTML"
+            )
             return
         # Create + auto-switch. The resolved (contained) cwd is stored, never the raw arg.
         try:
@@ -543,9 +575,12 @@ class TelegramClaudeBot:
         except DuplicateProject:
             await update.message.reply_text(f"❌ A project named {name} already exists.")
             return
+        # R6: the resolved cwd is wrapped in <code> (monospace, no auto-linkify); the name
+        # is bolded + escaped. HTML parse mode required for the tags to render.
         await update.message.reply_text(
-            f"✅ Created {name} at {target} and switched to it — "
-            "your next message runs there."
+            f"✅ Created <b>{html.escape(name, quote=False)}</b> at {code_path(target)} "
+            "and switched to it — your next message runs there.",
+            parse_mode="HTML",
         )
 
     async def cmd_to(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

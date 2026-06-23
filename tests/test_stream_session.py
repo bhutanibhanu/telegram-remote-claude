@@ -1761,6 +1761,21 @@ async def test_turn_refused_when_cwd_no_longer_within_roots(tmp_path):
     assert "no longer" in refusal and "permitted roots" in refusal
     assert str(outside) in refusal
     assert "/new" in refusal
+    # R6 (auto-linkify): the cwd is wrapped in <code>…</code> and the refusal is sent with
+    # parse_mode="HTML" so Telegram renders the path as inert monospace, not a row of
+    # tappable fake "/segment" command-links. The path appears ONLY inside the wrapper.
+    assert f"<code>{outside}</code>" in refusal
+    assert rec.sends[0]["parse_mode"] == "HTML"
+    assert str(outside) not in refusal.replace(f"<code>{outside}</code>", "")
+    # R6 (HTML validity): the "<name> <path>" placeholders MUST be escaped — this is an HTML
+    # message, so a bare "<name>" would be parsed as a broken tag and Telegram would reject
+    # the whole send. Assert they are written as &lt;…&gt; (and no bare "<name>" leaks).
+    assert "&lt;name&gt;" in refusal and "&lt;path&gt;" in refusal
+    assert "<name>" not in refusal and "<path>" not in refusal
+    # Belt-and-suspenders: stripping the only real tags (<code>…</code>) must leave NO stray
+    # "<"/">" — proof the message carries no other unescaped angle bracket Telegram'd reject.
+    bare = refusal.replace(f"<code>{outside}</code>", "")
+    assert "<" not in bare and ">" not in bare
     # The lock was released (not held) — the chat is usable, not wedged.
     assert session.is_busy(1) is False
 

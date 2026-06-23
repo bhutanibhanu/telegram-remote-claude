@@ -96,6 +96,7 @@ from .render import (
     ask_question_body,
     ask_question_body_html,
     ask_question_keyboard,
+    code_path,
     decode_callback,
     error_is_raw_external,
     notify_attention,
@@ -1632,15 +1633,23 @@ class StreamingSession:
                         # symlink). Refuse the turn fail-closed WITHOUT starting the engine; the
                         # lock releases on return AND the finally releases the slot (no leak).
                         # Operator-facing refusal → verbatim priority through the D8 gate.
+                        # R6: wrap the cwd in <code> (HTML) so Telegram renders the path as
+                        # inert monospace, not a row of tappable fake /segment command-links;
+                        # code_path HTML-escapes it so a stray &/</> can't break the message.
+                        # The literal "<name> <path>" placeholders are written ESCAPED
+                        # (&lt;…&gt;) because this is now an HTML message — unescaped "<name>"
+                        # would be parsed as a (broken) tag and Telegram would reject the send.
+                        # The send closure passes parse_mode straight through; with the path
+                        # escaped + the placeholders escaped, the content is always valid HTML.
                         await self._gated_send(
                             state, send, verbatim=True,
                             text=(
-                                f"❌ This project's directory {self.get_cwd(chat_id)} is no "
-                                "longer within the permitted roots — use /new <name> <path> to "
-                                "create one inside them."
+                                f"❌ This project's directory {code_path(self.get_cwd(chat_id))} "
+                                "is no longer within the permitted roots — use "
+                                "/new &lt;name&gt; &lt;path&gt; to create one inside them."
                             ),
                             reply_markup=None,
-                            parse_mode=None,
+                            parse_mode="HTML",
                         )
                         return
                     if resume_failed:
