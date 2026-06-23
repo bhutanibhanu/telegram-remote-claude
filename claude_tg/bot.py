@@ -429,11 +429,16 @@ class TelegramClaudeBot:
                 f"❌ {name} is the active project — /switch to another project first."
             )
             return
-        # P5 / ADR-005 D9: refuse a currently-RUNNING project (its per-project turn lock is
-        # held). Removing it would tear down a live engine mid-turn and orphan its parked
-        # hold — /cancel it first. A QUEUED-not-yet-running project's lock is NOT held, so it
-        # is not refused here; forget_project drains its waiter (no zombie run).
-        if self.streaming.is_busy(chat_id, name):
+        # P5 / ADR-005 D9 (round-3 BLOCKERS 1+2): INFLIGHT-AWARE admission. request_remove
+        # refuses ONLY a project running with a live engine (lock held — tearing it down would
+        # orphan its parked hold; /cancel first, T9 unchanged). For a QUEUED or TRANSFER-WINDOW
+        # turn (no lock, no started engine — nothing to orphan) it returns True AFTER setting
+        # that project's ABORT and draining its waiter — so a turn caught in the pop→lock
+        # transfer window aborts cleanly and never zombie-runs the project we are about to
+        # remove. Crucially this sets the abort BEFORE store.remove below, closing the race
+        # where a window turn would otherwise persist to an already-deleted record (the
+        # lock-based is_busy missed the window turn entirely — it holds no lock).
+        if not self.streaming.request_remove(chat_id, name):
             await update.message.reply_text(
                 f"❌ {name} has a turn in flight — /cancel {name} first, then /rm it."
             )

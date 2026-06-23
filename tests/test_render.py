@@ -1063,53 +1063,113 @@ def test_chat_send_gate_n_sends_are_bounded_not_simultaneous():
     assert waits == [pytest.approx(i * 1.0) for i in range(5)]
 
 
-def test_chat_send_gate_verbatim_is_not_starved_by_status_churn():
-    # ⭐ The load-bearing D8 priority rule. A burst of status edits reserves slots stretching
-    # into the future; a verbatim send (an ask/error/result) arriving amid that churn must
-    # NOT be pushed to the BACK of that backlog — it is spaced ~1 interval off the last
-    # ACTUAL send (the one leading-edge status that already fired this instant), independent
-    # of how DEEP the status backlog is (a starved status line is fine; a starved prompt is a
-    # deadlock). This is the case the priority actually has to handle, and it has TEETH:
-    # spacing the verbatim off the running tail instead (the priority-breaking mutation —
-    # base=_last_actual → base=_status_tail) would make the verbatim wait ~K, so the
-    # assertion below would FAIL. (Mutation-verified: confirmed the test goes red under that
-    # change, then restored.)
-    clock = FakeClock()
-    gate = ChatSendGate(now=clock, interval=1.0)
-    # A DEEP status backlog: 30 status edits at the same instant stack reservations
-    # 0,1,..,29. Only the FIRST fires at the leading edge (this instant); the other 29 are
-    # future-dated and must NOT drag the "last actual send" cursor forward.
-    k = 30
-    status_waits = [gate.reserve(verbatim=False) for _ in range(k)]
-    assert status_waits == [pytest.approx(i * 1.0) for i in range(k)]
-    # Now a verbatim arrives (still the same instant). It jumps ahead of the 29 queued status
-    # edits: spaced ~1 interval off the last actual send (the leading-edge status at +0), NOT
-    # ~30 at the tail of the backlog. The wait is bounded by the interval, NOT the churn
-    # depth — the whole point of the D8 priority.
-    verbatim_wait = gate.reserve(verbatim=True)
-    assert verbatim_wait == pytest.approx(1.0)
-    # Strictly: far below the depth-K wait the priority-breaking mutation would yield.
-    assert verbatim_wait < (k - 1) * 1.0
-    assert verbatim_wait >= 0.0
-
-
-def test_chat_send_gate_verbatim_wait_is_independent_of_status_backlog_depth():
-    # Companion teeth test from a different angle: the verbatim's wait is BOUNDED BY THE
-    # INTERVAL, not by how deep the status backlog is. A 5-deep churn and a 50-deep churn
-    # both yield the SAME ~1-interval verbatim wait (off the single leading-edge status that
-    # fired this instant). The priority-breaking mutation (base=_last_actual -> _status_tail)
-    # would make the wait scale with the depth (~5 vs ~50), so this equality would FAIL.
-    def verbatim_wait_after_status_burst(depth: int) -> float:
+def test_chat_send_gate_verbatim_jumps_ahead_of_future_status_depth_invariant():
+    # ⭐ The load-bearing D8 priority rule, in its COLLISION-FREE form (round-3 BLOCKER 3). A
+    # verbatim arriving amid LIVE status churn jumps ahead of all status reserved AFTER it,
+    # independent of how much status FOLLOWS — the deadlock-prevention case (a prompt must
+    # reach the operator; subsequent status churn must not bury it). And no two sends collide.
+    #
+    # This is the realistic flush pattern: status is reserved one-at-a-time as each project's
+    # Coalescer flushes, NOT all pre-committed in a single instant. A verbatim interleaved into
+    # that stream is spaced ~1 interval off the last ACTUAL send and the following status falls
+    # in BEHIND it. TEETH: the priority-breaking mutation (verbatim base=_last_actual ->
+    # base=_tail) makes the verbatim wait scale with the FOLLOWING churn → the depth-invariance
+    # below FAILS. (Note: a verbatim cannot leapfrog status whose fire-time was ALREADY handed
+    # to a waiting caller — un-scheduling a committed send is impossible — so the separate
+    # ``...behind_committed_backlog...`` test pins that collision-free boundary.)
+    def verbatim_wait_then_status_follows(following: int) -> float:
         clock = FakeClock()
         gate = ChatSendGate(now=clock, interval=1.0)
-        for _ in range(depth):  # depth status edits at one instant -> a deep backlog tail
-            gate.reserve(verbatim=False)
-        return gate.reserve(verbatim=True)  # verbatim jumps ahead of the queued tail
+        gate.reserve(verbatim=False)  # leading-edge status fires now (the last ACTUAL send)
+        w = gate.reserve(verbatim=True)  # verbatim jumps to ~1 interval off that actual send
+        for _ in range(following):  # FUTURE status — must all fall BEHIND the verbatim
+            assert gate.reserve(verbatim=False) >= w + 1.0 - 1e-9
+        return w
 
-    shallow = verbatim_wait_after_status_burst(5)
-    deep = verbatim_wait_after_status_burst(50)
-    assert shallow == pytest.approx(1.0)
-    assert deep == pytest.approx(shallow)  # depth-invariant: NOT 5 vs 50
+    shallow = verbatim_wait_then_status_follows(5)
+    deep = verbatim_wait_then_status_follows(50)
+    assert shallow == pytest.approx(1.0), "verbatim is ~1 interval off the last actual send"
+    assert deep == pytest.approx(shallow), "depth-invariant in the FOLLOWING churn: NOT 5 vs 50"
+
+
+def test_chat_send_gate_verbatim_behind_committed_backlog_is_collision_free():
+    # The collision-free boundary (round-3 BLOCKER 3). When a DEEP status backlog was ALREADY
+    # reserved (every slot 0..K-1 handed to a waiting caller) BEFORE the verbatim exists, the
+    # verbatim CANNOT land on an occupied slot — un-scheduling a committed send is impossible —
+    # so it takes the next FREE slot (K), collision-free, rather than firing on top of a
+    # reserved status (the pre-fix bug: it shared a slot, double-spending the per-chat budget).
+    # This relaxes the old (buggy) "depth-invariant even behind a fully-committed backlog"
+    # claim — impossible without a collision — in favour of the HARD combined-budget guarantee.
+    # In production the backlog is at most ~MAX_CONCURRENT_RUNS deep (status is throttled
+    # per-project by the Coalescer), so this bound is small; the deadlock-prevention property
+    # that actually matters (ahead of FUTURE status) is pinned by the test above.
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=1.0)
+    k = 30
+    status_waits = [gate.reserve(verbatim=False) for _ in range(k)]
+    assert status_waits == [pytest.approx(i * 1.0) for i in range(k)]  # 0..29, each committed
+    verbatim_wait = gate.reserve(verbatim=True)
+    # Collision-free: the verbatim does NOT share slot 1..29 with a committed status; it lands
+    # at the next free slot (30). The pre-fix gate returned ~1.0 here (colliding with the status
+    # already reserved at +1) — exactly the combined-budget violation BLOCKER 3 fixes.
+    assert verbatim_wait == pytest.approx(float(k))
+    # And every reserved fire-time (the K status + the verbatim) is distinct / ≥interval apart.
+    all_times = sorted(status_waits + [verbatim_wait])  # frozen clock → waits ARE fire-times
+    assert all(b - a >= 1.0 - 1e-9 for a, b in zip(all_times, all_times[1:]))
+
+
+def test_chat_send_gate_no_two_sends_share_an_interval_verbatim_amid_status(tmp_path=None):
+    # ⭐ Round-3 cross-model-QA BLOCKER 3. The per-chat budget is a COMBINED rate: NO two
+    # sends (verbatim OR status) may fire within one interval of each other. The pre-fix gate
+    # spaced a verbatim off ``_last_actual`` while a status was ALREADY reserved at that same
+    # future slot → the verbatim and that status both landed at the SAME timestamp, firing two
+    # sends in one interval (over-budget under status churn). This pins the combined budget by
+    # recording EVERY reserved fire-time (status + verbatim, interleaved) and asserting they
+    # are all ≥ interval apart.
+    clock = FakeClock()
+    interval = 1.0
+    gate = ChatSendGate(now=clock, interval=interval)
+    # Realistic interleave: a couple of status edits reserve future slots, THEN a verbatim
+    # arrives amid them (the exact churn the priority rule must handle), then more status.
+    fire_times: list[float] = []
+
+    def reserve(verbatim: bool) -> None:
+        fire_times.append(clock() + gate.reserve(verbatim=verbatim))
+
+    reserve(verbatim=False)  # status #1 — leading edge (fires now)
+    reserve(verbatim=False)  # status #2 — reserved 1 interval out
+    reserve(verbatim=True)   # a VERBATIM arrives amid the status churn (the bug trigger)
+    reserve(verbatim=False)  # status #3 — must fall behind the verbatim
+    reserve(verbatim=True)   # a second verbatim
+
+    ordered = sorted(fire_times)
+    gaps = [b - a for a, b in zip(ordered, ordered[1:])]
+    # THE invariant: every consecutive pair of reserved fire-times is ≥ one interval apart —
+    # no two sends share a slot, so the COMBINED per-chat rate is bounded regardless of how
+    # verbatim and status interleave. (Pre-fix this FAILS: the verbatim collides with status#2
+    # at the same timestamp → a 0.0 gap.)
+    assert all(g >= interval - 1e-9 for g in gaps), (
+        f"two sends within one interval (combined budget violated): {ordered}"
+    )
+    # All distinct (a sanity restatement of the above for the exact-collision case).
+    assert len(set(round(t, 9) for t in fire_times)) == len(fire_times), (
+        f"two sends reserved the SAME timestamp: {fire_times}"
+    )
+
+
+def test_chat_send_gate_verbatim_jumps_ahead_of_future_status_collision_free(tmp_path=None):
+    # The preserved D8 priority (collision-free form): a verbatim arriving BEFORE a status
+    # backlog builds jumps ahead of all FUTURE status — the deadlock-prevention case (a prompt
+    # must reach the operator; subsequent status churn must not bury it). And no two collide.
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=1.0)
+    w_status1 = gate.reserve(verbatim=False)   # leading edge, t=0
+    w_verbatim = gate.reserve(verbatim=True)    # jumps to t=1 (only status#1 precedes it)
+    w_status2 = gate.reserve(verbatim=False)    # FUTURE status — must fall BEHIND the verbatim
+    assert w_status1 == pytest.approx(0.0)
+    assert w_verbatim == pytest.approx(1.0), "verbatim is ~1 interval off the last actual send"
+    # The future status yields to the verbatim (lands at/after t=2, never sharing t=1).
+    assert w_status2 >= w_verbatim + 1.0 - 1e-9, "future status must not collide with / precede the verbatim"
 
 
 def test_chat_send_gate_zero_interval_never_waits():

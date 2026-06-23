@@ -104,6 +104,12 @@ class MatrixEngine:
         self._resolve_result = resolve_result
         self._raise_at = raise_at
         self._gate = asyncio.Event()
+        # True the instant ``send`` is first iterated — i.e. the turn actually STARTED
+        # driving this engine. The slot-transfer-window tests (BLOCKERS 1+2) assert a turn
+        # aborted in that window NEVER set this (it never ran), so a zombie run is detectable
+        # deterministically (no sleeps): if the woken turn slipped past the abort it would
+        # iterate ``send`` and flip this True.
+        self.send_started = False
 
     async def start(self) -> None:
         self.started = True
@@ -116,6 +122,7 @@ class MatrixEngine:
         self.stopped = True
 
     async def send(self, prompt: str, *, timeout=None):
+        self.send_started = True
         yielded = 0
         for item in self._script:
             if item is HOLD:
@@ -910,6 +917,201 @@ async def test_cap_queue_same_project_second_message_is_busy_not_queued(tmp_path
 
     eng.cancel()
     await asyncio.wait_for(turn, timeout=2.0)
+
+
+# ===========================================================================
+# 9b. ⭐ The SLOT-TRANSFER WINDOW: an in-flight (queued) turn must be CANCELLABLE by a
+#     control command (/cancel, /reset, /rm) at the EXACT moment its slot is being
+#     transferred — after _pop_next_waiter pops its waiter (so _drain_queued can no longer
+#     see it) but BEFORE it acquires its project lock / enters _drive_turn (so no live engine
+#     exists to cancel). Round-3 cross-model-QA BLOCKERS 1+2: a control command in this window
+#     used to miss the turn entirely → it ZOMBIE-RAN after cancellation/reset/removal.
+#
+#     Deterministic (NO sleeps): a ``_pop_next_waiter`` wrapper fires the control command at
+#     the precise pop — the queued turn is already popped (out of the queue) but its future is
+#     not yet resolved, i.e. dead-center in the window. We then drive the loop and assert the
+#     woken turn NEVER started (``send_started`` stays False), ``_running`` returns to 0, no
+#     slot leaks, ``inflight`` clears, and no session was persisted for the aborted project.
+# ===========================================================================
+
+
+async def _park_running_plus_queued(tmp_path, *, queued_active=False):
+    """cap=1: p1 runs + parks (holds the only slot); p2 is QUEUED behind it.
+
+    Returns ``(session, store, rec, eng1, eng2, turn1, turn2)``. ``eng2`` is the queued
+    project's engine — its ``send_started`` proves whether the queued turn ever ran. If
+    ``queued_active`` the queued project (p2) is made the chat's ACTIVE project (so a bare
+    ``/cancel`` / ``/reset`` with no name targets it) while p1 still holds the slot.
+    """
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "p1", "/work/p1", make_active=True)
+    store.create(1, "p2", "/work/p2", make_active=False)
+    # p1 holds the slot; p2 would complete immediately IF it ever ran (so a zombie run is loud:
+    # it persists s2 + sets send_started). p2 carries a result so a stray run would also persist.
+    eng1 = MatrixEngine([HOLD, ResultEvent(session_id="s1", is_error=False, subtype="success", result_text="p1 done")], session_id="s1")
+    eng2 = MatrixEngine([ResultEvent(session_id="s2", is_error=False, subtype="success", result_text="p2 done")], session_id="s2")
+    config = make_config(engine_mode="streaming", allow_any_path=True, max_concurrent_runs=1)
+    session = make_matrix_session({"/work/p1": eng1, "/work/p2": eng2}, store=store, config=config)
+    rec = Recorder()
+
+    turn1 = asyncio.create_task(session.handle_message(1, "go1", send=rec.send, edit=rec.edit))
+    await _wait(lambda: session.is_busy(1, "p1"))
+    store.switch(1, "p2")
+    turn2 = asyncio.create_task(session.handle_message(1, "go2", send=rec.send, edit=rec.edit))
+    await _wait(lambda: session.project_status(1, "p2") == "queued")
+    assert session._running == 1
+    assert not eng2.send_started, "p2 has not run yet (it is queued)"
+    if not queued_active:
+        # Leave p1 active (so a bare /cancel/reset would target p1, not p2) unless the test
+        # wants p2 active. Either way p2 is the QUEUED turn under test.
+        store.switch(1, "p1")
+    return session, store, rec, eng1, eng2, turn1, turn2
+
+
+def _fire_at_transfer_window(session, action):
+    """Wrap ``session._pop_next_waiter`` so ``action()`` fires at the EXACT transfer window.
+
+    The real ``_pop_next_waiter`` pops the oldest queued turn and returns it to
+    ``_release_slot``, which then resolves its future (waking it). We intercept AFTER the pop
+    (the turn is out of the queue — ``_drain_queued`` can't see it) but BEFORE ``_release_slot``
+    resolves the future / the woken turn acquires its lock — the precise window BLOCKERS 1+2
+    describe. ``action`` runs exactly once, on the first pop that returns a real waiter.
+    """
+    real = session._pop_next_waiter
+    fired = {"done": False}
+
+    def wrapper(state):
+        popped = real(state)
+        if popped is not None and not fired["done"]:
+            fired["done"] = True
+            action()
+        return popped
+
+    session._pop_next_waiter = wrapper  # type: ignore[assignment]
+    return fired
+
+
+async def test_transfer_window_cancel_named_aborts_queued_turn_no_zombie_run(tmp_path):
+    """``/cancel p2`` fired in p2's slot-transfer window → p2 NEVER starts (no zombie run),
+    ``_running`` returns to 0, the slot is not leaked, ``inflight`` clears.
+
+    RED (pre-fix): ``_cancel_project`` drained nothing (p2 already popped) and cancelled no
+    engine (p2 has none yet), so the woken turn proceeded into ``_drive_turn`` → ``eng2.send``
+    iterated (``send_started`` True) and ``s2`` persisted. The turn zombie-ran after /cancel.
+    """
+    session, store, rec, eng1, eng2, turn1, turn2 = await _park_running_plus_queued(tmp_path)
+
+    # Arrange: when p1 finishes and its slot transfers to p2, fire /cancel p2 dead-center in
+    # the window (p2 popped from the queue, future not yet resolved).
+    _fire_at_transfer_window(session, lambda: session.handle_cancel(1, "p2"))
+
+    eng1.release()  # finish p1 → _release_slot pops p2 (our hook fires /cancel p2 here)
+    await asyncio.wait_for(turn1, timeout=2.0)
+    # turn2 must unwind cleanly (cancelled in the window) — it never ran.
+    await asyncio.wait_for(turn2, timeout=2.0)
+
+    assert eng2.send_started is False, "p2 must NOT have started — /cancel hit it in the transfer window"
+    assert not eng2.resolve_calls and not eng2.cancel_calls
+    assert session._running == 0, "the slot returned to 0 (no leak from the cancelled transfer)"
+    assert session.is_busy(1) is False
+    assert session._chats[1].runtimes["p2"].inflight is False, "p2's inflight cleared"
+    assert len(session._chats[1].run_queue) == 0
+    # p2 persisted NOTHING (a zombie run would have written s2 as p2's session_id).
+    assert (store.get_project(1, "p2") or {}).get("session_id") is None
+
+
+async def test_transfer_window_reset_active_aborts_queued_turn_no_zombie_run(tmp_path):
+    """An active ``/reset`` fired in the queued ACTIVE project's transfer window → it NEVER
+    starts, ``_running`` returns to 0, no slot leak, ``inflight`` clears, no session persisted.
+
+    p2 is the queued AND active project (a bare /reset targets it). RED (pre-fix): reset's
+    ``_drain_queued`` saw nothing (p2 already popped) so the woken turn zombie-ran AFTER the
+    reset cleared the project — exactly the state reset was meant to wipe.
+    """
+    session, store, rec, eng1, eng2, turn1, turn2 = await _park_running_plus_queued(
+        tmp_path, queued_active=True
+    )
+    assert store.get_active(1) == "p2"
+
+    _fire_at_transfer_window(session, lambda: session.reset(1))  # active /reset → p2
+
+    eng1.release()
+    await asyncio.wait_for(turn1, timeout=2.0)
+    await asyncio.wait_for(turn2, timeout=2.0)
+
+    assert eng2.send_started is False, "p2 must NOT have started — /reset hit it in the transfer window"
+    assert session._running == 0
+    assert session.is_busy(1) is False
+    assert session._chats[1].runtimes["p2"].inflight is False
+    assert len(session._chats[1].run_queue) == 0
+    assert (store.get_project(1, "p2") or {}).get("session_id") is None
+
+
+async def test_transfer_window_rm_aborts_queued_turn_no_zombie_run(tmp_path):
+    """``/rm p2`` fired in p2's transfer window → p2 NEVER starts, its record is removed, the
+    runtime is purged, ``_running`` returns to 0, no slot leak.
+
+    p2 is queued (not the active project, so /rm is allowed). RED (pre-fix): the bot's
+    lock-based ``is_busy`` reported p2 idle (queued holds no lock) AND ``forget_project``'s
+    ``_drain_queued`` saw nothing (already popped) → the woken turn zombie-ran a NOW-REMOVED
+    project. ``/rm`` must use inflight-aware busyness and the window-abort must catch it.
+    """
+    session, store, rec, eng1, eng2, turn1, turn2 = await _park_running_plus_queued(tmp_path)
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+
+    # /rm p2 fired in the transfer window. forget_project is async; schedule it as a task from
+    # the sync hook so it runs concurrently with the woken turn (the real bot path is async too).
+    rm_task = {"t": None}
+
+    def fire_rm():
+        rm_task["t"] = asyncio.create_task(
+            bot.cmd_rm(make_update(1, "/rm p2"), make_cmd_ctx(args=["p2"]))
+        )
+
+    _fire_at_transfer_window(session, fire_rm)
+
+    eng1.release()
+    await asyncio.wait_for(turn1, timeout=2.0)
+    await asyncio.wait_for(turn2, timeout=2.0)
+    if rm_task["t"] is not None:
+        await asyncio.wait_for(rm_task["t"], timeout=2.0)
+
+    assert eng2.send_started is False, "p2 must NOT have started — /rm hit it in the transfer window"
+    assert session._running == 0, "no slot leak from the removed transfer"
+    assert session.is_busy(1) is False
+    assert len(session._chats[1].run_queue) == 0
+    # p2 was removed (record gone) and its runtime purged — and it never ran a zombie turn.
+    assert store.get_project(1, "p2") is None
+    assert "p2" not in session._chats[1].runtimes
+
+
+async def test_transfer_window_abort_does_not_wedge_project_next_turn_runs(tmp_path):
+    """After a transfer-window /cancel aborts p2's queued turn, p2 is NOT wedged: a FRESH
+    message to p2 clears the (stale) abort and runs normally.
+
+    The abort is a persistent ``asyncio.Event``; if it were never cleared, the next accepted
+    turn would check it at the window/in-lock and abort again → the project is permanently
+    dead. ``handle_message`` clears it alongside ``inflight = True`` for exactly this reason.
+    Non-vacuous: neuter the ``abort.clear()`` and p2's fresh turn never runs (``send_started``
+    stays False / it times out)."""
+    session, store, rec, eng1, eng2, turn1, turn2 = await _park_running_plus_queued(tmp_path)
+    _fire_at_transfer_window(session, lambda: session.handle_cancel(1, "p2"))
+    eng1.release()
+    await asyncio.wait_for(turn1, timeout=2.0)
+    await asyncio.wait_for(turn2, timeout=2.0)
+    assert eng2.send_started is False  # the queued turn was aborted in the window
+    assert session._chats[1].runtimes["p2"].abort.is_set(), "abort is still latched post-cancel"
+
+    # A FRESH message to p2 must run (the slot is free now). The runtime + its (completed)
+    # engine are reused; a fresh turn clears the latched abort before driving. eng2 has no more
+    # script, so it completes immediately — but only if it actually STARTS (send_started flips).
+    store.switch(1, "p2")
+    await asyncio.wait_for(session.handle_message(1, "p2 again", send=rec.send, edit=rec.edit), timeout=2.0)
+    assert eng2.send_started is True, "p2's fresh turn ran — the abort was cleared, not wedged"
+    assert session._chats[1].runtimes["p2"].abort.is_set() is False, "fresh turn cleared the abort"
+    assert session._running == 0
 
 
 # ===========================================================================

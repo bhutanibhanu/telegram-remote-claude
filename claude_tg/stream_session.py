@@ -241,6 +241,22 @@ class _ProjectRuntime:
     # DRAIN-cancel of a queued waiter, resume-failure, the post-wait StreamingBusy re-raise).
     # Transient in-memory like the rest of the runtime (RB3).
     inflight: bool = False
+    # P5 / ADR-005 D9 (round-3 cross-model-QA BLOCKERS 1+2): a per-project ABORT signal that
+    # makes the in-flight turn a first-class CANCELLABLE entity across its WHOLE lifecycle —
+    # queued, the pop→lock slot-transfer window, AND running — the same way ``inflight`` made
+    # it busy-guardable. ``handle_cancel`` / ``reset`` / ``forget_project`` SET it (alongside
+    # draining a still-queued waiter + cancelling a live engine) so a control command targets
+    # the turn no matter WHICH state it is in. The woken queued turn checks it the instant its
+    # slot future resolves — BEFORE acquiring the lock / starting the engine / entering
+    # ``_drive_turn`` — and if set aborts CLEANLY (releases the slot via the inner finally,
+    # clears ``inflight`` via the outer finally, persists NOTHING, never runs). This closes the
+    # gap where a turn in the pop→lock window is in NEITHER the run queue (``_drain_queued``
+    # already popped it) NOR holding a live engine (``engine.cancel`` finds none) — so a
+    # ``/cancel``|``/reset``|``/rm`` in that window used to miss it entirely and it ZOMBIE-RAN.
+    # CLEARED at the start of each accepted turn (alongside ``inflight = True``) so a stale
+    # abort from a previously-cancelled turn never kills a fresh one. Built lazily in
+    # __post_init__ (like ``lock``); transient in-memory (RB3).
+    abort: asyncio.Event = None  # type: ignore[assignment]
     # QF3 (B3/RB3): True from the moment ``engine.resume()`` SUCCEEDS until the first
     # turn on that resumed session completes WITHOUT a resume-failure-shaped error. A
     # stale/aged/torn session can resume "successfully" (connect) and then error on the
@@ -284,6 +300,10 @@ class _ProjectRuntime:
         # pattern _ChatState used for the (now-removed) chat-level lock.
         if self.lock is None:
             self.lock = asyncio.Lock()
+        # The per-project abort signal (ADR-005 D9 / round-3 BLOCKERS 1+2), lazily built for
+        # the same reason as ``lock`` (a runtime may be constructed off the running loop).
+        if self.abort is None:
+            self.abort = asyncio.Event()
 
 
 #: The kind of interactive request a pending-index entry holds open.
@@ -1093,6 +1113,47 @@ class StreamingSession:
         session_id = (record or {}).get("session_id")
         return session_id if isinstance(session_id, str) and session_id else None
 
+    def request_remove(self, chat_id: int, name: str) -> bool:
+        """INFLIGHT-AWARE ``/rm`` admission (ADR-005 D9 / round-3 BLOCKERS 1+2).
+
+        ``cmd_rm`` calls this BEFORE ``store.remove`` so the abort is set while the project's
+        store record still exists — closing the persist-race where a turn in the slot-transfer
+        window would otherwise start (and try to persist) a project the record-remove had
+        already deleted. Returns whether ``/rm`` may proceed:
+
+        * **Refuse (``False``)** iff the project has a turn RUNNING with a live engine — its
+          per-project lock is held (it is inside ``_drive_turn``). Tearing that down mid-turn
+          would orphan its parked answer-hold (the engine ref would be gone), so the operator
+          must ``/cancel`` it first (T9 — the lock-based running refusal, unchanged).
+        * **Allow + pre-abort (``True``)** otherwise — idle, QUEUED, or in the pop→lock
+          TRANSFER WINDOW. A queued/window turn holds NO lock and has NO started engine, so
+          there is nothing to orphan; it is made safe by SETTING this project's abort (so a
+          window turn checks it and aborts cleanly before it can start) and DRAINING a still-
+          queued waiter (so it unwinds now). The lock-based refusal alone misses the window
+          turn (lock not yet held) — the abort is what guarantees it never zombie-runs a
+          now-removed project. ``forget_project`` (called after the store-remove) repeats the
+          abort+drain idempotently and purges the runtime.
+
+        A project with no in-memory runtime (never run this process) is trivially removable
+        (``True``) — there is no in-flight turn to consider.
+        """
+        state = self._chats.get(chat_id)
+        if state is None:
+            return True
+        key = self._resolve_runtime_key(state.runtimes, name)
+        if key is None:
+            return True  # no runtime → nothing in flight; the store-remove is safe.
+        rt = state.runtimes[key]
+        # A live running turn (lock held, inside _drive_turn) → refuse (orphan hazard, T9).
+        if rt.lock.locked():
+            return False
+        # Idle / queued / transfer-window → make it safe to remove: set the abort BEFORE the
+        # caller removes the store record (so a window turn can never slip past its checks and
+        # persist to a deleted project) and drain any still-queued waiter now.
+        rt.abort.set()
+        self._drain_queued(state, rt)
+        return True
+
     async def forget_project(self, chat_id: int, name: str) -> None:
         """Drop a project's in-memory runtime (B4 — purge on ``/rm``). No-op if absent.
 
@@ -1126,6 +1187,15 @@ class StreamingSession:
         if key is None:
             return  # no in-memory runtime for that name — clean no-op.
         rt = state.runtimes[key]
+        # ADR-005 D9 (round-3 BLOCKERS 1+2): SET this project's abort BEFORE draining/purging.
+        # cmd_rm now refuses a project that is in-flight by ANY measure (running OR queued OR in
+        # the transfer window — inflight-aware busyness), so by the time forget_project runs the
+        # project should be idle; but a turn could be popped into the transfer window in the gap
+        # between the bot's busy check and here. Setting the abort guarantees that even such a
+        # window turn aborts cleanly (it checks the abort before it can start) and never
+        # zombie-runs a NOW-REMOVED project (the dropped store record made its result-persist a
+        # late UnknownProject). The draining below still unwinds a still-queued waiter.
+        rt.abort.set()
         # D9 (T9): drain a queued-not-yet-running turn for this project (no zombie run) and
         # drop its pending-index entries, before tearing the runtime down.
         self._drain_queued(state, rt)
@@ -1193,6 +1263,15 @@ class StreamingSession:
         name, rt = self._active_runtime(chat_id, create_default=False)
         state = self._chats.get(chat_id)
         if rt is not None:
+            # ADR-005 D9 (round-3 BLOCKERS 1+2): SET the active project's abort BEFORE clearing
+            # its session. The bot refuses /reset while the active project's OWN turn is RUNNING
+            # (lock held), but a QUEUED active project (or one in the pop→lock slot-transfer
+            # window) is not lock-busy, so /reset proceeds — and draining alone (below) misses a
+            # turn already popped from the queue, which would then ZOMBIE-RUN the project reset
+            # just cleared. The abort covers that window: the woken turn checks it and aborts
+            # cleanly before running. Cleared by the next accepted turn (it can't start until
+            # this reset returns since reset runs on the loop).
+            rt.abort.set()
             # NB3: drain a QUEUED-not-yet-running turn for the active project FIRST, so reset
             # doesn't leave a parked turn that would zombie-run when a slot frees. The waiter's
             # CancelledError handler removes its queue entry + releases any transferred slot
@@ -1432,6 +1511,11 @@ class StreamingSession:
         # CancelledError out of _acquire_slot, BEFORE the slot-release try) — so a cancelled /
         # drained / failed turn never leaves the project wedged as in-flight.
         target_rt.inflight = True
+        # ADR-005 D9 (round-3 BLOCKERS 1+2): a FRESH turn starts un-aborted. Clear any stale
+        # abort left set by a PREVIOUS turn's /cancel|/reset|/rm so it can't kill this one. Done
+        # under inflight=True (after the busy-guard) — no other turn for this project can run
+        # concurrently to observe a transient clear.
+        target_rt.abort.clear()
         try:
             # P5 / ADR-005 D6 (T6): acquire a run SLOT before driving. Under the cap → run now
             # (the counter is incremented). At the cap → enqueue (per-chat FIFO), set this
@@ -1449,6 +1533,20 @@ class StreamingSession:
             # once, so a raised turn can never leak a slot (which would permanently shrink
             # capacity) and a slot is never double-released. Mirrors T5's end-of-turn finally.
             try:
+                # ADR-005 D9 (round-3 BLOCKERS 1+2): THE SLOT-TRANSFER WINDOW abort check.
+                # We have just resumed from _acquire_slot holding a slot. If this turn was
+                # QUEUED, it spent the pop→here window in NEITHER the run queue (a transferring
+                # _release_slot already popped it — _drain_queued can't see it) NOR holding a
+                # live engine (none is started yet — engine.cancel finds nothing). So a
+                # /cancel|/reset|/rm landing in that window can't reach this turn via the
+                # queue-drain or the engine-cancel paths — it can only SET this project's abort.
+                # Honor it HERE, before acquiring the lock / starting the engine / entering
+                # _drive_turn: abort CLEANLY — the inner finally releases the slot we hold (no
+                # leak), the outer finally clears inflight, and we persist NOTHING and never run.
+                # This is the net invariant: a control command in the transfer window → the turn
+                # NEVER starts; _running returns to 0; no session is persisted.
+                if target_rt.abort.is_set():
+                    return
                 # While this turn was parked in the queue, another message to the SAME project
                 # could have started running it (its lock would now be held). Re-check after the
                 # slot is granted so the per-project one-run invariant holds even across a queue
@@ -1456,6 +1554,16 @@ class StreamingSession:
                 if target_rt.lock.locked():
                     raise StreamingBusy()
                 async with target_rt.lock:
+                    # ADR-005 D9: re-check the abort AFTER taking the lock and BEFORE starting
+                    # the engine — a /cancel|/reset|/rm could have set it during the (awaited)
+                    # lock acquisition above (the lock-wait sub-window). Bailing here means no
+                    # engine is ever started/resumed for an aborted turn (no connected-but-
+                    # undriven client, no _drive_turn, no persist). The finally still releases
+                    # the slot. Together with the window check above, the abort covers EVERY
+                    # pre-run await boundary; once _drive_turn starts streaming, a live engine
+                    # exists and the command's engine.cancel() unblocks it instead.
+                    if target_rt.abort.is_set():
+                        return
                     try:
                         engine, resume_failed = await self._ensure_engine(
                             chat_id, target=target
@@ -2462,6 +2570,16 @@ class StreamingSession:
         rt = state.runtimes.get(project_name)
         if rt is None:
             return 0
+        # (0) ADR-005 D9 (round-3 BLOCKERS 1+2): SET this project's abort signal. This is the
+        #     ONE mechanism that covers the slot-transfer window — a queued turn that has been
+        #     popped but not yet started holds no lock, no live engine, and no queue entry, so
+        #     neither the drain (1) nor the engine-cancel (2) below can reach it; only the abort
+        #     does (the woken turn checks it before it can run, and aborts cleanly). Set FIRST so
+        #     it is visible no matter which lifecycle state the turn is in (queued / window /
+        #     running). A still-queued turn is also drained (1) so it unwinds promptly rather
+        #     than waiting for a slot to transfer; a running turn is also cancelled (2). Harmless
+        #     for an idle project: the next accepted turn clears it before running.
+        rt.abort.set()
         # (1) Drain a QUEUED-not-yet-running turn for this project (T9): cancel its parked
         #     waiter so it never starts when a slot frees. The waiter's CancelledError
         #     handler removes it from the queue + releases any transferred slot (no leak).

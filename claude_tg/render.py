@@ -1398,55 +1398,76 @@ class ChatSendGate:
         self._now = now
         self._interval = float(chosen)
         # Scheduled time of the last ACTUAL send — a verbatim, or a status edit that fired
-        # at the leading edge (scheduled ≤ now, i.e. it went out immediately). Verbatim is
-        # spaced off THIS, so it is never dragged forward by a backlog of FUTURE-dated status
-        # reservations stacked ahead of it (the D8 fix: a queued status edit does NOT advance
-        # this cursor, so a verbatim arriving amid status churn waits ~1 interval off the last
-        # real send, not K×interval at the back of the backlog).
+        # at the leading edge (scheduled ≤ now, i.e. it went out immediately). A verbatim
+        # spaces off THIS (+interval) so it lands ~1 interval off the last real send and
+        # JUMPS AHEAD of any status reserved AFTER it (the D8 priority — a prompt must reach
+        # the operator; subsequent status churn must not bury it). A future-dated (queued)
+        # status does NOT advance this cursor.
         self._last_actual: float = float("-inf")
-        # Scheduled time of the last STATUS reservation (the coalesced-status running tail).
-        # Status edits space off this (+interval) so they stay ≥interval apart among
-        # themselves; a verbatim pushes it forward to its own slot so the NEXT status falls
-        # in behind the verbatim (never ahead of it).
-        self._status_tail: float = float("-inf")
+        # The COMBINED running tail: the latest slot reserved by ANY send (verbatim or
+        # status). Every new reservation lands strictly ≥interval after a colliding slot, so
+        # NO two sends ever share an interval — this is what bounds the COMBINED per-chat
+        # send rate regardless of how verbatim/status interleave (round-3 cross-model-QA
+        # BLOCKER 3). The pre-fix gate tracked only a separate status tail, so a verbatim
+        # spaced off ``_last_actual`` could land on a slot a status had ALREADY reserved at
+        # the same future time → two sends fired in one interval (over-budget under churn).
+        self._tail: float = float("-inf")
 
     def reserve(self, *, verbatim: bool) -> float:
         """Reserve the next send slot; return the wait (seconds, ≥0) before it may go.
 
-        ``verbatim=True`` (priority — a final answer / error / ask / plan / permission /
-        notification) is spaced only off the last *actual* send (:attr:`_last_actual`),
-        which a FUTURE-dated status backlog never advances — so a verbatim arriving amid K
-        coalesced status reservations waits ~1 interval off the last real send, **not**
-        K×interval at the back of that backlog (D8 — verbatim must not be starved by status
-        churn). The verbatim then pushes :attr:`_status_tail` to its own slot so the next
-        status falls in behind it. ``verbatim=False`` (a status-line edit) spaces off
-        :attr:`_status_tail` (+interval), so it stays ≥interval from the prior status and
-        YIELDS to verbatim; a status that fires at the leading edge (scheduled ≤ now) IS an
-        actual send and so also advances :attr:`_last_actual`.
+        The hard invariant (round-3 cross-model-QA BLOCKER 3): **no two reserved sends ever
+        share an interval** — every send, verbatim or status, lands in its OWN ≥interval-
+        spaced slot, so the COMBINED per-chat send rate stays bounded under any interleaving.
+        The :attr:`_tail` (the latest slot reserved by any kind) enforces it: a new
+        reservation that would fall at/within an interval of an already-reserved slot is
+        pushed to ``_tail + interval``.
 
-        Keeps the COMBINED rate ≤ one send per ``interval`` in steady state. **Nothing is
-        ever dropped** — a verbatim is merely *ordered ahead* of the pending status tail
-        (both still send; in the rare verbatim-amid-churn case one status may share the
-        verbatim's interval — the accepted D8 cost of never starving a prompt). Pure
-        decision (no I/O, no sleep): the caller awaits the returned delay then sends.
+        Within that hard collision-free bound, **verbatim keeps priority** over status:
+
+        * ``verbatim=True`` (a final answer / error / ask / plan / permission / notification)
+          targets ``_last_actual + interval`` — ~1 interval off the last ACTUAL send, NOT off
+          the (future-dated) status tail — so it JUMPS AHEAD of every status reserved AFTER
+          it (the deadlock-prevention case: a prompt is never buried behind subsequent status
+          churn). If that target collides with an already-reserved slot (status was reserved
+          ahead at that exact time), it is pushed to the next free slot (``_tail + interval``)
+          — it cannot leapfrog a send whose fire-time was ALREADY committed to a waiting
+          caller (un-scheduling that send is impossible), but it is still ahead of all future
+          status. It then advances ``_last_actual`` so following status falls in behind it.
+        * ``verbatim=False`` (a status-line edit) spaces off the combined tail (+interval) and
+          YIELDS to verbatim; a status that fires at the leading edge (scheduled ≤ now) IS an
+          actual send and so also advances ``_last_actual``.
+
+        **Nothing is ever dropped** — the gate only ORDERS sends (returns a wait); it never
+        discards a body and never touches message content (RB6/SB3). Pure decision (no I/O,
+        no sleep): the caller awaits the returned delay then sends.
         """
         now = self._now()
-        # Verbatim spaces off the last ACTUAL send (ignoring future status reserved ahead —
-        # it must not starve a prompt); status spaces off the running status tail.
-        base = self._last_actual if verbatim else self._status_tail
-        scheduled = max(now, base + self._interval)
         if verbatim:
-            # A verbatim is always an actual send; the next verbatim spaces off it, and the
-            # next status falls in behind it (never shrinking an existing deeper backlog).
+            # Priority: ~1 interval off the last ACTUAL send (jumps ahead of FUTURE status).
+            scheduled = max(now, self._last_actual + self._interval)
+            # Collision-free: never share a slot with an already-reserved send. If a status
+            # was reserved ahead at/within this slot, take the next free slot instead (we
+            # cannot un-schedule a send already handed to a waiting caller). Still ahead of
+            # any status reserved after this point.
+            if scheduled <= self._tail:
+                scheduled = self._tail + self._interval
+            # A verbatim is always an actual send; the next verbatim + following status space
+            # off it.
             self._last_actual = scheduled
-            self._status_tail = max(self._status_tail, scheduled)
         else:
-            self._status_tail = scheduled
+            # Status spaces off the combined tail, so it stays ≥interval from EVERY prior
+            # send (verbatim or status) — never colliding, always yielding to a verbatim that
+            # advanced the tail ahead of it.
+            scheduled = max(now, self._tail + self._interval)
             # A leading-edge status (goes immediately) IS a real send a following verbatim
             # must space off; a FUTURE-dated (queued) status must NOT advance _last_actual —
             # that is precisely what would otherwise push a verbatim to the back of the churn.
             if scheduled <= now:
                 self._last_actual = scheduled
+        # Advance the combined tail (monotonic) so the NEXT send of either kind is spaced off
+        # this one — the collision-free guarantee.
+        self._tail = max(self._tail, scheduled)
         wait = scheduled - now
         return wait if wait > 0 else 0.0
 
