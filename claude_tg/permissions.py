@@ -33,6 +33,11 @@ fail-closed.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from pathlib import Path
+
+from .paths import PathNotAllowed, resolve_within_roots
+
 #: The ONLY tools that auto-run without an approval prompt (ADR-003 §1, D1/D2).
 #: Local reads + search — low blast radius, so prompts stay rare and meaningful.
 #: EVERYTHING not in this set gates (fail-closed, SB6). Note ``WebSearch`` IS here
@@ -41,6 +46,119 @@ from __future__ import annotations
 SAFE_TOOLS: frozenset[str] = frozenset(
     {"Read", "Glob", "Grep", "LS", "TodoWrite", "WebSearch"}
 )
+
+# --- P6/C2: path confinement for the SDK's file/search tools (SB2) -----------
+#
+# The P2 classifier above is name-only (an explicit anti-goal, ADR-003 D4). P6/C2
+# reverses that *for the path dimension only*: a tool whose resolved target path falls
+# OUTSIDE the allowed roots must be operator-approved, even an otherwise-auto SAFE tool
+# and even a session-granted risky one (an out-of-root call always re-prompts). This is
+# the SDK-tool half of SB2 — ``resolve_within_roots`` already confines the bot's own
+# ``/cd``·``/new``·engine cwd; this confines the paths the SDK's tools ACT on.
+#
+# Per the C2 fix the path policy covers exactly the file/search tools that take an
+# explicit path input. Each entry maps a tool NAME to the ``tool_input`` key that holds
+# its target path. (Order/identity matters: a missing key is handled per-tool below.)
+#:   Read/Write/Edit/MultiEdit -> file_path ; NotebookRead/NotebookEdit -> notebook_path ;
+#:   Glob -> path (search root; OPTIONAL — defaults to cwd) ; Grep -> path ; LS -> path.
+#: NotebookRead is a REQUIRED-path read (like Read) — its ``notebook_path`` gets the same
+#: out-of-root framing as NotebookEdit so the map is exhaustive over the path-bearing tools
+#: (without it NotebookRead still gates as RISKY via the name-only classifier — not a hole —
+#: but it would lack the path layer's out-of-root re-prompt on an otherwise-granted call).
+_PATH_TOOL_KEYS: dict[str, str] = {
+    "Read": "file_path",
+    "Write": "file_path",
+    "Edit": "file_path",
+    "MultiEdit": "file_path",
+    "NotebookRead": "notebook_path",
+    "NotebookEdit": "notebook_path",
+    "Glob": "path",
+    "Grep": "path",
+    "LS": "path",
+}
+
+#: Tools whose path key is OPTIONAL: when absent the tool searches the cwd, which is
+#: itself an allowed root, so a missing key is in-root by construction (NOT fail-closed).
+#: Glob's ``path`` defaults to the cwd; Grep's ``path`` likewise. For the editing tools
+#: (Read/Write/Edit/MultiEdit/NotebookEdit) a path is REQUIRED — a missing/None/non-str
+#: value there is unparseable-when-expected and fails CLOSED (SB6) → approval.
+_PATH_TOOL_OPTIONAL: frozenset[str] = frozenset({"Glob", "Grep", "LS"})
+
+
+def path_needs_approval(
+    tool_name: str,
+    tool_input: dict | None,
+    *,
+    cwd: str | Path,
+    allowed_roots: Iterable[str | Path],
+    allow_any_path: bool,
+) -> bool:
+    """Return ``True`` iff this tool's target path is OUTSIDE ``allowed_roots`` (SB2/C2).
+
+    A **pure** predicate (no I/O beyond the ``Path.resolve`` canonicalization
+    :func:`~claude_tg.paths.resolve_within_roots` performs; no telegram/engine/SDK). It
+    is the SDK-tool path layer of SB2: the engine consults it BEFORE the name-only
+    SAFE_TOOLS/grant short-circuit so an out-of-root call always re-prompts — even an
+    otherwise-auto ``Read`` and even a session-granted ``Write`` (see
+    :meth:`~claude_tg.engine.engine.Engine.on_tool_request` for the ordering relative to
+    ``/yolo`` and ``ALLOW_ANY_PATH``).
+
+    Behavior:
+
+    * ``allow_any_path=True`` → always ``False`` (the explicit ``ALLOW_ANY_PATH=true``
+      opt-out disables the path policy entirely, exactly as it no-ops ``/cd`` confinement).
+    * A tool with **no path concept** (``TodoWrite``/``WebSearch``, ``Bash``, ``WebFetch``,
+      ``mcp__*``, ask/plan, anything not in :data:`_PATH_TOOL_KEYS`) → ``False`` here. The
+      path policy only governs the file/search tools with an explicit path input; the
+      name-only classifier still gates the risky ones. **In particular ``Bash`` is NOT
+      path-checked** — an arbitrary shell command has no reliable static target, so a
+      session-GRANTED ``Bash`` stays UNCONFINED (we do not pretend otherwise — see the C2
+      caveat in findings.md). The honest C2 boundary is the explicit-path file/search tools.
+    * Otherwise extract the tool's target from ``tool_input`` and resolve it CANONICALLY
+      against the roots via :func:`resolve_within_roots` (which follows ``..`` AND symlinks,
+      so a traversal/symlink escape is caught). In-root → ``False``; out-of-root
+      (:class:`~claude_tg.paths.PathNotAllowed`) → ``True`` (approval).
+    * **Fail-closed (SB6) on a malformed path when one is expected.** For the editing
+      tools the path key is REQUIRED: an ABSENT key, or a ``None`` / non-``str`` / empty
+      value, is unparseable and returns ``True`` (require approval), never silently allows.
+      For the search tools (:data:`_PATH_TOOL_OPTIONAL`) an *absent* key means "search the
+      cwd" (an allowed root) → ``False``; but a *present-but-malformed* value (key supplied
+      as ``None`` / non-``str`` / empty — distinct from "omitted") is still fail-closed →
+      ``True``. (Key-absent vs present-``None`` are distinguished by membership, not
+      ``dict.get`` — a supplied ``None`` is suspicious, not a "default to cwd" signal.)
+    """
+    # The explicit owner opt-out disables the path policy wholesale (mirrors /cd).
+    if allow_any_path:
+        return False
+    key = _PATH_TOOL_KEYS.get(tool_name) if isinstance(tool_name, str) else None
+    if key is None:
+        # No path concept (TodoWrite/WebSearch/Bash/WebFetch/mcp__*/unknown): the path
+        # policy does not apply. The name-only classifier governs these.
+        return False
+    if not isinstance(tool_input, dict) or key not in tool_input:
+        # Key ABSENT. Optional-path tools (Glob/Grep/LS) default to the cwd, which is an
+        # allowed root → in-root by construction (no approval). A required-path tool with
+        # no path key is unparseable-when-expected → fail closed (SB6). (A non-dict input
+        # is treated as "absent" then judged the same way — required → fail closed.)
+        return tool_name not in _PATH_TOOL_OPTIONAL
+    raw = tool_input[key]
+    if not isinstance(raw, str) or not raw:
+        # Key PRESENT but malformed (None / non-str / empty) where a path was expected →
+        # fail closed (SB6) — for optional AND required tools alike. A present-but-None
+        # path is suspicious (not the same as "omitted, default to cwd") so we gate it.
+        return True
+    try:
+        resolve_within_roots(
+            raw,
+            cwd=cwd,
+            allowed_roots=allowed_roots,
+            allow_any=False,  # allow_any handled above; here we always confine.
+        )
+    except PathNotAllowed:
+        # Canonical target is outside every root (or the path is OS-malformed, which
+        # resolve_within_roots also raises as PathNotAllowed) → require approval.
+        return True
+    return False
 
 
 def is_risky(tool_name: str, tool_input: dict | None = None) -> bool:
@@ -157,4 +275,4 @@ class PermissionPolicy:
         return frozenset(self._granted)
 
 
-__all__ = ["SAFE_TOOLS", "is_risky", "PermissionPolicy"]
+__all__ = ["SAFE_TOOLS", "is_risky", "PermissionPolicy", "path_needs_approval"]

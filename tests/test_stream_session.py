@@ -5101,3 +5101,82 @@ async def test_sb2_path_not_allowed_refusal_clears_inflight_project_usable_again
     after = len([s for s in rec.sends if "permitted roots" in s["text"]])
     assert after == before + 1, "the 2nd message must re-refuse (reach SB2), not be rejected as busy"
     assert rt.inflight is False
+
+
+# ===========================================================================
+# P6/C2 (SB2): the LIVE factory-wiring guard — StreamingSession.__init__ binds the
+# config's path-confinement context (allowed_roots / allow_any_path / cwd) into the
+# DEFAULT engine factory so the REAL bot's engines confine the SDK's file/search tools.
+#
+# Every OTHER test builds Engine(...) with explicit path kwargs or injects a fake factory,
+# so none of them exercises the production binding: an __init__ refactor could drop the
+# binding (revert to ``engine_factory or _default_engine_factory``) and silently turn C2
+# OFF for the live bot with all other tests still green. This test obtains an engine via
+# the session's OWN bound factory the same way ``_ensure_engine`` does and asserts it
+# confines. TEETH (verified in a throwaway): with the binding dropped, the default factory
+# is called with allowed_roots=() — under empty roots EVERY path is out-of-root, so the
+# in-root auto-allow assertion below goes RED (an in-root Read would HOLD), and the direct
+# ``_allowed_roots == config.allowed_roots`` assertion goes RED (() != the narrow root).
+# ===========================================================================
+
+
+async def _resolve_when_pending(eng, tool_use_id, decision):
+    """Resolve a held request as soon as it registers on the engine's pending registry.
+
+    Mirrors the helper in test_tool_path_confinement — no real wait; spins the loop until
+    the request is pending, then resolves it so the awaiting ``on_tool_request`` unblocks.
+    """
+    for _ in range(1000):
+        if eng._pending.has_pending(tool_use_id):
+            return eng.resolve(tool_use_id, decision)
+        await asyncio.sleep(0)
+    raise AssertionError(f"request {tool_use_id} never became pending")
+
+
+async def test_default_factory_binds_config_path_confinement_into_live_engine(tmp_path):
+    # A real StreamingSession with NARROW allowed_roots and NO injected engine_factory: the
+    # engine it builds (via its OWN bound default factory) must enforce the C2 path layer.
+    root = tmp_path / "root"
+    root.mkdir()
+    config = make_roots_config(tmp_path, root=root)  # allowed_roots=(root,), allow_any_path=False
+    session = StreamingSession(config, session_store=None, clock=lambda: 0.0)
+
+    # Obtain an engine EXACTLY as _ensure_engine does (cwd + backstop + a fresh policy) —
+    # through the session's bound default factory, NOT an injected one.
+    engine = session._engine_factory(
+        cwd=str(root),
+        backstop_seconds=float(config.answer_backstop_seconds),
+        permission_policy=PermissionPolicy(),
+    )
+
+    # (1) Direct teeth: the live config's path context reached the engine. Dropping the
+    # __init__ binding makes these () / (defaults), so the narrow-root assertion goes RED.
+    assert engine._allowed_roots == config.allowed_roots
+    assert engine._cwd == str(root)
+    assert engine._allow_any_path is config.allow_any_path
+
+    # (2) End-to-end confinement through the production binding: an OUT-of-root tool request
+    # HOLDS for approval (a PermissionEvent is injected + the request becomes pending and
+    # resolves to the operator's verdict), even an otherwise-auto SAFE Read.
+    out_id = "tu-out"
+    op = asyncio.create_task(
+        _resolve_when_pending(engine, out_id, PermissionDecision("allow_once"))
+    )
+    decision = await asyncio.wait_for(
+        engine.on_tool_request("Read", {"file_path": "/etc/shadow"}, out_id), timeout=5
+    )
+    assert await op is True  # it was HELD → the operator resolved a real pending request
+    assert decision.allow is True  # operator allowed it once (the hold was honored)
+
+    # (3) Teeth + P2 regression: an IN-root Read AUTO-ALLOWS with no hold. Under the dropped
+    # binding (empty roots) this would HOLD instead (never resolved → would time out), so
+    # this both proves in-root is unchanged AND is RED-on-unbind. The request must NOT be
+    # pending at any point, so we assert it returns promptly without a resolver.
+    in_decision = await asyncio.wait_for(
+        engine.on_tool_request(
+            "Read", {"file_path": str(root / "ok.py")}, "tu-in"
+        ),
+        timeout=5,
+    )
+    assert in_decision.allow is True  # auto-allowed (in-root, no prompt)
+    assert not engine._pending.has_pending("tu-in")  # never held

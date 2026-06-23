@@ -64,6 +64,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, Optional, Protocol
 
 from .claude_runner import ClaudeResult, ClaudeRunner
@@ -150,17 +151,30 @@ class EngineFactory(Protocol):
 
 
 def _default_engine_factory(
-    *, cwd: str, backstop_seconds: float, permission_policy: PermissionPolicy
+    *,
+    cwd: str,
+    backstop_seconds: float,
+    permission_policy: PermissionPolicy,
+    allowed_roots: tuple[Path, ...] = (),
+    allow_any_path: bool = False,
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
     The substrate's ``decision_callback`` is the engine's own ``on_tool_request`` seam
-    (the async answer-hold + the P2 permission gate). No bypass / skip-permissions flag
+    (the async answer-hold + the permission gate). No bypass / skip-permissions flag
     is set (SB5): the engine consults the injected ``permission_policy`` and is
     fail-closed by default — risky tools are held for approval unless a grant or
     ``/yolo`` allows them. ``permission_policy`` is the project's shared policy (the one
     the session mutates), so ``/yolo``, allow-session grants, and ``/reset``-clear all
     act on a single object.
+
+    **P6/C2 (SB2):** ``allowed_roots`` + ``allow_any_path`` (the same config the bot uses
+    to confine ``/cd``) are handed to the engine along with ``cwd`` so the engine confines
+    the paths the SDK's file/search tools ACT on — an out-of-root Read/Write/Glob/… is
+    held for approval even when name-only-safe or session-granted (see
+    :meth:`~claude_tg.engine.engine.Engine.on_tool_request`). The session binds the live
+    config into this factory in ``StreamingSession.__init__`` (see ``_bound_factory``); the
+    defaults here keep the path layer a no-op for a bare call.
     """
     engine: Engine
 
@@ -178,6 +192,9 @@ def _default_engine_factory(
         substrate,
         backstop_seconds=backstop_seconds,
         permission_policy=permission_policy,
+        cwd=cwd,
+        allowed_roots=allowed_roots,
+        allow_any_path=allow_any_path,
     )
     return engine
 
@@ -522,7 +539,31 @@ class StreamingSession:
     ) -> None:
         self.config = config
         self.store = session_store
-        self._engine_factory = engine_factory or _default_engine_factory
+        # P6/C2 (SB2): bind the live config's path-confinement context into the DEFAULT
+        # factory so the production engine confines the SDK's file/search tools to
+        # allowed_roots (an out-of-root tool call is held for approval — see
+        # Engine.on_tool_request). A bare _default_engine_factory(cwd=...,
+        # backstop_seconds=..., permission_policy=...) would default to no path context
+        # (the path layer no-ops), so the binding is what turns C2 ON for the real bot.
+        # An injected engine_factory (tests) is used verbatim — its 3-kwarg signature is
+        # unchanged, so every existing test factory keeps working; tests that want to
+        # exercise the path layer build a real Engine with the path kwargs directly.
+        if engine_factory is not None:
+            self._engine_factory: EngineFactory = engine_factory
+        else:
+
+            def _bound_factory(
+                *, cwd: str, backstop_seconds: float, permission_policy: PermissionPolicy
+            ) -> Engine:
+                return _default_engine_factory(
+                    cwd=cwd,
+                    backstop_seconds=backstop_seconds,
+                    permission_policy=permission_policy,
+                    allowed_roots=config.allowed_roots,
+                    allow_any_path=config.allow_any_path,
+                )
+
+            self._engine_factory = _bound_factory
         self._clock = clock
         self._min_edit_interval = min_edit_interval
         # P5 / ADR-005 D8 (T8): the per-chat send-rate budget (seconds between any two
