@@ -55,8 +55,66 @@ def test_defaults(monkeypatch):
     assert cfg.allowed_chat_ids == frozenset({42, 43})
     assert cfg.claude_bin == "claude"
     assert cfg.model is None
-    assert cfg.skip_permissions is True
+    # SB5 / C1: the operator approval gate is ON by default — an unset
+    # CLAUDE_SKIP_PERMISSIONS must NOT silently bypass the permission prompt.
+    # (Was `is True` pre-C1, which shipped a fail-open default; the secure
+    # default is False = gate.) See test_skip_permissions_* below.
+    assert cfg.skip_permissions is False
     assert cfg.timeout_seconds == 600
+
+
+# --- SB5 / C1: the permission bypass is OFF by default, opt-in only -------------
+
+
+def test_config_dataclass_default_skip_permissions_is_false():
+    """SB5/C1: a bare ``Config(...)`` (no env) GATES — the dataclass default is the
+    safe state. A regression flipping the field default back to ``True`` (the pre-C1
+    fail-open default that ran Claude's tools with no approval prompt on a fresh
+    install) trips this. Construct with only the required fields so the assertion is
+    purely about the *default* value of ``skip_permissions``.
+    """
+    from pathlib import Path
+
+    cfg = Config(
+        bot_token="t",
+        allowed_chat_ids=frozenset({1}),
+        workdir=Path("/tmp"),
+    )
+    assert cfg.skip_permissions is False  # the unset/default config gates
+
+
+def test_skip_permissions_unset_defaults_to_gate(monkeypatch):
+    """SB5/C1: ``CLAUDE_SKIP_PERMISSIONS`` unset → False (gate). The fresh-install
+    posture must be the SAFE one. RED on the pre-C1 code where ``from_env`` parsed
+    this with ``_env_bool(..., True)``.
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.delenv("CLAUDE_SKIP_PERMISSIONS", raising=False)
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.skip_permissions is False
+
+
+def test_skip_permissions_explicit_true_opts_in(monkeypatch):
+    """SB5/C1: the bypass is reachable, but ONLY by an explicit opt-in
+    (``CLAUDE_SKIP_PERMISSIONS=true``). Confirms the secure default did not break the
+    documented escape hatch.
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_SKIP_PERMISSIONS", "true")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.skip_permissions is True
+
+
+def test_skip_permissions_explicit_false_gates(monkeypatch):
+    """SB5/C1: an explicit ``=false`` also gates (the value is honored, not just the
+    unset case)."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_SKIP_PERMISSIONS", "false")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.skip_permissions is False
 
 
 def test_overrides(monkeypatch, tmp_path):

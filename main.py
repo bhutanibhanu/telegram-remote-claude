@@ -44,6 +44,17 @@ def main() -> None:
         config.skip_permissions,
         getattr(config, "engine_mode", "oneshot"),
     )
+    # SB5 / C1: make an allow-all posture LOUD. When the operator opted into the bypass
+    # (CLAUDE_SKIP_PERMISSIONS=true) the per-tool approval gate is DISABLED and Claude
+    # runs every tool unattended — surface that as a prominent WARNING (not buried in the
+    # INFO startup line) so it is obvious in the logs. The gated default stays at INFO.
+    if config.skip_permissions:
+        log.warning(
+            "⚠️  SECURITY: operator approval gate is DISABLED "
+            "(CLAUDE_SKIP_PERMISSIONS=true) — Claude runs ALL tools with NO approval "
+            "prompt (allow-all / --dangerously-skip-permissions). Unset "
+            "CLAUDE_SKIP_PERMISSIONS to restore the gate."
+        )
     # Python 3.14 no longer creates a default event loop for synchronous callers.
     # Streaming mode also needs callback_query updates (the inline-keyboard taps);
     # one-shot mode only needs messages.

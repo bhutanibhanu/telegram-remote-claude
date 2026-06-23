@@ -204,7 +204,13 @@ class Config:
     claude_bin: str = "claude"
     model: str | None = None
     timeout_seconds: int = 600
-    skip_permissions: bool = True
+    # SB5 / C1: the operator approval-gate bypass. Default **False** = the permission
+    # gate is ON, so a fresh install (and any bare ``Config(...)``) runs Claude's tools
+    # behind the CLI's approval prompt. Setting this True opts INTO
+    # ``--dangerously-skip-permissions`` (allow-all) on the oneshot path — a loud,
+    # explicit choice surfaced as a WARNING at startup (see main.py). The safe state is
+    # the default; the bypass is reachable only by an explicit opt-in.
+    skip_permissions: bool = False
     state_file: Path | None = None
     # S4 migration flag: "oneshot" (default, existing behavior) | "streaming" (P1 engine).
     # bot.py reads this to select the runner; T4 only parses/validates it (T7 wires the switch).
@@ -264,7 +270,10 @@ class Config:
         if timeout <= 0:
             raise ValueError("CLAUDE_TIMEOUT_SECONDS must be positive")
 
-        skip = _env_bool("CLAUDE_SKIP_PERMISSIONS", True)
+        # SB5 / C1: default OFF (gate). An unset/empty CLAUDE_SKIP_PERMISSIONS keeps the
+        # operator approval gate ON; only an explicit truthy value opts into the allow-all
+        # bypass. (Was `_env_bool(..., True)` pre-C1, which made a fresh install fail-open.)
+        skip = _env_bool("CLAUDE_SKIP_PERMISSIONS", False)
 
         state_raw = (os.environ.get("CLAUDE_STATE_FILE") or "").strip()
         state_file = Path(state_raw).expanduser() if state_raw else None

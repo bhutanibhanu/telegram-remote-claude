@@ -87,6 +87,9 @@ class ClaudeRunner:
     # ---- command building / invocation -------------------------------------
     def _build_cmd(self, chat_id: int) -> list[str]:
         cmd = [self.config.claude_bin, "-p", "--output-format", "json"]
+        # SB5 / C1: the allow-all bypass flag is added ONLY when the operator explicitly
+        # opted in (skip_permissions). The default is False (gate ON — see Config), so a
+        # fresh install runs Claude's tools behind the CLI's approval prompt.
         if self.config.skip_permissions:
             cmd.append("--dangerously-skip-permissions")
         if self.config.model:
