@@ -52,7 +52,7 @@ _Plan generated 2026-06-23 from design.md · 11 tasks · supervised build (auton
 - [x] T6 — Concurrency cap + FIFO queue (`MAX_CONCURRENT_RUNS`, D6) + config key (7a374a5)
 - [x] T7 — Relax busy-guards: /switch//new free; /reset per-project + /projects status + per-project persist (D2) (67e0b54)
 - [x] T8 — RB5: per-project coalescer + per-chat rate-gated sender + notification routing (D8/D4) (421fbbb)
-- [ ] T9 — Free-text routing + `/cancel <name>|all`, `/rm`-running-refused, `/to` (D5/D9) ⚠️  [+T6-review: /rm and /cancel of a QUEUED-not-yet-running project must DRAIN its parked waiter from run_queue (else a zombie run of a removed project when a slot frees); add tests for /cancel|/reset-while-queued + the post-acquire same-project re-check]
+- [x] T9 — Free-text routing + /cancel name|all, /rm-running-refused+drain, /to (D5/D9) (f629a14)
 - [ ] T10 — Integration / SB·RB·regression matrix (RB7 + cross-project routing + RB6)  [+T2-review gap: pin two CONCURRENT multi-question asks accumulate independently (per-id, no cross-contamination)]  [+T8-review: add (a) a turn that flips foreground→background mid-stream (inline→ping); (b) a MULTI-question BACKGROUND ask end-to-end (each question keyboard answerable via index)]
 - [ ] T11 — Live verify: two-project-concurrent phone-verify + verify.md checklist
 
