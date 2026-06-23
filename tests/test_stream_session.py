@@ -2062,6 +2062,55 @@ async def test_cap_queues_third_project_and_dequeues_when_slot_frees(tmp_path):
     assert any("gamma-done" in s["text"] for s in rec.sends)
 
 
+async def test_queued_notice_counts_queued_ahead_not_just_running_nb2(tmp_path):
+    # ⭐ NB2 (cross-model QA): the "⏳ Queued behind N run(s)" notice must count slot-holders
+    # RUNNING **plus** turns already QUEUED ahead — else a turn that queues behind other
+    # queued turns is told the wrong position. cap=1: alpha runs (1 slot-holder); beta queues
+    # → "behind 1"; gamma queues BEHIND beta → must say "behind 2" (1 running + 1 queued
+    # ahead). With the bug (ahead = _running, capped at 1) gamma wrongly says "behind 1".
+    store = _three_project_store(tmp_path)
+    eng_a, eng_b, eng_c = _holding_engine("alpha"), _holding_engine("beta"), _holding_engine("gamma")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b, "/work/gamma": eng_c},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    # beta queues behind the 1 running → "behind 1".
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if len(session._chat(1).run_queue) == 1:
+            break
+        await asyncio.sleep(0)
+    assert any("Queued behind 1 run(s)" in s["text"] for s in rec.sends), [s["text"] for s in rec.sends]
+    # gamma queues behind 1 running + 1 queued (beta) → must say "behind 2".
+    store.switch(1, "gamma")
+    turn_c = asyncio.create_task(session.handle_message(1, "c", send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if len(session._chat(1).run_queue) == 2:
+            break
+        await asyncio.sleep(0)
+    assert any("Queued behind 2 run(s)" in s["text"] for s in rec.sends), (
+        "gamma queued behind 1 running + 1 queued must report position 2 (NB2): "
+        f"{[s['text'] for s in rec.sends]}"
+    )
+
+    # Teardown: drain alpha → beta → gamma (FIFO), no leak.
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    await _wait_busy(session, 1, "beta", want=True)
+    eng_b.cancel()
+    await asyncio.wait_for(turn_b, timeout=2.0)
+    await _wait_busy(session, 1, "gamma", want=True)
+    eng_c.cancel()
+    await asyncio.wait_for(turn_c, timeout=2.0)
+    assert session._running == 0 and session._chat(1).run_queue == deque()
+
+
 async def test_queue_preserves_fifo_order(tmp_path):
     # With cap=1: alpha runs; beta then gamma are queued. Completing alpha starts BETA
     # (the older waiter), not gamma; completing beta then starts gamma. FIFO preserved.
@@ -3624,6 +3673,177 @@ async def test_background_attention_pings_are_throttled(tmp_path):
     assert any(s["text"] == "⚠️ alpha — turn_error" for s in rec.sends)
 
 
+# --- BLOCKER 1 (cross-model QA): a BACKGROUND project's actionable holds must NEVER be
+#     throttle-suppressed. The (project, kind) coalescing throttle is for repeated
+#     NON-actionable status/attention pings; a SECOND DISTINCT-tool_use_id permission /
+#     plan / ask arriving within the send interval lands in the pending index (a tap WOULD
+#     resolve it) but used to be dropped BEFORE its keyboard was sent — so the operator
+#     could not act on it until the 60-min backstop. Each distinct held request must always
+#     send its answerable keyboard. ----------------------------------------------------
+
+
+async def _open_window_two_project_session(tmp_path, *, active: str):
+    """Two live-engine projects (alpha/beta) but with the throttle window OPEN.
+
+    ``make_two_project_session`` runs at ``chat_send_interval`` 0 + a frozen clock, so the
+    ``(project, kind)`` throttle NEVER suppresses (``now - last < 0`` is false) — which would
+    let a buggy "drop the 2nd distinct-id ping" path pass the test vacuously. Here the clock
+    is frozen at 100.0 and the interval is a real 5 s, so the throttle window is genuinely
+    OPEN for every ping in the test: a second ping is suppressed UNLESS the distinct-id
+    bypass under test lets it through. This is what makes the BLOCKER-1 tests true RED tests.
+    Both runtimes are seeded with their own started engine so an id-routed tap can resolve
+    EITHER (the keyboard the ping must carry).
+    """
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=(active == "alpha"))
+    store.create(1, "beta", "/work/beta", make_active=(active == "beta"))
+    eng_alpha = FakeEngine([], session_id="alpha-sid")
+    eng_beta = FakeEngine([], session_id="beta-sid")
+    session = StreamingSession(
+        make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: {
+            "/work/alpha": eng_alpha, "/work/beta": eng_beta
+        }[cwd],
+        clock=lambda: 100.0,        # frozen — every ping arrives inside the throttle window
+        chat_send_interval=5.0,     # a real interval so the throttle window is genuinely OPEN
+        sleep=_no_sleep,
+    )
+    for name, eng in (("alpha", eng_alpha), ("beta", eng_beta)):
+        rt = session._runtime(1, name, f"/work/{name}")
+        rt.engine = eng
+        rt.started = True
+    return session, store, eng_alpha, eng_beta
+
+
+async def test_background_distinct_permission_holds_each_send_keyboard(tmp_path):
+    # ⭐ BLOCKER 1: two DISTINCT-tool_use_id permission holds from a BACKGROUND project,
+    # WITHIN the (open) throttle window, must BOTH send an answerable keyboard — and tapping
+    # EACH (via the real index/callback path) resolves the RIGHT request. With the bug, the
+    # 2nd distinct-id ping is suppressed by the (project, kind) throttle → only ONE bell →
+    # this fails. The two engines are seeded live so the id-routed resolve can reach each.
+    session, _store, eng_alpha, _eng_beta = await _open_window_two_project_session(tmp_path, active="beta")
+    state = session._chat(1)
+    perm1 = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(command=a)",
+        tool_use_id="a-perm-1", session_id="alpha-sid",
+    )
+    perm2 = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(command=b)",
+        tool_use_id="a-perm-2", session_id="alpha-sid",
+    )
+    rec = Recorder()
+    # Register BOTH holds in the index (as _drive_turn does on each injected event), then
+    # ping each. Both are background "permission" pings within the SAME open throttle window.
+    session._register_pending(state, "alpha", perm1)
+    await session._notify_background(state, 1, "alpha", perm1, "permission", send=rec.send)
+    session._register_pending(state, "alpha", perm2)
+    await session._notify_background(state, 1, "alpha", perm2, "permission", send=rec.send)
+
+    # BOTH pings sent, each carrying a verdict keyboard (the operator can act on each).
+    bell_sends = [s for s in rec.sends if s["text"] == "🔔 alpha — Claude needs approval"]
+    assert len(bell_sends) == 2, "a 2nd distinct-id permission hold must NOT be throttle-suppressed"
+    assert all(s["reply_markup"] is not None for s in bell_sends)  # each routes by id
+
+    # Tapping EACH resolves the RIGHT request against alpha's engine (the index owns id->proj).
+    out1 = session.resolve_callback(1, encode_callback("m", "a-perm-1", payload="o"))
+    out2 = session.resolve_callback(1, encode_callback("m", "a-perm-2", payload="s"))
+    assert out1.handled is True and out2.handled is True
+    assert eng_alpha.resolve_calls == [
+        ("a-perm-1", PermissionDecision(verdict="allow_once")),
+        ("a-perm-2", PermissionDecision(verdict="allow_session")),
+    ]
+
+
+async def test_background_distinct_plan_holds_each_send_keyboard(tmp_path):
+    # BLOCKER 1 (plan variant): two DISTINCT-id plan holds from a background project within
+    # the OPEN throttle window each send their [Approve/Reject] keyboard (neither dropped).
+    session, _store, eng_alpha, _eng_beta = await _open_window_two_project_session(tmp_path, active="beta")
+    state = session._chat(1)
+    plan1 = PlanEvent(plan="Plan one", tool_use_id="a-plan-1", session_id="alpha-sid")
+    plan2 = PlanEvent(plan="Plan two", tool_use_id="a-plan-2", session_id="alpha-sid")
+    rec = Recorder()
+    session._register_pending(state, "alpha", plan1)
+    await session._notify_background(state, 1, "alpha", plan1, "plan", send=rec.send)
+    session._register_pending(state, "alpha", plan2)
+    await session._notify_background(state, 1, "alpha", plan2, "plan", send=rec.send)
+
+    bell_sends = [s for s in rec.sends if s["text"] == "🔔 alpha — proposes a plan"]
+    assert len(bell_sends) == 2, "a 2nd distinct-id plan hold must NOT be throttle-suppressed"
+    assert all(s["reply_markup"] is not None for s in bell_sends)
+    out = session.resolve_callback(1, encode_callback("p", "a-plan-2", plan_action="a"))
+    assert out.handled is True
+    assert eng_alpha.resolve_calls == [("a-plan-2", PlanVerdict(approve=True))]
+
+
+async def test_background_same_permission_id_still_coalesced(tmp_path):
+    # The throttle still COALESCES a re-emit of the SAME tool_use_id (the operator already
+    # has that keyboard) — only DISTINCT ids bypass. Guards against the fix becoming "never
+    # throttle anything", which would regress test_background_attention_pings_are_throttled.
+    # Uses the OPEN-window rig so the throttle is genuinely active for the 2nd same-id ping.
+    session, _store, _eng_alpha, _eng_beta = await _open_window_two_project_session(tmp_path, active="beta")
+    state = session._chat(1)
+    perm = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(...)",
+        tool_use_id="a-perm-same", session_id="alpha-sid",
+    )
+    rec = Recorder()
+    session._register_pending(state, "alpha", perm)
+    await session._notify_background(state, 1, "alpha", perm, "permission", send=rec.send)
+    await session._notify_background(state, 1, "alpha", perm, "permission", send=rec.send)
+    assert sum(1 for s in rec.sends if s["text"] == "🔔 alpha — Claude needs approval") == 1
+
+
+async def test_background_two_distinct_holds_end_to_end_via_drive_turn(tmp_path):
+    # ⭐ BLOCKER 1 end-to-end through the REAL turn loop: a background project's stream emits
+    # two DISTINCT-id permission holds (parking between them). The driver must register +
+    # ping BOTH (each keyboard answerable), and resolving each unblocks the turn to its
+    # clean result — proving the request "lands in the index AND a keyboard is sent" for
+    # every distinct hold, not just the first. The OPEN-window rig makes the 2nd ping
+    # genuinely throttle-gated (with the bug the 2nd bell never fires → _wait_pings(2) times
+    # out → RED).
+    session, _store, eng_alpha, _eng_beta = await _open_window_two_project_session(tmp_path, active="beta")
+    perm1 = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(command=one)",
+        tool_use_id="a-p1", session_id="alpha-sid",
+    )
+    perm2 = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(command=two)",
+        tool_use_id="a-p2", session_id="alpha-sid",
+    )
+    # Two holds back to back (the FakeEngine HOLD parks after each yielded event until a
+    # resolve fires), then a clean result.
+    eng_alpha._script = [
+        perm1, HOLD,
+        perm2, HOLD,
+        ResultEvent(session_id="alpha-sid", is_error=False, subtype="success"),
+    ]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rec = Recorder()
+    turn = asyncio.create_task(_drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit))
+
+    # Wait for the FIRST ping, then resolve perm1 → the turn advances to perm2.
+    async def _wait_pings(n):
+        for _ in range(500):
+            if sum(1 for s in rec.sends if s["text"] == "🔔 alpha — Claude needs approval") >= n:
+                return
+            await asyncio.sleep(0)
+        raise AssertionError(f"expected >= {n} background permission pings")
+
+    await _wait_pings(1)
+    assert session.resolve_callback(1, encode_callback("m", "a-p1", payload="o")).handled is True
+    # The SECOND distinct-id hold must ALSO ping (this is exactly what the throttle dropped).
+    await _wait_pings(2)
+    assert session.resolve_callback(1, encode_callback("m", "a-p2", payload="o")).handled is True
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert eng_alpha.resolve_calls == [
+        ("a-p1", PermissionDecision(verdict="allow_once")),
+        ("a-p2", PermissionDecision(verdict="allow_once")),
+    ]
+
+
 # --- RB7: RB5 under concurrency — the per-chat send gate bounds the combined
 #     cross-project rate, and verbatim survives (ordered, never dropped). ------
 
@@ -4075,7 +4295,11 @@ async def test_cancel_queued_project_drains_waiter_no_zombie_run(tmp_path):
 
     # /cancel beta → drain its parked waiter (it never ran).
     aborted = session.handle_cancel(1, "beta")
-    assert aborted == 0  # queued-only: no pending requests, but the waiter is drained
+    # NB1: a drained queued-not-yet-running turn IS a cancelled unit, so the count reports 1
+    # (it had no live engine → 0 pending requests, but the operator DID cancel a turn — the
+    # feedback must not say "nothing was in flight"). The pending-request engine tally is 0;
+    # the +1 is the drained queued turn.
+    assert aborted == 1
     # beta's queued turn is cancelled → its task raises CancelledError.
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(turn_b, timeout=2.0)
@@ -4090,6 +4314,42 @@ async def test_cancel_queued_project_drains_waiter_no_zombie_run(tmp_path):
         await asyncio.sleep(0)
     assert eng_b.started is False, "cancelled queued project must NOT zombie-run on a freed slot"
     assert session._running == 0  # back to zero — no leaked / zombie slot
+
+
+async def test_cancel_queued_only_counts_as_cancelled_nb1(tmp_path):
+    # ⭐ NB1 (cross-model QA): /cancel of a QUEUED-ONLY project (no live engine, parked behind
+    # the cap) must report it as CANCELLED — the operator DID abort a turn, so the count must
+    # be > 0 (else cmd_cancel tells them "nothing was in flight" for a turn they just killed).
+    # With the bug the count is 0 (only the engine's pending tally) → RED.
+    store = _three_project_store(tmp_path)
+    eng_a = _holding_engine("alpha")
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    assert session.project_status(1, "beta") == "queued"
+    assert eng_b.started is False  # beta never started → 0 pending requests
+
+    cancelled = session.handle_cancel(1, "beta")
+    assert cancelled == 1, "a drained queued-only turn must count as cancelled (NB1)"
+
+    # Teardown.
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(turn_b, timeout=2.0)
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    assert session._running == 0
 
 
 async def test_cancel_all_drains_queued_and_cancels_running(tmp_path):
@@ -4155,6 +4415,8 @@ async def test_reset_while_queued_then_cancel_no_zombie(tmp_path):
     assert store.get_project(1, "beta")["session_id"] is None
 
     # cancel the still-queued beta → drained, no zombie run when alpha's slot frees.
+    # (NB3 now drains it in reset() above, so this /cancel is a harmless no-op — the focused
+    # NB3 test below pins that reset ALONE cancels the queued turn.)
     session.handle_cancel(1, "beta")
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(turn_b, timeout=2.0)
@@ -4164,6 +4426,102 @@ async def test_reset_while_queued_then_cancel_no_zombie(tmp_path):
         await asyncio.sleep(0)
     assert eng_b.started is False
     assert session._running == 0
+
+
+async def test_reset_drains_active_projects_queued_turn_nb3(tmp_path):
+    # ⭐ NB3 (cross-model QA): /reset of an active project that has a not-yet-started QUEUED
+    # turn must DRAIN (cancel) that queued turn as PART of the reset — it never started, so no
+    # orphan — then reset cleanly. Consistent with the P4 /reset-while-running handling
+    # (which cancels the held turn); the bot allows /reset here because a queued (lock-free)
+    # active project is "not busy". With the bug reset leaves the queued turn parked → it
+    # would zombie-run when alpha's slot frees (and a follow-up /cancel was required).
+    store = _three_project_store(tmp_path)
+    store.set_session_id(1, "beta", "beta-old")
+    eng_a = _holding_engine("alpha")
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    store.switch(1, "beta")  # beta is now the ACTIVE (foreground) project…
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    assert session.project_status(1, "beta") == "queued"  # …and it is QUEUED (cap=1, alpha runs)
+    assert len(session._chat(1).run_queue) == 1
+
+    # /reset (active == beta, queued, lock-free) → reset DRAINS beta's queued turn ITSELF.
+    session.reset(1)
+    # beta's queued turn is cancelled by the reset (no separate /cancel needed).
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(turn_b, timeout=2.0)
+    assert session._chat(1).run_queue == deque()        # waiter drained from the queue
+    assert store.get_project(1, "beta")["session_id"] is None  # session cleared (the reset)
+    assert session.project_status(1, "beta") == "idle"  # no longer "queued"
+
+    # alpha's freed slot must NOT zombie-start the drained beta; no slot leak.
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert eng_b.started is False, "reset-drained queued project must NOT zombie-run on a freed slot"
+    assert session._running == 0  # back to zero — no leaked / zombie slot
+
+
+async def test_second_message_to_queued_project_is_busy_not_double_queued(tmp_path):
+    # ⭐ BLOCKER 2 (cross-model QA): a project must NEVER queue behind ITSELF. cap=1: alpha
+    # holds the only slot, beta is QUEUED (its turn parked on a waiter, lock NOT yet held).
+    # A SECOND message to beta BEFORE it starts must raise StreamingBusy and leave EXACTLY
+    # ONE beta entry in the queue — not append a 2nd _QueuedTurn (two turns for one project,
+    # violating D6's one-turn-per-project). With the bug (the busy-guard checks only
+    # lock.locked(), which a queued-not-started turn does not hold) the 2nd message is
+    # accepted and the queue grows to 2.
+    store = _three_project_store(tmp_path)
+    eng_a = _holding_engine("alpha")
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    # Wait until beta is parked in the queue (not yet running — its lock is NOT held).
+    for _ in range(500):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    assert len(session._chat(1).run_queue) == 1
+    assert session.is_busy(1, "beta") is False  # queued, lock not held — the trap for the guard
+    assert session.project_status(1, "beta") == "queued"
+
+    # A SECOND message to the already-queued beta must be refused, NOT double-queued. Bounded
+    # by wait_for so the BUGGY path (the 2nd message also queues + parks on a waiter forever)
+    # fails fast as a TimeoutError instead of hanging the suite — either way it is RED until
+    # the guard rejects an already-queued project.
+    with pytest.raises(StreamingBusy):
+        await asyncio.wait_for(
+            session.handle_message(1, "b-again", send=rec.send, edit=rec.edit), timeout=1.0
+        )
+    assert len(session._chat(1).run_queue) == 1, "beta must never queue behind itself"
+
+    # Clean teardown: cancel beta's queued turn + finish alpha (no zombie / leak).
+    session.handle_cancel(1, "beta")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(turn_b, timeout=2.0)
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    assert session._running == 0 and session._chat(1).run_queue == deque()
 
 
 async def test_post_acquire_same_project_recheck(tmp_path):

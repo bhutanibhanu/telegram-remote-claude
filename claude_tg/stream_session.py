@@ -414,13 +414,15 @@ class _ChatState:
     # status churn (never starved / dropped — D8). Built lazily by the session (it needs the
     # injected clock + the configured interval); transient in-memory like the rest.
     send_gate: "Optional[ChatSendGate]" = None
-    # P5 / ADR-005 D4 (T8): per-(project, notification-kind) throttle for the proactive
-    # background pings, so a project bursting holds does not spam the chat with duplicate
-    # 🔔 pings. Maps (project_name, ping_kind) -> the monotonic time the last such ping was
-    # SENT; a duplicate within the gate interval is suppressed (the operator already knows
-    # that project needs attention — the keyboard from the first ping still routes the tap).
-    # Transient in-memory (RB3).
-    notify_last: dict[tuple[str, str], float] = field(default_factory=dict)
+    # P5 / ADR-005 D4 (T8): throttle for the proactive background pings, so a project
+    # bursting does not spam the chat with duplicate 🔔 pings. The key is
+    # (project_name, ping_kind) for a TERMINAL/non-actionable ping (done/error) and
+    # (project_name, ping_kind, tool_use_id) for an ACTIONABLE hold (permission/ask/plan) —
+    # so each DISTINCT held request keeps its own answerable keyboard (cross-model-QA
+    # BLOCKER 1) while a re-emit of the SAME id (or a repeated terminal) is coalesced. Maps
+    # the key -> the monotonic time the last such ping was SENT; a duplicate within the gate
+    # interval is suppressed. Transient in-memory (RB3).
+    notify_last: dict[tuple[str, ...], float] = field(default_factory=dict)
     # P5 / ADR-005 D5 (T9): the reply-to map for free-text disambiguation.
     # ``message_id -> tool_use_id`` — populated by the bot when it sends a free-text-
     # eliciting prompt (the ``✏️ <name>: reply…`` follow-up to an "Other"/"Reject" tap),
@@ -595,23 +597,41 @@ class StreamingSession:
 
     # -- proactive notifications for a BACKGROUND project (ADR-005 D4) -------
 
-    def _should_notify(self, state: _ChatState, name: str, ping_kind: str) -> bool:
+    def _should_notify(
+        self, state: _ChatState, name: str, ping_kind: str, *, dedup_id: Optional[str] = None
+    ) -> bool:
         """Throttle duplicate pings of one ``ping_kind`` for one project (D4 coalescing).
 
-        A background project bursting holds (or re-emitting the same kind) must not spam
-        the chat with duplicate 🔔 pings — the operator already knows that project needs
-        attention, and the keyboard from the FIRST ping still routes the tap (D3). So a
-        ping of the same ``(project, kind)`` within the per-chat send interval is
-        suppressed. Records the send time on the way through (so the first ping of a kind
-        always goes). ``ping_kind`` is the notification class — the held :data:`PendingKind`
+        A background project must not spam the chat with duplicate 🔔 pings — but the unit
+        of "duplicate" differs for actionable vs non-actionable pings:
+
+        * **Actionable holds (``dedup_id`` given — the held request's ``tool_use_id``).**
+          A permission / plan / ask ping carries an *answerable keyboard*; each DISTINCT
+          held request is a SEPARATE thing the operator must act on, so the throttle is
+          keyed by ``(project, kind, tool_use_id)`` — a second DISTINCT-``tool_use_id`` hold
+          arriving within the send interval **always** sends its keyboard (it landed in the
+          pending index; a tap would resolve it, but only if a keyboard reached the
+          operator — the cross-model-QA BLOCKER 1). A re-emit of the **same** id within the
+          window IS coalesced (the operator already has that exact keyboard; the first
+          ping's button still routes the tap, D3).
+        * **Non-actionable / terminal pings (``dedup_id`` omitted).** Repeated status /
+          attention pings of the same ``(project, kind)`` (e.g. ``done``/``error``, or a
+          burst of the same class) are coalesced within the interval — there is no per-id
+          keyboard to lose, so collapsing duplicates is the intended D4 behavior.
+
+        Records the send time on the way through (so the first ping of a key always goes).
+        ``ping_kind`` is the notification class — the held :data:`PendingKind`
         (``permission``/``ask``/``plan``) for an attention ping, or ``done``/``error`` for a
         terminal — so e.g. a permission ping never suppresses a later error ping.
         """
+        # Actionable holds dedup per id (each distinct request keeps its keyboard); terminal
+        # / non-actionable pings dedup per (project, kind) as before.
+        key: tuple[str, ...] = (name, ping_kind) if dedup_id is None else (name, ping_kind, dedup_id)
         now = self._clock()
-        last = state.notify_last.get((name, ping_kind))
+        last = state.notify_last.get(key)
         if last is not None and (now - last) < self._chat_send_interval:
             return False
-        state.notify_last[(name, ping_kind)] = now
+        state.notify_last[key] = now
         return True
 
     @staticmethod
@@ -655,7 +675,13 @@ class StreamingSession:
         if isinstance(event, AskEvent):
             await self._notify_background_ask(state, chat_id, name, event, send=send)
             return
-        if not self._should_notify(state, name, kind):
+        # BLOCKER 1: an actionable hold (permission/plan) dedups per tool_use_id, so a second
+        # DISTINCT request always sends its keyboard (the throttle only coalesces a re-emit of
+        # the SAME id). A hold with no id (defensive — the engine always sets one) falls back
+        # to the per-(project, kind) throttle.
+        if not self._should_notify(
+            state, name, kind, dedup_id=getattr(event, "tool_use_id", None)
+        ):
             return
         await self._gated_send(
             state, send, verbatim=True,
@@ -676,13 +702,17 @@ class StreamingSession:
         """Background ask ping: the ``🔔 <name> — asks a question`` line + each question's
         keyboard (so a multi-question ask stays fully answerable while backgrounded, D4).
 
-        The first message carries the bell line (throttled per ``(project, "ask")``); every
-        question's option keyboard is then sent (each its own message) so the operator can
-        answer each one via the D3 index regardless of foreground. SB3: only the project
-        name + the fixed "asks a question" phrase are interpolated by ``notify_attention`` —
-        the question TEXT rides the keyboard's own (already-safe) body, exactly as inline.
+        The first message carries the bell line (throttled per ``(project, "ask",
+        tool_use_id)`` — BLOCKER 1: a second DISTINCT background ask still pings + sends its
+        keyboards, while a re-emit of the SAME ask id is coalesced); every question's option
+        keyboard is then sent (each its own message) so the operator can answer each one via
+        the D3 index regardless of foreground. SB3: only the project name + the fixed "asks a
+        question" phrase are interpolated by ``notify_attention`` — the question TEXT rides
+        the keyboard's own (already-safe) body, exactly as inline.
         """
-        if self._should_notify(state, name, "ask"):
+        if self._should_notify(
+            state, name, "ask", dedup_id=getattr(ask, "tool_use_id", None)
+        ):
             await self._gated_send(
                 state, send, verbatim=True,
                 text=notify_attention(name, "ask"),
@@ -1118,12 +1148,27 @@ class StreamingSession:
         marker + status, set back to ``idle``) — NOT a chat-global slot — and drops the
         active project's pending-index entries. A concurrent project's runtime + held
         requests are untouched (reset is scoped to the active project, D2/D7).
+
+        **NB3 (cross-model QA) — drain a not-yet-started QUEUED turn first.** The bot refuses
+        ``/reset`` while the active project's OWN turn is in flight (its lock held), but a
+        QUEUED active project (parked behind the cap, lock NOT yet held) is "not busy", so
+        ``/reset`` proceeds. If reset just cleared the session and left the queued turn parked,
+        that turn would later **zombie-run** when a slot frees (running the project reset was
+        meant to clear). So reset first **drains** the active project's queued turn — it never
+        started, so there is no orphaned hold (unlike the running case the bot guards against)
+        — consistent with the P4 ``/reset``-while-running rationale, then clears the session.
         """
         # Resolve the active project WITHOUT creating one (reset is not a turn): if there
         # is no active project there is no session to clear.
         name, rt = self._active_runtime(chat_id, create_default=False)
         state = self._chats.get(chat_id)
         if rt is not None:
+            # NB3: drain a QUEUED-not-yet-running turn for the active project FIRST, so reset
+            # doesn't leave a parked turn that would zombie-run when a slot frees. The waiter's
+            # CancelledError handler removes its queue entry + releases any transferred slot
+            # (no leak); the turn never started, so there is no hold to orphan.
+            if state is not None:
+                self._drain_queued(state, rt)
             rt.engine = None
             rt.started = False
             rt.policy.clear()  # D7: drop grants + yolo so the next session is fail-closed.
@@ -1335,10 +1380,15 @@ class StreamingSession:
         # when its slot frees.
         target = (target_name, target_rt)
 
-        # A project is NEVER queued behind ITSELF (D6): a second message to the SAME running
-        # project is StreamingBusy, exactly as in T5 — checked BEFORE acquiring a slot so a
-        # busy project never consumes a queue entry.
-        if target_rt.lock.locked():
+        # A project is NEVER queued behind ITSELF (D6): a second message to the SAME project
+        # is StreamingBusy, exactly as in T5 — checked BEFORE acquiring a slot so a busy
+        # project never consumes a queue entry. "Busy" here is the project RUNNING (its lock
+        # held) OR already having a turn WAITING in the run queue (queued-behind-the-cap, lock
+        # not yet held) — the cross-model-QA BLOCKER 2: a queued-not-started turn holds no
+        # lock, so a lock-only guard would append a SECOND _QueuedTurn for one project (two
+        # turns for one project, violating D6's one-turn-per-project). One pending turn per
+        # project, period.
+        if target_rt.lock.locked() or self._is_queued(state, target_rt):
             raise StreamingBusy()
 
         # P5 / ADR-005 D6 (T6): acquire a run SLOT before driving. Under the cap → run now
@@ -1438,7 +1488,12 @@ class StreamingSession:
         # At the cap → queue this turn (FIFO) and park until a slot is transferred to it.
         # Mark the project queued so /projects shows it (the turn has not started running).
         target_rt.status = "queued"
-        ahead = self._running  # slot-holders ahead of this turn (== the cap when full).
+        # NB2: turns AHEAD of this one = the slot-holders RUNNING (== the cap when full) PLUS
+        # any turns already QUEUED ahead of it (counted BEFORE this turn's entry is appended
+        # below). Counting only ``_running`` would tell a turn queued behind other queued
+        # turns the wrong position (always "behind <cap>"). The queue is per-chat, so only
+        # this chat's already-queued turns precede it.
+        ahead = self._running + len(state.run_queue)
         waiter: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
         # Record the parked turn WITH its target runtime so /cancel + /rm can drain it (T9).
         queued = _QueuedTurn(runtime=target_rt, future=waiter)
@@ -1536,6 +1591,23 @@ class StreamingSession:
                 del state.run_queue[i]
                 return True
         return False
+
+    @staticmethod
+    def _is_queued(state: _ChatState, rt: _ProjectRuntime) -> bool:
+        """Whether ``rt`` already has a turn WAITING in the run queue (BLOCKER 2 guard).
+
+        A turn that queued behind the cap parks on a waiter in :meth:`_acquire_slot` and
+        holds NO lock until its slot is granted, so :meth:`is_busy` (lock-based) reports it
+        idle. The pre-slot busy-guard uses this so a SECOND message to an already-queued
+        project is refused (``StreamingBusy``) rather than appending a second
+        :class:`_QueuedTurn` — one pending turn per project (D6). A finished/cancelled
+        waiter (``future.done()``) does not count: its turn is no longer pending (its
+        CancelledError handler removes the entry, but a settled-but-not-yet-popped future
+        must not block a fresh turn).
+        """
+        return any(
+            q.runtime is rt and not q.future.done() for q in state.run_queue
+        )
 
     async def _drive_turn(
         self,
@@ -2286,9 +2358,11 @@ class StreamingSession:
         :meth:`resolve_callback` — a cancelled RUNNING turn holds its lock and ``cancel()``
         unblocks it (taking the lock would deadlock the very turn it must release).
 
-        Returns the number of pending requests aborted across the targeted project(s) (0
-        when nothing was running; a drained queued-only turn aborts 0 pending requests but
-        is still removed — the count is the *pending-request* tally, as in T2).
+        Returns the number of **cancelled units** across the targeted project(s): pending
+        requests aborted by the engine PLUS any drained queued-not-yet-running turn (NB1 — a
+        queued-only turn aborts 0 pending requests but the operator DID cancel a turn, so it
+        counts, letting ``cmd_cancel`` report it truthfully instead of "nothing in flight").
+        0 only when nothing was running AND nothing was queued for the target(s).
         """
         state = self._chats.get(chat_id)
         if state is None:
@@ -2324,7 +2398,12 @@ class StreamingSession:
         waiter for it first (no zombie run), then cancels a RUNNING engine, then clears the
         project's pending-index entries (so a late tap on a cancelled request no-ops). A
         concurrent project's still-open holds / queued turn survive (scoped by name, T5).
-        Returns the count of pending requests the engine aborted (0 if idle / queued-only).
+
+        Returns the number of **cancelled units**: the pending requests the engine aborted
+        PLUS any drained queued-not-yet-running turn (NB1 — a queued-only turn has no live
+        engine, so it aborts 0 pending requests, but the operator DID cancel a turn; counting
+        it lets ``cmd_cancel`` tell the truth instead of "nothing was in flight"). 0 only when
+        the project was genuinely idle (not running and not queued).
         """
         rt = state.runtimes.get(project_name)
         if rt is None:
@@ -2332,7 +2411,8 @@ class StreamingSession:
         # (1) Drain a QUEUED-not-yet-running turn for this project (T9): cancel its parked
         #     waiter so it never starts when a slot frees. The waiter's CancelledError
         #     handler removes it from the queue + releases any transferred slot (no leak).
-        self._drain_queued(state, rt)
+        #     A drained queued turn counts toward the cancelled total (NB1).
+        drained = self._drain_queued(state, rt)
         # (2) Cancel a RUNNING engine (lock-free — unblocks the held turn).
         aborted = 0
         if rt.engine is not None:
@@ -2340,10 +2420,10 @@ class StreamingSession:
         # (3) Drop this project's pending-index entries (+ a free-text marker aimed at them)
         #     so a late tap on a cancelled request is a stale-id no-op.
         self._clear_project_pending(state, project_name)
-        return aborted
+        return aborted + drained
 
     @staticmethod
-    def _drain_queued(state: _ChatState, rt: _ProjectRuntime) -> None:
+    def _drain_queued(state: _ChatState, rt: _ProjectRuntime) -> int:
         """Cancel every QUEUED (not-yet-running) waiter belonging to ``rt`` (T9 drain).
 
         A queued turn parks on its waiter inside :meth:`_acquire_slot` before it ever
@@ -2355,14 +2435,20 @@ class StreamingSession:
         hazard). We cancel the future and leave the queue mutation to that handler (so the
         slot-accounting stays in one place); a defensive ``status`` reset to ``idle`` covers
         the case where the parked task has not yet been scheduled to run its handler.
+
+        Returns the number of queued waiters drained (NB1: the caller counts these as
+        cancelled units so a queued-only ``/cancel`` reports the turn it really aborted).
+        Normally 0 or 1 (one pending turn per project — BLOCKER 2), but it drains every
+        matching waiter defensively.
         """
-        drained = False
+        drained = 0
         for queued in list(state.run_queue):
             if queued.runtime is rt and not queued.future.done():
                 queued.future.cancel()
-                drained = True
+                drained += 1
         if drained and rt.status == "queued":
             rt.status = "idle"
+        return drained
 
     # -- shutdown ------------------------------------------------------------
 

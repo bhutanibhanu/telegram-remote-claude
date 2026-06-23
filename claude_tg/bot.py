@@ -150,12 +150,17 @@ class TelegramClaudeBot:
         arg = " ".join(ctx.args).strip() if ctx.args else ""
         # No arg → active project (name=None); "all" → every run; else the named project.
         name = arg or None
-        aborted = self.streaming.handle_cancel(update.effective_chat.id, name)
-        if aborted:
-            await update.message.reply_text(f"🛑 Cancelled ({aborted} pending request(s) aborted).")
+        # NB1: handle_cancel returns the count of CANCELLED UNITS — pending requests the
+        # engine aborted PLUS any drained queued-not-yet-running turn. A queued-only cancel
+        # therefore returns >= 1 (0 pending requests, but a turn WAS cancelled), so the
+        # operator is no longer wrongly told "nothing was in flight" for a turn they killed.
+        cancelled = self.streaming.handle_cancel(update.effective_chat.id, name)
+        if cancelled:
+            await update.message.reply_text(f"🛑 Cancelled ({cancelled} aborted).")
         elif name and name.casefold() != "all":
-            # A named target that aborted nothing: either it was queued-only (drained, no
-            # pending requests) or it was not running. A clear, honest message either way.
+            # A named target with nothing to cancel — not running and not queued. A clear,
+            # honest message (NB1: a drained queued turn would have counted above, so reaching
+            # here means the project really had no in-flight or queued turn).
             await update.message.reply_text(
                 f"Nothing in flight to cancel for {name} (it may have already finished)."
             )
