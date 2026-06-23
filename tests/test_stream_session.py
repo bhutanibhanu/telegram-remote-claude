@@ -1120,7 +1120,8 @@ async def test_get_cwd_returns_active_project_cwd(tmp_path):
 async def test_per_project_resume_uses_each_projects_own_session_and_cwd(tmp_path):
     # Two projects with different cwds + session_ids: a turn resumes from the ACTIVE
     # project's own (session_id, cwd). Switching the active project makes the NEXT turn
-    # build/resume the OTHER project — and stops the previously-started engine (D2).
+    # build/resume the OTHER project. P5/T5: switching does NOT stop the previously-started
+    # engine (the single-active-run stop is removed so background runs survive a switch).
     from claude_tg.session_store import JsonSessionStore
 
     store = JsonSessionStore(tmp_path / "state.json")
@@ -1157,8 +1158,10 @@ async def test_per_project_resume_uses_each_projects_own_session_and_cwd(tmp_pat
         session.handle_message(1, "hi beta", send=rec.send, edit=rec.edit), timeout=2.0
     )
     assert eng_beta.resumed == "beta-sess" and eng_beta.started is True
-    # Single-active-run (D2): switching stopped alpha's previously-started engine.
-    assert eng_alpha.stopped is True
+    # P5/T5: switching no longer stops alpha's previously-started engine — a switched-away
+    # project keeps running in the background (the whole point of background concurrency).
+    assert eng_alpha.stopped is False
+    assert session._chat(1).runtimes["alpha"].started is True  # still live, not torn down
 
 
 async def test_per_project_session_id_persists_to_active_only(tmp_path):
@@ -1552,8 +1555,9 @@ async def test_interrupted_turn_comes_back_idle_and_recovers_on_restart(tmp_path
 # P4 (T8) — deferred defensive-branch tests (from T6/T7 review):
 #   * send-raises-on-refusal no-wedge (T7): if the SB2-refusal send() itself raises,
 #     the turn lock still releases (is_busy False after) — no wedge.
-#   * _stop_other_started stop-failure: switching when the old project's engine.stop()
-#     raises → the new turn still runs and the old runtime is cleared.
+#   * (P5/T5) switch-no-longer-stops-the-other-engine — see
+#     test_switch_does_not_stop_the_previously_started_engine above (the old
+#     _stop_other_started stop-failure test, repurposed now the cross-project stop is gone).
 #   * _resume_id defensive branches: a non-str / empty session_id → no-resume (fresh start).
 #
 # REAL JsonSessionStore + REAL allowed_roots (so the SB2 gate has teeth); scripted engines.
@@ -1563,9 +1567,10 @@ async def test_interrupted_turn_comes_back_idle_and_recovers_on_restart(tmp_path
 async def test_sb2_refusal_send_raising_does_not_wedge_the_lock(tmp_path):
     # T7 deferred: the SB2 refusal path sends a "no longer within roots" message; if THAT
     # send raises (Telegram hiccup at the worst moment), the exception propagates but the
-    # turn lock must still RELEASE (the `async with state.lock` unwinds) — the chat is not
-    # wedged busy forever. False-pass guard: if the refusal ran OUTSIDE the lock or swallowed
-    # into a hang, is_busy would stay True.
+    # turn lock must still RELEASE (the `async with target_rt.lock` unwinds — P5/T5 moved
+    # the lock onto the per-project runtime) — the chat is not wedged busy forever.
+    # False-pass guard: if the refusal ran OUTSIDE the lock or swallowed into a hang,
+    # is_busy would stay True.
     from claude_tg.session_store import JsonSessionStore
 
     root = tmp_path / "root"
@@ -1601,23 +1606,26 @@ async def test_sb2_refusal_send_raising_does_not_wedge_the_lock(tmp_path):
     assert session.is_busy(1) is False  # lock released — NOT wedged busy
 
 
-async def test_stop_failure_on_switch_still_runs_new_turn_and_clears_old(tmp_path):
-    # T8 (12a): single-active-run switch stops the previously-started engine; if that
-    # stop() RAISES, _stop_other_started logs + proceeds (marks the old runtime stopped /
-    # engine None) so a wedged old engine never blocks the new active turn. The new turn
-    # must still run, and the old runtime must be cleared.
+async def test_switch_does_not_stop_the_previously_started_engine(tmp_path):
+    # P5/T5: switching the active project must NOT tear down the previously-started
+    # engine (the P4 _stop_other_started single-active-run stop is REMOVED so a
+    # switched-away project keeps its engine live for a background run). After turn 1 on
+    # alpha + switch to beta + turn 2 on beta, alpha's engine was never stopped and its
+    # runtime is still live. (Was the old "stop-failure-on-switch swallow" test, whose
+    # premise — switching stops the other engine — no longer holds.)
     from claude_tg.session_store import JsonSessionStore
 
     store = JsonSessionStore(tmp_path / "state.json")
     store.create(1, "alpha", "/work/alpha", make_active=True)
     store.create(1, "beta", "/work/beta", make_active=False)
 
-    class StopBoomEngine(FakeEngine):
+    class StopTrackingEngine(FakeEngine):
         async def stop(self):
+            # If T5 regressed and re-introduced the cross-project stop, this would flip
+            # stopped True on the switched-away alpha — the assertion below would catch it.
             self.stopped = True
-            raise RuntimeError("stop blew up")
 
-    eng_alpha = StopBoomEngine(
+    eng_alpha = StopTrackingEngine(
         [ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="a")],
         session_id="alpha-sess",
     )
@@ -1636,17 +1644,260 @@ async def test_stop_failure_on_switch_still_runs_new_turn_and_clears_old(tmp_pat
     )
     assert eng_alpha.started is True
 
-    # Switch to beta; turn 2 must stop alpha (which raises) yet still run beta.
+    # Switch to beta; turn 2 runs beta WITHOUT stopping alpha (concurrent runs, T5).
     store.switch(1, "beta")
     await asyncio.wait_for(
         session.handle_message(1, "go beta", send=rec.send, edit=rec.edit), timeout=2.0
     )
-    assert eng_alpha.stopped is True  # stop() was attempted (and raised, swallowed)
-    assert eng_beta.started is True  # the new turn ran despite the stop failure
+    assert eng_beta.started is True  # the new turn ran
     assert any("b" == s["text"] for s in rec.sends)
-    # The old (alpha) runtime was cleared so a wedged engine can't block future turns.
+    # alpha was NOT stopped and its runtime is still live (left running in the background).
+    assert eng_alpha.stopped is False
     alpha_rt = session._chat(1).runtimes["alpha"]
-    assert alpha_rt.started is False and alpha_rt.engine is None
+    assert alpha_rt.started is True and alpha_rt.engine is eng_alpha
+
+
+# ===========================================================================
+# P5 (T5) — per-project turn lock + CONCURRENT runs (ADR-005 D1). The moment
+# background concurrency turns ON: the turn lock moved off _ChatState onto each
+# _ProjectRuntime, so a message to an idle project runs even while another project's
+# turn is parked. Switching away no longer stops the other run; a resolve routes by id
+# to the owning project (T2) regardless of which is foreground.
+# ===========================================================================
+
+
+async def _wait_busy(session, chat_id, name, *, want=True):
+    """Spin the loop until ``is_busy(chat_id, name) is want`` (bounded; no real sleep)."""
+    for _ in range(500):
+        if session.is_busy(chat_id, name) is want:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"is_busy({chat_id!r}, {name!r}) never became {want}")
+
+
+async def test_two_projects_run_concurrent_turns(tmp_path):
+    # ⭐ The headline concurrency proof at the unit level. Start a turn in alpha (parks on
+    # a HOLD awaiting an answer), SWITCH the active project to beta, start a turn in beta
+    # (also parks). BOTH engines are live + BOTH turns are in flight at once (alpha is NOT
+    # stopped by the switch). Resolve each INDEPENDENTLY via the id-routed callback path
+    # and both turns run to completion.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+
+    ask_a = AskEvent(
+        questions=[{"question": "A?", "options": [{"label": "Ya"}, {"label": "Na"}]}],
+        tool_use_id="tid-a",
+    )
+    ask_b = AskEvent(
+        questions=[{"question": "B?", "options": [{"label": "Yb"}, {"label": "Nb"}]}],
+        tool_use_id="tid-b",
+    )
+    eng_alpha = FakeEngine(
+        [ask_a, HOLD, ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="alpha-done")],
+        session_id="alpha-sess",
+    )
+    eng_beta = FakeEngine(
+        [ask_b, HOLD, ResultEvent(session_id="beta-sess", is_error=False, subtype="success", result_text="beta-done")],
+        session_id="beta-sess",
+    )
+    session = make_multi_session(
+        {"/work/alpha": eng_alpha, "/work/beta": eng_beta}, store=store
+    )
+    rec = Recorder()
+
+    # Turn 1 on alpha (active) → parks at the HOLD holding ALPHA's lock.
+    turn_a = asyncio.create_task(session.handle_message(1, "go alpha", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    assert session.is_busy(1, "alpha") is True
+    assert session.is_busy(1, "beta") is False  # beta idle so far
+
+    # Operator SWITCHES the active project to beta WHILE alpha is parked (T7 frees this;
+    # here we drive the store directly). Then turn 2 on beta starts CONCURRENTLY.
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "go beta", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "beta", want=True)
+
+    # BOTH turns are in flight at once — neither was stopped by the other starting.
+    assert session.is_busy(1, "alpha") is True
+    assert session.is_busy(1, "beta") is True
+    assert not turn_a.done() and not turn_b.done()
+    assert eng_alpha.started is True and eng_beta.started is True
+    assert eng_alpha.stopped is False  # the switch did NOT tear alpha down
+    # Each project's held ask is in the pending index, routed to its OWNING project (T2).
+    idx = session._chat(1).pending_index
+    assert idx["tid-a"].project_name == "alpha"
+    assert idx["tid-b"].project_name == "beta"
+
+    # Resolve BETA's ask via the id-routed callback path → only beta's engine resolves.
+    out_b = session.resolve_callback(1, encode_callback("a", "tid-b", question_index=0, option_index=0))
+    assert out_b.handled is True
+    assert eng_beta.resolve_calls == [("tid-b", QuestionAnswer(answers={"B?": "Yb"}))]
+    assert eng_alpha.resolve_calls == []  # alpha untouched by beta's resolve
+    await asyncio.wait_for(turn_b, timeout=2.0)
+    assert any("beta-done" in s["text"] for s in rec.sends)
+    # alpha is STILL parked + busy after beta finished (independent runs).
+    assert session.is_busy(1, "alpha") is True and not turn_a.done()
+    assert session.is_busy(1, "beta") is False
+
+    # Now resolve ALPHA's ask → alpha's engine resolves and its turn completes.
+    out_a = session.resolve_callback(1, encode_callback("a", "tid-a", question_index=0, option_index=0))
+    assert out_a.handled is True
+    assert eng_alpha.resolve_calls == [("tid-a", QuestionAnswer(answers={"A?": "Ya"}))]
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    assert any("alpha-done" in s["text"] for s in rec.sends)
+    assert session.is_busy(1) is False  # both done → nothing busy
+
+
+async def test_same_project_second_message_raises_streaming_busy(tmp_path):
+    # Per-project lock: a SECOND message to the SAME running project raises StreamingBusy
+    # (one run per project — unchanged per-project UX). A real answer-hold keeps the lock.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+
+    eng = FakeEngine(
+        [HOLD, ResultEvent(session_id="alpha-sess", is_error=False, subtype="success")],
+        session_id="alpha-sess",
+    )
+    session = make_multi_session({"/work/alpha": eng}, store=store)
+    rec = Recorder()
+
+    turn = asyncio.create_task(session.handle_message(1, "first", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    # A second message to the same (active, busy) project is refused.
+    with pytest.raises(StreamingBusy):
+        await session.handle_message(1, "second", send=rec.send, edit=rec.edit)
+    # Release + finish.
+    eng.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert session.is_busy(1, "alpha") is False
+
+
+async def test_is_busy_name_reflects_per_project_lock_state(tmp_path):
+    # is_busy(chat, name) is True ONLY for the project whose turn holds its lock; a sibling
+    # idle project reads False. is_busy(chat) with no name is True iff ANY project is busy.
+    # Matched case-insensitively (mirrors the store), so /projects + /switch WORK agree.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+
+    eng_alpha = FakeEngine([HOLD, ResultEvent(session_id="a", is_error=False, subtype="success")], session_id="a")
+    eng_beta = FakeEngine([], session_id="b")
+    session = make_multi_session({"/work/alpha": eng_alpha, "/work/beta": eng_beta}, store=store)
+    rec = Recorder()
+
+    assert session.is_busy(1) is False  # nothing running
+    assert session.is_busy(1, "alpha") is False
+    assert session.is_busy(1, "missing") is False  # unknown name → never busy (RB1)
+
+    turn = asyncio.create_task(session.handle_message(1, "go", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    assert session.is_busy(1, "alpha") is True
+    assert session.is_busy(1, "ALPHA") is True  # case-insensitive
+    assert session.is_busy(1, "beta") is False  # the sibling is idle
+    assert session.is_busy(1) is True  # SOME project is busy
+
+    eng_alpha.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert session.is_busy(1, "alpha") is False
+    assert session.is_busy(1) is False
+
+
+async def test_turn_exception_releases_lock_and_resets_status_idle(tmp_path):
+    # T4-review finally-wrap: a _drive_turn whose engine.send RAISES mid-stream must leave
+    # the project at status idle, its transient status line cleared, and its per-project
+    # lock released — the chat stays usable (a concurrent run, or a retry on this project,
+    # is unaffected). Without the try/finally, the project would stick at running/awaiting_*
+    # and a /projects read would mislead.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+
+    class BoomMidStreamEngine(FakeEngine):
+        async def send(self, prompt, *, timeout=None):
+            # Emit one status event (so a status line is created), then blow up mid-stream.
+            yield ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)")
+            raise RuntimeError("engine exploded mid-stream")
+
+    eng = BoomMidStreamEngine([], session_id="alpha-sess")
+    session = make_multi_session({"/work/alpha": eng}, store=store)
+    rec = Recorder()
+
+    # The turn raises; the exception surfaces (RB2 clean-fail), but the finally must run.
+    # Pass `delete` so the finally's best-effort status-line cleanup is observable.
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(
+            session.handle_message(1, "go", send=rec.send, edit=rec.edit, delete=rec.delete),
+            timeout=2.0,
+        )
+
+    rt = session._chat(1).runtimes["alpha"]
+    # finally: status forced back to idle (NOT stuck at running/awaiting_*).
+    assert rt.status == "idle"
+    # finally: the transient status line was cleared (id/text reset), and best-effort
+    # deleted (a status line was created by the ToolUseEvent before the raise).
+    assert rt.status_message_id is None and rt.status_text is None
+    assert rec.deletes, "the transient status line should be deleted in the finally"
+    # The per-project lock was released → the chat is NOT wedged busy and a retry works.
+    assert session.is_busy(1, "alpha") is False
+    assert session.is_busy(1) is False
+    # A SUBSEQUENT turn on the same project runs cleanly (the chat is usable, not wedged).
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="recovered")],
+        session_id="alpha-sess",
+    )
+    session._chat(1).runtimes["alpha"].engine = eng2  # swap in a healthy engine for the retry
+    session._chat(1).runtimes["alpha"].started = True
+    rec2 = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "again", send=rec2.send, edit=rec2.edit), timeout=2.0
+    )
+    assert any("recovered" in s["text"] for s in rec2.sends)
+
+
+async def test_held_ask_then_cancel_returns_status_to_idle(tmp_path):
+    # The cancel-path status outcome: a turn parked on a held ask reports awaiting_answer;
+    # /cancel (handle_cancel) aborts it → the held turn unblocks, runs out, and the project
+    # returns to idle (not stuck at awaiting_answer). The pending-index entry is cleared.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+
+    ask = AskEvent(
+        questions=[{"question": "Proceed?", "options": [{"label": "Yes"}, {"label": "No"}]}],
+        tool_use_id="hold-tid",
+    )
+    eng = FakeEngine(
+        [ask, HOLD, ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="done")],
+        session_id="alpha-sess",
+    )
+    session = make_multi_session({"/work/alpha": eng}, store=store)
+    rec = Recorder()
+
+    turn = asyncio.create_task(session.handle_message(1, "go", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    rt = session._chat(1).runtimes["alpha"]
+    # Parked on the ask → status is awaiting_answer + the id is in the index.
+    assert rt.status == "awaiting_answer"
+    assert "hold-tid" in session._chat(1).pending_index
+
+    # /cancel aborts the run (lock-free) → the held turn unblocks and completes.
+    aborted = session.handle_cancel(1)
+    assert aborted == 1
+    # The pending-index entry for the cancelled project is cleared immediately.
+    assert "hold-tid" not in session._chat(1).pending_index
+    await asyncio.wait_for(turn, timeout=2.0)
+    # The turn ended → status is back to idle (the finally / turn-end path), lock released.
+    assert rt.status == "idle"
+    assert session.is_busy(1, "alpha") is False
 
 
 async def test_resume_id_empty_string_session_id_starts_fresh(tmp_path):
@@ -2204,7 +2455,8 @@ async def test_ensure_engine_discards_non_started_engine_and_builds_fresh(tmp_pa
 async def test_ensure_engine_discard_swallows_stop_failure_and_builds_fresh(tmp_path):
     # Best-effort: if the stale (non-started) engine's stop() RAISES while being discarded,
     # _ensure_engine swallows it and still builds + starts the fresh engine (a wedged stale
-    # engine must never block the rebuild). Mirrors the _stop_other_started swallow.
+    # engine must never block the rebuild). This is the SAME-project QF5 discard (kept under
+    # P5/T5 concurrency — only the cross-project _stop_other_started stop was removed).
     from claude_tg.session_store import JsonSessionStore
 
     store = JsonSessionStore(tmp_path / "state.json")

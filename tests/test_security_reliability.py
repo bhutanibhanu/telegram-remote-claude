@@ -599,8 +599,9 @@ async def test_rb2_engine_send_failure_surfaces_clean_and_turn_ends():
     await asyncio.wait_for(drive(), timeout=2.0)  # the load-bearing no-hang assertion
     # Nothing leaked a raw traceback to the operator via a send.
     assert all("Traceback" not in s["text"] for s in rec.sends)
-    # RB4-shape: the failed turn released the per-chat lock — the chat is NOT wedged.
-    assert not session._chat(1).lock.locked()
+    # RB4-shape: the failed turn released its per-project turn lock (P5/T5: the lock moved
+    # off the chat onto each _ProjectRuntime) — the chat is NOT wedged busy.
+    assert session.is_busy(1) is False
 
 
 # ===========================================================================
