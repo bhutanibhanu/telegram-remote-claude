@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Protocol
@@ -362,6 +363,14 @@ class _ChatState:
     # pending_plan slots; every resolve/cancel/free-text routes through it by id. The
     # cross-project router (id -> project) — correctly on the chat, not a project (D7).
     pending_index: dict[str, _PendingRef] = field(default_factory=dict)
+    # P5 / ADR-005 D6 (T6): the per-chat FIFO run queue. When a turn would start but the
+    # process is AT the concurrency cap (StreamingSession._running >= cap), handle_message
+    # appends a waiter Future here and parks on it instead of running; a finishing run pops
+    # the OLDEST waiter (FIFO) and hands it the freed slot. The QUEUE is per-chat (no
+    # cross-chat semantics — the anti-goal); the run COUNTER is process-global (the cap is
+    # per-deployment). Transient in-memory, like everything else on _ChatState (RB3 — no
+    # in-flight runs survive a restart).
+    run_queue: "deque[asyncio.Future[None]]" = field(default_factory=deque)
 
 
 class StreamingBusy(Exception):
@@ -416,6 +425,15 @@ class StreamingSession:
         # NOTE (P4 / D3): no __init__ harvest of persisted (session_id, cwd). Resume now
         # resolves PER ACTIVE PROJECT from the registry at _ensure_engine time, and the
         # in-memory _ProjectRuntime starts fresh every process (transient bypass reset).
+        # P5 / ADR-005 D6 (T6): process-global count of turns currently RUNNING (across all
+        # projects + chats). A turn started while ``_running >= config.max_concurrent_runs``
+        # is QUEUED (per-chat FIFO on _ChatState.run_queue) instead of run; a finishing run
+        # decrements this and hands the freed slot to the next queued waiter. The counter is
+        # global (the cap is per-deployment); the queue is per-chat (no cross-chat
+        # semantics). MUST decrement exactly once on EVERY turn-exit path (normal end,
+        # mid-stream raise, cancel, resume-failure) so a raised turn can never leak a slot
+        # and permanently shrink capacity — see handle_message's try/finally + _release_slot.
+        self._running = 0
 
     # -- per-chat state ------------------------------------------------------
 
@@ -542,16 +560,25 @@ class StreamingSession:
 
     # -- engine lifecycle ----------------------------------------------------
 
-    async def _ensure_engine(self, chat_id: int) -> tuple[Engine, bool]:
-        """Lazily start (or resume) the ACTIVE project's engine. Idempotent per project.
+    async def _ensure_engine(
+        self,
+        chat_id: int,
+        *,
+        target: Optional[tuple[str, _ProjectRuntime]] = None,
+    ) -> tuple[Engine, bool]:
+        """Lazily start (or resume) a project's engine. Idempotent per project.
 
         Returns ``(engine, resume_failed)`` — ``resume_failed`` is True iff a persisted
         ``session_id`` was present but ``resume`` raised and we fell back to a fresh
         ``start`` THIS call (so the caller can post the RB3 operator notice). It is False
         for a fresh start, a clean resume, and the already-started fast path.
 
-        Resolves the chat's active project (auto-creating ``default`` if none — a turn
-        always has a project), then:
+        ``target`` PINS the project to build for (its ``(name, runtime)``). When omitted the
+        chat's **active** project is resolved (auto-creating ``default`` if none — a turn
+        always has a project). ``handle_message`` passes the project it captured at message
+        time so a turn that **queued** behind the cap (D6/T6) — and thus parked BEFORE this
+        call, during which the active project may have moved — still builds/resumes ITS OWN
+        project, not whatever happens to be active when its slot frees. Then:
 
         * **SB2 cwd re-validation (the authoritative gate, T7).** Re-validate the stored
           cwd against the permitted roots via :func:`resolve_within_roots` BEFORE building
@@ -573,7 +600,12 @@ class StreamingSession:
           harvested from the runner's resume-failure recovery — and is signalled back to
           the caller (RB3) so the operator learns the previous session could not resume.
         """
-        name, rt = self._active_runtime(chat_id, create_default=True)
+        name: Optional[str]
+        rt: Optional[_ProjectRuntime]
+        if target is not None:
+            name, rt = target
+        else:
+            name, rt = self._active_runtime(chat_id, create_default=True)
         assert name is not None and rt is not None  # create_default guarantees both
         # SB2 (T7): re-validate the stored cwd BEFORE building/resuming the engine. A
         # PathNotAllowed propagates out of _ensure_engine (the engine is NOT started) and
@@ -869,6 +901,17 @@ class StreamingSession:
         lock does NOT cover a free-text resolve targeting an *already running* turn — that
         path must run concurrently with the held turn, so it is handled before locking.
 
+        **Concurrency cap + FIFO queue (P5 / ADR-005 D6; T6).** Before driving, the turn
+        acquires a process-global run SLOT (:meth:`_acquire_slot`). While the number of
+        running turns is BELOW ``config.max_concurrent_runs`` it runs immediately; AT the
+        cap it is **accepted and queued** (per-chat FIFO) — this project reports ``queued``
+        to ``/projects``, the operator gets a one-time ``⏳ queued behind N run(s)`` notice,
+        and the turn parks until a finishing run hands it the freed slot (SB6 fail-closed —
+        queued, never refused, never dropped). A project is never queued behind ITSELF (the
+        same-project :class:`StreamingBusy` check above runs first). The slot is released —
+        exactly once, on EVERY exit path — by the ``finally`` (the D6 slot-leak hazard: a
+        raised turn must never leak a slot and permanently shrink capacity).
+
         **SB2 fail-closed (T7).** If the active project's stored cwd is no longer within
         the permitted roots, :meth:`_ensure_engine` raises
         :class:`~claude_tg.paths.PathNotAllowed`; the engine is never started, this
@@ -897,41 +940,195 @@ class StreamingSession:
         # DIFFERENT idle project takes its own lock and runs concurrently. _ensure_engine /
         # _drive_turn re-resolve + pin the active project (the busy-guards keep it stable for
         # the turn in T5; T7 frees /switch but _drive_turn still pins the turn's project).
-        _target_name, target_rt = self._active_runtime(chat_id, create_default=True)
-        assert target_rt is not None  # create_default=True always yields a runtime
+        target_name, target_rt = self._active_runtime(chat_id, create_default=True)
+        assert target_name is not None and target_rt is not None  # create_default => both
+        # Pin the captured (name, runtime) so _ensure_engine + _drive_turn act on THIS
+        # project even if the turn QUEUES behind the cap (D6/T6) and the active project moves
+        # while it is parked — a queued turn must run ITS OWN project, not whatever is active
+        # when its slot frees.
+        target = (target_name, target_rt)
 
+        # A project is NEVER queued behind ITSELF (D6): a second message to the SAME running
+        # project is StreamingBusy, exactly as in T5 — checked BEFORE acquiring a slot so a
+        # busy project never consumes a queue entry.
         if target_rt.lock.locked():
             raise StreamingBusy()
 
-        async with target_rt.lock:
-            try:
-                engine, resume_failed = await self._ensure_engine(chat_id)
-            except PathNotAllowed:
-                # SB2 (T7): the active project's stored cwd drifted out of the permitted
-                # roots (config narrowed, or a path component became an out-of-root
-                # symlink). Refuse the turn fail-closed WITHOUT starting the engine; the
-                # lock releases on return (no hang).
-                await send(
-                    text=(
-                        f"❌ This project's directory {self.get_cwd(chat_id)} is no longer "
-                        "within the permitted roots — use /new <name> <path> to create one "
-                        "inside them."
-                    ),
-                    reply_markup=None,
-                    parse_mode=None,
+        # P5 / ADR-005 D6 (T6): acquire a run SLOT before driving. Under the cap → run now
+        # (the counter is incremented). At the cap → enqueue (per-chat FIFO), set this
+        # project's status to "queued", send a one-time "queued behind N run(s)" notice, and
+        # park until a finishing run hands this turn the freed slot (SB6: queue, never drop /
+        # refuse). After this returns a slot is held and MUST be released exactly once below.
+        await self._acquire_slot(state, target_rt, send=send)
+        # SLOT-LEAK SAFETY (the flagged D6 hazard): from here the slot is HELD. The whole
+        # remainder — _ensure_engine, the SB2 refusal, the resume notice, AND _drive_turn —
+        # runs inside this try so the finally's _release_slot fires on EVERY exit path
+        # (normal end, mid-stream raise, cancel, resume-failure return, StreamingBusy below).
+        # _release_slot decrements the global counter and pops the next queued waiter exactly
+        # once, so a raised turn can never leak a slot (which would permanently shrink
+        # capacity) and a slot is never double-released. Mirrors T5's end-of-turn finally.
+        try:
+            # While this turn was parked in the queue, another message to the SAME project
+            # could have started running it (its lock would now be held). Re-check after the
+            # slot is granted so the per-project one-run invariant holds even across a queue
+            # wait; the finally still releases the slot this turn acquired.
+            if target_rt.lock.locked():
+                raise StreamingBusy()
+            async with target_rt.lock:
+                try:
+                    engine, resume_failed = await self._ensure_engine(
+                        chat_id, target=target
+                    )
+                except PathNotAllowed:
+                    # SB2 (T7): the active project's stored cwd drifted out of the permitted
+                    # roots (config narrowed, or a path component became an out-of-root
+                    # symlink). Refuse the turn fail-closed WITHOUT starting the engine; the
+                    # lock releases on return AND the finally releases the slot (no leak).
+                    await send(
+                        text=(
+                            f"❌ This project's directory {self.get_cwd(chat_id)} is no "
+                            "longer within the permitted roots — use /new <name> <path> to "
+                            "create one inside them."
+                        ),
+                        reply_markup=None,
+                        parse_mode=None,
+                    )
+                    return
+                if resume_failed:
+                    # RB3: the persisted session could not be resumed; a fresh one was
+                    # started. Tell the operator BEFORE driving the turn (it still completes).
+                    await send(
+                        text="⚠️ Couldn't resume this project's previous session; started a fresh one.",
+                        reply_markup=None,
+                        parse_mode=None,
+                    )
+                await self._drive_turn(
+                    state, chat_id, engine, text,
+                    send=send, edit=edit, delete=delete, target=target,
                 )
-                return
-            if resume_failed:
-                # RB3: the persisted session could not be resumed; a fresh one was started.
-                # Tell the operator BEFORE driving the turn (the turn still completes).
-                await send(
-                    text="⚠️ Couldn't resume this project's previous session; started a fresh one.",
-                    reply_markup=None,
-                    parse_mode=None,
-                )
-            await self._drive_turn(
-                state, chat_id, engine, text, send=send, edit=edit, delete=delete
+        finally:
+            # SLOT-LEAK SAFETY: release the slot this turn held — exactly once, on every
+            # exit path. _release_slot decrements the global counter and, if a turn is
+            # queued (this chat first, then any chat — FIFO), TRANSFERS the freed slot to
+            # the oldest waiter (re-incrementing + waking it) so the dequeue fires on every
+            # turn-exit too (normal / error / cancel / resume-failure). Pure bookkeeping +
+            # a Future.set_result — it never awaits and never raises, so it cannot itself
+            # leak or mask the turn's own exception (which propagates after the finally).
+            self._release_slot(state)
+
+    # -- the run scheduler: cap + per-chat FIFO queue (ADR-005 D6 / T6) -------
+
+    async def _acquire_slot(
+        self, state: _ChatState, target_rt: _ProjectRuntime, *, send: SendFn
+    ) -> None:
+        """Acquire one process-global run slot — run now if under the cap, else QUEUE.
+
+        The concurrency cap (``config.max_concurrent_runs``, D6) bounds how many turns RUN
+        at once across the whole process. When the global :attr:`_running` count is below
+        the cap, increment it and return immediately (run now). When AT the cap, the turn
+        is **accepted and queued** (never refused / dropped — SB6 fail-closed → queue):
+
+        * mark this project ``queued`` for ``/projects`` (T4 status / T7 render),
+        * send a **one-time** ``⏳ queued behind N run(s)`` notice (D6 — N is the number of
+          slot-holders ahead, i.e. the cap; richer live position is deferrable),
+        * append a waiter :class:`asyncio.Future` to this chat's FIFO :attr:`run_queue` and
+          ``await`` it. A finishing run pops the OLDEST waiter and **transfers** it the freed
+          slot via :meth:`_release_slot` (which re-increments :attr:`_running` and resolves
+          the future) — so on wake the slot is already counted as held and this turn just
+          proceeds. FIFO order is preserved (``popleft`` of the oldest).
+
+        Returns once a slot is held; the caller MUST release it exactly once (the
+        ``handle_message`` ``finally`` → :meth:`_release_slot`). The counter is global; the
+        queue is per-chat (no cross-chat semantics — D6).
+        """
+        cap = self.config.max_concurrent_runs
+        if self._running < cap:
+            self._running += 1
+            return
+        # At the cap → queue this turn (FIFO) and park until a slot is transferred to it.
+        # Mark the project queued so /projects shows it (the turn has not started running).
+        target_rt.status = "queued"
+        ahead = self._running  # slot-holders ahead of this turn (== the cap when full).
+        waiter: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        state.run_queue.append(waiter)
+        # One-time queued notice (D6). Best-effort: a failed notice must not strand the turn
+        # in the queue (the wait below is what actually gates it), so swallow a send error.
+        try:
+            await send(
+                text=f"⏳ Queued behind {ahead} run(s) — it'll start when a slot frees.",
+                reply_markup=None,
+                parse_mode=None,
             )
+        except Exception:
+            log.debug("queued-notice send failed (turn still queued)", exc_info=True)
+        # Park until a finishing run hands us the slot (it re-incremented _running for us).
+        # If the wait is cancelled (shutdown / the awaiting task is torn down) we must not
+        # leak: either we were still queued (drop our entry — we never held a slot), or a
+        # _release_slot had ALREADY transferred us the slot (our future is resolved, the
+        # counter holds it for us) — in which case hand that slot straight back on
+        # (_release_slot transfers it to the next waiter or decrements). Either way the
+        # global count stays correct; the CancelledError then propagates (the turn is gone).
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            try:
+                state.run_queue.remove(waiter)
+            except ValueError:
+                # Not in the queue → it was popped by a transfer that resolved our future a
+                # tick before the cancel landed; that slot is counted as held for us, so
+                # release it rather than leak it.
+                if waiter.done() and not waiter.cancelled():
+                    self._release_slot(state)
+            raise
+
+    def _release_slot(self, state: _ChatState) -> None:
+        """Release the current turn's run slot — decrement, or TRANSFER to the next waiter.
+
+        Called exactly once per running turn from ``handle_message``'s ``finally`` (every
+        exit path — normal end, mid-stream raise, cancel, resume-failure). The slot-leak
+        safety contract (the flagged D6 hazard): a turn that consumed a slot ALWAYS reaches
+        here, so capacity can never permanently shrink; and it adjusts :attr:`_running` by
+        exactly one net step (either ``-1`` to free, or ``0`` because the slot is handed
+        straight to a waiter), so the counter never drifts.
+
+        FIFO dequeue: look for the OLDEST queued waiter — this chat's queue first, then any
+        other chat's (the cap is global, so a slot freed here may unblock a turn queued in
+        another chat; per-chat queues keep order within a chat). If one exists, **transfer**
+        the slot to it: keep :attr:`_running` as-is (the slot stays held, now by the waiter)
+        and resolve its future (waking the parked :meth:`_acquire_slot`). If none, simply
+        decrement (the slot is now free). Pure + non-awaiting + never raises, so it cannot
+        itself leak a slot or mask the turn's exception.
+        """
+        waiter = self._pop_next_waiter(state)
+        if waiter is not None:
+            # Transfer: the freed slot stays counted (now held by the woken turn). Do NOT
+            # decrement — set the waiter's result so its parked _acquire_slot returns.
+            waiter.set_result(None)
+            return
+        # No one waiting → the slot is free. Decrement, clamped at 0 (defensive: a double
+        # release must never drive the count negative and wrongly grant extra capacity).
+        if self._running > 0:
+            self._running -= 1
+
+    def _pop_next_waiter(
+        self, state: _ChatState
+    ) -> "Optional[asyncio.Future[None]]":
+        """Pop the oldest still-pending queued waiter (this chat first, then any), FIFO.
+
+        Skips any already-cancelled/done futures (a queued turn whose task was torn down —
+        its CancelledError handler removes it, but a race could leave a settled future), so
+        a transferred slot always goes to a LIVE waiter. Returns ``None`` when no chat has a
+        pending waiter (the slot is then freed by the caller).
+        """
+        # This chat's queue first (preserve its FIFO order), then every other chat's.
+        queues = [state.run_queue]
+        queues.extend(s.run_queue for s in self._chats.values() if s is not state)
+        for q in queues:
+            while q:
+                waiter = q.popleft()
+                if not waiter.done():
+                    return waiter
+        return None
 
     async def _drive_turn(
         self,
@@ -943,6 +1140,7 @@ class StreamingSession:
         send: SendFn,
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
+        target: Optional[tuple[str, _ProjectRuntime]] = None,
     ) -> None:
         """Iterate ``engine.send`` → render → Telegram send/edit (coalesced).
 
@@ -966,12 +1164,18 @@ class StreamingSession:
         AFTER the loop ends naturally (the substrate stream always terminates — RB2), so we
         never re-drive a turn mid-stream (no double-render / re-entrancy).
         """
-        # Capture the project this turn is running on AT TURN START (defense-in-depth, T7
-        # review): the busy-guard keeps the active project stable for the turn, but pinning
-        # the name/runtime here means the result-persist, any QF3 recovery, AND the
-        # pending-index registration (ADR-005 D3 — id -> THIS turn's project) act on THIS
-        # turn's project, not "whatever is active when the turn ends".
-        turn_name, turn_rt = self._active_runtime(chat_id, create_default=True)
+        # The project this turn is running on. ``handle_message`` passes the project it
+        # captured at message time (``target``) so the result-persist, any QF3 recovery, AND
+        # the pending-index registration (ADR-005 D3 — id -> THIS turn's project) act on THIS
+        # turn's project — critically for a turn that QUEUED behind the cap (D6/T6) and so
+        # parked while the active project may have moved. Falling back to the active project
+        # (no target) preserves the prior behavior for any direct caller.
+        turn_name: Optional[str]
+        turn_rt: Optional[_ProjectRuntime]
+        if target is not None:
+            turn_name, turn_rt = target
+        else:
+            turn_name, turn_rt = self._active_runtime(chat_id, create_default=True)
         assert turn_name is not None  # create_default=True always yields a project name
         assert turn_rt is not None  # create_default=True always yields a runtime too
         # This first turn applies the resume-failure heuristic iff the session was resumed

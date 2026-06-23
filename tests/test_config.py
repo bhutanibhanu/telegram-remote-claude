@@ -2,7 +2,13 @@ import os
 
 import pytest
 
-from claude_tg.config import Config, load_dotenv, parse_allowed_roots, parse_chat_ids
+from claude_tg.config import (
+    Config,
+    load_dotenv,
+    parse_allowed_roots,
+    parse_chat_ids,
+    parse_max_concurrent_runs,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -14,6 +20,9 @@ def clean_env(monkeypatch):
     # auto-cleared, so clear them here too to stop host/CI leakage into these tests.
     monkeypatch.delenv("ALLOWED_ROOTS", raising=False)
     monkeypatch.delenv("ALLOW_ANY_PATH", raising=False)
+    # MAX_CONCURRENT_RUNS (P5/T6) has no TELEGRAM_/CLAUDE_ prefix either — clear it so a
+    # host/CI value can't leak into the cap parse matrix below.
+    monkeypatch.delenv("MAX_CONCURRENT_RUNS", raising=False)
 
 
 def test_parse_chat_ids():
@@ -135,3 +144,57 @@ def test_allow_any_path_override(monkeypatch, tmp_path):
     monkeypatch.setenv("ALLOW_ANY_PATH", "true")
     cfg = Config.from_env(dotenv_path=None)
     assert cfg.allow_any_path is True
+
+
+# --- D6: MAX_CONCURRENT_RUNS (the concurrency cap, P5/T6) ----------------------
+
+
+def test_parse_max_concurrent_runs_unset_empty_and_zero_default_to_3():
+    # The locked D6 rule: unset / empty / "0" all read as "use the default" (3). A zero cap
+    # would queue every turn forever (deadlock), so 0 is treated as unset, not accepted.
+    assert parse_max_concurrent_runs(None) == 3
+    assert parse_max_concurrent_runs("") == 3
+    assert parse_max_concurrent_runs("   ") == 3
+    assert parse_max_concurrent_runs("0") == 3
+
+
+def test_parse_max_concurrent_runs_positive_value():
+    assert parse_max_concurrent_runs("5") == 5
+    assert parse_max_concurrent_runs(" 2 ") == 2  # surrounding whitespace tolerated
+
+
+def test_parse_max_concurrent_runs_negative_or_non_integer_raise():
+    # Negative or non-integer is a configuration error → fail loud at startup (a typo must
+    # not silently change the cap). Mirrors ANSWER_BACKSTOP_SECONDS's fail-loud posture.
+    with pytest.raises(ValueError):
+        parse_max_concurrent_runs("-1")
+    with pytest.raises(ValueError):
+        parse_max_concurrent_runs("x")
+    with pytest.raises(ValueError):
+        parse_max_concurrent_runs("1.5")
+
+
+def test_config_default_max_concurrent_runs(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.max_concurrent_runs == 3  # unset → default
+
+
+def test_config_max_concurrent_runs_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("MAX_CONCURRENT_RUNS", "7")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.max_concurrent_runs == 7
+
+
+def test_config_bad_max_concurrent_runs_fails_loud(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("MAX_CONCURRENT_RUNS", "-2")
+    with pytest.raises(ValueError):
+        Config.from_env(dotenv_path=None)

@@ -101,6 +101,13 @@ def parse_engine_mode(raw: str | None) -> str:
 #: this elapses, leaving the session usable. Configurable via ``ANSWER_BACKSTOP_SECONDS``.
 DEFAULT_ANSWER_BACKSTOP_SECONDS = 3600
 
+#: Default concurrency cap (P5 / ADR-005 D6): at most 3 turns RUN at once across the
+#: whole process; a turn started while at the cap is QUEUED (FIFO, per chat) and starts
+#: when a slot frees — never refused, never dropped (SB6 fail-closed → queue). The cap
+#: protects host CPU + the shared CLI/SDK + the Telegram send budget. Configurable via
+#: ``MAX_CONCURRENT_RUNS``.
+DEFAULT_MAX_CONCURRENT_RUNS = 3
+
 
 def parse_answer_backstop_seconds(raw: str | None) -> int:
     """Parse + validate ANSWER_BACKSTOP_SECONDS (default 3600 = 60 min).
@@ -125,6 +132,35 @@ def parse_answer_backstop_seconds(raw: str | None) -> int:
     return seconds
 
 
+def parse_max_concurrent_runs(raw: str | None) -> int:
+    """Parse + validate MAX_CONCURRENT_RUNS (default 3; P5 / ADR-005 D6).
+
+    Bounds simultaneously-*executing* runs across the whole process: a turn started
+    while at the cap is QUEUED (FIFO, per chat) and starts when a slot frees, never
+    refused (D6/SB6). Parsing mirrors :func:`parse_answer_backstop_seconds` with one
+    deliberate difference (the locked D6 rule): **empty/unset/``0`` → the default 3**
+    (``0`` reads as "unset" — a cap of zero would deadlock every turn, so it is treated
+    as the default rather than accepted), while a **negative or non-integer** value is a
+    configuration error and fails loud at startup (a typo must not silently change the
+    cap). So ``""``/unset/``"0"`` → 3; ``"5"`` → 5; ``"-1"``/``"x"`` → raise.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_CONCURRENT_RUNS
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"MAX_CONCURRENT_RUNS must be an integer, got {raw!r}"
+        ) from exc
+    if value < 0:
+        raise ValueError("MAX_CONCURRENT_RUNS must not be negative")
+    if value == 0:
+        # 0 == "unset" (a zero cap would queue every turn forever — deadlock). Treat it
+        # as the default rather than accept an unusable cap (D6).
+        return DEFAULT_MAX_CONCURRENT_RUNS
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -142,6 +178,12 @@ class Config:
     # ask/plan request before auto-denying + notifying. Default 60 min; T7 passes it
     # to the Engine. Only consulted in streaming mode.
     answer_backstop_seconds: int = DEFAULT_ANSWER_BACKSTOP_SECONDS
+    # P5 / ADR-005 D6 concurrency cap: the max number of turns that RUN at once across the
+    # whole process (streaming mode). A turn started while at the cap is QUEUED (FIFO, per
+    # chat) and runs when a slot frees — never refused (SB6 → queue). Default 3; 0/unset →
+    # default; negative/non-integer → fail loud (parse_max_concurrent_runs). Only consulted
+    # in streaming mode.
+    max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS
     # SB2 /cd path confinement (decision-log: confinement ON by default). The canonical
     # roots a `/cd` target must sit inside; the default is `(workdir,)` (set by
     # from_env), so an unset ALLOWED_ROOTS confines /cd to the workdir (which itself
@@ -189,6 +231,9 @@ class Config:
         answer_backstop = parse_answer_backstop_seconds(
             os.environ.get("ANSWER_BACKSTOP_SECONDS")
         )
+        max_concurrent_runs = parse_max_concurrent_runs(
+            os.environ.get("MAX_CONCURRENT_RUNS")
+        )
 
         # SB2 /cd confinement. Default the allow-list to the workdir so an unset
         # ALLOWED_ROOTS still confines /cd (ON by default); ALLOW_ANY_PATH=true is the
@@ -210,6 +255,7 @@ class Config:
             state_file=state_file,
             engine_mode=engine_mode,
             answer_backstop_seconds=answer_backstop,
+            max_concurrent_runs=max_concurrent_runs,
             allowed_roots=allowed_roots,
             allow_any_path=allow_any_path,
         )

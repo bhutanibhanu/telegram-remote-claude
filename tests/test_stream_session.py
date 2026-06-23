@@ -11,6 +11,7 @@ wiring bug fails fast rather than hanging the suite.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ def make_config(
     *,
     allowed_roots=(),
     allow_any_path=True,
+    max_concurrent_runs=3,
 ):
     # NOTE (T7): turn-behavior tests default to ``allow_any_path=True`` so that
     # ``_ensure_engine``'s SB2 cwd re-validation (added in T7) NO-OPS — these tests are
@@ -60,6 +62,7 @@ def make_config(
         state_file=state_file,
         engine_mode=engine_mode,
         answer_backstop_seconds=3600,
+        max_concurrent_runs=max_concurrent_runs,
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
     )
@@ -1898,6 +1901,346 @@ async def test_held_ask_then_cancel_returns_status_to_idle(tmp_path):
     # The turn ended → status is back to idle (the finally / turn-end path), lock released.
     assert rt.status == "idle"
     assert session.is_busy(1, "alpha") is False
+
+
+# ===========================================================================
+# T6 — concurrency cap + per-chat FIFO queue (MAX_CONCURRENT_RUNS, ADR-005 D6).
+# Mock-only (the FakeEngine HOLD/resolve dance). The cap bounds RUNNING turns
+# process-wide; excess turns queue per chat and start when a slot frees.
+# ===========================================================================
+
+
+async def _wait_running(session, n, *, timeout_iters=1000):
+    """Spin the loop until ``session._running == n`` (bounded; no real sleep)."""
+    for _ in range(timeout_iters):
+        if session._running == n:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"session._running never became {n} (is {session._running})")
+
+
+def _three_project_store(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    store.create(1, "gamma", "/work/gamma", make_active=False)
+    return store
+
+
+def _holding_engine(name):
+    """A FakeEngine that parks on a HOLD then completes (so its turn stays 'running')."""
+    return FakeEngine(
+        [HOLD, ResultEvent(session_id=f"{name}-sess", is_error=False, subtype="success", result_text=f"{name}-done")],
+        session_id=f"{name}-sess",
+    )
+
+
+async def test_cap_queues_third_project_and_dequeues_when_slot_frees(tmp_path):
+    # ⭐ The headline cap proof. With MAX_CONCURRENT_RUNS=2: two project turns RUN
+    # concurrently; a THIRD project's message is QUEUED (a one-time notice + status
+    # "queued", NOT refused) and starts only when one running turn completes (FIFO).
+    store = _three_project_store(tmp_path)
+    eng_a, eng_b, eng_c = _holding_engine("alpha"), _holding_engine("beta"), _holding_engine("gamma")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b, "/work/gamma": eng_c},
+        store=store,
+        config=make_config(max_concurrent_runs=2),
+    )
+    rec = Recorder()
+
+    # Start alpha (active) → runs, parks at HOLD, holds slot 1.
+    turn_a = asyncio.create_task(session.handle_message(1, "go alpha", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    # Switch active to beta, start beta → runs concurrently, holds slot 2 (AT the cap now).
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "go beta", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "beta", want=True)
+    await _wait_running(session, 2)
+    assert session.is_busy(1, "alpha") and session.is_busy(1, "beta")
+
+    # Switch active to gamma, start gamma → AT the cap → it QUEUES (does NOT run yet).
+    store.switch(1, "gamma")
+    turn_c = asyncio.create_task(session.handle_message(1, "go gamma", send=rec.send, edit=rec.edit))
+    # Give the queued turn a chance to park + send its notice.
+    for _ in range(50):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    # gamma is QUEUED: a waiter is parked, gamma reports "queued", and it is NOT running.
+    assert len(session._chat(1).run_queue) == 1
+    assert session.project_status(1, "gamma") == "queued"
+    assert session.is_busy(1, "gamma") is False  # not running — no lock held
+    assert eng_c.started is False  # the queued engine has NOT been started yet
+    assert session._running == 2  # still exactly the cap (gamma did not consume a slot)
+    # The one-time "queued behind N run(s)" notice was sent (N == the cap == 2).
+    assert any("Queued behind 2" in s["text"] for s in rec.sends), [s["text"] for s in rec.sends]
+    assert not turn_c.done()  # accepted + parked, NOT refused/dropped (SB6)
+
+    # Resolve ALPHA's HOLD → alpha completes → its slot frees → gamma DEQUEUES + starts.
+    eng_a.cancel()  # releases alpha's HOLD; alpha's turn runs out to its result
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    # gamma now starts (the freed slot was transferred to it, FIFO).
+    await _wait_busy(session, 1, "gamma", want=True)
+    assert eng_c.started is True
+    assert session._chat(1).run_queue == deque()  # queue drained
+    assert session._running == 2  # beta + gamma now hold the two slots
+
+    # Drain the rest.
+    eng_b.cancel()
+    eng_c.cancel()
+    await asyncio.wait_for(turn_b, timeout=2.0)
+    await asyncio.wait_for(turn_c, timeout=2.0)
+    assert session._running == 0
+    assert any("gamma-done" in s["text"] for s in rec.sends)
+
+
+async def test_queue_preserves_fifo_order(tmp_path):
+    # With cap=1: alpha runs; beta then gamma are queued. Completing alpha starts BETA
+    # (the older waiter), not gamma; completing beta then starts gamma. FIFO preserved.
+    store = _three_project_store(tmp_path)
+    eng_a, eng_b, eng_c = _holding_engine("alpha"), _holding_engine("beta"), _holding_engine("gamma")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b, "/work/gamma": eng_c},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    # Queue beta, then gamma (order matters).
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(50):
+        if len(session._chat(1).run_queue) == 1:
+            break
+        await asyncio.sleep(0)
+    store.switch(1, "gamma")
+    turn_c = asyncio.create_task(session.handle_message(1, "c", send=rec.send, edit=rec.edit))
+    for _ in range(50):
+        if len(session._chat(1).run_queue) == 2:
+            break
+        await asyncio.sleep(0)
+    assert len(session._chat(1).run_queue) == 2
+    assert eng_b.started is False and eng_c.started is False
+
+    # Finish alpha → BETA starts (older waiter), gamma still queued.
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    await _wait_busy(session, 1, "beta", want=True)
+    assert eng_b.started is True
+    assert eng_c.started is False  # gamma is still waiting behind beta (FIFO)
+    assert len(session._chat(1).run_queue) == 1
+
+    # Finish beta → GAMMA starts.
+    eng_b.cancel()
+    await asyncio.wait_for(turn_b, timeout=2.0)
+    await _wait_busy(session, 1, "gamma", want=True)
+    assert eng_c.started is True
+    assert session._chat(1).run_queue == deque()
+
+    eng_c.cancel()
+    await asyncio.wait_for(turn_c, timeout=2.0)
+    assert session._running == 0
+
+
+async def test_slot_leak_safety_mid_stream_raise_frees_slot_and_dequeues(tmp_path):
+    # ⚠️ THE FLAGGED SLOT-LEAK HAZARD. cap=1: alpha runs, beta is queued. alpha's engine
+    # RAISES mid-stream — its slot MUST still be released AND the queued beta MUST start
+    # (the counter returns to a correct value; capacity is not permanently lost).
+    store = _three_project_store(tmp_path)
+
+    class BoomMidStreamEngine(FakeEngine):
+        async def send(self, prompt, *, timeout=None):
+            yield ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)")
+            raise RuntimeError("engine exploded mid-stream")
+
+    eng_a = BoomMidStreamEngine([], session_id="alpha-sess")
+    # alpha must hold its slot long enough for beta to queue; a frozen-clock status edit is
+    # synchronous, so we let beta queue FIRST (cap=1), then trigger alpha's raise by awaiting.
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+
+    # alpha takes the only slot and raises almost immediately; capture the raise on its task.
+    turn_a = asyncio.create_task(
+        session.handle_message(1, "boom", send=rec.send, edit=rec.edit, delete=rec.delete)
+    )
+    # alpha will raise; await it and assert the RuntimeError surfaced (RB2 clean-fail).
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(turn_a, timeout=2.0)
+    # alpha's slot was released by the finally (no leak): the counter is back to 0.
+    await _wait_running(session, 0)
+    assert session._chat(1).run_queue == deque()
+    assert session.is_busy(1, "alpha") is False  # lock released too
+
+    # Now a FRESH turn on beta must be able to run — capacity was NOT permanently lost by
+    # alpha's raise (a leaked slot would leave _running stuck at 1 and queue beta forever).
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "go beta", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "beta", want=True)
+    assert session._running == 1  # beta got the (correctly-freed) slot
+    assert eng_b.started is True
+    eng_b.cancel()
+    await asyncio.wait_for(turn_b, timeout=2.0)
+    assert session._running == 0  # back to zero — no drift across the raised turn
+
+
+async def test_slot_leak_safety_raise_while_a_turn_is_queued(tmp_path):
+    # The stricter leak proof: a turn raises WHILE another is queued behind it — the freed
+    # slot must transfer to the queued turn (dequeue fires on the exception path too).
+    store = _three_project_store(tmp_path)
+
+    # alpha holds, beta queues; THEN we make alpha's held turn raise after the HOLD is
+    # released. send() is an async generator (yields a status event so the turn is clearly
+    # running, then parks on the gate exactly like a HOLD, then raises when released).
+    class RaiseAfterHoldEngine(FakeEngine):
+        async def send(self, prompt, *, timeout=None):
+            yield ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)")
+            await self._gate.wait()  # park like a HOLD until cancel()/resolve() fires
+            self._gate.clear()
+            raise RuntimeError("blew up after the hold released")
+
+    eng_a = RaiseAfterHoldEngine([], session_id="alpha-sess")
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    assert session._running == 1
+    # Queue beta behind alpha (cap=1).
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(50):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    assert len(session._chat(1).run_queue) == 1 and eng_b.started is False
+
+    # Release alpha's hold → alpha's send RAISES → its turn errors. The slot must transfer
+    # to the queued beta (NOT just decrement-and-strand-beta).
+    eng_a.resolve("x", PlanVerdict(approve=True))  # trips the gate; alpha then raises
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(turn_a, timeout=2.0)
+    # beta DEQUEUED + started on alpha's freed slot (the exception path popped the next).
+    await _wait_busy(session, 1, "beta", want=True)
+    assert eng_b.started is True
+    assert session._running == 1  # beta now holds the single slot (no leak, no double-grant)
+    assert session._chat(1).run_queue == deque()
+
+    eng_b.cancel()
+    await asyncio.wait_for(turn_b, timeout=2.0)
+    assert session._running == 0
+
+
+async def test_cancelled_held_turn_frees_slot_for_queued_turn(tmp_path):
+    # A cancelled HELD turn frees its slot. cap=1: alpha parks on a held ask, beta queued;
+    # /cancel alpha → alpha unblocks + ends → beta starts on the freed slot.
+    store = _three_project_store(tmp_path)
+    ask = AskEvent(
+        questions=[{"question": "Go?", "options": [{"label": "Y"}, {"label": "N"}]}],
+        tool_use_id="hold-a",
+    )
+    eng_a = FakeEngine(
+        [ask, HOLD, ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="a-done")],
+        session_id="alpha-sess",
+    )
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    assert session.project_status(1, "alpha") == "awaiting_answer"
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(50):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    assert len(session._chat(1).run_queue) == 1
+    assert session.project_status(1, "beta") == "queued"
+
+    # Cancel alpha's run → its held turn unblocks (lock-free) and completes → slot frees.
+    # /cancel targets the ACTIVE project; switch back to alpha to cancel it.
+    store.switch(1, "alpha")
+    aborted = session.handle_cancel(1)
+    assert aborted == 1
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    # beta DEQUEUED + started on alpha's freed slot.
+    await _wait_busy(session, 1, "beta", want=True)
+    assert eng_b.started is True
+    assert session._running == 1
+
+    eng_b.cancel()
+    await asyncio.wait_for(turn_b, timeout=2.0)
+    assert session._running == 0
+
+
+async def test_same_project_second_message_is_busy_not_a_queue_slot(tmp_path):
+    # A project is never queued behind ITSELF: a second message to a RUNNING project raises
+    # StreamingBusy (not a queue entry) even when there is queue room under the cap.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    eng = _holding_engine("alpha")
+    session = make_multi_session(
+        {"/work/alpha": eng}, store=store, config=make_config(max_concurrent_runs=3)
+    )
+    rec = Recorder()
+
+    turn = asyncio.create_task(session.handle_message(1, "first", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    assert session._running == 1
+    # Second message to the SAME (running) project → StreamingBusy, NOT queued.
+    with pytest.raises(StreamingBusy):
+        await session.handle_message(1, "second", send=rec.send, edit=rec.edit)
+    assert session._chat(1).run_queue == deque()  # nothing queued
+    assert session._running == 1  # the StreamingBusy refusal consumed no slot
+
+    eng.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert session._running == 0
+
+
+async def test_under_cap_runs_immediately_without_queue_notice(tmp_path):
+    # Below the cap, a turn runs immediately — no queue entry, no "queued" notice, status
+    # never "queued". (Guards against a false-positive: the notice is gated on the cap.)
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    eng = FakeEngine(
+        [ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="done")],
+        session_id="alpha-sess",
+    )
+    session = make_multi_session(
+        {"/work/alpha": eng}, store=store, config=make_config(max_concurrent_runs=3)
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert not any("Queued behind" in s["text"] for s in rec.sends)
+    assert session._chat(1).run_queue == deque()
+    assert session._running == 0  # released cleanly at turn end
+    assert session.project_status(1, "alpha") == "idle"
 
 
 async def test_resume_id_empty_string_session_id_starts_fresh(tmp_path):
