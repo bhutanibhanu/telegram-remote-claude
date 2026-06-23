@@ -41,6 +41,21 @@ Streaming has the P5 `ChatSendGate` + cap; the default oneshot reply path chunks
 ## What's solid (don't re-litigate)
 SB1 (authn on every inbound incl. routed callbacks), SB4 (name validation), RB1 (never-crash), RB3 (restart/resume), RB6 (atomic+0600 persistence) are enforced with evidence. The Telegram **ingress** boundary is well-built; the weaknesses are concentrated on the **bot→Claude/host** boundary (C2) and the **shipped default posture** (C1).
 
-## Verdict
-- **Owner's own use today — SAFE WITH CONDITIONS:** run `ENGINE_MODE=streaming` with `CLAUDE_SKIP_PERMISSIONS=false`, keep `ALLOWED_ROOTS` narrow, and treat the host as reachable by any approved or auto-allowed (`Read`/etc.) tool call — i.e. don't run untrusted prompts. Under those conditions the operator approves each risky tool and the ingress boundary holds.
-- **Public OSS release (P9) — NOT YET.** Blockers: **C1** (default permission bypass) and **C2** (no SDK tool path confinement). Should also fix **H1** (leakage) and **H2** (long-approval wedge) before presenting it as hardened. C1 is a contained config-default change; C2 is the substantive one (a path-policy layer in the permission decision, reversing P2's name-only anti-goal).
+## Verdict — original (pre-remediation)
+- **Owner's own use today — SAFE WITH CONDITIONS:** run `ENGINE_MODE=streaming` with `CLAUDE_SKIP_PERMISSIONS=false`, keep `ALLOWED_ROOTS` narrow, don't run untrusted prompts.
+- **Public OSS release (P9) — NOT YET.** Blockers: **C1** (default permission bypass) + **C2** (no SDK tool path confinement); also **H1** (leakage) + **H2** (long-approval wedge).
+
+## ✅ Remediation complete (R1–R6) — re-audited CLOSED + live-verified
+All four findings fixed (supervised build, each red-green + independent reviewer; the engine/path-confinement fixes got full adversarial review). Plus the owner-reported duplicate-message bug + a Telegram UX pass.
+- **C1/SB5 → CLOSED** (`b695dc8`): permission gate ON by default (`skip_permissions`/`CLAUDE_SKIP_PERMISSIONS` default False); bypass is an explicit opt-in + loud startup WARNING. Live: startup logged `skip_permissions: False`, no gate-disabled warning, and an in-root Write **prompted**.
+- **C2/SB2 → CLOSED** (`78cfccd`): SDK file/search tools confined to `ALLOWED_ROOTS` (prompt-on-out-of-root, canonical resolve, even SAFE/granted; `/yolo`+`ALLOW_ANY_PATH` opt-outs; Bash documented-unconfined); live-wiring regression guard. Live: out-of-root `/etc/hosts` read **prompted**; in-root read auto-ran.
+- **H1/SB3 → CLOSED** (`8428ce1`): session ids redacted in logs; raw external (`tool`/`turn`) error bodies render body-free (raw → scrubbed local log); bot-authored errors stay readable.
+- **H2/RB2 → CLOSED** (`2d7f2b7`): liveness timeout suspended during approval holds; generous configurable per-message bound (300s, `STREAM_MESSAGE_TIMEOUT_SECONDS`) so long approved tools don't spuriously error; verified-session `driver_error` rebuilds the engine (no wedge); boundary-race guard. Live: a **~207s** approval **completed** (no driver_error).
+- **Duplicate-message bug → FIXED** (`e77b1f3`): `result_text` re-rendered the assistant prose every turn (+ orphaned status line + double error block). Live: answer rendered **once**.
+- **Telegram UX → polished** (`1cadcaa`): operator-facing paths wrapped in `<code>` (no more `/segment` fake-command-links) + HTML escaping. Live: DOM-verified monospace.
+- **README → corrected** (`36925b4`): the stale "permissions bypassed by default" claims now match the secure defaults.
+- **Cross-model Codex re-audit: all four CLOSED, no new issues.** Full gates green (854 tests, ruff/mypy/secret_scan clean).
+
+### Verdict now
+- **Owner's own use — SAFE** (streaming mode, the now-default gate + path confinement + allowlist hold; live-verified end-to-end).
+- **Public OSS release (P9) — the security blockers C1+C2 are CLOSED.** Remaining before publishing are **not** security-code blockers but P7/P8 scope: a full **README/docs refresh** (commands, streaming/multi-project/concurrency, all configs — only the security claims were corrected here), and the recorded P8 polish (tool-summary/permission-prompt path linkify; name-styling consistency; `notify_last` prune; `_is_resume_failure` live-text confirmation). P9 remains a hard stop for explicit owner go.
