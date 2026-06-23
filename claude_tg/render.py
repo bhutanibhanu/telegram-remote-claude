@@ -57,7 +57,7 @@ import html
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Final, Literal, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -638,6 +638,184 @@ def yolo_indicator() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Proactive background-project notifications (P5 / ADR-005 D4) — pure strings
+# ---------------------------------------------------------------------------
+#
+# When a project that is NOT the chat's current foreground needs the operator
+# (a held permission/ask/plan) or terminates (result/error), the relay (T5/T7)
+# sends a name-prefixed ping so the operator knows WHICH project and can answer
+# it. A foreground project renders inline as today (no ping). **T3 only provides
+# the strings**; the relay decides *when* to send them (inline-vs-notify by
+# foreground) in T5/T7.
+#
+# SB3 (body-free). These builders carry ONLY the project name + a fixed,
+# kind-specific phrase (for needs-attention) or a short, caller-supplied status
+# word (for done/error). They take **no tool input** and **never re-derive a
+# summary** — there is nothing here from which a Write body / Bash secret could
+# leak. The needs-attention strings are entirely fixed phrases; the only
+# interpolated values are the (SB4-validated) project name and, for the error
+# ping, a short error label the caller already produced body-free (e.g. the
+# engine's ``ErrorEvent.kind_of_error`` / a clipped message — never raw input).
+#
+# Project names are SB4-constrained upstream (``^[A-Za-z0-9_-]{1,32}$`` —
+# session_store._NAME_RE), so the name is safe to interpolate with no escaping;
+# these helpers do not validate (the relay only ever passes a stored name) and
+# do not interpolate anything else unvalidated.
+
+#: Bell glyph for a background project that needs the operator's attention (D4).
+_NOTIFY_ATTENTION_GLYPH: Final = "🔔"
+#: Done glyph for a background project that finished cleanly (D4).
+_NOTIFY_DONE_GLYPH: Final = "✅"
+#: Warning glyph for a background project that errored (D4) — matches ``_render_error``.
+_NOTIFY_ERROR_GLYPH: Final = "⚠️"
+
+#: Fixed, body-free phrase per pending kind (the needs-attention triggers, D4). Keyed by
+#: the SAME :data:`PendingKind` the relay's pending index already holds, so T5/T7 map a
+#: held request straight to its ping with no extra branching. The phrases are constant —
+#: no event field is interpolated (SB3): a permission/ask/plan ping reveals only that the
+#: project needs approval / asks a question / proposes a plan, never *what* it wants.
+_NOTIFY_ATTENTION_PHRASE: Final[dict[str, str]] = {
+    "permission": "Claude needs approval",
+    "ask": "asks a question",
+    "plan": "proposes a plan",
+}
+
+#: Fallback phrase for an unknown pending kind (RB1 — never crash on a value the relay
+#: did not expect; degrade to a generic, still body-free "needs attention" ping).
+_NOTIFY_ATTENTION_FALLBACK: Final = "needs attention"
+
+
+def notify_attention(name: str, kind: str) -> str:
+    """Body-free ping for a BACKGROUND project that needs the operator (D4; SB3).
+
+    ``kind`` is the held request's :data:`PendingKind` (``"permission"`` / ``"ask"`` /
+    ``"plan"``) — the same value the relay's pending index already carries — and selects
+    a **fixed phrase**:
+
+    * ``permission`` → ``🔔 <name> — Claude needs approval``
+    * ``ask``        → ``🔔 <name> — asks a question``
+    * ``plan``       → ``🔔 <name> — proposes a plan``
+
+    An **unknown** kind degrades to ``🔔 <name> — needs attention`` (RB1) rather than
+    raising. Pure string; no I/O. **SB3:** the phrase is constant per kind — no event
+    field (no question text, plan body, or tool input) is ever interpolated, so a ping
+    cannot leak content. ``name`` is an SB4-validated project name (safe to interpolate
+    unescaped); nothing else unvalidated is interpolated.
+    """
+    phrase = _NOTIFY_ATTENTION_PHRASE.get(kind, _NOTIFY_ATTENTION_FALLBACK)
+    return f"{_NOTIFY_ATTENTION_GLYPH} {name} — {phrase}"
+
+
+def notify_done(name: str) -> str:
+    """Body-free ping for a BACKGROUND project that finished cleanly (D4; SB3).
+
+    ``✅ <name> — done``. Pure string; no I/O. Carries only the project name + a fixed
+    ``done`` word — never the result text (SB3); the foreground project still renders its
+    full :class:`ResultEvent` inline (T5/T7 decides inline-vs-notify).
+    """
+    return f"{_NOTIFY_DONE_GLYPH} {name} — done"
+
+
+def notify_error(name: str, short_error: str) -> str:
+    """Body-free ping for a BACKGROUND project that errored (D4; SB3).
+
+    ``⚠️ <name> — <short_error>``. ``short_error`` is a **short, already-body-free** error
+    label the relay supplies — e.g. the engine's :data:`~claude_tg.engine.types.ErrorKind`
+    (``tool_error`` / ``turn_error`` / ``driver_error``) — **never** raw tool input or an
+    untrimmed dump. This builder neither re-derives nor expands it (SB3); it only prefixes
+    the glyph + the (SB4-validated) name. A blank ``short_error`` degrades to a generic
+    ``error`` so the ping is never an empty tail (RB1). Pure string; no I/O.
+    """
+    label = short_error.strip() or "error"
+    return f"{_NOTIFY_ERROR_GLYPH} {name} — {label}"
+
+
+# ---------------------------------------------------------------------------
+# Free-text prompt (the "Other" / plan-reject follow-up) — name-echoed (D5)
+# ---------------------------------------------------------------------------
+#
+# When the operator taps "Other"/"Reject" on a project's prompt, the bot replies a
+# follow-up asking for the free-text answer. Under concurrency several projects can be
+# awaiting free text at once, so the prompt is NAME-ECHOED (D5) — the operator can tell
+# WHICH project the next plain message will resolve (the most-recently-armed is the
+# default; reply-to-message / `/to <name>` override). The free-text prompt is the
+# reply-to anchor: the relay maps that prompt's message_id -> tool_use_id, so a reply to
+# it routes by id (an explicit disambiguation over the most-recent default).
+#
+# SB3/SB4: carries ONLY the (SB4-validated) project name + a fixed phrase — no event body
+# (the question/plan text is never re-echoed here). Pure string; no I/O.
+
+#: Pencil glyph for a free-text prompt (matches the "✏️ Other (free text)" button).
+_FREE_TEXT_GLYPH: Final = "✏️"
+
+
+def free_text_prompt(name: str) -> str:
+    """Name-echoed prompt for a pending "Other" answer / plan-reject feedback (D5).
+
+    ``✏️ <name>: reply with your answer…`` — so with several projects awaiting free text
+    the operator knows WHICH project the next plain message (or a reply to THIS prompt)
+    resolves (the most-recently-armed project is the default; a reply-to / ``/to <name>``
+    overrides it). ``name`` is an SB4-validated project name (safe to interpolate); the
+    phrase is fixed (SB3 — no event body). Pure string; no I/O.
+    """
+    return f"{_FREE_TEXT_GLYPH} {name}: reply with your answer…"
+
+
+# ---------------------------------------------------------------------------
+# Per-project status labels for /projects (P5 / ADR-005 D7) — pure label map
+# ---------------------------------------------------------------------------
+#
+# T4 adds a per-project ``status`` enum on ``_ProjectRuntime`` and T7 renders a
+# status column on ``/projects``. T3 provides ONLY the value→label mapping the
+# column will consume. The enum VALUES below MUST match what T4/T7 set — they
+# are the exact set fixed by design D7 / ADR-005 §D7:
+#     idle · running · awaiting_approval · awaiting_answer · awaiting_plan · queued
+# (``awaiting_*`` mirrors the three :data:`PendingKind`s the project can hold:
+#  permission→awaiting_approval, ask→awaiting_answer, plan→awaiting_plan.)
+
+#: Per-project status enum values (the keys T4 sets on ``_ProjectRuntime.status``; D7).
+ProjectStatus = Literal[
+    "idle",
+    "running",
+    "awaiting_approval",
+    "awaiting_answer",
+    "awaiting_plan",
+    "queued",
+]
+
+#: Status enum value → human label for the ``/projects`` status column (D7). The labels
+#: spell out the ``awaiting_*`` states (design D7 / T7 acceptance: "awaiting approval" /
+#: "awaiting answer" / "awaiting plan"). Keep the keys in lock-step with T4's enum.
+_STATUS_LABELS: Final[dict[str, str]] = {
+    "idle": "idle",
+    "running": "running",
+    "awaiting_approval": "awaiting approval",
+    "awaiting_answer": "awaiting answer",
+    "awaiting_plan": "awaiting plan",
+    "queued": "queued",
+}
+
+#: Fallback label for an unknown/missing status value (RB1 — a project with no runtime, or
+#: a value T7 did not expect, never crashes the /projects render; it reads as ``idle``,
+#: matching D7's "a project with no runtime defaults to idle").
+_STATUS_FALLBACK: Final = "idle"
+
+
+def project_status_label(status: object) -> str:
+    """Map a per-project ``status`` enum value to its ``/projects`` column label (D7).
+
+    Pure mapping, no I/O. ``running`` → ``"running"``, ``awaiting_approval`` →
+    ``"awaiting approval"``, etc. Anything **not** a known value (an unexpected enum,
+    ``None`` for a project with no runtime, a stray string) falls back to ``"idle"``
+    (**RB1** — the status column never crashes on an unknown value, mirroring D7's
+    "no runtime → idle" default). T4 sets the enum; T7 calls this to render the column.
+    """
+    if isinstance(status, str):
+        return _STATUS_LABELS.get(status, _STATUS_FALLBACK)
+    return _STATUS_FALLBACK
+
+
+# ---------------------------------------------------------------------------
 # Event -> RenderAction (the verbatim-vs-one-liner split)
 # ---------------------------------------------------------------------------
 
@@ -1150,6 +1328,158 @@ def coalesce_stream(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Per-chat send-rate gate (RB5 under concurrency, P5 / ADR-005 D8)
+# ---------------------------------------------------------------------------
+#
+# The Coalescer (above) throttles ONE project's status line. Under concurrency (P5)
+# N projects in one chat each run their own Coalescer, so a status burst in A never
+# resets B's throttle — but N projects flushing at once (plus the proactive
+# notifications, D4) can still burst PAST Telegram's ~1 msg/s/chat ceiling. The
+# ChatSendGate is the per-chat backstop: ALL outbound for a chat (every status edit,
+# verbatim message, and notification) funnels through it, and it spaces sends at a
+# minimum interval so the COMBINED cross-project rate stays bounded.
+#
+# Like the Coalescer it is a PURE class over an INJECTED clock: it only *decides* how
+# long to wait before a send may proceed (the actual awaiting stays in the session/bot,
+# exactly as the Coalescer leaves the real edit-waiting to T7). So it is unit-testable
+# with no real sleeps.
+#
+# **Verbatim is PRIORITY over coalesced status churn (the load-bearing D8 rule).** A
+# starved status line is fine (it is noise — the newest wins); a starved ask/plan/error/
+# result is NOT (the operator can't answer a prompt they never receive — a deadlock).
+# So the gate gives verbatim sends precedence: a verbatim is spaced off the last ACTUAL
+# send, and a backlog of FUTURE-dated status reservations does NOT advance that cursor —
+# so a verbatim arriving amid K coalesced status edits waits ~1 interval off the last real
+# send, NOT K×interval at the back of the backlog. (Spacing verbatim off the gate's running
+# tail instead would land it behind all K — the exact starvation D8 forbids.) Status edits
+# space off the status tail (so they stay ≥interval apart) and a verbatim pushes that tail
+# to its own slot, so the next status falls in BEHIND the verbatim. Nothing is ever dropped
+# — the gate ORDERS sends (returns a wait), it never discards a body (RB6/SB3: it does not
+# touch message content at all); a verbatim is merely inserted ahead of the pending status
+# tail (in that rare case one status may share the verbatim's interval — the accepted cost
+# of never starving a prompt). It gates SENDS, never the resolve path (taking it on a
+# resolve would deadlock a held turn — the session only ever consults it around outbound
+# I/O).
+
+
+class ChatSendGate:
+    """Bound a single chat's COMBINED send/edit rate under concurrency (RB5/D8).
+
+    All outbound for a chat (status edits, verbatim messages, notifications) calls
+    :meth:`reserve` to learn how long to wait before sending; the caller does the actual
+    awaiting (the gate, like :class:`Coalescer`, decides timing only — no real sleep). A
+    minimum ``interval`` between sends keeps the combined cross-project rate under
+    Telegram's ~1 msg/s/chat ceiling even when N concurrent projects flush at once.
+
+    The **clock is injected** (``now: Callable[[], float]`` monotonic seconds) so tests
+    advance time deterministically.
+
+    Verbatim sends are **priority** (``reserve(verbatim=True)``): they are spaced only off
+    the last *actual* send, and a backlog of future-dated status reservations does NOT
+    advance that cursor — so a verbatim arriving amid K coalesced status edits waits ~1
+    interval off the last real send, never K×interval at the back of the backlog (the D8
+    invariant — a starved status line is acceptable noise, a starved prompt is a deadlock).
+    Status edits (``verbatim=False``) space off the status tail and yield to verbatim (a
+    verbatim pushes the tail to its own slot, so the next status falls in behind it). Either
+    way :meth:`reserve` returns a non-negative wait and **never drops** a send — it only
+    orders them.
+    """
+
+    def __init__(
+        self,
+        *,
+        now: Callable[[], float],
+        interval: Optional[float] = None,
+    ) -> None:
+        chosen = DEFAULT_CHAT_SEND_INTERVAL if interval is None else interval
+        if chosen < 0:
+            raise ValueError("interval must be non-negative")
+        self._now = now
+        self._interval = float(chosen)
+        # Scheduled time of the last ACTUAL send — a verbatim, or a status edit that fired
+        # at the leading edge (scheduled ≤ now, i.e. it went out immediately). A verbatim
+        # spaces off THIS (+interval) so it lands ~1 interval off the last real send and
+        # JUMPS AHEAD of any status reserved AFTER it (the D8 priority — a prompt must reach
+        # the operator; subsequent status churn must not bury it). A future-dated (queued)
+        # status does NOT advance this cursor.
+        self._last_actual: float = float("-inf")
+        # The COMBINED running tail: the latest slot reserved by ANY send (verbatim or
+        # status). Every new reservation lands strictly ≥interval after a colliding slot, so
+        # NO two sends ever share an interval — this is what bounds the COMBINED per-chat
+        # send rate regardless of how verbatim/status interleave (round-3 cross-model-QA
+        # BLOCKER 3). The pre-fix gate tracked only a separate status tail, so a verbatim
+        # spaced off ``_last_actual`` could land on a slot a status had ALREADY reserved at
+        # the same future time → two sends fired in one interval (over-budget under churn).
+        self._tail: float = float("-inf")
+
+    def reserve(self, *, verbatim: bool) -> float:
+        """Reserve the next send slot; return the wait (seconds, ≥0) before it may go.
+
+        The hard invariant (round-3 cross-model-QA BLOCKER 3): **no two reserved sends ever
+        share an interval** — every send, verbatim or status, lands in its OWN ≥interval-
+        spaced slot, so the COMBINED per-chat send rate stays bounded under any interleaving.
+        The :attr:`_tail` (the latest slot reserved by any kind) enforces it: a new
+        reservation that would fall at/within an interval of an already-reserved slot is
+        pushed to ``_tail + interval``.
+
+        Within that hard collision-free bound, **verbatim keeps priority** over status:
+
+        * ``verbatim=True`` (a final answer / error / ask / plan / permission / notification)
+          targets ``_last_actual + interval`` — ~1 interval off the last ACTUAL send, NOT off
+          the (future-dated) status tail — so it JUMPS AHEAD of every status reserved AFTER
+          it (the deadlock-prevention case: a prompt is never buried behind subsequent status
+          churn). If that target collides with an already-reserved slot (status was reserved
+          ahead at that exact time), it is pushed to the next free slot (``_tail + interval``)
+          — it cannot leapfrog a send whose fire-time was ALREADY committed to a waiting
+          caller (un-scheduling that send is impossible), but it is still ahead of all future
+          status. It then advances ``_last_actual`` so following status falls in behind it.
+        * ``verbatim=False`` (a status-line edit) spaces off the combined tail (+interval) and
+          YIELDS to verbatim; a status that fires at the leading edge (scheduled ≤ now) IS an
+          actual send and so also advances ``_last_actual``.
+
+        **Nothing is ever dropped** — the gate only ORDERS sends (returns a wait); it never
+        discards a body and never touches message content (RB6/SB3). Pure decision (no I/O,
+        no sleep): the caller awaits the returned delay then sends.
+        """
+        now = self._now()
+        if verbatim:
+            # Priority: ~1 interval off the last ACTUAL send (jumps ahead of FUTURE status).
+            scheduled = max(now, self._last_actual + self._interval)
+            # Collision-free: never share a slot with an already-reserved send. If a status
+            # was reserved ahead at/within this slot, take the next free slot instead (we
+            # cannot un-schedule a send already handed to a waiting caller). Still ahead of
+            # any status reserved after this point.
+            if scheduled <= self._tail:
+                scheduled = self._tail + self._interval
+            # A verbatim is always an actual send; the next verbatim + following status space
+            # off it.
+            self._last_actual = scheduled
+        else:
+            # Status spaces off the combined tail, so it stays ≥interval from EVERY prior
+            # send (verbatim or status) — never colliding, always yielding to a verbatim that
+            # advanced the tail ahead of it.
+            scheduled = max(now, self._tail + self._interval)
+            # A leading-edge status (goes immediately) IS a real send a following verbatim
+            # must space off; a FUTURE-dated (queued) status must NOT advance _last_actual —
+            # that is precisely what would otherwise push a verbatim to the back of the churn.
+            if scheduled <= now:
+                self._last_actual = scheduled
+        # Advance the combined tail (monotonic) so the NEXT send of either kind is spaced off
+        # this one — the collision-free guarantee.
+        self._tail = max(self._tail, scheduled)
+        wait = scheduled - now
+        return wait if wait > 0 else 0.0
+
+
+#: Default minimum interval between sends through a :class:`ChatSendGate` (seconds).
+#: Telegram's practical per-chat send ceiling is ~1 msg/s; 1 s is the conservative
+#: per-chat budget for the COMBINED cross-project rate (the per-project status
+#: Coalescer already uses a larger ``DEFAULT_MIN_EDIT_INTERVAL`` for its own line).
+#: Configurable via ``RENDER_CHAT_SEND_INTERVAL_SECONDS`` (Config, P5/T8).
+DEFAULT_CHAT_SEND_INTERVAL = 1.0
+
+
 __all__ = [
     # action
     "RenderAction",
@@ -1182,9 +1512,21 @@ __all__ = [
     # /yolo loud indicator (D6)
     "yolo_banner",
     "yolo_indicator",
+    # proactive background-project notifications (D4)
+    "notify_attention",
+    "notify_done",
+    "notify_error",
+    # free-text prompt (name-echoed; D5)
+    "free_text_prompt",
+    # per-project status labels for /projects (D7)
+    "ProjectStatus",
+    "project_status_label",
     # coalesce / throttle
     "Coalescer",
     "FlushResult",
     "coalesce_stream",
     "DEFAULT_MIN_EDIT_INTERVAL",
+    # per-chat send-rate gate (RB5 under concurrency, D8)
+    "ChatSendGate",
+    "DEFAULT_CHAT_SEND_INTERVAL",
 ]

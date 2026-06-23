@@ -346,6 +346,32 @@ class JsonSessionStore:
         record["last_active"] = _now()
         self._save_raw(raw)
 
+    def set_session_id(
+        self, chat_id: int, name: str, session_id: str | None
+    ) -> None:
+        """Write ``session_id`` to the **named** project (matched case-insensitively).
+
+        The targeted counterpart of the flat :meth:`update` (which only ever touches a
+        chat's *active* project). P5/ADR-005 needs this because, with ``/switch`` now
+        free (the busy-guard relaxed in D2), the active project can change **mid-turn**;
+        a concurrent run must persist its result ``session_id`` to the project it ran
+        **on** — the captured target — not to whatever is active when the result lands
+        (the lock-P-drive-Q / persist-drift hazard). Like :meth:`update`'s session field:
+        a value is stored; ``None`` **clears** it (a reset / dead-resume drop). The
+        project's fixed ``cwd`` is left untouched (D4); ``last_active`` is bumped. Raises
+        :class:`UnknownProject` if no such project exists (the caller — the streaming
+        session — only ever passes a project it just ran, so absence is a real error, not
+        a silent no-op). Persists.
+        """
+        raw = self._load_raw()
+        _chat, projects, key = self._resolve(raw, chat_id, name)
+        record = projects[key]
+        if not isinstance(record, dict):
+            raise UnknownProject(name)
+        record["session_id"] = session_id
+        record["last_active"] = _now()
+        self._save_raw(raw)
+
     # ---- registry internals -----------------------------------------------
 
     @staticmethod

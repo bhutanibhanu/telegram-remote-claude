@@ -465,6 +465,62 @@ def test_touch_unknown_raises(tmp_path):
         store.touch(1, "nope")
 
 
+# ---- P5/T7: set_session_id — targeted per-project session write -------------
+
+
+def test_set_session_id_writes_named_project_not_active(tmp_path):
+    """set_session_id targets the NAMED project — even when a DIFFERENT one is active.
+
+    This is the store half of the P5 per-project persist: with /switch free, a turn's
+    result must land on the project it ran on, not on whatever is active when it lands."""
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.create(1, "A", "/a", make_active=True)
+    store.create(1, "B", "/b", make_active=False)
+    store.switch(1, "B")  # B is active; we still write A explicitly
+
+    store.set_session_id(1, "A", "sid-a")
+    assert store.get_project(1, "A")["session_id"] == "sid-a"  # the NAMED project
+    assert store.get_project(1, "B")["session_id"] is None  # active B untouched
+    assert store.get_project(1, "A")["cwd"] == "/a"  # cwd left untouched (D4)
+    assert store.get_active(1) == "B"  # active unchanged
+
+
+def test_set_session_id_none_clears(tmp_path):
+    """set_session_id(None) clears the named project's session_id (reset / dead resume)."""
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.create(1, "A", "/a")
+    store.set_session_id(1, "A", "sid-a")
+    store.set_session_id(1, "A", None)
+    assert store.get_project(1, "A")["session_id"] is None
+
+
+def test_set_session_id_case_insensitive(tmp_path):
+    """set_session_id matches the name case-insensitively (like the rest of the CRUD)."""
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.create(1, "Work", "/w")
+    store.set_session_id(1, "WORK", "sid")  # casing variant
+    assert store.get_project(1, "Work")["session_id"] == "sid"
+
+
+def test_set_session_id_unknown_raises(tmp_path):
+    """set_session_id of a non-existent project raises UnknownProject (real error)."""
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.create(1, "A", "/a")
+    with pytest.raises(UnknownProject):
+        store.set_session_id(1, "nope", "sid")
+
+
+def test_set_session_id_bumps_last_active(tmp_path):
+    """set_session_id advances last_active (a turn result is recent activity)."""
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.create(1, "A", "/a")
+    raw = store._load_raw()
+    raw["chats"]["1"]["projects"]["A"]["last_active"] = "2000-01-01T00:00:00+00:00"
+    store._save_raw(raw)
+    store.set_session_id(1, "A", "sid")
+    assert store.get_project(1, "A")["last_active"] != "2000-01-01T00:00:00+00:00"
+
+
 # ---- T3: additivity guard (the flat one-shot view is undisturbed) ----------
 
 

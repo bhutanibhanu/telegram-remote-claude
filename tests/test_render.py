@@ -38,6 +38,7 @@ from claude_tg.engine.types import (
 from claude_tg.render import (
     CALLBACK_LIMIT,
     KIND_PERMISSION,
+    ChatSendGate,
     Coalescer,
     RenderAction,
     answers_from_ask,
@@ -47,8 +48,13 @@ from claude_tg.render import (
     coalesce_stream,
     decode_callback,
     encode_callback,
+    free_text_prompt,
+    notify_attention,
+    notify_done,
+    notify_error,
     permission_keyboard,
     plan_keyboard,
+    project_status_label,
     render_event,
     yolo_banner,
     yolo_indicator,
@@ -585,6 +591,141 @@ def test_yolo_indicator_is_loud_nonempty_marker():
 
 
 # ============================================================================
+# Proactive background-project notifications (P5 / ADR-005 D4) — pure strings
+# ============================================================================
+
+
+def test_notify_attention_permission_is_name_prefixed_bell():
+    msg = notify_attention("work", "permission")
+    assert msg == "🔔 work — Claude needs approval"
+    assert msg.startswith("🔔 ")  # bell glyph (D4)
+    assert "work" in msg  # name-prefixed so the operator knows WHICH project
+
+
+def test_notify_attention_ask_and_plan_have_their_own_phrases():
+    assert notify_attention("bot", "ask") == "🔔 bot — asks a question"
+    assert notify_attention("bot", "plan") == "🔔 bot — proposes a plan"
+
+
+def test_notify_attention_unknown_kind_falls_back_safely():
+    # RB1: a pending kind the relay did not expect degrades to a generic, still
+    # body-free "needs attention" ping rather than raising / leaking the raw kind.
+    msg = notify_attention("work", "totally-unknown-kind")
+    assert msg == "🔔 work — needs attention"
+    assert "totally-unknown-kind" not in msg  # the stray value is never echoed
+
+
+def test_notify_done_is_name_prefixed_check():
+    msg = notify_done("work")
+    assert msg == "✅ work — done"
+    assert msg.startswith("✅ ")  # done glyph (D4)
+
+
+def test_notify_error_is_name_prefixed_warning_with_short_label():
+    msg = notify_error("work", "tool_error")
+    assert msg == "⚠️ work — tool_error"
+    assert msg.startswith("⚠️ ")  # warning glyph (D4)
+
+
+def test_notify_error_blank_label_falls_back():
+    # RB1: a blank/whitespace short_error never leaves an empty tail.
+    assert notify_error("work", "") == "⚠️ work — error"
+    assert notify_error("work", "   ") == "⚠️ work — error"
+
+
+def test_notify_attention_is_body_free_sb3():
+    # SB3 mutation-probe: a held PermissionEvent whose summary carried a secret-bearing
+    # tool_input must NEVER surface in the ping — the attention phrase is FIXED, so even
+    # if a caller had the event in hand, the body cannot leak through this builder.
+    secret = "S3CR3T-" + "x" * 200
+    leaky_summary = f"Write(file_path=/tmp/x, content={secret})"
+    ev = make_permission(tool_name="Write", tool_input_summary=leaky_summary)
+    # The builder takes only (name, kind) — it cannot even SEE the event's body.
+    msg = notify_attention("work", ev.kind)  # PendingKind == event.kind == "permission"
+    assert msg == "🔔 work — Claude needs approval"
+    assert secret not in msg
+    assert "S3CR3T" not in msg
+    assert leaky_summary not in msg
+
+
+def test_notify_error_is_body_free_sb3():
+    # SB3: only the SHORT, body-free label the relay supplies appears — never a raw body.
+    # A caller that wrongly handed raw content would still only get its (stripped) text,
+    # but the relay supplies the body-free ErrorKind; we assert a secret-bearing body
+    # passed as the label is not silently expanded into anything else and a real raw
+    # tool body never reaches this builder (it takes a short label, not an event/input).
+    raw_body = "S3CR3T-" + "y" * 300
+    # The relay passes the body-free kind, NOT the raw body:
+    msg = notify_error("work", "tool_error")
+    assert raw_body not in msg
+    assert msg == "⚠️ work — tool_error"
+
+
+def test_notification_builders_are_pure_no_io():
+    # Purity / determinism: same inputs -> identical output, no side effects, no I/O.
+    assert notify_attention("p", "ask") == notify_attention("p", "ask")
+    assert notify_done("p") == notify_done("p")
+    assert notify_error("p", "boom") == notify_error("p", "boom")
+
+
+# ============================================================================
+# Name-echoed free-text prompt (P5 / ADR-005 D5) — pure string
+# ============================================================================
+
+
+def test_free_text_prompt_is_name_echoed():
+    # D5 name-echo: the prompt carries the project name so the operator knows WHICH project
+    # the next plain message (or a reply to this prompt) resolves when several are awaiting.
+    msg = free_text_prompt("work")
+    assert msg == "✏️ work: reply with your answer…"
+    assert "work" in msg and msg.startswith("✏️")
+
+
+def test_free_text_prompt_is_pure_and_body_free():
+    # Pure / deterministic, and carries ONLY the (SB4-validated) name + a fixed phrase — no
+    # event body (SB3): there is nothing here from which a question/plan/tool body could leak.
+    assert free_text_prompt("bot") == free_text_prompt("bot")
+    assert free_text_prompt("a-b_C9") == "✏️ a-b_C9: reply with your answer…"
+
+
+# ============================================================================
+# Per-project status labels for /projects (P5 / ADR-005 D7) — pure label map
+# ============================================================================
+
+
+def test_project_status_label_covers_every_status_value():
+    # Every enum value design D7 / ADR-005 fixes (the set T4/T7 will set) maps to its
+    # human /projects label. If T4 adds/renames a value, this is where it surfaces.
+    expected = {
+        "idle": "idle",
+        "running": "running",
+        "awaiting_approval": "awaiting approval",
+        "awaiting_answer": "awaiting answer",
+        "awaiting_plan": "awaiting plan",
+        "queued": "queued",
+    }
+    for value, label in expected.items():
+        assert project_status_label(value) == label
+
+
+def test_project_status_label_unknown_value_falls_back_to_idle():
+    # RB1: an unexpected enum / a stray string / None (a project with no runtime) reads
+    # as "idle" rather than crashing the /projects render (D7: no runtime -> idle).
+    assert project_status_label("nonsense") == "idle"
+    assert project_status_label("") == "idle"
+    assert project_status_label(None) == "idle"
+    assert project_status_label(123) == "idle"  # type: ignore[arg-type]
+
+
+def test_awaiting_labels_are_human_readable_spaced():
+    # The awaiting_* enum keys are snake_case; the labels are spelled out for the column.
+    for value in ("awaiting_approval", "awaiting_answer", "awaiting_plan"):
+        label = project_status_label(value)
+        assert "_" not in label  # rendered, not the raw enum key
+        assert label.startswith("awaiting ")
+
+
+# ============================================================================
 # Coalesce / throttle (RB5)
 # ============================================================================
 
@@ -878,3 +1019,166 @@ def test_ask_question_body_html_escapes_question_and_converts_markdown():
     assert "Storage" in html_body  # the scaffolding header label survives
     # The plain variant is unchanged (the raw fallback the send path resends on rejection).
     assert ask_question_body(ask, 0) == "❓ Storage: Use **JSON** or <raw> ?"
+
+
+# ============================================================================
+# ChatSendGate (RB5 under concurrency, P5 / ADR-005 D8) — pure timing decisions
+# over an injected clock, mirroring the Coalescer test style (no real sleeps).
+# The gate decides the WAIT before a send may proceed; the session does the
+# awaiting. Verbatim is PRIORITY over coalesced status churn (never starved).
+# ============================================================================
+
+
+def test_chat_send_gate_leading_edge_is_immediate():
+    # The first send through an idle gate goes immediately (no artificial lag), whether it
+    # is verbatim or a status edit — the leading edge, exactly like the Coalescer.
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=1.0)
+    assert gate.reserve(verbatim=True) == 0.0
+    clock.advance(5.0)  # idle long past the interval
+    assert gate.reserve(verbatim=False) == 0.0
+
+
+def test_chat_send_gate_spaces_subsequent_sends_by_interval():
+    # Two sends in quick succession through one gate are spaced by the interval: the first
+    # goes now (wait 0), the second must wait the remaining interval (bounded rate).
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=1.0)
+    assert gate.reserve(verbatim=True) == 0.0  # send #1 now
+    # No time has passed; send #2 must wait ~1 s (the per-chat budget).
+    assert gate.reserve(verbatim=True) == pytest.approx(1.0)
+    # After the clock advances past that reservation, the next send is immediate again.
+    clock.advance(2.0)
+    assert gate.reserve(verbatim=True) == 0.0
+
+
+def test_chat_send_gate_n_sends_are_bounded_not_simultaneous():
+    # ⭐ The RB5 property at the unit level: N back-to-back sends (the worst case — N
+    # concurrent projects flushing at the same instant) do NOT all go at once; their
+    # cumulative scheduled offsets grow by the interval, so the COMBINED rate is bounded.
+    clock = FakeClock()  # frozen — every send arrives at the same instant
+    gate = ChatSendGate(now=clock, interval=1.0)
+    waits = [gate.reserve(verbatim=True) for _ in range(5)]
+    # 0, 1, 2, 3, 4 — strictly increasing by the interval (≤ one send per interval).
+    assert waits == [pytest.approx(i * 1.0) for i in range(5)]
+
+
+def test_chat_send_gate_verbatim_jumps_ahead_of_future_status_depth_invariant():
+    # ⭐ The load-bearing D8 priority rule, in its COLLISION-FREE form (round-3 BLOCKER 3). A
+    # verbatim arriving amid LIVE status churn jumps ahead of all status reserved AFTER it,
+    # independent of how much status FOLLOWS — the deadlock-prevention case (a prompt must
+    # reach the operator; subsequent status churn must not bury it). And no two sends collide.
+    #
+    # This is the realistic flush pattern: status is reserved one-at-a-time as each project's
+    # Coalescer flushes, NOT all pre-committed in a single instant. A verbatim interleaved into
+    # that stream is spaced ~1 interval off the last ACTUAL send and the following status falls
+    # in BEHIND it. TEETH: the priority-breaking mutation (verbatim base=_last_actual ->
+    # base=_tail) makes the verbatim wait scale with the FOLLOWING churn → the depth-invariance
+    # below FAILS. (Note: a verbatim cannot leapfrog status whose fire-time was ALREADY handed
+    # to a waiting caller — un-scheduling a committed send is impossible — so the separate
+    # ``...behind_committed_backlog...`` test pins that collision-free boundary.)
+    def verbatim_wait_then_status_follows(following: int) -> float:
+        clock = FakeClock()
+        gate = ChatSendGate(now=clock, interval=1.0)
+        gate.reserve(verbatim=False)  # leading-edge status fires now (the last ACTUAL send)
+        w = gate.reserve(verbatim=True)  # verbatim jumps to ~1 interval off that actual send
+        for _ in range(following):  # FUTURE status — must all fall BEHIND the verbatim
+            assert gate.reserve(verbatim=False) >= w + 1.0 - 1e-9
+        return w
+
+    shallow = verbatim_wait_then_status_follows(5)
+    deep = verbatim_wait_then_status_follows(50)
+    assert shallow == pytest.approx(1.0), "verbatim is ~1 interval off the last actual send"
+    assert deep == pytest.approx(shallow), "depth-invariant in the FOLLOWING churn: NOT 5 vs 50"
+
+
+def test_chat_send_gate_verbatim_behind_committed_backlog_is_collision_free():
+    # The collision-free boundary (round-3 BLOCKER 3). When a DEEP status backlog was ALREADY
+    # reserved (every slot 0..K-1 handed to a waiting caller) BEFORE the verbatim exists, the
+    # verbatim CANNOT land on an occupied slot — un-scheduling a committed send is impossible —
+    # so it takes the next FREE slot (K), collision-free, rather than firing on top of a
+    # reserved status (the pre-fix bug: it shared a slot, double-spending the per-chat budget).
+    # This relaxes the old (buggy) "depth-invariant even behind a fully-committed backlog"
+    # claim — impossible without a collision — in favour of the HARD combined-budget guarantee.
+    # In production the backlog is at most ~MAX_CONCURRENT_RUNS deep (status is throttled
+    # per-project by the Coalescer), so this bound is small; the deadlock-prevention property
+    # that actually matters (ahead of FUTURE status) is pinned by the test above.
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=1.0)
+    k = 30
+    status_waits = [gate.reserve(verbatim=False) for _ in range(k)]
+    assert status_waits == [pytest.approx(i * 1.0) for i in range(k)]  # 0..29, each committed
+    verbatim_wait = gate.reserve(verbatim=True)
+    # Collision-free: the verbatim does NOT share slot 1..29 with a committed status; it lands
+    # at the next free slot (30). The pre-fix gate returned ~1.0 here (colliding with the status
+    # already reserved at +1) — exactly the combined-budget violation BLOCKER 3 fixes.
+    assert verbatim_wait == pytest.approx(float(k))
+    # And every reserved fire-time (the K status + the verbatim) is distinct / ≥interval apart.
+    all_times = sorted(status_waits + [verbatim_wait])  # frozen clock → waits ARE fire-times
+    assert all(b - a >= 1.0 - 1e-9 for a, b in zip(all_times, all_times[1:]))
+
+
+def test_chat_send_gate_no_two_sends_share_an_interval_verbatim_amid_status(tmp_path=None):
+    # ⭐ Round-3 cross-model-QA BLOCKER 3. The per-chat budget is a COMBINED rate: NO two
+    # sends (verbatim OR status) may fire within one interval of each other. The pre-fix gate
+    # spaced a verbatim off ``_last_actual`` while a status was ALREADY reserved at that same
+    # future slot → the verbatim and that status both landed at the SAME timestamp, firing two
+    # sends in one interval (over-budget under status churn). This pins the combined budget by
+    # recording EVERY reserved fire-time (status + verbatim, interleaved) and asserting they
+    # are all ≥ interval apart.
+    clock = FakeClock()
+    interval = 1.0
+    gate = ChatSendGate(now=clock, interval=interval)
+    # Realistic interleave: a couple of status edits reserve future slots, THEN a verbatim
+    # arrives amid them (the exact churn the priority rule must handle), then more status.
+    fire_times: list[float] = []
+
+    def reserve(verbatim: bool) -> None:
+        fire_times.append(clock() + gate.reserve(verbatim=verbatim))
+
+    reserve(verbatim=False)  # status #1 — leading edge (fires now)
+    reserve(verbatim=False)  # status #2 — reserved 1 interval out
+    reserve(verbatim=True)   # a VERBATIM arrives amid the status churn (the bug trigger)
+    reserve(verbatim=False)  # status #3 — must fall behind the verbatim
+    reserve(verbatim=True)   # a second verbatim
+
+    ordered = sorted(fire_times)
+    gaps = [b - a for a, b in zip(ordered, ordered[1:])]
+    # THE invariant: every consecutive pair of reserved fire-times is ≥ one interval apart —
+    # no two sends share a slot, so the COMBINED per-chat rate is bounded regardless of how
+    # verbatim and status interleave. (Pre-fix this FAILS: the verbatim collides with status#2
+    # at the same timestamp → a 0.0 gap.)
+    assert all(g >= interval - 1e-9 for g in gaps), (
+        f"two sends within one interval (combined budget violated): {ordered}"
+    )
+    # All distinct (a sanity restatement of the above for the exact-collision case).
+    assert len(set(round(t, 9) for t in fire_times)) == len(fire_times), (
+        f"two sends reserved the SAME timestamp: {fire_times}"
+    )
+
+
+def test_chat_send_gate_verbatim_jumps_ahead_of_future_status_collision_free(tmp_path=None):
+    # The preserved D8 priority (collision-free form): a verbatim arriving BEFORE a status
+    # backlog builds jumps ahead of all FUTURE status — the deadlock-prevention case (a prompt
+    # must reach the operator; subsequent status churn must not bury it). And no two collide.
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=1.0)
+    w_status1 = gate.reserve(verbatim=False)   # leading edge, t=0
+    w_verbatim = gate.reserve(verbatim=True)    # jumps to t=1 (only status#1 precedes it)
+    w_status2 = gate.reserve(verbatim=False)    # FUTURE status — must fall BEHIND the verbatim
+    assert w_status1 == pytest.approx(0.0)
+    assert w_verbatim == pytest.approx(1.0), "verbatim is ~1 interval off the last actual send"
+    # The future status yields to the verbatim (lands at/after t=2, never sharing t=1).
+    assert w_status2 >= w_verbatim + 1.0 - 1e-9, "future status must not collide with / precede the verbatim"
+
+
+def test_chat_send_gate_zero_interval_never_waits():
+    # interval=0 disables spacing (a valid low-traffic choice) — every send is immediate.
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=0.0)
+    assert [gate.reserve(verbatim=v) for v in (True, False, True, False)] == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_chat_send_gate_rejects_negative_interval():
+    with pytest.raises(ValueError):
+        ChatSendGate(now=FakeClock(), interval=-1.0)

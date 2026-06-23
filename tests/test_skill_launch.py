@@ -73,7 +73,11 @@ class FakeStreaming:
     def __init__(self):
         self.handle_message_calls: list[tuple[int, str]] = []
 
-    async def handle_message(self, chat_id, text, *, send, edit, delete=None):
+    async def handle_message(
+        self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None
+    ):
+        # P5/T9: handle_message gained reply_to_message_id (D5); the skill-launch tests
+        # don't exercise reply-to, so we keep recording just (chat_id, text).
         self.handle_message_calls.append((chat_id, text))
 
     def reset(self, chat_id):
