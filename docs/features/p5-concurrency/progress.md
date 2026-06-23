@@ -48,9 +48,9 @@ _Plan generated 2026-06-23 from design.md · 11 tasks · supervised build (auton
 - [x] T2 — Pending-request index + id-routed resolve/cancel (the core; retire `_active_engine`) (7ecb402)
 - [x] T3 — Notification triggers: inline-vs-`🔔 name —` by foreground (D4; render strings + SB3) (bc33b40)
 - [x] T4 — Lift live-turn state `_ChatState`→`_ProjectRuntime` + per-project `status` (D7) ⚠️ (bc21e9f)
-- [ ] T5 — Per-project turn lock + concurrent runs; `is_busy(chat_id, name)` (D1)  [+T4-review: wrap end-of-turn status/status-line reset in try/finally (concurrent+persistent runs mustnt stick at running/awaiting_*); add held-ask→/cancel→status idle test]
+- [x] T5 — Per-project turn lock + concurrent runs; `is_busy(chat_id, name)` (D1) (c13ee5e)
 - [ ] T6 — Concurrency cap + FIFO queue (`MAX_CONCURRENT_RUNS`, D6) + config key
-- [ ] T7 — Relax the busy-guards: `/switch`/`/new` free; `/reset` per-project-guarded (D2) ⚠️  [+T3-review: when wiring notify-error, pass body-free ErrorKind NOT event.message; add SB3-at-call-site test + foreground-routing test]
+- [ ] T7 — Relax the busy-guards: `/switch`/`/new` free; `/reset` per-project-guarded (D2) ⚠️  [+T3-review: when wiring notify-error, pass body-free ErrorKind NOT event.message; add SB3-at-call-site test + foreground-routing test]  [+T5-review: once /switch is free, pass handle_message's captured target project into _ensure_engine (dont re-resolve active) so a concurrent /switch cant lock-P-drive-Q; re-assert /switch-while-same-project-busy refusal under per-project locks]
 - [ ] T8 — RB5 under concurrency: per-project coalescer + per-chat rate-gated sender (D8)
 - [ ] T9 — Free-text routing + `/cancel <name>|all`, `/rm`-running-refused, `/to` (D5/D9) ⚠️
 - [ ] T10 — Integration / SB·RB·regression matrix (RB7 + cross-project routing + RB6)  [+T2-review gap: pin two CONCURRENT multi-question asks accumulate independently (per-id, no cross-contamination)]
