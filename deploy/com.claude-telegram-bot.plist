@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS LaunchAgent TEMPLATE for the Claude Telegram bot (P7/T3).
+
+  This is a TEMPLATE: replace every __PLACEHOLDER__ below, then install it as
+  ~/Library/LaunchAgents/com.claude-telegram-bot.plist. Easiest path: run
+  deploy/install-launchd.sh, which fills these in from your current install and
+  loads the agent for you. See deploy/README.md for the launchctl commands.
+
+  Guarantees / notes:
+    * ONE instance per user: the Label below is fixed, and launchd will not run
+      two agents with the same Label. Combined with one bot == one Telegram token,
+      this prevents duplicate pollers (which cause a Telegram `Conflict`). ALWAYS
+      `launchctl unload` this agent before starting the bot by hand (./run.sh),
+      or the two pollers will Conflict.
+    * RunAtLoad + KeepAlive => starts at login and restarts on crash/reboot.
+    * The bot token is NOT in this file. It is read from `.env` in the
+      WorkingDirectory below (Config.from_env loads ./.env). Never embed the token here.
+    * StandardOutPath / StandardErrorPath capture logs (token is never logged; httpx
+      URL logging is suppressed in main.py).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-telegram-bot</string>
+
+    <!-- The command that starts the bot. Use the absolute path to the installed
+         `claude-telegram-bot` console script (e.g. <venv>/bin/claude-telegram-bot),
+         OR an interpreter + `-m claude_tg`. install-launchd.sh fills in the absolute
+         path it detected. Keep argv as one token per <string>. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BOT_COMMAND__</string>
+    </array>
+
+    <!-- Directory the bot runs from. MUST be the directory that holds your `.env`
+         (the bot loads `.env` from its CWD) — typically your repo checkout. -->
+    <key>WorkingDirectory</key>
+    <string>__WORKING_DIR__</string>
+
+    <!-- launchd hands processes a minimal PATH; add the dirs holding `claude` and the
+         bot's venv so the subprocess + entry point resolve. Adjust if your `claude`
+         lives elsewhere (check with `which claude`). No secrets here. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+
+    <!-- Start at login/boot. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if the bot crashes or exits. This is the keep-alive. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't hammer-restart on a tight crash loop (e.g. a bad .env): wait 10s. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logs. Defaults to ~/Library/Logs; install-launchd.sh expands the absolute path.
+         Tail with: tail -f "__STDOUT_LOG__". -->
+    <key>StandardOutPath</key>
+    <string>__STDOUT_LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__STDERR_LOG__</string>
+</dict>
+</plist>
