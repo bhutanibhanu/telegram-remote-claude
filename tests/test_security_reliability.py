@@ -245,8 +245,14 @@ class Recorder:
 
 
 def make_streaming_session(engine: FakeEngine, *, config=None, store=None) -> StreamingSession:
+    # NOTE (T7): the default streaming-session config uses ``allow_any_path=True`` so the
+    # driver's SB2 cwd re-validation (added in T7) NO-OPS — the turn tests built on this
+    # exercise the turn loop / callback / error plumbing (SB4/RB1/RB2…), not path
+    # confinement, and run in the synthetic ``/work`` cwd which is not a real dir. SB2 on
+    # the turn path has its own focused tests (in test_stream_session.py) that pass REAL
+    # ``allowed_roots`` + real dirs with ``allow_any_path=False``.
     return StreamingSession(
-        config or make_config(engine_mode="streaming"),
+        config or make_config(engine_mode="streaming", allow_any_path=True),
         session_store=store,
         engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
         clock=lambda: 0.0,  # frozen clock: status edits are always "due"
@@ -525,7 +531,7 @@ async def test_rb1_garbage_callback_data_does_not_raise():
     """
     engine = FakeEngine([])
     session = make_streaming_session(engine)
-    await session._ensure_engine(session._chat(1), 1)  # start the engine for chat 1
+    await session._ensure_engine(1)  # start the active project's engine for chat 1
     for bad in ["garbage", "a|tid", "x|tid|0.0", "a|tid|x.y", 12345, None, b"a|x|0.0", "", "a||0.0"]:
         outcome = session.resolve_callback(1, bad)  # must not raise
         assert outcome.handled is False

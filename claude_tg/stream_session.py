@@ -1,21 +1,26 @@
-"""Streaming-mode driver (T7) — the collaborator ``bot.py`` delegates to when
+"""Streaming-mode driver — the collaborator ``bot.py`` delegates to when
 ``ENGINE_MODE=streaming``.
 
 The one-shot path (``claude_runner.ClaudeRunner``) is untouched; this module is the
 *parallel* streaming runner gated behind the S4 flag. It owns everything the live
-engine needs that the pure layers (``engine``/``render``) deliberately left to T7:
+engine needs that the pure layers (``engine``/``render``) deliberately left to T7,
+now **per active project** (P4 / ADR-004):
 
-* **Per-chat :class:`~claude_tg.engine.engine.Engine` lifecycle.** One engine per chat,
-  started lazily on the first turn (or resumed from the persisted ``(session_id, cwd)``
-  — the cwd-scoped-resume coupling, ADR-001 / C6). Harvested from
-  ``claude_runner``: the ``(session_id, cwd)`` persistence, ``--resume``, and the
-  per-chat single-active-turn lock (we do NOT rebuild those concepts).
+* **Per-project :class:`~claude_tg.engine.engine.Engine` lifecycle.** One engine per
+  *active project* (D2 single-active-run: at most one started engine per chat), started
+  lazily on the first turn (or resumed from that project's persisted ``(session_id,
+  cwd)`` — the cwd-scoped-resume coupling, ADR-001 / C6). The project runtime
+  (``cwd``/``engine``/``started``/``policy``) lives on a :class:`_ProjectRuntime` held
+  in a per-project dict on :class:`_ChatState`; the **active** project is resolved from
+  the **store** (the source of truth), and a project's ``(session_id, cwd)`` is
+  read/written via the registry CRUD.
 
 * **The turn lock (harvested ``ClaudeBusy`` invariant).** A per-chat
   :class:`asyncio.Lock` guards the **turn driver** (``handle_message`` /
   ``handle_cancel``-as-turn) so a chat runs one turn at a time — exactly the
-  single-active-run invariant ``ClaudeRunner`` enforces. **It deliberately does NOT
-  guard :meth:`resolve_callback`**: a button tap / "Other" reply resolves a pending
+  single-active-run invariant ``ClaudeRunner`` enforces (one active turn per chat —
+  hence the live-turn state stays on the chat, not the project). **It deliberately does
+  NOT guard :meth:`resolve_callback`**: a button tap / "Other" reply resolves a pending
   decision that the *currently running* turn is awaiting, so it MUST run concurrently
   with the held turn (the turn loop is parked inside ``engine.send`` awaiting the
   operator; the callback handler calls ``engine.resolve`` on the same loop to unblock
@@ -26,12 +31,19 @@ engine needs that the pure layers (``engine``/``render``) deliberately left to T
   :class:`~claude_tg.render.Coalescer`, and performs the actual Telegram send / edit
   the render layer deferred — batching incremental/status edits at the min interval,
   flushing verbatim ask/plan/error/result as their own messages, attaching the
-  ask/plan inline keyboard. Persists ``session_id`` from the ``result`` event.
+  ask/plan inline keyboard. Persists ``session_id`` from the ``result`` event to the
+  **active project** (per-project, not a chat-global slot).
 
 * **The free-text "Other" / plan-reject state machine.** A per-chat pending-input
   marker: when the operator taps "Other" on an ask or "Reject + feedback" on a plan,
   the NEXT text message is captured as the free-text answer / reject feedback and
   routed via ``engine.resolve`` instead of opening a new turn.
+
+* **Transient bypass reset on restart (D3/SB5).** The :class:`_ProjectRuntime` (and its
+  :class:`~claude_tg.permissions.PermissionPolicy`) is in-memory only — a fresh process
+  starts every project with a new policy (``/yolo`` OFF, no allow-session grants).
+  Identity (name, cwd, ``session_id``) reloads from the persisted registry at
+  :meth:`_ensure_engine` time; the bypass posture never persists.
 
 **SB1 is enforced at the bot** (``filters.Chat(allowed)`` + an explicit
 ``_authorized`` recheck in the handler) — this module is only reached for an
@@ -50,10 +62,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Protocol
 
+from .claude_runner import ClaudeResult, ClaudeRunner
 from .config import Config
 from .engine import (
     AskEvent,
     Engine,
+    ErrorEvent,
+    Event,
     PermissionDecision,
     PlanEvent,
     PlanVerdict,
@@ -62,6 +77,7 @@ from .engine import (
     SubstrateDecision,
 )
 from .engine.adapter_sdk import SdkSubstrate
+from .paths import PathNotAllowed, resolve_within_roots
 from .permissions import PermissionPolicy
 from .render import (
     Callback,
@@ -75,6 +91,7 @@ from .render import (
     strip_telegram_html,
     yolo_indicator,
 )
+from .session_store import DEFAULT_PROJECT
 
 log = logging.getLogger(__name__)
 
@@ -106,11 +123,11 @@ _PERMISSION_NOTES: dict[PermissionVerdictName, str] = {
 
 
 class EngineFactory(Protocol):
-    """Builds an :class:`Engine` for a chat (injected so tests pass a mock).
+    """Builds an :class:`Engine` for a project (injected so tests pass a mock).
 
     The default production factory wires an :class:`SdkSubstrate` (Substrate A) with
     the engine's decision callback; tests pass a factory returning a scripted fake.
-    ``permission_policy`` is the chat's single per-session :class:`PermissionPolicy`
+    ``permission_policy`` is the project's single per-session :class:`PermissionPolicy`
     (P2, ADR-003): the SAME object the session mutates via ``/yolo`` and clears on
     ``/reset``, handed in so the engine's gate and the session act on one policy.
     """
@@ -129,9 +146,9 @@ def _default_engine_factory(
     (the async answer-hold + the P2 permission gate). No bypass / skip-permissions flag
     is set (SB5): the engine consults the injected ``permission_policy`` and is
     fail-closed by default — risky tools are held for approval unless a grant or
-    ``/yolo`` allows them. ``permission_policy`` is the chat's shared policy (the one the
-    session mutates), so ``/yolo``, allow-session grants, and ``/reset``-clear all act on
-    a single object.
+    ``/yolo`` allows them. ``permission_policy`` is the project's shared policy (the one
+    the session mutates), so ``/yolo``, allow-session grants, and ``/reset``-clear all
+    act on a single object.
     """
     engine: Engine
 
@@ -154,18 +171,49 @@ def _default_engine_factory(
 
 
 @dataclass
-class _ChatState:
-    """Per-chat streaming state (engine + turn lock + ask/plan + free-text marker)."""
+class _ProjectRuntime:
+    """In-memory runtime for ONE project (engine + cwd + its permission policy).
+
+    Per ADR-004: the durable identity (name, cwd, ``session_id``, timestamps) lives in
+    the persisted registry; **this** is the transient runtime — created lazily in memory
+    when a project is first used, dropped on a restart (so ``/yolo`` and allow-session
+    grants never survive a restart, D3/SB5). ``cwd`` is the project's fixed cwd (D4),
+    seeded from the registry record (falling back to ``config.workdir`` only if the
+    record's cwd is missing). ``policy`` is a FRESH :class:`PermissionPolicy` per project
+    (fail-closed: no grants, yolo off) — the SAME object handed to that project's engine
+    and mutated by the session (``/yolo`` via :meth:`set_yolo`, dropped by ``policy.clear()``
+    on ``/reset``).
+    """
 
     cwd: str
     engine: Optional[Engine] = None
     started: bool = False
-    # The chat's single per-session permission policy (P2, ADR-003). A FRESH one per
-    # chat (fail-closed: no grants, yolo off). The SAME object is handed to the engine
-    # (so the engine's gate + allow-session grants act on it) and mutated by the session
-    # (/yolo via set_yolo, dropped by clear() on /reset).
     policy: PermissionPolicy = field(default_factory=PermissionPolicy)
+    # QF3 (B3/RB3): True from the moment ``engine.resume()`` SUCCEEDS until the first
+    # turn on that resumed session completes WITHOUT a resume-failure-shaped error. A
+    # stale/aged/torn session can resume "successfully" (connect) and then error on the
+    # FIRST ``send`` — this flag tells :meth:`_drive_turn` the current turn is that first,
+    # unconfirmed use of a resumed session, so it (and ONLY it) applies the
+    # ``_is_resume_failure`` heuristic. A FRESH-started session never sets this, so a fresh
+    # session erroring is never mistaken for a resume failure. Reset on the in-memory
+    # runtime only (never persisted).
+    resumed_unverified: bool = False
+
+
+@dataclass
+class _ChatState:
+    """Per-chat LIVE-TURN state (turn lock + ask/plan + free-text marker) + project runtimes.
+
+    There is exactly ONE active turn per chat (the turn lock enforces it), so the
+    live-turn fields (status line, pending ask/plan, free-text capture) belong to the
+    **chat**. The per-**project** runtime (engine/cwd/policy) lives in :attr:`runtimes`,
+    keyed by the stored project name; the *active* project is resolved from the store.
+    """
+
     lock: asyncio.Lock = None  # type: ignore[assignment]
+    # Per-project in-memory runtimes, keyed by the project's STORED (as-created) name.
+    # Created lazily by _active_runtime; never persisted (D3 — transient bypass).
+    runtimes: dict[str, _ProjectRuntime] = field(default_factory=dict)
     # The status-line message id for in-place coalesced edits (created on first edit).
     status_message_id: Optional[int] = None
     # The text currently shown on that status line — used to SKIP an edit when the new
@@ -205,6 +253,12 @@ class StreamingSession:
     loop). The turn lock guards :meth:`handle_message` (one turn per chat at a time —
     the harvested ``ClaudeBusy`` invariant); :meth:`resolve_callback` is intentionally
     lock-free so it can resolve the pending decision the held turn is awaiting.
+
+    **Per active project (P4).** The chat's active project (and its cwd) is resolved
+    from the store on each turn; the engine is built/resumed from that project's
+    ``(session_id, cwd)`` and persists its ``session_id`` back to that project. At most
+    one engine is started per chat at a time (D2): switching the active project stops the
+    previously-started one before starting/resuming the new active one.
     """
 
     def __init__(
@@ -222,109 +276,406 @@ class StreamingSession:
         self._clock = clock
         self._min_edit_interval = min_edit_interval
         self._chats: dict[int, _ChatState] = {}
-        # Harvest persisted (session_id, cwd) so a streaming turn can resume.
-        self._resume_ids: dict[int, str] = {}
-        if self.store is not None:
-            data = self.store.load()
-            for key, entry in data.items():
-                if not isinstance(entry, dict):
-                    continue
-                try:
-                    cid = int(key)
-                except (TypeError, ValueError):
-                    continue
-                if entry.get("session_id"):
-                    self._resume_ids[cid] = entry["session_id"]
-                if entry.get("cwd"):
-                    self._chat(cid).cwd = entry["cwd"]
+        # NOTE (P4 / D3): no __init__ harvest of persisted (session_id, cwd). Resume now
+        # resolves PER ACTIVE PROJECT from the registry at _ensure_engine time, and the
+        # in-memory _ProjectRuntime starts fresh every process (transient bypass reset).
 
     # -- per-chat state ------------------------------------------------------
 
     def _chat(self, chat_id: int) -> _ChatState:
         state = self._chats.get(chat_id)
         if state is None:
-            state = _ChatState(cwd=str(self.config.workdir))
+            state = _ChatState()
             self._chats[chat_id] = state
         return state
 
+    # -- active-project resolution (the store is the source of truth) --------
+
+    def _active_runtime(
+        self, chat_id: int, *, create_default: bool
+    ) -> tuple[Optional[str], Optional[_ProjectRuntime]]:
+        """Resolve the chat's ACTIVE project + its in-memory :class:`_ProjectRuntime`.
+
+        The **store** owns which project is active and its cwd. Returns ``(name,
+        runtime)`` for the active project, lazily creating the runtime in memory (cwd
+        from the registry record, falling back to ``config.workdir`` if the record's cwd
+        is missing). When the chat has **no active project**:
+
+        * ``create_default=True`` (a turn / ``set_yolo`` — anything that runs the engine):
+          auto-create a ``default`` project at ``config.workdir`` and make it active
+          (ADR-004 D6 symmetry — preserves the pre-P4 "just send a message and it works"
+          UX), then resolve it. If a ``default`` exists but isn't active, switch to it.
+        * ``create_default=False`` (a read-only query like :meth:`get_cwd`): no side
+          effects — return ``(None, None)``.
+
+        With no store at all (tests that pass ``session_store=None``), fall back to a
+        single implicit ``default`` runtime at ``config.workdir`` so the driver still
+        works without persistence.
+        """
+        if self.store is None:
+            # No persistence: a single implicit project so the engine still runs.
+            if not create_default:
+                # Mirror the with-store read-only contract: no runtime unless one exists.
+                rt = self._chat(chat_id).runtimes.get(DEFAULT_PROJECT)
+                return (DEFAULT_PROJECT, rt) if rt is not None else (None, None)
+            return DEFAULT_PROJECT, self._runtime(chat_id, DEFAULT_PROJECT, None)
+
+        active = self.store.get_active(chat_id)
+        if active is None:
+            if not create_default:
+                return None, None
+            active = self._ensure_default_active(chat_id)
+        record = self.store.get_project(chat_id, active)
+        cwd = (record or {}).get("cwd")
+        return active, self._runtime(chat_id, active, cwd)
+
+    def _ensure_default_active(self, chat_id: int) -> str:
+        """Auto-create (or switch to) a ``default`` project for a chat with no active one.
+
+        ADR-004 D6: a fresh streaming chat with no active project gets a ``default`` at
+        ``config.workdir`` (symmetric with the v1→v2 migration) so the operator can just
+        send a message. If ``default`` already exists but isn't active, switch to it
+        rather than failing on the duplicate. Returns the now-active project name.
+        """
+        from .session_store import DuplicateProject
+
+        workdir = str(self.config.workdir)
+        try:
+            self.store.create(chat_id, DEFAULT_PROJECT, workdir, make_active=True)
+        except DuplicateProject:
+            # A default already exists (e.g. from a prior reset that kept it) but is not
+            # active — make it active rather than creating a second.
+            self.store.switch(chat_id, DEFAULT_PROJECT)
+        return DEFAULT_PROJECT
+
+    def _runtime(
+        self, chat_id: int, name: str, cwd: Optional[str]
+    ) -> _ProjectRuntime:
+        """The in-memory :class:`_ProjectRuntime` for ``name`` (create lazily).
+
+        ``cwd`` is the registry record's cwd; an absent cwd falls back to
+        ``config.workdir`` (a project record should always carry a cwd, but a
+        hand-edited / partially-written record must not wedge the turn — fail to the
+        default workdir). The runtime is created ONCE and reused (so its engine + policy
+        persist across turns within the process); a subsequent call ignores ``cwd`` (a
+        project's cwd is fixed for the life of its session — D4).
+        """
+        runtimes = self._chat(chat_id).runtimes
+        rt = runtimes.get(name)
+        if rt is None:
+            rt = _ProjectRuntime(cwd=cwd or str(self.config.workdir))
+            runtimes[name] = rt
+        return rt
+
     def get_cwd(self, chat_id: int) -> str:
-        return self._chat(chat_id).cwd
+        """The active project's cwd, or ``config.workdir`` if there is no active project.
+
+        Read-only (RB1): never creates a project or a runtime — a chat that has never run
+        a turn simply reports the default workdir.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=False)
+        if rt is not None:
+            return rt.cwd
+        # No active project (or no store): fall back to the default workdir without
+        # mutating anything.
+        if self.store is not None:
+            active = self.store.get_active(chat_id)
+            if active is not None:
+                record = self.store.get_project(chat_id, active)
+                cwd = (record or {}).get("cwd")
+                if cwd:
+                    return cwd
+        return str(self.config.workdir)
 
     def set_yolo(self, chat_id: int, on: bool) -> None:
-        """Flip the chat's ``/yolo`` allow-all bit on its shared policy (P2, D6).
+        """Flip the ``/yolo`` allow-all bit on the ACTIVE project's policy (P2, D6).
 
         ``/yolo`` -> ``True`` (every tool runs with NO approval prompt this session);
         ``/unyolo`` -> ``False`` (the fail-closed gate is restored). Mutates the SAME
-        :class:`PermissionPolicy` object the engine's gate consults, so the bypass takes
-        effect immediately for in-flight and subsequent turns. The bot makes the toggle
-        loud (the enable banner); :meth:`_drive_turn` keeps it loud throughout (the
-        persistent ``⚠️`` turn marker). Cleared by :meth:`reset` (D7).
+        :class:`PermissionPolicy` object the active project's engine gate consults, so
+        the bypass takes effect immediately for in-flight and subsequent turns of that
+        project. Auto-creates ``default`` if there is no active project (consistent with
+        starting a turn). The bot makes the toggle loud (the enable banner);
+        :meth:`_drive_turn` keeps it loud throughout (the persistent ``⚠️`` turn marker).
+        Cleared by :meth:`reset` (D7).
         """
-        self._chat(chat_id).policy.set_yolo(on)
+        _name, rt = self._active_runtime(chat_id, create_default=True)
+        if rt is not None:
+            rt.policy.set_yolo(on)
 
     # -- engine lifecycle ----------------------------------------------------
 
-    async def _ensure_engine(self, state: _ChatState, chat_id: int) -> Engine:
-        """Lazily start (or resume) the chat's engine. Idempotent within a chat.
+    async def _ensure_engine(self, chat_id: int) -> tuple[Engine, bool]:
+        """Lazily start (or resume) the ACTIVE project's engine. Idempotent per project.
 
-        On first use: build the engine for the chat's cwd, then ``resume`` the persisted
-        ``(session_id, cwd)`` if one exists (cwd-scoped — C6), else ``start`` fresh. A
-        resume failure falls back to a fresh ``start`` (the dead id is dropped) so the
-        chat is never wedged on a stale session — harvested from the runner's
-        resume-failure recovery.
+        Returns ``(engine, resume_failed)`` — ``resume_failed`` is True iff a persisted
+        ``session_id`` was present but ``resume`` raised and we fell back to a fresh
+        ``start`` THIS call (so the caller can post the RB3 operator notice). It is False
+        for a fresh start, a clean resume, and the already-started fast path.
+
+        Resolves the chat's active project (auto-creating ``default`` if none — a turn
+        always has a project), then:
+
+        * **SB2 cwd re-validation (the authoritative gate, T7).** Re-validate the stored
+          cwd against the permitted roots via :func:`resolve_within_roots` BEFORE building
+          or resuming the engine. A project whose cwd was in-roots at ``/new`` can later
+          drift out (config narrowed, or a path component became an out-of-root symlink);
+          if so this raises :class:`~claude_tg.paths.PathNotAllowed` and the engine is
+          **never** built/resumed — :meth:`handle_message` catches it and refuses the turn
+          fail-closed (SB6/RB1). ``ALLOW_ANY_PATH=true`` no-ops the check (the resolver
+          returns the canonical path), as on ``/new``.
+        * **Single-active-run (D2).** If a DIFFERENT project's engine is currently
+          started for this chat (the operator switched), ``stop()`` it first — at most
+          one engine is live per chat.
+        * Build the engine for the active project's cwd + **its** ``policy``, then
+          ``resume`` the project's persisted ``session_id`` (cwd-scoped — C6) if one
+          exists, else ``start`` fresh. A resume failure falls back to a fresh ``start``
+          (the dead id is dropped) so the project is never wedged on a stale session —
+          harvested from the runner's resume-failure recovery — and is signalled back to
+          the caller (RB3) so the operator learns the previous session could not resume.
         """
-        if state.engine is not None and state.started:
-            return state.engine
-        engine = state.engine or self._engine_factory(
-            cwd=state.cwd,
-            backstop_seconds=float(self.config.answer_backstop_seconds),
-            permission_policy=state.policy,
+        name, rt = self._active_runtime(chat_id, create_default=True)
+        assert name is not None and rt is not None  # create_default guarantees both
+        # SB2 (T7): re-validate the stored cwd BEFORE building/resuming the engine. A
+        # PathNotAllowed propagates out of _ensure_engine (the engine is NOT started) and
+        # is caught by handle_message, which refuses the turn fail-closed.
+        resolve_within_roots(
+            rt.cwd,
+            cwd=rt.cwd,
+            allowed_roots=self.config.allowed_roots,
+            allow_any=self.config.allow_any_path,
         )
-        state.engine = engine
-        resume_id = self._resume_ids.get(chat_id)
+        await self._stop_other_started(chat_id, keep=name)
+        if rt.engine is not None and rt.started:
+            return rt.engine, False
+        # Past the warm fast-path: rt is either fresh (engine None) OR holds a NON-started
+        # engine — a prior start()/resume() that raised AFTER the adapter allocated its
+        # client (so the engine is non-None but unusable). Never REUSE such an engine: a
+        # start()/resume() on it hits the adapter's "already started" guard → the turn
+        # wedges (the same coupling the QF4 resume-raises path recovers from). So if a
+        # non-started engine is present, best-effort stop() it (free its partial client,
+        # like _stop_other_started) and build a FRESH one — a non-started engine is always
+        # discarded + replaced, never reused.
+        if rt.engine is not None:
+            try:
+                await rt.engine.stop()
+            except Exception:
+                log.debug(
+                    "stop of non-started engine raised for chat %s project %s "
+                    "(ignored — building fresh)",
+                    chat_id,
+                    name,
+                    exc_info=True,
+                )
+        engine = self._engine_factory(
+            cwd=rt.cwd,
+            backstop_seconds=float(self.config.answer_backstop_seconds),
+            permission_policy=rt.policy,
+        )
+        rt.engine = engine
+        resume_id = self._resume_id(chat_id, name)
+        resume_failed = False
         if resume_id:
             try:
                 await engine.resume(resume_id)
             except Exception:
-                log.info("resume failed for chat %s; starting a fresh session", chat_id)
-                self._resume_ids.pop(chat_id, None)
+                # QF4 (B3′/RB3): resume() RAISED — e.g. the SDK adapter assigns its
+                # client BEFORE connect(), so a connect failure (dead/aged session)
+                # leaves the FAILED engine with a partial, non-None client. We CANNOT
+                # reuse it: start() on that same instance hits the adapter's
+                # "session already started" guard and would re-raise → the turn fails
+                # AND the dead id is never cleared → the project is permanently wedged
+                # re-resuming the same dead id. So recover onto a FRESH engine instead.
+                log.info(
+                    "resume failed for chat %s project %s; starting a fresh session",
+                    chat_id,
+                    name,
+                )
+                # (a) Best-effort stop the FAILED engine to free its partial SDK client.
+                #     A stop failure must not break recovery (the partial client is the
+                #     adapter's problem; we proceed regardless).
+                try:
+                    await engine.stop()
+                except Exception:
+                    log.debug(
+                        "stop of failed-resume engine raised for chat %s project %s "
+                        "(ignored — recovering fresh)",
+                        chat_id,
+                        name,
+                        exc_info=True,
+                    )
+                # (b) Clear the persisted dead id so it is NOT re-resumed on any future
+                #     turn (the wedge fix). Done BEFORE the fresh start so even if the
+                #     fresh start were to raise, the dead id is already gone.
+                self._persist(chat_id, session_id=None)
+                # (c) Build a FRESH engine instance (its _client is None, so its start()
+                #     cannot hit the "already started" guard) and adopt it as the runtime
+                #     engine, replacing the failed one.
+                engine = self._engine_factory(
+                    cwd=rt.cwd,
+                    backstop_seconds=float(self.config.answer_backstop_seconds),
+                    permission_policy=rt.policy,
+                )
+                rt.engine = engine
+                # (d) Start the FRESH engine — a clean fresh session (the dead id is gone).
                 await engine.start()
+                # (e) Signal the caller so handle_message posts the T7 "couldn't resume,
+                #     started fresh" notice. The session is fresh (start, not resume), so
+                #     it is NOT resumed_unverified — a fresh-session error is an ordinary
+                #     turn error, never mistaken for a resume failure.
+                resume_failed = True
+            else:
+                # Resume CONNECTED. It is not yet CONFIRMED good — a stale/aged/torn
+                # session can connect and then error on the first turn (B3). Mark the
+                # runtime so _drive_turn applies the resume-failure heuristic to this
+                # first turn only (cleared once a turn completes clean — QF3/RB3).
+                rt.resumed_unverified = True
         else:
             await engine.start()
-        state.started = True
-        return engine
+        rt.started = True
+        return engine, resume_failed
+
+    def _resume_id(self, chat_id: int, name: str) -> Optional[str]:
+        """The active project's persisted ``session_id`` to resume from, if any."""
+        if self.store is None:
+            return None
+        record = self.store.get_project(chat_id, name)
+        session_id = (record or {}).get("session_id")
+        return session_id if isinstance(session_id, str) and session_id else None
+
+    async def _stop_other_started(self, chat_id: int, *, keep: str) -> None:
+        """Stop any STARTED engine for a project other than ``keep`` (D2 single-active-run).
+
+        The operator can only drive one active project at a time; when they switch, the
+        previously-started engine must be stopped so we never hold two live engines for
+        one chat. Best-effort: a stop failure is logged, the runtime is marked stopped,
+        and we proceed (a wedged old engine must not block the new active turn).
+        """
+        for other_name, other_rt in self._chat(chat_id).runtimes.items():
+            if other_name == keep:
+                continue
+            if other_rt.started and other_rt.engine is not None:
+                try:
+                    await other_rt.engine.stop()
+                except Exception:
+                    log.exception(
+                        "error stopping engine for chat %s project %s on switch",
+                        chat_id,
+                        other_name,
+                    )
+                other_rt.started = False
+                other_rt.engine = None
+
+    async def forget_project(self, chat_id: int, name: str) -> None:
+        """Drop a project's in-memory runtime (B4 — purge on ``/rm``). No-op if absent.
+
+        ``/rm <name>`` removes a project from the persisted registry, but its transient
+        :class:`_ProjectRuntime` (cached engine + cwd + :class:`PermissionPolicy`) lives in
+        ``state.runtimes`` keyed by the stored name. ``_runtime`` caches by name and
+        deliberately ignores the passed cwd on a hit (a project's cwd is fixed for the life
+        of its session — D4), so a stale runtime left here would be reused if the SAME name
+        is re-created — running the recreated project in the OLD cwd and inheriting the OLD
+        ``/yolo`` + allow-session grants (the SB5 bypass leak / D4 cwd leak). So after the
+        store-remove, the runtime must be purged: find it by **case-insensitive** name
+        (mirroring the store's case-insensitive match — ``/rm WORK`` must purge the runtime
+        stored as ``work``), best-effort ``stop()`` its engine to free any live SDK client
+        (try/except, the ``_stop_other_started`` pattern — a stop failure must not break the
+        purge), then drop it from ``state.runtimes``. A subsequent ``/new <name>`` then
+        builds a FRESH runtime from the store's record (new cwd, fail-closed policy) — no
+        leak. ``cmd_rm`` already refuses the ACTIVE project, so the purged runtime is never
+        the live one.
+        """
+        state = self._chats.get(chat_id)
+        if state is None:
+            return
+        key = self._resolve_runtime_key(state.runtimes, name)
+        if key is None:
+            return  # no in-memory runtime for that name — clean no-op.
+        rt = state.runtimes[key]
+        if rt.engine is not None:
+            try:
+                await rt.engine.stop()
+            except Exception:
+                log.debug(
+                    "stop of engine raised while forgetting chat %s project %s "
+                    "(ignored — dropping the runtime regardless)",
+                    chat_id,
+                    key,
+                    exc_info=True,
+                )
+        del state.runtimes[key]
+
+    @staticmethod
+    def _resolve_runtime_key(
+        runtimes: dict[str, "_ProjectRuntime"], name: str
+    ) -> Optional[str]:
+        """The actual ``runtimes`` key whose casefold matches ``name``, or ``None``.
+
+        Mirrors the store's :func:`~claude_tg.session_store._resolve_name`: runtimes are
+        keyed by the project's STORED (as-created) name, and the store matches names
+        case-insensitively, so a lookup against the in-memory runtimes must too (else a
+        casing variant — ``/rm WORK`` for a ``work`` project — would leave the stale runtime
+        behind). Defensive against a non-``str`` ``name``.
+        """
+        if not isinstance(name, str):
+            return None
+        target = name.casefold()
+        for key in runtimes:
+            if isinstance(key, str) and key.casefold() == target:
+                return key
+        return None
 
     def reset(self, chat_id: int) -> None:
-        """Drop the chat's session so the next turn starts fresh (harvested /reset).
+        """Reset the ACTIVE project to a fresh conversation (harvested /reset, D3/D7).
 
-        Clears the persisted resume id and any in-memory engine + pending state, AND
-        wipes the chat's :class:`PermissionPolicy` (drops every allow-session grant and
-        turns ``/yolo`` off — D7) so a reset/new session always restarts **fail-closed**:
-        no inherited grants, no silently-resumed allow-all posture. A running turn
-        (holding the lock) is not force-killed here; ``/cancel`` aborts a live turn. This
-        mirrors the one-shot runner's ``reset``.
+        Clears the active project's persisted ``session_id`` (a fresh conversation — the
+        project is KEPT in the registry, not deleted), drops its in-memory engine +
+        pending state, and wipes its :class:`PermissionPolicy` (drops every allow-session
+        grant and turns ``/yolo`` off — D7) so the next session restarts **fail-closed**.
+        A running turn (holding the lock) is not force-killed here; ``/cancel`` aborts a
+        live turn. With no active project there is nothing to reset (no side effects).
         """
-        self._resume_ids.pop(chat_id, None)
+        # Live-turn state is per-chat → always cleared.
         state = self._chats.get(chat_id)
         if state is not None:
-            state.engine = None
-            state.started = False
             state.status_message_id = None
             state.status_text = None
             self._clear_pending(state)
-            # D7: drop grants + yolo so the next session starts fail-closed.
-            state.policy.clear()
-        self._persist(chat_id, session_id=None)
+        # Resolve the active project WITHOUT creating one (reset is not a turn): if there
+        # is no active project there is no session to clear.
+        name, rt = self._active_runtime(chat_id, create_default=False)
+        if rt is not None:
+            rt.engine = None
+            rt.started = False
+            rt.policy.clear()  # D7: drop grants + yolo so the next session is fail-closed.
+        if name is not None:
+            # Clear the persisted session_id for the active project (keep cwd — D4 — and
+            # the project record itself). update() writes the active project's fields.
+            self._persist(chat_id, session_id=None)
 
     def _persist(self, chat_id: int, *, session_id: Optional[str]) -> None:
+        """Write ``session_id`` to the chat's ACTIVE project (flat update, cwd untouched).
+
+        The flat :meth:`~JsonSessionStore.update` writes the active project's fields;
+        ``cwd=None`` leaves the project's fixed cwd untouched (D4). ``session_id=None``
+        clears it (a reset / fresh conversation).
+        """
         if self.store is None:
             return
-        state = self._chats.get(chat_id)
-        cwd = state.cwd if state is not None else None
         try:
-            self.store.update(chat_id, session_id=session_id, cwd=cwd)
+            self.store.update(chat_id, session_id=session_id, cwd=None)
         except Exception:
             log.exception("failed to persist streaming session state for chat %s", chat_id)
+
+    def is_busy(self, chat_id: int) -> bool:
+        """Whether a turn is in flight for ``chat_id`` (the turn lock is held).
+
+        The D2 busy-guard surface: ``/switch`` and ``/new`` (T5/T6) refuse while a turn
+        is running so the active project can't change mid-turn. A chat with no state yet
+        is never busy.
+        """
+        state = self._chats.get(chat_id)
+        return state is not None and state.lock.locked()
 
     # -- the turn driver (LOCK-GUARDED: one turn per chat) -------------------
 
@@ -342,27 +693,62 @@ class StreamingSession:
         Free-text capture takes precedence: if the chat is awaiting an "Other" answer /
         plan-reject feedback, this text is routed to ``engine.resolve`` (NOT a new turn)
         and the held turn — still inside ``engine.send`` — continues. Otherwise it opens
-        a new turn via ``engine.send`` and renders the event stream.
+        a new turn via ``engine.send`` and renders the event stream against the **active
+        project's** engine (auto-creating ``default`` on the first turn — ADR-004 D6).
 
         Guarded by the per-chat turn lock (the harvested single-active-turn invariant):
         a second concurrent message raises :class:`StreamingBusy` (the bot replies
         "still working"), never two interleaved turns. The lock does NOT cover a
         free-text resolve targeting an *already running* turn — that path must run
         concurrently with the held turn, so it is handled before acquiring the lock.
+
+        **SB2 fail-closed (T7).** If the active project's stored cwd is no longer within
+        the permitted roots, :meth:`_ensure_engine` raises
+        :class:`~claude_tg.paths.PathNotAllowed`; the engine is never started, this
+        replies a clear refusal via ``send`` and RETURNS cleanly (the lock is released —
+        no hang, RB1/SB6). **RB3 resume notice.** If a persisted session could not be
+        resumed and a fresh one was started instead, a one-line notice is sent via
+        ``send`` BEFORE the turn is driven (the turn still completes — never hangs, RB2).
         """
         state = self._chat(chat_id)
 
         # Free-text capture for a prior "Other"/reject tap routes to resolve(), not a
-        # new turn — and must NOT take the turn lock (the awaiting turn holds it).
+        # new turn — and must NOT take the turn lock (the awaiting turn holds it). It
+        # resolves against the engine of whatever project is active (the same one the
+        # held turn is running on).
         if state.awaiting_text_for is not None:
-            self._resolve_free_text(state, text)
+            self._resolve_free_text(state, chat_id, text)
             return
 
         if state.lock.locked():
             raise StreamingBusy()
 
         async with state.lock:
-            engine = await self._ensure_engine(state, chat_id)
+            try:
+                engine, resume_failed = await self._ensure_engine(chat_id)
+            except PathNotAllowed:
+                # SB2 (T7): the active project's stored cwd drifted out of the permitted
+                # roots (config narrowed, or a path component became an out-of-root
+                # symlink). Refuse the turn fail-closed WITHOUT starting the engine; the
+                # lock releases on return (no hang).
+                await send(
+                    text=(
+                        f"❌ This project's directory {self.get_cwd(chat_id)} is no longer "
+                        "within the permitted roots — use /new <name> <path> to create one "
+                        "inside them."
+                    ),
+                    reply_markup=None,
+                    parse_mode=None,
+                )
+                return
+            if resume_failed:
+                # RB3: the persisted session could not be resumed; a fresh one was started.
+                # Tell the operator BEFORE driving the turn (the turn still completes).
+                await send(
+                    text="⚠️ Couldn't resume this project's previous session; started a fresh one.",
+                    reply_markup=None,
+                    parse_mode=None,
+                )
             await self._drive_turn(
                 state, chat_id, engine, text, send=send, edit=edit, delete=delete
             )
@@ -380,19 +766,47 @@ class StreamingSession:
     ) -> None:
         """Iterate ``engine.send`` → render → Telegram send/edit (coalesced).
 
-        D6 "loud throughout": if the chat's policy has ``/yolo`` on, lead the turn with a
-        persistent ``⚠️`` marker (its OWN message, before any event renders) so an
-        in-progress allow-all session is never silent — the bypass shows on every turn,
-        not just at the ``/yolo`` toggle. A plain ``send`` (no coalescer / no status-line
-        edit) so it cannot be overwritten by the in-place status edits that follow.
+        D6 "loud throughout": if the active project's policy has ``/yolo`` on, lead the
+        turn with a persistent ``⚠️`` marker (its OWN message, before any event renders)
+        so an in-progress allow-all session is never silent — the bypass shows on every
+        turn, not just at the ``/yolo`` toggle. A plain ``send`` (no coalescer / no
+        status-line edit) so it cannot be overwritten by the in-place status edits that
+        follow.
+
+        **QF3 (B3/RB3): recover from a resume that connects then errors on first use.**
+        If this is the FIRST turn on a freshly-resumed session (the runtime's
+        ``resumed_unverified`` flag), every ``error``/``result`` event is checked with the
+        ported ``_is_resume_failure`` heuristic. On a resume-failure-shaped event the dead
+        ``session_id`` is NOT persisted; instead, AFTER the stream drains, the persisted id
+        is cleared, the engine is dropped (so the next turn starts fresh — never re-resumes
+        the dead id), and the operator is told to resend. If the turn instead completes
+        cleanly, the flag is cleared (the resume is confirmed good). A FRESH session is
+        never ``resumed_unverified``, so an unrelated fresh-turn error is never mistaken for
+        a resume failure. The check happens INLINE while iterating and recovery happens
+        AFTER the loop ends naturally (the substrate stream always terminates — RB2), so we
+        never re-drive a turn mid-stream (no double-render / re-entrancy).
         """
+        # Capture the project this turn is running on AT TURN START (defense-in-depth, T7
+        # review): the busy-guard keeps the active project stable for the turn, but pinning
+        # the name/runtime here means the result-persist and any QF3 recovery act on THIS
+        # turn's project, not "whatever is active when the turn ends".
+        turn_name, turn_rt = self._active_runtime(chat_id, create_default=True)
+        # This first turn applies the resume-failure heuristic iff the session was resumed
+        # (not freshly started) and is not yet confirmed good.
+        check_resume = turn_rt is not None and turn_rt.resumed_unverified
+        resume_failure_detected = False
+
         coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
         # Status line for THIS turn starts unset; create on first edit_status.
         state.status_message_id = None
         state.status_text = None
-        if state.policy.yolo:
+        if self._active_policy(chat_id).yolo:
             await send(text=yolo_indicator(), reply_markup=None, parse_mode=None)
         async for event in engine.send(prompt):
+            # QF3: on the first turn of a resumed session, flag a resume-failure-shaped
+            # error/result. Latch on the first hit (the dead id is the same all turn).
+            if check_resume and not resume_failure_detected and _is_resume_failure_event(event):
+                resume_failure_detected = True
             # Remember an ask/plan so a tap can reconstruct the native answer.
             if isinstance(event, AskEvent):
                 state.pending_ask = event
@@ -426,7 +840,10 @@ class StreamingSession:
             if isinstance(event, PlanEvent):
                 state.pending_plan = event
             elif isinstance(event, ResultEvent):
-                self._persist(chat_id, session_id=event.session_id or engine.session_id)
+                # QF3: do NOT re-persist the dead session_id on a resume-failure result —
+                # it would just re-arm the same broken resume. The recovery below clears it.
+                if not resume_failure_detected:
+                    self._persist(chat_id, session_id=event.session_id or engine.session_id)
             for action in coalescer.offer(event).actions:
                 await self._perform(state, action, send=send, edit=edit)
         # End of turn: flush any trailing coalesced status line, then DELETE the transient
@@ -443,6 +860,82 @@ class StreamingSession:
                 log.debug("status-line delete failed at turn end", exc_info=True)
             state.status_message_id = None
             state.status_text = None
+
+        # QF3 (B3/RB3): finalize the resume verification AFTER the stream has fully drained
+        # (so we never re-enter the render loop mid-turn). Either recover from a detected
+        # resume failure, or confirm the resume good by clearing the flag.
+        if check_resume:
+            if resume_failure_detected:
+                await self._recover_failed_resume(chat_id, turn_name, turn_rt, send=send)
+            elif turn_rt is not None:
+                # The first resumed turn completed without a resume failure → confirmed good.
+                turn_rt.resumed_unverified = False
+
+    async def _recover_failed_resume(
+        self,
+        chat_id: int,
+        name: Optional[str],
+        rt: Optional[_ProjectRuntime],
+        *,
+        send: SendFn,
+    ) -> None:
+        """Recover when a resumed session errored on its first turn (QF3 / B3 / RB3).
+
+        Fail clean, never hang: clear the active project's persisted ``session_id`` so the
+        dead id is NOT retried, drop the runtime's engine/started so the NEXT turn starts
+        fresh, and notify the operator to resend (a clean-fail-then-fresh-next-turn rather
+        than an in-loop auto-re-send, which would risk double-render / re-entrancy). The
+        notice send is best-effort the same as the rest of the turn; if it raises it
+        propagates, but the persisted id is ALREADY cleared and the engine dropped first, so
+        the project is never left wedged on the dead session.
+        """
+        log.info(
+            "resume connected but first turn failed for chat %s project %s; "
+            "clearing the persisted session and recovering fresh",
+            chat_id,
+            name,
+        )
+        # 1) Clear the persisted dead id FIRST so even if the notice send fails the stale
+        #    session is gone (the next turn will start fresh, not re-resume it).
+        self._persist(chat_id, session_id=None)
+        # 2) Drop the in-memory engine so the next turn rebuilds + starts fresh. Best-effort
+        #    stop() the connected-but-dead engine BEFORE dropping the reference so its SDK
+        #    client is closed rather than orphaned (QF3-review non-blocker, same pattern as
+        #    the resume-raises path). A stop failure must NOT re-wedge — the dead id is
+        #    already cleared above, so even if stop() raises the next turn starts fresh.
+        if rt is not None:
+            if rt.engine is not None:
+                try:
+                    await rt.engine.stop()
+                except Exception:
+                    log.debug(
+                        "stop of dead-resumed engine raised for chat %s project %s "
+                        "(ignored — id already cleared, recovering fresh)",
+                        chat_id,
+                        name,
+                        exc_info=True,
+                    )
+            rt.engine = None
+            rt.started = False
+            rt.resumed_unverified = False
+        # 3) Tell the operator (the turn already rendered the underlying error).
+        await send(
+            text=(
+                "⚠️ Couldn't resume this project's previous session (it may be expired) — "
+                "cleared it. Send your message again to start fresh."
+            ),
+            reply_markup=None,
+            parse_mode=None,
+        )
+
+    def _active_policy(self, chat_id: int) -> PermissionPolicy:
+        """The active project's :class:`PermissionPolicy` (auto-create ``default`` if needed).
+
+        Used by :meth:`_drive_turn` for the loud-yolo marker; a turn always has an active
+        project (``_ensure_engine`` created one), so this resolves the same runtime.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=True)
+        return rt.policy if rt is not None else PermissionPolicy()
 
     async def _perform(
         self,
@@ -539,6 +1032,9 @@ class StreamingSession:
         the pending decision the currently-running turn is awaiting (the turn loop is
         parked inside ``engine.send``), so it must run concurrently with the held turn.
 
+        The decision resolves against the **active project's** engine — the same engine
+        the held turn is running on (one active run per chat, D2).
+
         Mapping:
 
         * ask option tap (``a``)   → :class:`QuestionAnswer` (native answers map) →
@@ -557,9 +1053,9 @@ class StreamingSession:
         if decoded is None:
             return CallbackOutcome(handled=False, note="ignored")
         state = self._chat(chat_id)
-        engine = state.engine
+        engine = self._active_engine(chat_id)
         if engine is None:
-            # No live engine for this chat → nothing to resolve (stale button).
+            # No live engine for the active project → nothing to resolve (stale button).
             return CallbackOutcome(handled=False, note="no active session")
 
         if decoded.kind == "ask":
@@ -571,6 +1067,16 @@ class StreamingSession:
         if decoded.kind == "permission":
             return self._resolve_permission(engine, decoded)
         return CallbackOutcome(handled=False, note="ignored")
+
+    def _active_engine(self, chat_id: int) -> Optional[Engine]:
+        """The active project's engine, or ``None`` (read-only — no project creation).
+
+        A callback / cancel only makes sense against a live turn, which runs on the
+        active project's engine. Resolves WITHOUT creating a default (a tap with no
+        active project / no started engine is a stale button → no-op).
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=False)
+        return rt.engine if rt is not None else None
 
     def _resolve_ask_option(
         self, state: _ChatState, engine: Engine, decoded: Callback
@@ -680,16 +1186,17 @@ class StreamingSession:
         # Nothing pending for this id — already decided / backstopped / cancelled.
         return CallbackOutcome(handled=False, note="no pending request")
 
-    def _resolve_free_text(self, state: _ChatState, text: str) -> None:
+    def _resolve_free_text(self, state: _ChatState, chat_id: int, text: str) -> None:
         """Resolve a pending "Other"/reject with the just-typed ``text``; clear the marker.
 
         Routed from :meth:`handle_message` (free-text capture takes precedence over a new
         turn). An "Other" answer becomes a :class:`QuestionAnswer` keyed by the held
         question text; reject feedback becomes :class:`PlanVerdict` ``approve=False`` with
-        the feedback on the deny channel. If the engine has nothing pending for the id
+        the feedback on the deny channel. Resolves against the active project's engine (the
+        one the held turn is running on). If the engine has nothing pending for the id
         (already resolved / cancelled), this is a harmless no-op.
         """
-        engine = state.engine
+        engine = self._active_engine(chat_id)
         tool_use_id = state.awaiting_text_for
         mode = state.awaiting_text_mode
         q_idx = state.awaiting_text_question_index
@@ -714,27 +1221,32 @@ class StreamingSession:
     def handle_cancel(self, chat_id: int) -> int:
         """Abort the chat's in-flight turn cleanly (RB4); clear any free-text capture.
 
-        Delegates to ``engine.cancel()`` (cancels every pending interactive request as a
-        clean deny, so a held turn unblocks and the session stays usable). Lock-free for
-        the same reason as :meth:`resolve_callback` — the turn being cancelled holds the
-        lock. Returns the number of pending requests aborted (0 if the engine is idle).
+        Delegates to ``engine.cancel()`` on the ACTIVE project's engine (cancels every
+        pending interactive request as a clean deny, so a held turn unblocks and the
+        session stays usable). Lock-free for the same reason as :meth:`resolve_callback`
+        — the turn being cancelled holds the lock. Returns the number of pending requests
+        aborted (0 if there is no active engine / it is idle).
         """
         state = self._chats.get(chat_id)
-        if state is None or state.engine is None:
+        if state is None:
+            return 0
+        engine = self._active_engine(chat_id)
+        if engine is None:
             return 0
         self._clear_pending(state)
-        return state.engine.cancel()
+        return engine.cancel()
 
     # -- shutdown ------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Stop every chat's engine (idempotent). For a clean process exit."""
+        """Stop every project's engine across every chat (idempotent). For a clean exit."""
         for state in self._chats.values():
-            if state.engine is not None:
-                try:
-                    await state.engine.stop()
-                except Exception:
-                    log.exception("error stopping engine during shutdown")
+            for rt in state.runtimes.values():
+                if rt.engine is not None:
+                    try:
+                        await rt.engine.stop()
+                    except Exception:
+                        log.exception("error stopping engine during shutdown")
 
     # -- internals -----------------------------------------------------------
 
@@ -749,6 +1261,49 @@ class StreamingSession:
         state.pending_ask = None
         state.pending_plan = None
         state.ask_answers = {}
+
+
+def _resume_failure_text(event: Event) -> Optional[str]:
+    """The error text of ``event`` IF it is an error-shaped turn/result frame, else None.
+
+    Only an :class:`ErrorEvent` or an ``is_error`` :class:`ResultEvent` can carry a
+    resume failure — every other event (text/tool_use/ask/plan/permission/status, or a
+    CLEAN result) is not an error and returns None so the heuristic is never even
+    consulted for it. The text mirrors what the one-shot runner puts in
+    ``ClaudeResult.error``: an ``ErrorEvent`` carries its ``message`` (this is where the
+    SDK adapter surfaces a torn/aged-transcript ``turn_error`` or a ``driver_error``
+    exception string); an ``is_error`` ``ResultEvent`` carries its ``result_text`` /
+    ``subtype``.
+    """
+    if isinstance(event, ErrorEvent) and event.is_error:
+        return event.message or ""
+    if isinstance(event, ResultEvent) and event.is_error:
+        return event.result_text or event.subtype or ""
+    return None
+
+
+def _is_resume_failure_event(event: Event) -> bool:
+    """Reuse the one-shot ``_is_resume_failure`` heuristic on a streaming event (QF3/B3).
+
+    The streaming turn surfaces a failed resume as an error/result EVENT (not a returned
+    ``ClaudeResult`` like the one-shot path), so we extract that event's error text and
+    feed it through the EXACT same heuristic by wrapping it in a ``ClaudeResult`` — no
+    forked or re-implemented matching logic. Importing and reusing
+    :meth:`ClaudeRunner._is_resume_failure` means a future tightening of the heuristic
+    applies to BOTH runners. A non-error event has no error text → never a resume failure.
+
+    Detection signal (judgement call): the heuristic keys on session-gone phrasing —
+    "no conversation found", or "session" + ("not found" | "invalid" | "expired") — and
+    explicitly excludes "timed out" / "binary not found". So an ORDINARY tool/turn error
+    (e.g. "Bash: command not found", a tool stack trace) does NOT match; only a
+    resume/session-not-found-shaped message does. This is necessarily a text heuristic
+    (the normalized event shape has no dedicated "resume failed" discriminator), shared
+    verbatim with the proven one-shot path so the two stay consistent.
+    """
+    text = _resume_failure_text(event)
+    if text is None:
+        return False
+    return ClaudeRunner._is_resume_failure(ClaudeResult(ok=False, text="", error=text))
 
 
 @dataclass(frozen=True)
