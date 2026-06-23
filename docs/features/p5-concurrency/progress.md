@@ -53,7 +53,7 @@ _Plan generated 2026-06-23 from design.md · 11 tasks · supervised build (auton
 - [x] T7 — Relax busy-guards: /switch//new free; /reset per-project + /projects status + per-project persist (D2) (67e0b54)
 - [x] T8 — RB5: per-project coalescer + per-chat rate-gated sender + notification routing (D8/D4) (421fbbb)
 - [x] T9 — Free-text routing + /cancel name|all, /rm-running-refused+drain, /to (D5/D9) (f629a14)
-- [ ] T10 — Integration / SB·RB·regression matrix (RB7 + cross-project routing + RB6)  [+T2-review gap: pin two CONCURRENT multi-question asks accumulate independently (per-id, no cross-contamination)]  [+T8-review: add (a) a turn that flips foreground→background mid-stream (inline→ping); (b) a MULTI-question BACKGROUND ask end-to-end (each question keyboard answerable via index)]
+- [x] T10 — Integration / SB·RB·regression matrix (RB7 + cross-project routing + RB6)  [+T2-review gap: pin two CONCURRENT multi-question asks accumulate independently (per-id, no cross-contamination)]  [+T8-review: add (a) a turn that flips foreground→background mid-stream (inline→ping); (b) a MULTI-question BACKGROUND ask end-to-end (each question keyboard answerable via index)] (9cb0fb7)
 - [ ] T11 — Live verify: two-project-concurrent phone-verify + verify.md checklist
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` blocked · ⚠️ owner-review decision baked in (D2/D5/D7)
@@ -194,7 +194,7 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (short sha) · `[!]` block
   - **Cap/queue (D6):** at the cap, the (N+1)th turn queues and starts when a slot frees; `/projects` shows `queued`.
   - **One-shot unchanged:** one-shot mode behaves **exactly as pre-P5** against a v2 store (regression assertion).
 - **Tests:** all of the above scenarios via the session/registry/render layers with mock substrate + a scripted multi-project event interleaving; the **P1–P4 floor still green**.
-- **Status:** todo
+- **Status:** done (9cb0fb7) — `tests/test_concurrency_matrix.py`, 17 tests, all acceptance criteria pinned end-to-end (cross-project routing via real `on_callback`, the 3 carried-forward review gaps, SB1 `_authorized` recheck with teeth, RB6/RB1/RB2/RB3, cap/queue FIFO no-leak, one-shot regression). 729 green. Reviewer AGREE; the one flagged vacuous SB1 test was rebuilt with teeth (de-allowlist a pending-holding chat → mutation-proven). Out-of-CI-scope (honest): two concurrent *background* status bursts isn't reachable (background runs silent inline, D4); live SDK concurrent-open-holds = T11.
 
 ### T11 — Live verify: two-project-concurrent phone-verify + verify.md checklist
 - **Goal:** Verify against **real** Claude (not in CI), two projects concurrently, and hand the owner a phone-checklist. **Mandatory real-Telegram path** — per the project memory, `engine.resolve` probes bypass the PTB callback path, so a real two-project concurrent run with a **real button tap** is the only authoritative proof of cross-project routing on the live relay.
