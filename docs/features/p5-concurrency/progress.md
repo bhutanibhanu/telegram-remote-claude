@@ -44,7 +44,7 @@ _Plan generated 2026-06-23 from design.md · 11 tasks · supervised build (auton
 > is where it lands.
 
 ## Task list
-- [ ] T1 — ADR-005: concurrency model + the session/run correlation envelope
+- [x] T1 — ADR-005: concurrency model + the session/run correlation envelope (93a352e)
 - [ ] T2 — Pending-request index + id-routed resolve/cancel (the core; retire `_active_engine`)
 - [ ] T3 — Notification triggers: inline-vs-`🔔 name —` by foreground (D4; render strings + SB3)
 - [ ] T4 — Lift live-turn state `_ChatState`→`_ProjectRuntime` + per-project `status` (D7) ⚠️
