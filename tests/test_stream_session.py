@@ -45,6 +45,7 @@ def make_config(
     allow_any_path=True,
     max_concurrent_runs=3,
     render_chat_send_interval_seconds=0.0,
+    stream_message_timeout_seconds=300.0,
 ):
     # NOTE (T7): turn-behavior tests default to ``allow_any_path=True`` so that
     # ``_ensure_engine``'s SB2 cwd re-validation (added in T7) NO-OPS — these tests are
@@ -73,6 +74,7 @@ def make_config(
         answer_backstop_seconds=3600,
         max_concurrent_runs=max_concurrent_runs,
         render_chat_send_interval_seconds=render_chat_send_interval_seconds,
+        stream_message_timeout_seconds=stream_message_timeout_seconds,
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
     )
@@ -1567,6 +1569,136 @@ async def test_resume_failure_falls_back_to_fresh_start(tmp_path):
         session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
     )
     assert engine.started is True  # fell back to a fresh start despite the resume boom
+
+
+# ===========================================================================
+# P6 H2/RB2: a driver_error on an ALREADY-VERIFIED session must tear down +
+# rebuild that project's engine, so the NEXT turn starts a fresh client (no
+# wedge-until-restart). The P5/QF3 recovery only covered the resume-failure
+# case (first turn of a freshly-resumed session); a verified session that
+# later driver_errors (the long-approval-timeout finding, or any transport
+# failure) used to leave the engine in place → every later turn re-times-out.
+#
+# Mock-only: a factory that hands out a SEQUENCE of engines for one project so
+# the test can assert the 2nd turn built a FRESH engine and the 1st was stopped.
+# No real sleeps; the driver_error is a scripted event.
+# ===========================================================================
+
+
+def make_sequence_session(engines: list, *, store=None, config=None) -> StreamingSession:
+    """A session whose factory pops the NEXT engine from ``engines`` on each build.
+
+    Models per-project rebuild: a fresh ``_ensure_engine`` for the same project gets a
+    new engine instance, so a test can prove a torn-down engine was replaced rather than
+    reused. (``make_multi_session`` reuses one engine per cwd — the opposite contract.)
+    """
+    seq = list(engines)
+
+    def factory(*, cwd, backstop_seconds, permission_policy):
+        assert seq, "factory asked to build more engines than the test scripted"
+        return seq.pop(0)
+
+    return StreamingSession(
+        config or make_config(),
+        session_store=store,
+        engine_factory=factory,
+        clock=lambda: 0.0,
+    )
+
+
+async def test_verified_session_driver_error_rebuilds_engine_next_turn_succeeds():
+    """RED on current code: a verified-session driver_error leaves the engine in place,
+    so the next turn reuses the SAME (dead) engine. GREEN: the engine is torn down +
+    rebuilt, so turn 2 runs on a FRESH engine and succeeds — no wedge."""
+    # Turn 1: a fresh-started session that emits a driver_error mid-turn (transport/
+    # liveness failure on an already-verified session — NOT a resume failure).
+    eng1 = FakeEngine(
+        [ErrorEvent(kind_of_error="driver_error", message="send timed out after 120s", is_error=True)]
+    )
+    # Turn 2: a DISTINCT engine that completes cleanly — proves the rebuild happened.
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="s2", is_error=False, subtype="success", result_text="recovered")]
+    )
+    session = make_sequence_session([eng1, eng2])
+    rec = Recorder()
+
+    # Turn 1: surfaces the driver_error (rendered), then the engine must be torn down.
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng1.started is True
+    assert eng1.stopped is True, "the dead verified-session engine must be stop()ed"
+    # The runtime's engine reference was dropped so the next turn rebuilds fresh.
+    rt = active_rt(session, 1)
+    assert rt.engine is not eng1, "the dead engine must not be reused on the next turn"
+
+    # No slot/lock leak after the failed turn (the chat must be usable).
+    assert session.is_busy(1) is False
+    assert session._running == 0
+
+    # Turn 2: a fresh engine is built + started and the turn completes — NOT wedged.
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng2.started is True, "the next turn must run on a freshly-built engine"
+    assert any("recovered" in s["text"] for s in rec.sends)
+    assert session.is_busy(1) is False
+    assert session._running == 0
+
+
+async def test_clean_turn_does_not_rebuild_engine():
+    """Over-reach guard: a turn that completes cleanly (no driver_error) must REUSE its
+    engine on the next turn — the rebuild path fires ONLY on a driver_error, never on a
+    healthy turn (else every turn would pay a fresh start)."""
+    eng1 = FakeEngine(
+        [ResultEvent(session_id="s1", is_error=False, subtype="success", result_text="ok")]
+    )
+    # If the impl wrongly rebuilds after a clean turn, the factory hands out eng2 and the
+    # reuse assertion below fails (eng2 started / eng1 stopped).
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="s2", is_error=False, subtype="success", result_text="second")]
+    )
+    session = make_sequence_session([eng1, eng2])
+    rec = Recorder()
+
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The SAME engine ran both turns (idempotent _ensure_engine); never torn down/rebuilt.
+    assert eng1.stopped is False
+    assert eng2.started is False, "a clean turn must not trigger a rebuild"
+    assert active_rt(session, 1).engine is eng1
+
+
+async def test_tool_error_does_not_rebuild_engine():
+    """Over-reach guard: an ordinary tool_error / turn_error (Claude reporting a failed
+    tool) is NOT a driver_error and must NOT tear down the engine — only a transport/
+    liveness driver_error wedges a session, so only it triggers the rebuild."""
+    eng1 = FakeEngine(
+        [
+            ErrorEvent(kind_of_error="tool_error", message="Bash: command not found", is_error=True),
+            ResultEvent(session_id="s1", is_error=False, subtype="success", result_text="ok"),
+        ]
+    )
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="s2", is_error=False, subtype="success", result_text="second")]
+    )
+    session = make_sequence_session([eng1, eng2])
+    rec = Recorder()
+
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng1.stopped is False, "a tool_error must not tear down the engine"
+    assert active_rt(session, 1).engine is eng1
+    # The next turn still reuses eng1 (no rebuild).
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng2.started is False
 
 
 # ===========================================================================
@@ -5384,3 +5516,61 @@ async def test_default_factory_binds_config_path_confinement_into_live_engine(tm
     )
     assert in_decision.allow is True  # auto-allowed (in-root, no prompt)
     assert not engine._pending.has_pending("tu-in")  # never held
+
+
+# ===========================================================================
+# P6/H2/RB2: the LIVE factory-wiring guard for the per-message liveness bound —
+# StreamingSession.__init__ binds config.stream_message_timeout_seconds into the
+# DEFAULT engine factory as Engine.send_timeout (the per-message asyncio.wait_for
+# the substrate applies). The bound is config-driven, GENEROUS by default (so an
+# approved long-running tool that emits no intermediate message does not trip a
+# spurious driver_error), and still bounds a genuinely-silent Claude.
+#
+# Like the C2 binding test above, EVERY other test injects a fake factory or builds
+# Engine(...) directly, so none exercises the production send_timeout binding: an
+# __init__ refactor could drop it and silently revert the live bot to the hardcoded
+# 120 s with all other tests green. This obtains an engine via the session's OWN
+# bound factory (as _ensure_engine does) and asserts the configured bound reached it.
+# TEETH: with the binding dropped (or reverted to the 120 s default), the override
+# assertion (== 45.0) goes RED.
+# ===========================================================================
+
+
+async def test_default_factory_binds_stream_message_timeout_into_live_engine(tmp_path):
+    # A real StreamingSession with a small configured liveness bound and NO injected
+    # engine_factory: the engine it builds (via its OWN bound default factory) must carry
+    # that bound as send_timeout (NOT the hardcoded 120 s).
+    config = make_config(workdir=str(tmp_path), stream_message_timeout_seconds=45.0)
+    session = StreamingSession(config, session_store=None, clock=lambda: 0.0)
+
+    # Obtain an engine EXACTLY as _ensure_engine does — through the session's bound default
+    # factory, NOT an injected one.
+    engine = session._engine_factory(
+        cwd=str(tmp_path),
+        backstop_seconds=float(config.answer_backstop_seconds),
+        permission_policy=PermissionPolicy(),
+    )
+
+    # Teeth: the configured bound reached the engine. Dropping the __init__ binding leaves
+    # the 120 s default, so this == 45.0 assertion goes RED.
+    assert engine._send_timeout == 45.0
+    assert engine._send_timeout == config.stream_message_timeout_seconds
+
+
+async def test_default_factory_uses_generous_default_stream_message_timeout(tmp_path):
+    # Over-reach / regression guard: with NO STREAM_MESSAGE_TIMEOUT_SECONDS override the live
+    # engine gets the GENEROUS 300 s default — NOT the old hardcoded 120 s — so a normal
+    # multi-minute approved tool (build/test/install) completes without a spurious
+    # driver_error. (RED if anyone re-pins the live bound back to 120 s.)
+    from claude_tg.config import DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS
+
+    config = make_config(workdir=str(tmp_path))  # default stream_message_timeout_seconds
+    assert config.stream_message_timeout_seconds == DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS == 300.0
+    session = StreamingSession(config, session_store=None, clock=lambda: 0.0)
+
+    engine = session._engine_factory(
+        cwd=str(tmp_path),
+        backstop_seconds=float(config.answer_backstop_seconds),
+        permission_policy=PermissionPolicy(),
+    )
+    assert engine._send_timeout == 300.0, "the live bound must default to the generous 300 s, not 120 s"

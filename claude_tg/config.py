@@ -117,6 +117,19 @@ DEFAULT_MAX_CONCURRENT_RUNS = 3
 #: consulted in streaming mode.
 DEFAULT_CHAT_SEND_INTERVAL_SECONDS = 1.0
 
+#: Default per-message liveness bound (P6/H2/RB2): the max seconds the streaming substrate
+#: waits for the NEXT SDK message before declaring Claude wedged and surfacing a clean
+#: ``driver_error`` (RB2). It bounds BOTH a genuinely-silent Claude AND the execution time
+#: of an APPROVED long-running tool (a build / test-run / install) that legitimately emits
+#: no intermediate message for minutes — so it must be GENEROUS or such a tool trips it and
+#: a completed-but-slow turn is reported as a spurious ``driver_error`` + needless engine
+#: rebuild. The earlier hardcoded 120 s was too tight for a coding agent; 300 s lets normal
+#: multi-minute tools finish while a truly-hung Claude still eventually times out. The bound
+#: is SUSPENDED entirely while a decision hold is open (the human-approval wait is bounded by
+#: the ~60-min answer-backstop instead — see ``adapter_sdk._next_message``). Configurable via
+#: ``STREAM_MESSAGE_TIMEOUT_SECONDS``; only consulted in streaming mode.
+DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS = 300.0
+
 
 def parse_answer_backstop_seconds(raw: str | None) -> int:
     """Parse + validate ANSWER_BACKSTOP_SECONDS (default 3600 = 60 min).
@@ -196,6 +209,33 @@ def parse_chat_send_interval_seconds(raw: str | None) -> float:
     return value
 
 
+def parse_stream_message_timeout_seconds(raw: str | None) -> float:
+    """Parse + validate STREAM_MESSAGE_TIMEOUT_SECONDS (default 300 s; P6/H2/RB2).
+
+    The per-message liveness bound the streaming substrate applies while waiting for the
+    next SDK message (suspended while a decision hold is open). It must be GENEROUS: it
+    also governs how long an APPROVED long-running tool (build/test/install) may run with
+    no intermediate message before the turn is declared wedged, so too small a value turns
+    a slow-but-fine tool into a spurious ``driver_error``. Parsing mirrors
+    :func:`parse_answer_backstop_seconds`: empty/unset → the default; must be a **positive**
+    number (a ``0``/negative bound would time out every message instantly — nothing could
+    complete — so, unlike the send interval where ``0`` validly disables spacing, it is a
+    configuration error here and fails loud at startup rather than silently wedging every
+    turn). So ``""``/unset → 300.0; ``"600"`` → 600.0; ``"0"``/``"-1"``/``"x"`` → raise.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"STREAM_MESSAGE_TIMEOUT_SECONDS must be a number, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError("STREAM_MESSAGE_TIMEOUT_SECONDS must be positive")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -232,6 +272,16 @@ class Config:
     # dropped — D8). Default ~1 s; unset → default; negative/non-numeric → fail loud
     # (parse_chat_send_interval_seconds). Only consulted in streaming mode.
     render_chat_send_interval_seconds: float = DEFAULT_CHAT_SEND_INTERVAL_SECONDS
+    # P6/H2/RB2 per-message liveness bound: the max seconds the streaming substrate waits
+    # for the next SDK message before declaring Claude wedged and yielding a clean
+    # driver_error (suspended while a decision hold is open — the human-approval wait is
+    # bounded by answer_backstop_seconds instead). GENEROUS because it ALSO bounds how long
+    # an approved long-running tool (build/test/install) may run with no intermediate
+    # message — too tight and a slow-but-fine tool trips a spurious driver_error. Threaded
+    # to the Engine's send_timeout by stream_session's factory. Default 300 s; unset →
+    # default; 0/negative/non-numeric → fail loud (parse_stream_message_timeout_seconds).
+    # Only consulted in streaming mode.
+    stream_message_timeout_seconds: float = DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS
     # SB2 /cd path confinement (decision-log: confinement ON by default). The canonical
     # roots a `/cd` target must sit inside; the default is `(workdir,)` (set by
     # from_env), so an unset ALLOWED_ROOTS confines /cd to the workdir (which itself
@@ -288,6 +338,9 @@ class Config:
         render_chat_send_interval_seconds = parse_chat_send_interval_seconds(
             os.environ.get("RENDER_CHAT_SEND_INTERVAL_SECONDS")
         )
+        stream_message_timeout_seconds = parse_stream_message_timeout_seconds(
+            os.environ.get("STREAM_MESSAGE_TIMEOUT_SECONDS")
+        )
 
         # SB2 /cd confinement. Default the allow-list to the workdir so an unset
         # ALLOWED_ROOTS still confines /cd (ON by default); ALLOW_ANY_PATH=true is the
@@ -311,6 +364,7 @@ class Config:
             answer_backstop_seconds=answer_backstop,
             max_concurrent_runs=max_concurrent_runs,
             render_chat_send_interval_seconds=render_chat_send_interval_seconds,
+            stream_message_timeout_seconds=stream_message_timeout_seconds,
             allowed_roots=allowed_roots,
             allow_any_path=allow_any_path,
         )

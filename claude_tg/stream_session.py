@@ -160,6 +160,7 @@ def _default_engine_factory(
     permission_policy: PermissionPolicy,
     allowed_roots: tuple[Path, ...] = (),
     allow_any_path: bool = False,
+    send_timeout: float = 120.0,
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
@@ -178,6 +179,13 @@ def _default_engine_factory(
     :meth:`~claude_tg.engine.engine.Engine.on_tool_request`). The session binds the live
     config into this factory in ``StreamingSession.__init__`` (see ``_bound_factory``); the
     defaults here keep the path layer a no-op for a bare call.
+
+    **P6/H2/RB2:** ``send_timeout`` is the engine's per-message liveness bound (threaded to
+    :class:`~claude_tg.engine.engine.Engine`'s ``send_timeout`` → the substrate's per-message
+    ``asyncio.wait_for``). It is SUSPENDED while a decision hold is open and otherwise also
+    bounds APPROVED long-running tool execution, so the live bot passes the GENEROUS
+    ``config.stream_message_timeout_seconds`` via ``_bound_factory``; the 120 s default here
+    only keeps a bare/legacy call's behavior unchanged.
     """
     engine: Engine
 
@@ -193,6 +201,7 @@ def _default_engine_factory(
     )
     engine = Engine(
         substrate,
+        send_timeout=send_timeout,
         backstop_seconds=backstop_seconds,
         permission_policy=permission_policy,
         cwd=cwd,
@@ -548,9 +557,13 @@ class StreamingSession:
         # Engine.on_tool_request). A bare _default_engine_factory(cwd=...,
         # backstop_seconds=..., permission_policy=...) would default to no path context
         # (the path layer no-ops), so the binding is what turns C2 ON for the real bot.
-        # An injected engine_factory (tests) is used verbatim — its 3-kwarg signature is
-        # unchanged, so every existing test factory keeps working; tests that want to
-        # exercise the path layer build a real Engine with the path kwargs directly.
+        # P6/H2/RB2: the SAME binding threads the GENEROUS, configurable per-message liveness
+        # bound (config.stream_message_timeout_seconds → Engine.send_timeout) — a bare call
+        # keeps the 120 s default, so the binding is what raises it for the real bot (a
+        # multi-minute approved tool no longer trips a spurious driver_error). An injected
+        # engine_factory (tests) is used verbatim — its 3-kwarg signature is unchanged, so
+        # every existing test factory keeps working; tests that want to exercise the path
+        # layer (or a small liveness bound) build a real Engine with those kwargs directly.
         if engine_factory is not None:
             self._engine_factory: EngineFactory = engine_factory
         else:
@@ -564,6 +577,7 @@ class StreamingSession:
                     permission_policy=permission_policy,
                     allowed_roots=config.allowed_roots,
                     allow_any_path=config.allow_any_path,
+                    send_timeout=float(config.stream_message_timeout_seconds),
                 )
 
             self._engine_factory = _bound_factory
@@ -1867,6 +1881,16 @@ class StreamingSession:
         # (not freshly started) and is not yet confirmed good.
         check_resume = turn_rt.resumed_unverified
         resume_failure_detected = False
+        # P6/H2/RB2: latch a transport/liveness ``driver_error`` on this turn. A
+        # driver_error means the SDK client is dead/wedged (a 120s liveness timeout that
+        # was NOT a held human-approval — that case is suppressed in the adapter now — or a
+        # transport failure). On an already-VERIFIED session (not the resume-failure case,
+        # which has its OWN rebuild via _recover_failed_resume) the engine must be torn down
+        # + rebuilt so the NEXT turn starts a fresh client, instead of every later turn
+        # re-timing-out against the same dead client (the wedge-until-restart finding, RB2).
+        # Latched here (body-free — only the kind_of_error is read, never the message, SB3)
+        # and acted on AFTER the stream drains so we never re-enter the render loop mid-turn.
+        driver_error_detected = False
 
         coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
         # P6/R5: per-turn duplicate-render dedup (the single foreground policy point for the
@@ -1907,6 +1931,18 @@ class StreamingSession:
                 # error/result. Latch on the first hit (the dead id is the same all turn).
                 if check_resume and not resume_failure_detected and _is_resume_failure_event(event):
                     resume_failure_detected = True
+                # P6/H2/RB2: latch a transport/liveness driver_error (body-free — kind only,
+                # never event.message, SB3) so the verified-session engine is rebuilt after
+                # the stream drains. Independent of the resume-failure check above: a fresh
+                # OR resume-confirmed session can still driver_error mid-life, and that is the
+                # wedge this guards. (A resume-failure-shaped driver_error on an UNVERIFIED
+                # resumed session is handled by _recover_failed_resume instead — see below.)
+                if (
+                    not driver_error_detected
+                    and isinstance(event, ErrorEvent)
+                    and event.kind_of_error == "driver_error"
+                ):
+                    driver_error_detected = True
                 # ADR-005 D3: register an injected ask/plan/permission in the pending index,
                 # keyed by tool_use_id -> THIS turn's project, so a later tap / free-text
                 # reply routes to THIS project's engine (not _active_engine). Cleared on
@@ -2059,12 +2095,26 @@ class StreamingSession:
         # QF3 (B3/RB3): finalize the resume verification AFTER the stream has fully drained
         # (so we never re-enter the render loop mid-turn). Either recover from a detected
         # resume failure, or confirm the resume good by clearing the flag.
+        recovered = False
         if check_resume:
             if resume_failure_detected:
                 await self._recover_failed_resume(chat_id, turn_name, turn_rt, send=send)
+                recovered = True  # the engine was already torn down + dropped here.
             elif turn_rt is not None:
                 # The first resumed turn completed without a resume failure → confirmed good.
                 turn_rt.resumed_unverified = False
+
+        # P6/H2/RB2: a transport/liveness driver_error on a VERIFIED session (a fresh start,
+        # or a resume already confirmed good) leaves a dead/wedged SDK client behind — every
+        # later turn on it would re-time-out (the wedge-until-restart finding). Tear it down +
+        # drop the engine so the NEXT turn rebuilds a fresh client. Skipped when the resume-
+        # failure path above already recovered (it dropped the engine + cleared the dead id);
+        # acted on AFTER the stream drained (never mid-render). The session_id is NOT cleared
+        # here — unlike a resume failure, the persisted (session_id, cwd) is still valid; the
+        # rebuilt engine resumes it next turn (RB3). The operator already saw the driver_error
+        # rendered, so no extra notice is sent (SB3 — the error body never re-surfaces).
+        if driver_error_detected and not recovered:
+            await self._rebuild_after_driver_error(chat_id, turn_name, turn_rt)
 
     async def _recover_failed_resume(
         self,
@@ -2126,6 +2176,58 @@ class StreamingSession:
             reply_markup=None,
             parse_mode=None,
         )
+
+    async def _rebuild_after_driver_error(
+        self,
+        chat_id: int,
+        name: Optional[str],
+        rt: Optional[_ProjectRuntime],
+    ) -> None:
+        """Tear down + drop a VERIFIED session's engine after a transport/liveness driver_error
+        so the NEXT turn rebuilds a fresh client (P6/H2/RB2 — no wedge-until-restart).
+
+        Mirrors the engine-teardown half of :meth:`_recover_failed_resume`, but for a session
+        that was already CONFIRMED good (a fresh start, or a resume verified by a prior clean
+        turn) and then driver_errored mid-life — the dead SDK client would otherwise make every
+        later turn re-time-out against it. Differences from the resume-failure path:
+
+        * **The persisted ``session_id`` is NOT cleared.** Unlike an expired/torn resume, the
+          ``(session_id, cwd)`` is still valid; the rebuilt engine RESUMES it next turn (RB3),
+          so the conversation continues rather than starting over. The rebuilt engine is
+          ``resumed_unverified`` again iff it resumes a persisted id (set by ``_ensure_engine``).
+        * **No operator notice is sent.** The driver_error was already rendered to the operator
+          on this turn; re-announcing it would be noise (and the body must not re-surface, SB3).
+
+        Best-effort ``stop()`` (a failing stop must not re-wedge — the reference is dropped
+        regardless, so the next turn starts fresh). Per-project + no slot/lock work here: this
+        runs INSIDE ``_drive_turn``, after the stream drained, while ``handle_message`` still
+        holds this project's lock and its run slot; both are released by ``handle_message``'s
+        ``finally`` on return exactly as on any turn exit (no leak, P5 lifecycle preserved).
+        Other projects' live engines are untouched (per-project isolation).
+        """
+        log.info(
+            "driver_error on a verified session for chat %s project %s; tearing down the "
+            "engine so the next turn rebuilds a fresh client (no wedge)",
+            chat_id,
+            name,
+        )
+        if rt is None:
+            return
+        if rt.engine is not None:
+            try:
+                await rt.engine.stop()
+            except Exception:
+                log.debug(
+                    "stop of driver_errored engine raised for chat %s project %s "
+                    "(ignored — reference dropped, rebuilding fresh next turn)",
+                    chat_id,
+                    name,
+                    exc_info=True,
+                )
+        # Drop the engine + started flag so _ensure_engine rebuilds on the next turn. The
+        # persisted session_id is deliberately LEFT in place (resume it next turn, RB3).
+        rt.engine = None
+        rt.started = False
 
     async def _perform(
         self,
