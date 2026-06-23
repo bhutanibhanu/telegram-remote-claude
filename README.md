@@ -7,8 +7,7 @@ You (Telegram)  ──▶  this bot (on your Mac)  ──▶  claude -p ...  ─
 ```
 
 - Each Telegram chat maps to one resumable Claude session (context is kept; `/reset` to clear).
-- Claude runs with `--dangerously-skip-permissions` so it executes without approval prompts
-  (see **Security** below — this is why the allowlist matters).
+- **Tool use requires your approval by default.** In streaming mode (`ENGINE_MODE=streaming`) you get an Allow/Deny prompt in Telegram before Claude runs a risky tool, and file/search tools are confined to `ALLOWED_ROOTS` (an out-of-root path prompts too). The old allow-all behavior is an explicit, loud opt-in (`CLAUDE_SKIP_PERMISSIONS=true`) — **off by default**.
 - Only **allowlisted chat ids** can talk to the bot; everyone else is ignored.
 
 ## Requirements
@@ -59,18 +58,22 @@ Long replies are split into Telegram-sized chunks automatically; a "typing…" i
 | `CLAUDE_BIN` | | `claude` | Path to the claude binary |
 | `CLAUDE_MODEL` | | Claude default | e.g. `claude-opus-4-8` |
 | `CLAUDE_TIMEOUT_SECONDS` | | `600` | Per-turn timeout |
-| `CLAUDE_SKIP_PERMISSIONS` | | `true` | Bypass Claude permission prompts |
+| `CLAUDE_SKIP_PERMISSIONS` | | `false` | **Allow-all bypass — OFF by default** (gate ON). `true` = Claude runs every tool with no approval prompt (loud WARNING at startup). Prefer streaming mode + per-tool approval instead. |
+| `ENGINE_MODE` | | `oneshot` | `streaming` enables interactive Telegram approval prompts, multi-project sessions, and concurrency (recommended). |
+| `ALLOWED_ROOTS` | | `CLAUDE_WORKDIR` | Comma-separated roots that `/cd`, `/new`, **and Claude's file/search tools** are confined to (out-of-root tool use prompts for approval). |
+| `ALLOW_ANY_PATH` | | `false` | `true` disables path confinement entirely (you take the wheel). |
 | `CLAUDE_STATE_FILE` | | none | Persist sessions/cwd across restarts |
 
 ## Security ⚠️
 
-This bot lets a Telegram chat run Claude Code on your Mac **with permissions bypassed** — i.e.
-Claude can edit files and run shell commands without asking. Protect it:
+This bot lets a Telegram chat run Claude Code on your Mac — it can edit files and run shell
+commands. The defences, in layers:
 
-- **Keep `TELEGRAM_BOT_TOKEN` secret** (it's git-ignored; never commit `.env`).
-- Only your **allowlisted chat id(s)** are served; all other chats are ignored.
-- Run it on a machine/working dir you trust. Consider a narrower `CLAUDE_WORKDIR`.
-- Anyone who obtains your token **and** is on the allowlist could control your Mac — treat it like an SSH key.
+- **Approval gate (on by default).** In streaming mode you approve each risky tool via a Telegram Allow/Deny prompt; safe reads/searches inside your roots run automatically. The allow-all bypass (`CLAUDE_SKIP_PERMISSIONS=true`) is off by default and warns loudly at startup.
+- **Path confinement.** `/cd`, `/new`, **and Claude's own file/search tools** are confined to `ALLOWED_ROOTS` (defaults to `CLAUDE_WORKDIR`); a tool targeting a path outside the roots prompts for approval. Set a narrow `ALLOWED_ROOTS`. (`Bash` commands are not statically path-checked — grant `Bash` only when you mean it.)
+- **Allowlist.** Only your **allowlisted chat id(s)** are served (on every message *and* button tap); all other chats are ignored.
+- **Keep `TELEGRAM_BOT_TOKEN` secret** (it's git-ignored; never commit `.env`). Anyone who obtains your token **and** is on the allowlist could control your Mac — treat it like an SSH key.
+- Run it on a machine/working dir you trust.
 
 ## Keeping it running
 
