@@ -64,6 +64,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, Optional, Protocol
 
 from .claude_runner import ClaudeResult, ClaudeRunner
@@ -80,6 +81,7 @@ from .engine import (
     QuestionAnswer,
     ResultEvent,
     SubstrateDecision,
+    TextEvent,
 )
 from .engine.adapter_sdk import SdkSubstrate
 from .paths import PathNotAllowed, resolve_within_roots
@@ -94,7 +96,9 @@ from .render import (
     ask_question_body,
     ask_question_body_html,
     ask_question_keyboard,
+    code_path,
     decode_callback,
+    error_is_raw_external,
     notify_attention,
     notify_done,
     notify_error,
@@ -104,6 +108,7 @@ from .render import (
     yolo_indicator,
 )
 from .session_store import DEFAULT_PROJECT
+from .util import _redact_sid, _redact_sid_in_text
 
 log = logging.getLogger(__name__)
 
@@ -150,17 +155,38 @@ class EngineFactory(Protocol):
 
 
 def _default_engine_factory(
-    *, cwd: str, backstop_seconds: float, permission_policy: PermissionPolicy
+    *,
+    cwd: str,
+    backstop_seconds: float,
+    permission_policy: PermissionPolicy,
+    allowed_roots: tuple[Path, ...] = (),
+    allow_any_path: bool = False,
+    send_timeout: float = 120.0,
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
     The substrate's ``decision_callback`` is the engine's own ``on_tool_request`` seam
-    (the async answer-hold + the P2 permission gate). No bypass / skip-permissions flag
+    (the async answer-hold + the permission gate). No bypass / skip-permissions flag
     is set (SB5): the engine consults the injected ``permission_policy`` and is
     fail-closed by default — risky tools are held for approval unless a grant or
     ``/yolo`` allows them. ``permission_policy`` is the project's shared policy (the one
     the session mutates), so ``/yolo``, allow-session grants, and ``/reset``-clear all
     act on a single object.
+
+    **P6/C2 (SB2):** ``allowed_roots`` + ``allow_any_path`` (the same config the bot uses
+    to confine ``/cd``) are handed to the engine along with ``cwd`` so the engine confines
+    the paths the SDK's file/search tools ACT on — an out-of-root Read/Write/Glob/… is
+    held for approval even when name-only-safe or session-granted (see
+    :meth:`~claude_tg.engine.engine.Engine.on_tool_request`). The session binds the live
+    config into this factory in ``StreamingSession.__init__`` (see ``_bound_factory``); the
+    defaults here keep the path layer a no-op for a bare call.
+
+    **P6/H2/RB2:** ``send_timeout`` is the engine's per-message liveness bound (threaded to
+    :class:`~claude_tg.engine.engine.Engine`'s ``send_timeout`` → the substrate's per-message
+    ``asyncio.wait_for``). It is SUSPENDED while a decision hold is open and otherwise also
+    bounds APPROVED long-running tool execution, so the live bot passes the GENEROUS
+    ``config.stream_message_timeout_seconds`` via ``_bound_factory``; the 120 s default here
+    only keeps a bare/legacy call's behavior unchanged.
     """
     engine: Engine
 
@@ -176,8 +202,12 @@ def _default_engine_factory(
     )
     engine = Engine(
         substrate,
+        send_timeout=send_timeout,
         backstop_seconds=backstop_seconds,
         permission_policy=permission_policy,
+        cwd=cwd,
+        allowed_roots=allowed_roots,
+        allow_any_path=allow_any_path,
     )
     return engine
 
@@ -522,7 +552,36 @@ class StreamingSession:
     ) -> None:
         self.config = config
         self.store = session_store
-        self._engine_factory = engine_factory or _default_engine_factory
+        # P6/C2 (SB2): bind the live config's path-confinement context into the DEFAULT
+        # factory so the production engine confines the SDK's file/search tools to
+        # allowed_roots (an out-of-root tool call is held for approval — see
+        # Engine.on_tool_request). A bare _default_engine_factory(cwd=...,
+        # backstop_seconds=..., permission_policy=...) would default to no path context
+        # (the path layer no-ops), so the binding is what turns C2 ON for the real bot.
+        # P6/H2/RB2: the SAME binding threads the GENEROUS, configurable per-message liveness
+        # bound (config.stream_message_timeout_seconds → Engine.send_timeout) — a bare call
+        # keeps the 120 s default, so the binding is what raises it for the real bot (a
+        # multi-minute approved tool no longer trips a spurious driver_error). An injected
+        # engine_factory (tests) is used verbatim — its 3-kwarg signature is unchanged, so
+        # every existing test factory keeps working; tests that want to exercise the path
+        # layer (or a small liveness bound) build a real Engine with those kwargs directly.
+        if engine_factory is not None:
+            self._engine_factory: EngineFactory = engine_factory
+        else:
+
+            def _bound_factory(
+                *, cwd: str, backstop_seconds: float, permission_policy: PermissionPolicy
+            ) -> Engine:
+                return _default_engine_factory(
+                    cwd=cwd,
+                    backstop_seconds=backstop_seconds,
+                    permission_policy=permission_policy,
+                    allowed_roots=config.allowed_roots,
+                    allow_any_path=config.allow_any_path,
+                    send_timeout=float(config.stream_message_timeout_seconds),
+                )
+
+            self._engine_factory = _bound_factory
         self._clock = clock
         self._min_edit_interval = min_edit_interval
         # P5 / ADR-005 D8 (T8): the per-chat send-rate budget (seconds between any two
@@ -1574,15 +1633,23 @@ class StreamingSession:
                         # symlink). Refuse the turn fail-closed WITHOUT starting the engine; the
                         # lock releases on return AND the finally releases the slot (no leak).
                         # Operator-facing refusal → verbatim priority through the D8 gate.
+                        # R6: wrap the cwd in <code> (HTML) so Telegram renders the path as
+                        # inert monospace, not a row of tappable fake /segment command-links;
+                        # code_path HTML-escapes it so a stray &/</> can't break the message.
+                        # The literal "<name> <path>" placeholders are written ESCAPED
+                        # (&lt;…&gt;) because this is now an HTML message — unescaped "<name>"
+                        # would be parsed as a (broken) tag and Telegram would reject the send.
+                        # The send closure passes parse_mode straight through; with the path
+                        # escaped + the placeholders escaped, the content is always valid HTML.
                         await self._gated_send(
                             state, send, verbatim=True,
                             text=(
-                                f"❌ This project's directory {self.get_cwd(chat_id)} is no "
-                                "longer within the permitted roots — use /new <name> <path> to "
-                                "create one inside them."
+                                f"❌ This project's directory {code_path(self.get_cwd(chat_id))} "
+                                "is no longer within the permitted roots — use "
+                                "/new &lt;name&gt; &lt;path&gt; to create one inside them."
                             ),
                             reply_markup=None,
-                            parse_mode=None,
+                            parse_mode="HTML",
                         )
                         return
                     if resume_failed:
@@ -1823,8 +1890,25 @@ class StreamingSession:
         # (not freshly started) and is not yet confirmed good.
         check_resume = turn_rt.resumed_unverified
         resume_failure_detected = False
+        # P6/H2/RB2: latch a transport/liveness ``driver_error`` on this turn. A
+        # driver_error means the SDK client is dead/wedged (a 120s liveness timeout that
+        # was NOT a held human-approval — that case is suppressed in the adapter now — or a
+        # transport failure). On an already-VERIFIED session (not the resume-failure case,
+        # which has its OWN rebuild via _recover_failed_resume) the engine must be torn down
+        # + rebuilt so the NEXT turn starts a fresh client, instead of every later turn
+        # re-timing-out against the same dead client (the wedge-until-restart finding, RB2).
+        # Latched here (body-free — only the kind_of_error is read, never the message, SB3)
+        # and acted on AFTER the stream drains so we never re-enter the render loop mid-turn.
+        driver_error_detected = False
 
         coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
+        # P6/R5: per-turn duplicate-render dedup (the single foreground policy point for the
+        # twin-render paths, alongside the ask/plan dedup the engine does in _drain_substrate).
+        # Remembers verbatim bodies emitted THIS turn so the terminal frame doesn't re-send the
+        # assistant prose (#1) or re-render a tool_error as a near-identical turn_error (#3).
+        # Foreground-only: the background branch pings ✅/🔔 and continues before the render
+        # section, so this never touches a backgrounded run.
+        dedup = _TurnDedup()
         # P5 / ADR-005 D7: THIS project's status line + status enum (per-project, not a
         # chat-global slot). Status line starts unset (create on first edit_status); the
         # status enum goes idle -> running at turn start, awaiting_<kind> on a hold, back to
@@ -1856,6 +1940,18 @@ class StreamingSession:
                 # error/result. Latch on the first hit (the dead id is the same all turn).
                 if check_resume and not resume_failure_detected and _is_resume_failure_event(event):
                     resume_failure_detected = True
+                # P6/H2/RB2: latch a transport/liveness driver_error (body-free — kind only,
+                # never event.message, SB3) so the verified-session engine is rebuilt after
+                # the stream drains. Independent of the resume-failure check above: a fresh
+                # OR resume-confirmed session can still driver_error mid-life, and that is the
+                # wedge this guards. (A resume-failure-shaped driver_error on an UNVERIFIED
+                # resumed session is handled by _recover_failed_resume instead — see below.)
+                if (
+                    not driver_error_detected
+                    and isinstance(event, ErrorEvent)
+                    and event.kind_of_error == "driver_error"
+                ):
+                    driver_error_detected = True
                 # ADR-005 D3: register an injected ask/plan/permission in the pending index,
                 # keyed by tool_use_id -> THIS turn's project, so a later tap / free-text
                 # reply routes to THIS project's engine (not _active_engine). Cleared on
@@ -1911,7 +2007,9 @@ class StreamingSession:
                     # can't tell which buttons belong to which question). Flush any buffered
                     # status first so the questions appear after it, in order.
                     for action in coalescer.flush().actions:
-                        await self._perform(state, turn_rt, action, send=send, edit=edit)
+                        await self._perform(
+                            state, turn_rt, action, send=send, edit=edit, delete=delete
+                        )
                     for q_idx in range(len(event.questions)):
                         keyboard = ask_question_keyboard(event, q_idx)
                         # The question text is Claude-authored CommonMark -> render as HTML
@@ -1933,15 +2031,49 @@ class StreamingSession:
                                 parse_mode=None,
                             )
                     continue
-                for action in coalescer.offer(event).actions:
-                    await self._perform(state, turn_rt, action, send=send, edit=edit)
+                # P6/R5 #3: a terminal turn_error that merely repeats a tool_error already
+                # shown this turn is a duplicate error block — drop it (the tool_error already
+                # rendered the failure verbatim). Done BEFORE record so we never compare an
+                # event against itself.
+                if dedup.suppresses(event):
+                    continue
+                # P6/R5 #1: when the terminal ResultEvent.result_text just repeats assistant
+                # prose already emitted this turn, render only the compact ✅ done footer rather
+                # than re-sending the identical answer. Swap in a footer-only result (keeps
+                # num_turns/cost) — the done indicator still appears, the prose is sent once.
+                render_event_ = event
+                if isinstance(event, ResultEvent) and dedup.result_is_duplicate_prose(event):
+                    render_event_ = _footer_only_result(event)
+                # Remember this turn's verbatim bodies (assistant prose + tool_error messages)
+                # so a later twin (the result_text / terminal turn_error) can dedup against it.
+                dedup.record(event)
+                # SB3/H1 (body-free): a RAW EXTERNAL error (tool/SDK stderr) renders as a
+                # body-free summary to the chat (see render._render_error); its raw detail
+                # goes ONLY to the LOCAL debug log, SCRUBBED through _redact_sid (the body can
+                # carry a session id — the bot token is never logged anywhere). This is the
+                # single place the raw body is persisted, and only at DEBUG.
+                if isinstance(render_event_, ErrorEvent) and error_is_raw_external(render_event_):
+                    log.debug(
+                        "raw external error (%s) for chat %s project %s [%s]: %s",
+                        render_event_.kind_of_error,
+                        chat_id,
+                        turn_name,
+                        _redact_sid(render_event_.session_id),
+                        _redact_sid_in_text(render_event_.message),
+                    )
+                for action in coalescer.offer(render_event_).actions:
+                    await self._perform(
+                        state, turn_rt, action, send=send, edit=edit, delete=delete
+                    )
             # End of turn: flush any trailing coalesced status line, then DELETE the
             # transient status message ("💭 Claude is thinking…") so a stale thinking-line
             # never lingers after the turn's real content. Best-effort (RB1): a failed delete
             # must never kill the turn — the content is already sent. Optional `delete` so
             # existing callers that don't pass one keep working (the status line just stays).
             for action in coalescer.flush().actions:
-                await self._perform(state, turn_rt, action, send=send, edit=edit)
+                await self._perform(
+                    state, turn_rt, action, send=send, edit=edit, delete=delete
+                )
         finally:
             # T4-review: ALWAYS clear this project's transient status line + set status idle,
             # even if the loop above raised mid-stream — so a concurrent project is never
@@ -1972,12 +2104,26 @@ class StreamingSession:
         # QF3 (B3/RB3): finalize the resume verification AFTER the stream has fully drained
         # (so we never re-enter the render loop mid-turn). Either recover from a detected
         # resume failure, or confirm the resume good by clearing the flag.
+        recovered = False
         if check_resume:
             if resume_failure_detected:
                 await self._recover_failed_resume(chat_id, turn_name, turn_rt, send=send)
+                recovered = True  # the engine was already torn down + dropped here.
             elif turn_rt is not None:
                 # The first resumed turn completed without a resume failure → confirmed good.
                 turn_rt.resumed_unverified = False
+
+        # P6/H2/RB2: a transport/liveness driver_error on a VERIFIED session (a fresh start,
+        # or a resume already confirmed good) leaves a dead/wedged SDK client behind — every
+        # later turn on it would re-time-out (the wedge-until-restart finding). Tear it down +
+        # drop the engine so the NEXT turn rebuilds a fresh client. Skipped when the resume-
+        # failure path above already recovered (it dropped the engine + cleared the dead id);
+        # acted on AFTER the stream drained (never mid-render). The session_id is NOT cleared
+        # here — unlike a resume failure, the persisted (session_id, cwd) is still valid; the
+        # rebuilt engine resumes it next turn (RB3). The operator already saw the driver_error
+        # rendered, so no extra notice is sent (SB3 — the error body never re-surfaces).
+        if driver_error_detected and not recovered:
+            await self._rebuild_after_driver_error(chat_id, turn_name, turn_rt)
 
     async def _recover_failed_resume(
         self,
@@ -2040,6 +2186,58 @@ class StreamingSession:
             parse_mode=None,
         )
 
+    async def _rebuild_after_driver_error(
+        self,
+        chat_id: int,
+        name: Optional[str],
+        rt: Optional[_ProjectRuntime],
+    ) -> None:
+        """Tear down + drop a VERIFIED session's engine after a transport/liveness driver_error
+        so the NEXT turn rebuilds a fresh client (P6/H2/RB2 — no wedge-until-restart).
+
+        Mirrors the engine-teardown half of :meth:`_recover_failed_resume`, but for a session
+        that was already CONFIRMED good (a fresh start, or a resume verified by a prior clean
+        turn) and then driver_errored mid-life — the dead SDK client would otherwise make every
+        later turn re-time-out against it. Differences from the resume-failure path:
+
+        * **The persisted ``session_id`` is NOT cleared.** Unlike an expired/torn resume, the
+          ``(session_id, cwd)`` is still valid; the rebuilt engine RESUMES it next turn (RB3),
+          so the conversation continues rather than starting over. The rebuilt engine is
+          ``resumed_unverified`` again iff it resumes a persisted id (set by ``_ensure_engine``).
+        * **No operator notice is sent.** The driver_error was already rendered to the operator
+          on this turn; re-announcing it would be noise (and the body must not re-surface, SB3).
+
+        Best-effort ``stop()`` (a failing stop must not re-wedge — the reference is dropped
+        regardless, so the next turn starts fresh). Per-project + no slot/lock work here: this
+        runs INSIDE ``_drive_turn``, after the stream drained, while ``handle_message`` still
+        holds this project's lock and its run slot; both are released by ``handle_message``'s
+        ``finally`` on return exactly as on any turn exit (no leak, P5 lifecycle preserved).
+        Other projects' live engines are untouched (per-project isolation).
+        """
+        log.info(
+            "driver_error on a verified session for chat %s project %s; tearing down the "
+            "engine so the next turn rebuilds a fresh client (no wedge)",
+            chat_id,
+            name,
+        )
+        if rt is None:
+            return
+        if rt.engine is not None:
+            try:
+                await rt.engine.stop()
+            except Exception:
+                log.debug(
+                    "stop of driver_errored engine raised for chat %s project %s "
+                    "(ignored — reference dropped, rebuilding fresh next turn)",
+                    chat_id,
+                    name,
+                    exc_info=True,
+                )
+        # Drop the engine + started flag so _ensure_engine rebuilds on the next turn. The
+        # persisted session_id is deliberately LEFT in place (resume it next turn, RB3).
+        rt.engine = None
+        rt.started = False
+
     async def _perform(
         self,
         state: _ChatState,
@@ -2048,6 +2246,7 @@ class StreamingSession:
         *,
         send: SendFn,
         edit: EditFn,
+        delete: Optional[DeleteFn] = None,
     ) -> None:
         """Execute ONE :class:`RenderAction` against Telegram (the deferred I/O).
 
@@ -2057,11 +2256,16 @@ class StreamingSession:
         (``state`` carries it — ADR-005 D8): an ``op="new"`` (verbatim) send is PRIORITY,
         an ``op="edit_status"`` is the low-priority status line that yields to it (so a
         concurrent project's status churn never starves this verbatim message).
+
+        ``delete`` (optional) lets an ``edit_status`` whose in-place edit FAILS clean up the
+        orphaned old status line before sending its replacement (P6/R5 #2) — only one status
+        line ever lives. Absent (direct callers / tests that pass no ``delete``), the old line
+        is simply left as before — no crash.
         """
         if action.op == "none" or not action.chunks:
             return
         if action.op == "edit_status":
-            await self._edit_status(state, rt, action, send=send, edit=edit)
+            await self._edit_status(state, rt, action, send=send, edit=edit, delete=delete)
             return
         # op == "new": one message per chunk. The keyboard rides the FIRST NON-EMPTY chunk —
         # whitespace-only chunks are skipped, so if the head chunk is whitespace the buttons
@@ -2113,6 +2317,7 @@ class StreamingSession:
         *,
         send: SendFn,
         edit: EditFn,
+        delete: Optional[DeleteFn] = None,
     ) -> None:
         """Edit THIS project's coalesced status line in place (create on first use).
 
@@ -2121,6 +2326,13 @@ class StreamingSession:
         never touches another's. The actual create/edit funnels through the chat's
         send-rate gate as the **non-verbatim** (low-priority) kind (ADR-005 D8), so this
         status churn yields to verbatim and the combined cross-project rate stays bounded.
+
+        **P6/R5 #2 (orphaned status line):** when the in-place edit FAILS (message gone /
+        too old) the fallback sends a brand-new status message and re-points
+        ``status_message_id`` at it. But turn-end cleanup deletes only the LATEST id, so the
+        old line would be ORPHANED — left visible forever. So if a ``delete`` is available we
+        best-effort DELETE the stale id BEFORE sending the replacement; only one status line
+        ever exists. A failed delete is swallowed (RB1) — the replacement still goes out.
         """
         body = action.text
         if not body.strip():
@@ -2150,6 +2362,15 @@ class StreamingSession:
             # (RB1/RB2); fall back to a fresh status message. Identical-text edits are
             # already skipped above, so this is a real failure, not a no-op edit.
             log.debug("status edit failed for chat; sending a fresh status line", exc_info=True)
+            # P6/R5 #2: delete the soon-to-be-orphaned old status line first (best-effort)
+            # so the turn-end cleanup's single-id delete doesn't leave it behind. A failed
+            # delete is ignored — the replacement must still be sent (RB1).
+            if delete is not None:
+                stale_id = rt.status_message_id
+                try:
+                    await delete(message_id=stale_id)
+                except Exception:
+                    log.debug("orphaned status-line delete failed (ignored)", exc_info=True)
             mid = await self._gated_send(
                 state, send, verbatim=False,
                 text=body, reply_markup=None, parse_mode=action.parse_mode,
@@ -2250,13 +2471,15 @@ class StreamingSession:
         held_session = getattr(ref.event, "session_id", None)
         if held_session is not None and rt.engine.session_id is not None:
             if held_session != rt.engine.session_id:
+                # SB3/H1: redact both ids — the comparison stays debuggable (two distinct
+                # tags ⇒ a genuine mismatch) without logging the raw resumable ids.
                 log.debug(
-                    "refusing to resolve id for chat %s project %s: held session %s != "
-                    "engine session %s (stale id after resume)",
+                    "refusing to resolve id for chat %s project %s: held %s != "
+                    "engine %s (stale id after resume)",
                     chat_id,
                     ref.project_name,
-                    held_session,
-                    rt.engine.session_id,
+                    _redact_sid(held_session),
+                    _redact_sid(rt.engine.session_id),
                 )
                 return None
         return rt.engine
@@ -2915,6 +3138,83 @@ def _is_resume_failure_event(event: Event) -> bool:
     if text is None:
         return False
     return ClaudeRunner._is_resume_failure(ClaudeResult(ok=False, text="", error=text))
+
+
+class _TurnDedup:
+    """Per-turn dedup of the duplicate-render paths (P6/R5). Pure; no I/O.
+
+    Production builds the substrate with ``include_partial_messages=False``, so a normal
+    answer turn surfaces the SAME final text on TWO foreground paths and renders it twice:
+
+    * **#1 (every normal answer turn):** Claude's final answer arrives as an assembled
+      :class:`~claude_tg.engine.types.TextEvent` (``incremental=False``) → a verbatim
+      ``op="new"`` message, AND the terminal :class:`~claude_tg.engine.types.ResultEvent`
+      carries the SAME string in ``result_text`` → ANOTHER verbatim ``op="new"``. The
+      engine's ``_drain_substrate`` dedups only ask/plan, not this. Fix: when the
+      ``result_text`` duplicates assistant prose already emitted this turn, render only the
+      compact ``✅ done`` footer instead of re-sending the identical prose (see
+      :meth:`result_is_duplicate_prose`; the driver swaps in a footer-only ``ResultEvent``).
+
+    * **#3 (error turns):** a failing tool renders a ``tool_error``
+      :class:`~claude_tg.engine.types.ErrorEvent` verbatim, then the terminal
+      ``ResultMessage(is_error)`` surfaces a near-identical ``turn_error`` ``ErrorEvent``
+      carrying the same message → a SECOND error block. Fix: suppress a terminal
+      ``turn_error`` whose message duplicates a ``tool_error`` already rendered this turn
+      (see :meth:`suppresses`).
+
+    The comparison is on the **raw source** (the assistant ``TextEvent.text`` /
+    ``ErrorEvent.message``), not the rendered HTML, so it is exact-match and intent-clear:
+    a result_text or terminal error that DIFFERS from what was already shown is never
+    suppressed (the multi-message-turn + distinct-error guards). State is per-turn — one
+    instance lives on the stack of a single ``_drive_turn`` call, reset for the next turn.
+
+    Only foreground renders feed this (the driver's background branch pings ``✅``/``🔔``
+    and ``continue``s before the render section), so background turns are unaffected.
+    """
+
+    def __init__(self) -> None:
+        # Raw bodies actually rendered verbatim this turn (newest-last not needed — a set
+        # is enough since dedup is exact-match equality, not "immediately-preceding").
+        self._assistant_texts: set[str] = set()
+        self._tool_error_messages: set[str] = set()
+
+    def record(self, event: Event) -> None:
+        """Remember a verbatim body that was just rendered (so a later twin can dedup)."""
+        if isinstance(event, TextEvent) and not event.incremental and event.text:
+            self._assistant_texts.add(event.text)
+        elif (
+            isinstance(event, ErrorEvent)
+            and event.kind_of_error == "tool_error"
+            and event.message
+        ):
+            self._tool_error_messages.add(event.message)
+
+    def result_is_duplicate_prose(self, event: ResultEvent) -> bool:
+        """True iff this result's ``result_text`` repeats assistant prose already shown (#1)."""
+        return bool(event.result_text) and event.result_text in self._assistant_texts
+
+    def suppresses(self, event: Event) -> bool:
+        """True iff ``event`` is a terminal ``turn_error`` duplicating a shown ``tool_error`` (#3)."""
+        return (
+            isinstance(event, ErrorEvent)
+            and event.kind_of_error == "turn_error"
+            and bool(event.message)
+            and event.message in self._tool_error_messages
+        )
+
+
+def _footer_only_result(event: ResultEvent) -> ResultEvent:
+    """A copy of ``event`` with ``result_text`` dropped → renders the compact ``✅ done``
+    footer instead of the (duplicate) prose (#1). The footer still carries ``num_turns`` /
+    ``total_cost_usd`` so the done indicator stays informative."""
+    return ResultEvent(
+        session_id=event.session_id,
+        is_error=event.is_error,
+        subtype=event.subtype,
+        num_turns=event.num_turns,
+        total_cost_usd=event.total_cost_usd,
+        result_text=None,
+    )
 
 
 @dataclass(frozen=True)

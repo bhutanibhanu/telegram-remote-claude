@@ -96,6 +96,45 @@ async def test_skip_permissions_false(monkeypatch):
     assert "--dangerously-skip-permissions" not in captured["cmd"]
 
 
+async def test_oneshot_cmd_omits_bypass_flag_on_secure_default(monkeypatch):
+    """SB5/C1: the oneshot invocation must NOT add ``--dangerously-skip-permissions``
+    unless the operator explicitly enabled the bypass. With the secure default
+    (``skip_permissions=False``) the flag is ABSENT, so a fresh install runs Claude's
+    tools behind the CLI's approval prompt. The local ``make_config`` here builds the
+    config with ONLY the required fields (matching the dataclass default for
+    ``skip_permissions``) so this asserts the shipped-default behavior, not a value the
+    helper happened to set.
+    """
+    runner = ClaudeRunner(
+        Config(bot_token="t", allowed_chat_ids=frozenset({1}), workdir=Path("/tmp"))
+    )
+    captured = {}
+
+    async def fake(cmd, stdin, cwd):
+        captured["cmd"] = cmd
+        return 0, ok_json(), ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    await runner.run(1, "x")
+    assert "--dangerously-skip-permissions" not in captured["cmd"]
+
+
+async def test_oneshot_cmd_adds_bypass_flag_only_on_explicit_opt_in(monkeypatch):
+    """SB5/C1: the bypass flag IS added when (and only when) the operator opted in
+    (``skip_permissions=True``). The opt-in escape hatch still works.
+    """
+    runner = ClaudeRunner(make_config(skip_permissions=True))
+    captured = {}
+
+    async def fake(cmd, stdin, cwd):
+        captured["cmd"] = cmd
+        return 0, ok_json(), ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    await runner.run(1, "x")
+    assert "--dangerously-skip-permissions" in captured["cmd"]
+
+
 async def test_error_json(monkeypatch):
     runner = ClaudeRunner(make_config())
 

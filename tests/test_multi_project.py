@@ -266,10 +266,13 @@ async def test_full_project_lifecycle_via_bot(tmp_path):
     await bot.cmd_projects(upd, make_cmd_ctx())
     reply = upd.message.reply_text.await_args.args[0]
     assert str(dir_a) in reply and str(dir_b) in reply  # both cwds listed
-    # The active project's line carries the marker; the inactive one does not. Match on the
-    # rendered "→ <name> —" / "  <name> —" line shape (mirrors cmd_projects' format).
-    b_line = next(line for line in reply.splitlines() if line.strip().split(" — ")[0].endswith("b"))
-    a_line = next(line for line in reply.splitlines() if line.strip().split(" — ")[0].endswith("a"))
+    # The active project's line carries the marker; the inactive one does not. R6: /projects
+    # now sends HTML — the name is wrapped in <b>…</b> and the cwd in <code>…</code> so the
+    # path renders as inert monospace (not tappable fake /segment command-links). Match on
+    # the bolded name token ("<b>b</b>" / "<b>a</b>") rather than the old bare "<name> —"
+    # shape, which the <b> wrapper now breaks.
+    b_line = next(line for line in reply.splitlines() if "<b>b</b>" in line)
+    a_line = next(line for line in reply.splitlines() if "<b>a</b>" in line)
     assert "→" in b_line and "→" not in a_line
 
     # /switch a → active flips back to a.
@@ -372,7 +375,12 @@ async def test_free_switch_and_new_during_answer_hold_then_alpha_still_resolves(
     up_new = make_update(1, "/new gamma " + str(gamma_dir))
     await bot.cmd_new(up_new, make_cmd_ctx(args=["gamma", str(gamma_dir)]))
     new_reply = up_new.message.reply_text.await_args.args[0]
-    assert "created gamma" in new_reply.lower(), new_reply
+    # R6: /new now confirms in HTML — the name is wrapped in <b>…</b> (and the cwd in
+    # <code>…</code> so the path renders as monospace, not fake /segment command-links), so
+    # the old "created gamma" substring no longer matches across the tag. Assert the
+    # success word + the bolded name token instead (still proves it created gamma, not a
+    # busy/error reply).
+    assert "created" in new_reply.lower() and "<b>gamma</b>" in new_reply, new_reply
     assert store.get_active(1) == "gamma"
 
     # alpha is STILL parked + busy — switching/creating did NOT disturb its run.

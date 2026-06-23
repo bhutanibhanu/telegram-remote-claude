@@ -11,6 +11,7 @@ wiring bug fails fast rather than hanging the suite.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from pathlib import Path
 
@@ -44,6 +45,7 @@ def make_config(
     allow_any_path=True,
     max_concurrent_runs=3,
     render_chat_send_interval_seconds=0.0,
+    stream_message_timeout_seconds=300.0,
 ):
     # NOTE (T7): turn-behavior tests default to ``allow_any_path=True`` so that
     # ``_ensure_engine``'s SB2 cwd re-validation (added in T7) NO-OPS — these tests are
@@ -72,6 +74,7 @@ def make_config(
         answer_backstop_seconds=3600,
         max_concurrent_runs=max_concurrent_runs,
         render_chat_send_interval_seconds=render_chat_send_interval_seconds,
+        stream_message_timeout_seconds=stream_message_timeout_seconds,
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
     )
@@ -774,7 +777,12 @@ async def test_handle_cancel_idle_chat_is_noop():
     assert engine.cancel_calls == []
 
 
-async def test_error_event_renders_clean_message():
+async def test_error_event_renders_clean_message(caplog):
+    # P6/R3 (SB3/H1): a tool_error wraps RAW tool output → it renders BODY-FREE to the chat
+    # (a clean ⚠️ summary, the raw "it broke" absent), while the raw detail still reaches the
+    # LOCAL debug log so the operator can debug. This replaces the old assertion that the raw
+    # body appeared in the chat — the new body-free behavior is the SB3 fix.
+    caplog.set_level(logging.DEBUG)
     engine = FakeEngine(
         [
             ErrorEvent(kind_of_error="tool_error", message="it broke"),
@@ -786,9 +794,12 @@ async def test_error_event_renders_clean_message():
     await asyncio.wait_for(
         session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
     )
-    # The error is a clean verbatim message (no traceback), its own send.
-    err_send = next(s for s in rec.sends if "it broke" in s["text"])
-    assert err_send["text"].startswith("⚠️")
+    # A clean ⚠️ error block was sent, but it is BODY-FREE: the raw tool body never rides it.
+    err_send = next(s for s in rec.sends if s["text"].startswith("⚠️") and "tool_error" in s["text"])
+    assert "it broke" not in err_send["text"]
+    assert all("it broke" not in s["text"] for s in rec.sends)  # nowhere in the chat
+    # The raw detail DID reach the local debug log (so it is recoverable for debugging).
+    assert "it broke" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -1039,6 +1050,201 @@ async def test_status_delete_failure_does_not_kill_turn():
     )
     assert any("done" in s["text"] for s in rec.sends)  # turn completed cleanly
     assert active_rt(session).status_message_id is None  # still reset (on the runtime, D7)
+
+
+# ---------------------------------------------------------------------------
+# P6/R5: duplicate-render dedup. Production builds the substrate with
+# include_partial_messages=False, so a normal answer turn yields the final prose
+# TWICE — once as an assembled TextEvent (op="new"), and again as the terminal
+# ResultEvent.result_text (op="new"). Nothing deduped result_text against the
+# assembled text, so the answer was sent twice (#1). Sibling cases: a transient
+# status-edit FAILURE left the old status line orphaned (#2); a failing tool's
+# tool_error ErrorEvent + the terminal turn_error ErrorEvent rendered the SAME
+# error twice (#3). These tests assert each duplicate is now sent exactly once.
+# ---------------------------------------------------------------------------
+
+
+def _send_texts(rec) -> list[str]:
+    """The plain text of every NEW message the driver sent (status edits excluded)."""
+    return [s["text"] for s in rec.sends]
+
+
+async def test_result_text_duplicating_assistant_prose_is_sent_once():
+    # #1 (PRIMARY): the assembled answer arrives as a TextEvent(incremental=False) AND the
+    # terminal ResultEvent.result_text carries the SAME string. The prose body must be sent
+    # exactly ONCE (the assistant TextEvent), and the terminal frame collapses to the compact
+    # ✅ done footer — never a verbatim re-send of the identical prose.
+    answer = "Here is the **final** answer with detail."
+    engine = FakeEngine(
+        [
+            TextEvent(text=answer, incremental=False),
+            ResultEvent(
+                session_id="s", is_error=False, subtype="success", result_text=answer
+            ),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The distinctive prose substring appears in exactly ONE sent message (the assistant
+    # TextEvent render); the ResultEvent did NOT re-send it.
+    bodies_with_answer = [t for t in _send_texts(rec) if "final" in t and "detail" in t]
+    assert len(bodies_with_answer) == 1, (
+        f"the answer prose must be sent exactly once, got {len(bodies_with_answer)}: "
+        f"{bodies_with_answer!r}"
+    )
+    # The "done" indicator still appears (the terminal frame rendered the compact footer).
+    assert any(t.startswith("✅ done") for t in _send_texts(rec)), (
+        "the compact done footer must still appear after the deduped result"
+    )
+
+
+async def test_distinct_result_text_still_renders_both_messages():
+    # #1 guard (no over-suppression): when the terminal ResultEvent.result_text DIFFERS from
+    # the assistant prose, BOTH bodies must still render — the dedup is exact-match only.
+    engine = FakeEngine(
+        [
+            TextEvent(text="Intermediate progress note.", incremental=False),
+            ResultEvent(
+                session_id="s",
+                is_error=False,
+                subtype="success",
+                result_text="The genuinely different final summary.",
+            ),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    texts = _send_texts(rec)
+    assert any("Intermediate progress note." in t for t in texts), "assistant prose dropped"
+    assert any("genuinely different final summary" in t for t in texts), (
+        "a distinct result_text must NOT be suppressed"
+    )
+
+
+async def test_multi_message_turn_with_distinct_prose_all_render():
+    # #1 guard: two DISTINCT assistant messages mid-turn, then a result whose text equals the
+    # SECOND. The first message and the second message both show (distinct), and the result
+    # does not duplicate the second — exactly one copy of each distinct body.
+    first = "First step done."
+    second = "Second step done — this is the final answer."
+    engine = FakeEngine(
+        [
+            TextEvent(text=first, incremental=False),
+            TextEvent(text=second, incremental=False),
+            ResultEvent(
+                session_id="s", is_error=False, subtype="success", result_text=second
+            ),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    texts = _send_texts(rec)
+    assert sum(1 for t in texts if "First step done." in t) == 1
+    assert sum(1 for t in texts if "Second step done" in t) == 1, (
+        "the second prose must appear once — not duplicated by the identical result_text"
+    )
+
+
+async def test_transient_status_edit_failure_does_not_orphan_old_status_line():
+    # #2: a status line is created, then a status EDIT fails (message gone / too old). The
+    # edit-failure fallback sends a BRAND-NEW status message — but turn-end cleanup deletes
+    # only the LATEST status_message_id, so before the fix the FIRST status line was orphaned
+    # and left visible. After the fix the edit-failure path best-effort DELETEs the old
+    # status id before sending the replacement, so the orphan id is cleaned up.
+    engine = FakeEngine(
+        [
+            ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)"),  # creates status #1
+            TextEvent(text="now editing", incremental=True),  # EDIT of #1 -> made to fail
+            ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok"),
+        ]
+    )
+    session = make_session(engine)  # frozen clock => every status update is "due"
+    rec = Recorder()
+
+    # The FIRST status edit fails (forces the fresh-status-message fallback).
+    fail_state = {"first": True}
+
+    async def flaky_edit(*, message_id, text, parse_mode=None):
+        if fail_state["first"]:
+            fail_state["first"] = False
+            raise RuntimeError("Telegram BadRequest: message to edit not found")
+        rec.edits.append({"message_id": message_id, "text": text, "parse_mode": parse_mode})
+
+    # The Recorder hands out ids 101, 102, … in send order. The first status line is the
+    # first send -> id 101; the edit-failure fallback then sends a replacement -> id 102.
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=flaky_edit, delete=rec.delete),
+        timeout=2.0,
+    )
+    deleted_ids = {d["message_id"] for d in rec.deletes}
+    # The ORPHANED first status line (id 101) must have been deleted — it was abandoned when
+    # the edit failed and a replacement was sent. Before the fix only the final id is deleted.
+    assert 101 in deleted_ids, (
+        f"the orphaned pre-failure status line (id 101) must be deleted, deletes={rec.deletes!r}"
+    )
+    # And the turn still ends cleanly with no lingering status id on the runtime.
+    assert active_rt(session).status_message_id is None
+
+
+async def test_tool_error_then_terminal_turn_error_renders_error_once():
+    # #3 (R5 dedup, preserved under R3 body-free): a failing tool renders a tool_error
+    # ErrorEvent, and the terminal ResultMessage(is_error) surfaces a near-identical
+    # turn_error ErrorEvent carrying the SAME raw message. R5's _TurnDedup compares the RAW
+    # .message (kept intact for exactly this reason) and suppresses the duplicate terminal
+    # turn_error → exactly ONE error block renders. Both kinds now render BODY-FREE, so we
+    # count the ⚠️ error blocks (the raw msg is absent from the chat — SB3).
+    msg = "Command failed: exit code 2"
+    engine = FakeEngine(
+        [
+            ErrorEvent(kind_of_error="tool_error", message=msg, is_error=True),
+            ErrorEvent(kind_of_error="turn_error", message=msg, is_error=True),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert all(msg not in t for t in _send_texts(rec))  # body-free: raw body never sent
+    error_blocks = [t for t in _send_texts(rec) if t.startswith("⚠️")]
+    assert len(error_blocks) == 1, (
+        f"the error must render exactly once (R5 dedup), got {len(error_blocks)}: {error_blocks!r}"
+    )
+
+
+async def test_distinct_terminal_error_still_renders():
+    # #3 guard (no over-suppression), preserved under R3 body-free: a tool_error then a
+    # terminal turn_error with a DIFFERENT raw message → R5 does NOT suppress (the raw
+    # .messages differ), so BOTH error blocks render. Both render body-free now, so we
+    # distinguish them by KIND (the raw bodies are absent from the chat — SB3).
+    engine = FakeEngine(
+        [
+            ErrorEvent(kind_of_error="tool_error", message="tool blew up", is_error=True),
+            ErrorEvent(kind_of_error="turn_error", message="turn aborted for another reason", is_error=True),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    texts = _send_texts(rec)
+    # Raw bodies never reach the chat (body-free); the two DISTINCT errors both still render,
+    # told apart by kind — proving the dedup did not over-suppress the distinct terminal one.
+    assert all("tool blew up" not in t and "turn aborted" not in t for t in texts)
+    assert any(t.startswith("⚠️") and "tool_error" in t for t in texts)
+    assert any(t.startswith("⚠️") and "turn_error" in t for t in texts), (
+        "a distinct terminal error must NOT be suppressed"
+    )
 
 
 async def test_keyboard_attaches_to_first_non_empty_chunk():
@@ -1366,6 +1572,136 @@ async def test_resume_failure_falls_back_to_fresh_start(tmp_path):
 
 
 # ===========================================================================
+# P6 H2/RB2: a driver_error on an ALREADY-VERIFIED session must tear down +
+# rebuild that project's engine, so the NEXT turn starts a fresh client (no
+# wedge-until-restart). The P5/QF3 recovery only covered the resume-failure
+# case (first turn of a freshly-resumed session); a verified session that
+# later driver_errors (the long-approval-timeout finding, or any transport
+# failure) used to leave the engine in place → every later turn re-times-out.
+#
+# Mock-only: a factory that hands out a SEQUENCE of engines for one project so
+# the test can assert the 2nd turn built a FRESH engine and the 1st was stopped.
+# No real sleeps; the driver_error is a scripted event.
+# ===========================================================================
+
+
+def make_sequence_session(engines: list, *, store=None, config=None) -> StreamingSession:
+    """A session whose factory pops the NEXT engine from ``engines`` on each build.
+
+    Models per-project rebuild: a fresh ``_ensure_engine`` for the same project gets a
+    new engine instance, so a test can prove a torn-down engine was replaced rather than
+    reused. (``make_multi_session`` reuses one engine per cwd — the opposite contract.)
+    """
+    seq = list(engines)
+
+    def factory(*, cwd, backstop_seconds, permission_policy):
+        assert seq, "factory asked to build more engines than the test scripted"
+        return seq.pop(0)
+
+    return StreamingSession(
+        config or make_config(),
+        session_store=store,
+        engine_factory=factory,
+        clock=lambda: 0.0,
+    )
+
+
+async def test_verified_session_driver_error_rebuilds_engine_next_turn_succeeds():
+    """RED on current code: a verified-session driver_error leaves the engine in place,
+    so the next turn reuses the SAME (dead) engine. GREEN: the engine is torn down +
+    rebuilt, so turn 2 runs on a FRESH engine and succeeds — no wedge."""
+    # Turn 1: a fresh-started session that emits a driver_error mid-turn (transport/
+    # liveness failure on an already-verified session — NOT a resume failure).
+    eng1 = FakeEngine(
+        [ErrorEvent(kind_of_error="driver_error", message="send timed out after 120s", is_error=True)]
+    )
+    # Turn 2: a DISTINCT engine that completes cleanly — proves the rebuild happened.
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="s2", is_error=False, subtype="success", result_text="recovered")]
+    )
+    session = make_sequence_session([eng1, eng2])
+    rec = Recorder()
+
+    # Turn 1: surfaces the driver_error (rendered), then the engine must be torn down.
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng1.started is True
+    assert eng1.stopped is True, "the dead verified-session engine must be stop()ed"
+    # The runtime's engine reference was dropped so the next turn rebuilds fresh.
+    rt = active_rt(session, 1)
+    assert rt.engine is not eng1, "the dead engine must not be reused on the next turn"
+
+    # No slot/lock leak after the failed turn (the chat must be usable).
+    assert session.is_busy(1) is False
+    assert session._running == 0
+
+    # Turn 2: a fresh engine is built + started and the turn completes — NOT wedged.
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng2.started is True, "the next turn must run on a freshly-built engine"
+    assert any("recovered" in s["text"] for s in rec.sends)
+    assert session.is_busy(1) is False
+    assert session._running == 0
+
+
+async def test_clean_turn_does_not_rebuild_engine():
+    """Over-reach guard: a turn that completes cleanly (no driver_error) must REUSE its
+    engine on the next turn — the rebuild path fires ONLY on a driver_error, never on a
+    healthy turn (else every turn would pay a fresh start)."""
+    eng1 = FakeEngine(
+        [ResultEvent(session_id="s1", is_error=False, subtype="success", result_text="ok")]
+    )
+    # If the impl wrongly rebuilds after a clean turn, the factory hands out eng2 and the
+    # reuse assertion below fails (eng2 started / eng1 stopped).
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="s2", is_error=False, subtype="success", result_text="second")]
+    )
+    session = make_sequence_session([eng1, eng2])
+    rec = Recorder()
+
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The SAME engine ran both turns (idempotent _ensure_engine); never torn down/rebuilt.
+    assert eng1.stopped is False
+    assert eng2.started is False, "a clean turn must not trigger a rebuild"
+    assert active_rt(session, 1).engine is eng1
+
+
+async def test_tool_error_does_not_rebuild_engine():
+    """Over-reach guard: an ordinary tool_error / turn_error (Claude reporting a failed
+    tool) is NOT a driver_error and must NOT tear down the engine — only a transport/
+    liveness driver_error wedges a session, so only it triggers the rebuild."""
+    eng1 = FakeEngine(
+        [
+            ErrorEvent(kind_of_error="tool_error", message="Bash: command not found", is_error=True),
+            ResultEvent(session_id="s1", is_error=False, subtype="success", result_text="ok"),
+        ]
+    )
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="s2", is_error=False, subtype="success", result_text="second")]
+    )
+    session = make_sequence_session([eng1, eng2])
+    rec = Recorder()
+
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng1.stopped is False, "a tool_error must not tear down the engine"
+    assert active_rt(session, 1).engine is eng1
+    # The next turn still reuses eng1 (no rebuild).
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert eng2.started is False
+
+
+# ===========================================================================
 # P4 (T7): resume hardening — SB2 cwd re-validation on the turn path + RB3
 # resume-failure operator notice + RB3 interrupted-turn-on-restart recovery.
 #
@@ -1425,6 +1761,21 @@ async def test_turn_refused_when_cwd_no_longer_within_roots(tmp_path):
     assert "no longer" in refusal and "permitted roots" in refusal
     assert str(outside) in refusal
     assert "/new" in refusal
+    # R6 (auto-linkify): the cwd is wrapped in <code>…</code> and the refusal is sent with
+    # parse_mode="HTML" so Telegram renders the path as inert monospace, not a row of
+    # tappable fake "/segment" command-links. The path appears ONLY inside the wrapper.
+    assert f"<code>{outside}</code>" in refusal
+    assert rec.sends[0]["parse_mode"] == "HTML"
+    assert str(outside) not in refusal.replace(f"<code>{outside}</code>", "")
+    # R6 (HTML validity): the "<name> <path>" placeholders MUST be escaped — this is an HTML
+    # message, so a bare "<name>" would be parsed as a broken tag and Telegram would reject
+    # the whole send. Assert they are written as &lt;…&gt; (and no bare "<name>" leaks).
+    assert "&lt;name&gt;" in refusal and "&lt;path&gt;" in refusal
+    assert "<name>" not in refusal and "<path>" not in refusal
+    # Belt-and-suspenders: stripping the only real tags (<code>…</code>) must leave NO stray
+    # "<"/">" — proof the message carries no other unescaped angle bracket Telegram'd reject.
+    bare = refusal.replace(f"<code>{outside}</code>", "")
+    assert "<" not in bare and ">" not in bare
     # The lock was released (not held) — the chat is usable, not wedged.
     assert session.is_busy(1) is False
 
@@ -5101,3 +5452,140 @@ async def test_sb2_path_not_allowed_refusal_clears_inflight_project_usable_again
     after = len([s for s in rec.sends if "permitted roots" in s["text"]])
     assert after == before + 1, "the 2nd message must re-refuse (reach SB2), not be rejected as busy"
     assert rt.inflight is False
+
+
+# ===========================================================================
+# P6/C2 (SB2): the LIVE factory-wiring guard — StreamingSession.__init__ binds the
+# config's path-confinement context (allowed_roots / allow_any_path / cwd) into the
+# DEFAULT engine factory so the REAL bot's engines confine the SDK's file/search tools.
+#
+# Every OTHER test builds Engine(...) with explicit path kwargs or injects a fake factory,
+# so none of them exercises the production binding: an __init__ refactor could drop the
+# binding (revert to ``engine_factory or _default_engine_factory``) and silently turn C2
+# OFF for the live bot with all other tests still green. This test obtains an engine via
+# the session's OWN bound factory the same way ``_ensure_engine`` does and asserts it
+# confines. TEETH (verified in a throwaway): with the binding dropped, the default factory
+# is called with allowed_roots=() — under empty roots EVERY path is out-of-root, so the
+# in-root auto-allow assertion below goes RED (an in-root Read would HOLD), and the direct
+# ``_allowed_roots == config.allowed_roots`` assertion goes RED (() != the narrow root).
+# ===========================================================================
+
+
+async def _resolve_when_pending(eng, tool_use_id, decision):
+    """Resolve a held request as soon as it registers on the engine's pending registry.
+
+    Mirrors the helper in test_tool_path_confinement — no real wait; spins the loop until
+    the request is pending, then resolves it so the awaiting ``on_tool_request`` unblocks.
+    """
+    for _ in range(1000):
+        if eng._pending.has_pending(tool_use_id):
+            return eng.resolve(tool_use_id, decision)
+        await asyncio.sleep(0)
+    raise AssertionError(f"request {tool_use_id} never became pending")
+
+
+async def test_default_factory_binds_config_path_confinement_into_live_engine(tmp_path):
+    # A real StreamingSession with NARROW allowed_roots and NO injected engine_factory: the
+    # engine it builds (via its OWN bound default factory) must enforce the C2 path layer.
+    root = tmp_path / "root"
+    root.mkdir()
+    config = make_roots_config(tmp_path, root=root)  # allowed_roots=(root,), allow_any_path=False
+    session = StreamingSession(config, session_store=None, clock=lambda: 0.0)
+
+    # Obtain an engine EXACTLY as _ensure_engine does (cwd + backstop + a fresh policy) —
+    # through the session's bound default factory, NOT an injected one.
+    engine = session._engine_factory(
+        cwd=str(root),
+        backstop_seconds=float(config.answer_backstop_seconds),
+        permission_policy=PermissionPolicy(),
+    )
+
+    # (1) Direct teeth: the live config's path context reached the engine. Dropping the
+    # __init__ binding makes these () / (defaults), so the narrow-root assertion goes RED.
+    assert engine._allowed_roots == config.allowed_roots
+    assert engine._cwd == str(root)
+    assert engine._allow_any_path is config.allow_any_path
+
+    # (2) End-to-end confinement through the production binding: an OUT-of-root tool request
+    # HOLDS for approval (a PermissionEvent is injected + the request becomes pending and
+    # resolves to the operator's verdict), even an otherwise-auto SAFE Read.
+    out_id = "tu-out"
+    op = asyncio.create_task(
+        _resolve_when_pending(engine, out_id, PermissionDecision("allow_once"))
+    )
+    decision = await asyncio.wait_for(
+        engine.on_tool_request("Read", {"file_path": "/etc/shadow"}, out_id), timeout=5
+    )
+    assert await op is True  # it was HELD → the operator resolved a real pending request
+    assert decision.allow is True  # operator allowed it once (the hold was honored)
+
+    # (3) Teeth + P2 regression: an IN-root Read AUTO-ALLOWS with no hold. Under the dropped
+    # binding (empty roots) this would HOLD instead (never resolved → would time out), so
+    # this both proves in-root is unchanged AND is RED-on-unbind. The request must NOT be
+    # pending at any point, so we assert it returns promptly without a resolver.
+    in_decision = await asyncio.wait_for(
+        engine.on_tool_request(
+            "Read", {"file_path": str(root / "ok.py")}, "tu-in"
+        ),
+        timeout=5,
+    )
+    assert in_decision.allow is True  # auto-allowed (in-root, no prompt)
+    assert not engine._pending.has_pending("tu-in")  # never held
+
+
+# ===========================================================================
+# P6/H2/RB2: the LIVE factory-wiring guard for the per-message liveness bound —
+# StreamingSession.__init__ binds config.stream_message_timeout_seconds into the
+# DEFAULT engine factory as Engine.send_timeout (the per-message asyncio.wait_for
+# the substrate applies). The bound is config-driven, GENEROUS by default (so an
+# approved long-running tool that emits no intermediate message does not trip a
+# spurious driver_error), and still bounds a genuinely-silent Claude.
+#
+# Like the C2 binding test above, EVERY other test injects a fake factory or builds
+# Engine(...) directly, so none exercises the production send_timeout binding: an
+# __init__ refactor could drop it and silently revert the live bot to the hardcoded
+# 120 s with all other tests green. This obtains an engine via the session's OWN
+# bound factory (as _ensure_engine does) and asserts the configured bound reached it.
+# TEETH: with the binding dropped (or reverted to the 120 s default), the override
+# assertion (== 45.0) goes RED.
+# ===========================================================================
+
+
+async def test_default_factory_binds_stream_message_timeout_into_live_engine(tmp_path):
+    # A real StreamingSession with a small configured liveness bound and NO injected
+    # engine_factory: the engine it builds (via its OWN bound default factory) must carry
+    # that bound as send_timeout (NOT the hardcoded 120 s).
+    config = make_config(workdir=str(tmp_path), stream_message_timeout_seconds=45.0)
+    session = StreamingSession(config, session_store=None, clock=lambda: 0.0)
+
+    # Obtain an engine EXACTLY as _ensure_engine does — through the session's bound default
+    # factory, NOT an injected one.
+    engine = session._engine_factory(
+        cwd=str(tmp_path),
+        backstop_seconds=float(config.answer_backstop_seconds),
+        permission_policy=PermissionPolicy(),
+    )
+
+    # Teeth: the configured bound reached the engine. Dropping the __init__ binding leaves
+    # the 120 s default, so this == 45.0 assertion goes RED.
+    assert engine._send_timeout == 45.0
+    assert engine._send_timeout == config.stream_message_timeout_seconds
+
+
+async def test_default_factory_uses_generous_default_stream_message_timeout(tmp_path):
+    # Over-reach / regression guard: with NO STREAM_MESSAGE_TIMEOUT_SECONDS override the live
+    # engine gets the GENEROUS 300 s default — NOT the old hardcoded 120 s — so a normal
+    # multi-minute approved tool (build/test/install) completes without a spurious
+    # driver_error. (RED if anyone re-pins the live bound back to 120 s.)
+    from claude_tg.config import DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS
+
+    config = make_config(workdir=str(tmp_path))  # default stream_message_timeout_seconds
+    assert config.stream_message_timeout_seconds == DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS == 300.0
+    session = StreamingSession(config, session_store=None, clock=lambda: 0.0)
+
+    engine = session._engine_factory(
+        cwd=str(tmp_path),
+        backstop_seconds=float(config.answer_backstop_seconds),
+        permission_policy=PermissionPolicy(),
+    )
+    assert engine._send_timeout == 300.0, "the live bound must default to the generous 300 s, not 120 s"

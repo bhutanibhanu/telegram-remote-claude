@@ -839,6 +839,21 @@ def _escape_html(text: str) -> str:
     return html.escape(text, quote=False)
 
 
+def code_path(path: object) -> str:
+    """Wrap a filesystem path in ``<code>…</code>`` for a ``parse_mode="HTML"`` reply (R6).
+
+    Telegram auto-linkifies each ``/segment`` of a bare path in a bot message as a fake
+    command-link (a cwd ``/tmp/p5verify/a`` renders as tappable ``/tmp`` ``/p5verify``
+    ``/a`` "commands") — ugly and confusing. Wrapping the path in ``<code>`` makes Telegram
+    render it as inert monospace instead. The path is HTML-escaped EXACTLY once here
+    (``&`` ``<`` ``>``) so a path that contains those characters can't break the HTML
+    message or inject a tag, so callers must pass the RAW path (never a pre-escaped one).
+    The reply MUST be sent with ``parse_mode="HTML"`` or the literal ``<code>`` tags show.
+    Pure string; no I/O.
+    """
+    return f"<code>{html.escape(str(path), quote=False)}</code>"
+
+
 def _chunk(text: str, limit: int = TELEGRAM_MAX) -> tuple[str, ...]:
     """Split to Telegram-safe UTF-16 chunks (reuses :func:`split_message`)."""
     return tuple(split_message(text, limit=limit))
@@ -993,8 +1008,67 @@ def status_line(event: StatusEvent) -> str:
     return " · ".join(bits)
 
 
+#: Error kinds whose ``message`` wraps a RAW EXTERNAL body — tool stderr/stdout
+#: (``tool_error``, from ``ToolResultBlock.content``) or SDK/CLI result text
+#: (``turn_error``, from ``ResultMessage.result``). These can carry file contents or a
+#: secret Claude just read, so their raw body is NEVER rendered to the chat (SB3 / H1 /
+#: body-free). Everything NOT in this set is treated as a bot-AUTHORED safe message and
+#: rendered readably (see :func:`error_is_raw_external`).
+_RAW_EXTERNAL_ERROR_KINDS: Final[frozenset[str]] = frozenset({"tool_error", "turn_error"})
+
+#: The fixed, body-free line shown in place of a raw external error body. It names the
+#: project nowhere (the foreground render is project-agnostic — the chat thread already
+#: scopes it) and points the operator at the local log for the detail. Public so the
+#: one-shot reply path (``bot.py``) renders the SAME body-free line as streaming.
+BODY_FREE_ERROR_LINE: Final = "the last step failed (details in the local log)"
+
+
+def error_is_raw_external(event: ErrorEvent) -> bool:
+    """Classify an :class:`ErrorEvent` for SB3 body-free rendering (P6/R3 · H1).
+
+    Classification rule — by ``kind_of_error`` (the cleanest, audited discriminator,
+    since each kind has a FIXED construction site, see ``adapter_sdk``):
+
+    * ``tool_error``  — built from ``ToolResultBlock.content`` (a tool's raw
+      stderr/stdout). RAW EXTERNAL → body-free.
+    * ``turn_error``  — built from ``ResultMessage.result`` / ``.subtype`` (the SDK/CLI's
+      raw turn-failure text). RAW EXTERNAL → body-free.
+    * ``driver_error`` — bot-AUTHORED: ``adapter_sdk`` builds it as a fixed
+      ``"send timed out after Ns"`` or a ``"<ExcType>: <exc>"`` diagnostic label (the
+      timeout / transport-exception summary the owner explicitly wants to read). Returns
+      ``False`` → rendered readably. (An exception's ``str`` is a Python error label, not
+      a tool body / file content; if a future driver_error were ever sourced from raw
+      external output it should be reclassified here.)
+
+    Returns ``True`` iff the event's ``message`` must be treated as a raw external body
+    (render body-free, log the raw detail only locally + scrubbed). **Fail-safe (SB3):**
+    only the explicitly bot-authored ``driver_error`` is exempted; every other (incl. an
+    UNKNOWN/unexpected) ``kind_of_error`` defaults to body-free — we never leak an
+    unclassified body to the chat. ``_RAW_EXTERNAL_ERROR_KINDS`` documents the known
+    raw-external kinds; the default-deny below covers anything unforeseen.
+    """
+    if event.kind_of_error == "driver_error":
+        return False
+    return True
+
+
 def _render_error(event: ErrorEvent) -> RenderAction:
-    body = f"⚠️ {event.kind_of_error}: {event.message}"
+    """Render an :class:`ErrorEvent` — body-free for RAW EXTERNAL bodies (SB3 / H1).
+
+    A ``tool_error`` / ``turn_error`` wraps a raw tool/SDK body that can carry file
+    content or a secret, so it renders as a SAFE SUMMARY — the error KIND + a fixed
+    generic line (:data:`BODY_FREE_ERROR_LINE`) — NOT the raw ``message``. The raw detail
+    is written only to the LOCAL debug log (scrubbed) by the driver at the render call
+    site; it never rides a Telegram send. A bot-authored ``driver_error`` (timeout /
+    transport label) stays readable — it is safe and helpful UX.
+
+    ``ErrorEvent.message`` still carries the raw text (untouched) so R5's ``_TurnDedup``
+    can compare raw bodies for de-duplication; only what is RENDERED is body-free.
+    """
+    if error_is_raw_external(event):
+        body = f"⚠️ {event.kind_of_error} — {BODY_FREE_ERROR_LINE}"
+    else:
+        body = f"⚠️ {event.kind_of_error}: {event.message}"
     return RenderAction(op="new", chunks=_chunk(body), verbatim=True)
 
 
@@ -1485,6 +1559,8 @@ __all__ = [
     "RenderAction",
     "RenderOp",
     "render_event",
+    "error_is_raw_external",
+    "BODY_FREE_ERROR_LINE",
     # keyboards + codec
     "ask_keyboard",
     "ask_question_body",

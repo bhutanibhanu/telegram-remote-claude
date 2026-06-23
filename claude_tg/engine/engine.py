@@ -50,9 +50,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
-from ..permissions import PermissionPolicy
+from ..permissions import PermissionPolicy, path_needs_approval
+from ..util import _redact_sid
 from .pending import DEFAULT_BACKSTOP_SECONDS, PendingRegistry
 from .substrate import Substrate
 from .types import (
@@ -94,6 +96,9 @@ class Engine:
         send_timeout: float = 120.0,
         backstop_seconds: float = DEFAULT_BACKSTOP_SECONDS,
         permission_policy: PermissionPolicy | None = None,
+        cwd: str | None = None,
+        allowed_roots: tuple[str | Path, ...] = (),
+        allow_any_path: bool = False,
     ) -> None:
         self._substrate = substrate
         self._send_timeout = send_timeout
@@ -103,6 +108,19 @@ class Engine:
         # grants and yolo off, so every risky tool gates. The bot (T5) injects the
         # session's shared policy so /yolo + allow-session grants + /reset-clear apply.
         self._policy = permission_policy if permission_policy is not None else PermissionPolicy()
+        # P6/C2 (SB2): the SDK-tool path-confinement context. ``cwd`` is the project's
+        # fixed working dir (used to resolve a tool's relative path AND as the default
+        # target for optional-path tools like Glob/Grep); ``allowed_roots`` are the
+        # canonical roots a tool's target must sit inside; ``allow_any_path`` is the
+        # explicit ALLOW_ANY_PATH opt-out that disables the path policy. **Defaults
+        # (cwd=None, allowed_roots=(), allow_any_path=False) make the path layer a no-op**
+        # — an Engine built without them behaves exactly as before (every existing test
+        # + the synchronous-provider lifecycle is unchanged): the path check is SKIPPED
+        # when there is no cwd to resolve against. The bot's _default_engine_factory wires
+        # the real config in (so the live path is confined). See on_tool_request.
+        self._cwd = cwd
+        self._allowed_roots = allowed_roots
+        self._allow_any_path = allow_any_path
         # The answer-hold registry: PendingDecision Futures keyed by tool_use_id, with
         # the per-request backstop timer. notify() pushes the operator-facing event.
         # Shared by the ask/plan answer-hold AND the P2 permission hold (RB4 for free).
@@ -157,13 +175,27 @@ class Engine:
         if tool_name in (ASK_TOOL, PLAN_TOOL) and tool_use_id is not None:
             return await self._answer_hold(tool_name, tool_input, tool_use_id)
 
-        # --- ordinary tool: the P2 permission gate (ADR-003 §2/§4) --------------
-        # Ask the per-session policy whether this tool may run without a prompt. False
-        # iff it is a safe read/search, has a live allow-session grant, or /yolo is on
-        # (PermissionPolicy.needs_approval). In that case allow with no prompt, echoing
-        # the original input as the record (decision_to_substrate guarantees a dict —
-        # the B updatedInput gotcha).
-        if not self._policy.needs_approval(tool_name, tool_input):
+        # --- ordinary tool: the permission gate (P2 name-only + P6/C2 path layer) ----
+        # Ordering (owner-approved posture, PROMPT-ON-OUT-OF-ROOT):
+        #   1. /yolo (D6) bypasses EVERYTHING — the operator took the wheel; an out-of-root
+        #      call is allowed under yolo (the explicit allow-all opt-out, checked first).
+        #   2. P6/C2 path layer (SB2): a file/search tool whose RESOLVED target is OUTSIDE
+        #      allowed_roots must be approved — even an otherwise-auto SAFE tool (Read/Glob/
+        #      LS) and even a session-GRANTED risky one (Write/Edit) — so an out-of-root
+        #      call ALWAYS re-prompts. This comes BEFORE the name-only safe/grant
+        #      short-circuit and is disabled by ALLOW_ANY_PATH=true (the other opt-out) and
+        #      when no cwd is wired (the path layer is then a no-op — see __init__).
+        #   3. otherwise the P2 name-only verdict: safe→auto, risky→grant-or-prompt.
+        if not self._policy.yolo and self._path_out_of_root(tool_name, tool_input):
+            # Out-of-root + not yolo → hold for approval regardless of name/grant. A risky
+            # tool with no tool_use_id still can't open a resolvable hold (fail closed →
+            # deny, below); an out-of-root SAFE tool with no id would be vanishingly rare on
+            # the live path but is handled the same fail-closed way.
+            log.debug(
+                "tool %s target is outside allowed_roots — requiring approval (C2/SB2)",
+                tool_name,
+            )
+        elif not self._policy.needs_approval(tool_name, tool_input):
             log.debug("policy allows tool %s without prompt", tool_name)
             return decision_to_substrate(
                 PermissionVerdict(behavior="allow"), tool_input=tool_input
@@ -186,6 +218,28 @@ class Engine:
             )
 
         return await self._permission_hold(tool_name, tool_input, tool_use_id)
+
+    def _path_out_of_root(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
+        """Return ``True`` iff this tool's target path is outside ``allowed_roots`` (C2/SB2).
+
+        A thin, side-effect-free wrapper over the pure
+        :func:`~claude_tg.permissions.path_needs_approval` that supplies the engine's
+        wired path context (``cwd`` / ``allowed_roots`` / ``allow_any_path``). **When no
+        ``cwd`` is wired the path layer is a no-op** (returns ``False``) — an Engine built
+        without the P6 path context (every pre-C2 construction, incl. the test fakes and
+        the synchronous-provider lifecycle) behaves exactly as before. ``Bash`` and the
+        no-path tools return ``False`` here by construction (``path_needs_approval`` only
+        governs the explicit-path file/search tools — the documented C2 boundary).
+        """
+        if self._cwd is None:
+            return False
+        return path_needs_approval(
+            tool_name,
+            tool_input,
+            cwd=self._cwd,
+            allowed_roots=self._allowed_roots,
+            allow_any_path=self._allow_any_path,
+        )
 
     async def _answer_hold(
         self,
@@ -315,12 +369,14 @@ class Engine:
     async def start(self) -> None:
         """Establish a fresh session (host CLI auth; no API key)."""
         await self._substrate.start()
-        log.debug("engine started; session_id=%s", self.session_id)
+        # SB3/H1: log a redacted, correlatable tag — never the raw resumable session id.
+        log.debug("engine started; %s", _redact_sid(self.session_id))
 
     async def resume(self, session_id: str) -> None:
         """Re-attach to an existing session by id (cwd-scoped — engine-owned, C6)."""
         await self._substrate.resume(session_id)
-        log.debug("engine resumed session_id=%s", self.session_id)
+        # SB3/H1: redacted tag only (the raw id is a credential — see _redact_sid).
+        log.debug("engine resumed %s", _redact_sid(self.session_id))
 
     async def send(self, prompt: str, *, timeout: Optional[float] = None) -> AsyncIterator[Event]:
         """Send one operator turn; async-yield normalized events out.

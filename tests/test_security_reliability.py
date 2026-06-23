@@ -65,7 +65,7 @@ from claude_tg.claude_runner import ClaudeResult, ClaudeRunner
 from claude_tg.config import Config
 from claude_tg.engine.types import ErrorEvent, ResultEvent, TextEvent
 from claude_tg.paths import PathNotAllowed, resolve_within_roots
-from claude_tg.render import Coalescer, RenderAction
+from claude_tg.render import BODY_FREE_ERROR_LINE, Coalescer, RenderAction
 from claude_tg.session_store import JsonSessionStore
 from claude_tg.stream_session import StreamingSession
 
@@ -471,6 +471,128 @@ def test_sb3_state_file_is_chmod_0600(tmp_path):
     store.update(1, session_id="sess-xyz", cwd=str(tmp_path))
     mode = (tmp_path / "state.json").stat().st_mode & 0o777
     assert mode == 0o600
+
+
+# --- SB3/H1 (P6/R3): body-free rendering of RAW EXTERNAL error bodies -------
+# A stand-in for a secret a tool's stderr might echo into an error body (e.g. a Read of a
+# .env that then failed, or a CLI dumping a token). If the raw body were rendered to the
+# chat, this string would appear in a send — the body-free assertions below pin that it
+# does NOT, while the local debug log still carries it (scrubbed) for debugging.
+SB3_SECRET_BODY = "AKIA-SECRETKEY-do-not-send-to-chat-1234567890"
+
+
+async def test_sb3_raw_external_error_renders_body_free_streaming(caplog):
+    """SB3/H1: a streaming ``tool_error`` carrying a secret-like body renders BODY-FREE.
+
+    The raw body is ABSENT from everything sent to the chat; a safe summary (the error
+    KIND + the fixed body-free line) is present instead. The raw detail still reaches the
+    LOCAL debug log so the operator can recover it. Distinguishes the two sources by KIND
+    (tool_error = raw external → body-free).
+    """
+    caplog.set_level(logging.DEBUG)
+    engine = FakeEngine(
+        [
+            ErrorEvent(kind_of_error="tool_error", message=SB3_SECRET_BODY, is_error=True),
+            ResultEvent(session_id="s", is_error=False, subtype="success"),
+        ]
+    )
+    session = make_streaming_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # BODY-FREE: the secret never rides any Telegram send.
+    assert all(SB3_SECRET_BODY not in s["text"] for s in rec.sends)
+    # A safe summary IS shown (kind + fixed line) — the operator still learns a step failed.
+    summary = next(s for s in rec.sends if s["text"].startswith("⚠️") and "tool_error" in s["text"])
+    assert BODY_FREE_ERROR_LINE in summary["text"]
+    # The raw detail still reaches the LOCAL debug log (recoverable for debugging).
+    assert SB3_SECRET_BODY in caplog.text
+
+
+async def test_sb3_bot_authored_driver_error_stays_readable_streaming():
+    """SB3/H1 (classification, no over-redaction): a BOT-AUTHORED ``driver_error`` (a
+    timeout / transport label — safe and helpful) still renders READABLY to the chat."""
+    engine = FakeEngine(
+        [
+            ErrorEvent(kind_of_error="driver_error", message="send timed out after 120s"),
+            ResultEvent(session_id="s", is_error=False, subtype="success"),
+        ]
+    )
+    session = make_streaming_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    readable = next(s for s in rec.sends if s["text"].startswith("⚠️"))
+    assert "send timed out after 120s" in readable["text"]  # bot-authored detail kept
+    assert BODY_FREE_ERROR_LINE not in readable["text"]
+
+
+async def test_sb3_raw_external_oneshot_error_renders_body_free(caplog):
+    """SB3/H1: the ONE-SHOT reply path renders a ``raw_external`` error BODY-FREE too.
+
+    A ``ClaudeResult`` flagged ``raw_external`` (derived from raw CLI stderr) replies with
+    the fixed body-free line, not the raw body; the raw detail goes to the local debug log.
+    """
+    caplog.set_level(logging.DEBUG)
+    cfg = make_config(allowed=(1,))
+    runner = FakeRunner(ClaudeResult(ok=False, text="", error=SB3_SECRET_BODY, raw_external=True))
+    bot = TelegramClaudeBot(cfg, runner)
+    upd = make_update(chat_id=1, text="go")
+    await bot.on_message(upd, make_ctx())
+
+    sent = " ".join(str(c.args[0]) for c in upd.message.reply_text.await_args_list)
+    assert SB3_SECRET_BODY not in sent  # body-free reply
+    assert BODY_FREE_ERROR_LINE in sent  # safe summary present
+    assert SB3_SECRET_BODY in caplog.text  # raw detail still in the local log
+
+
+async def test_sb3_bot_authored_oneshot_error_stays_readable():
+    """SB3/H1 (classification): a bot-AUTHORED one-shot error (raw_external False — e.g. a
+    timeout / bad-cwd notice) still renders READABLY (helpful UX, no secret risk)."""
+    cfg = make_config(allowed=(1,))
+    runner = FakeRunner(ClaudeResult(ok=False, text="", error="Claude timed out after 600s."))
+    bot = TelegramClaudeBot(cfg, runner)
+    upd = make_update(chat_id=1, text="go")
+    await bot.on_message(upd, make_ctx())
+
+    sent = " ".join(str(c.args[0]) for c in upd.message.reply_text.await_args_list)
+    assert "Claude timed out after 600s." in sent
+    assert BODY_FREE_ERROR_LINE not in sent
+
+
+async def test_sb3_oneshot_cli_stderr_is_flagged_raw_external(tmp_path):
+    """SB3/H1 (the flag is really SET, not just wired): a real ``ClaudeRunner`` turn whose
+    CLI exits non-zero with stderr produces ``raw_external=True`` (so the reply layer makes
+    it body-free). Proves the classification fires on the actual error-construction site,
+    not only when a test hands the flag in.
+    """
+    cfg = make_config(allowed=(1,), workdir=tmp_path)  # a REAL cwd so _run_once invokes
+    runner = ClaudeRunner(cfg)
+
+    async def fake_invoke(cmd, stdin_text, cwd):
+        return (1, "", SB3_SECRET_BODY)  # non-zero exit, secret on stderr, no parseable JSON
+
+    runner._invoke = fake_invoke  # type: ignore[method-assign]
+    result = await runner.run(1, "do a thing")
+    assert result.ok is False
+    assert result.raw_external is True  # the CLI-stderr error is flagged raw external
+    assert SB3_SECRET_BODY in (result.error or "")  # .error still carries it (for heuristics)
+
+
+def test_sb3_body_free_mutation_probe_raw_body_would_leak(caplog):
+    """Mutation-probe (highest-value: raw-body-to-chat). Pins that ``_render_error`` is what
+    keeps the raw body out of the rendered text: render a raw-external error and assert the
+    rendered action's TEXT lacks the raw body but carries the safe summary. A mutation that
+    reverted ``_render_error`` to ``f"⚠️ {kind}: {message}"`` (the OLD behavior) would put
+    the raw body back into ``action.text`` and FAIL this.
+    """
+    from claude_tg.render import render_event
+
+    action = render_event(ErrorEvent(kind_of_error="tool_error", message=SB3_SECRET_BODY))
+    assert SB3_SECRET_BODY not in action.text  # the render layer strips the raw body
+    assert "tool_error" in action.text and BODY_FREE_ERROR_LINE in action.text
 
 
 # ===========================================================================

@@ -268,6 +268,17 @@ class SdkSubstrate:
 
         self._client: Any = None  # ClaudeSDKClient | None (lazily typed)
         self.session_id: Optional[str] = None
+        # P6/H2/RB2: how many decision holds are OPEN right now (the SDK's can_use_tool
+        # is outstanding, awaiting the engine's answer-hold for the operator's verdict).
+        # Incremented by ``can_use_tool`` before it awaits the engine callback and
+        # decremented in its finally. The receive loop SUSPENDS the per-message liveness
+        # timeout while this is > 0: a permission/ask/plan hold is bounded by the engine's
+        # ~60-min answer-backstop (the SDK awaits can_use_tool with no fail_after — see
+        # engine/pending.py), NOT by the 120s liveness bound, which exists only to catch a
+        # genuinely-SILENT Claude. The counter (not a bool) tolerates the unlikely nested/
+        # concurrent hold without a premature un-suspend. Single asyncio task per the
+        # substrate contract, so no lock is needed.
+        self._hold_depth = 0
 
     # -- options -------------------------------------------------------------
 
@@ -305,7 +316,19 @@ class SdkSubstrate:
             from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny  # lazy
 
             tool_use_id = getattr(context, "tool_use_id", None)
-            decision: SubstrateDecision = await callback(tool_name, tool_input, tool_use_id)
+            # P6/H2/RB2: a decision hold is now OPEN for this turn — the operator may take
+            # up to the answer-backstop to decide. Mark it so the receive loop suspends the
+            # 120s liveness timeout for the duration (the human-wait must NOT be counted as
+            # Claude going silent). Restored in the finally the instant the verdict returns,
+            # so a Claude that then goes silent is bounded by the 120s again (the bound is
+            # suspended, not removed). The engine's own backstop bounds the hold itself.
+            self._hold_depth += 1
+            try:
+                decision: SubstrateDecision = await callback(
+                    tool_name, tool_input, tool_use_id
+                )
+            finally:
+                self._hold_depth -= 1
             if decision.allow:
                 return PermissionResultAllow(updated_input=dict(decision.updated_input or {}))
             return PermissionResultDeny(message=decision.message or "")
@@ -340,6 +363,19 @@ class SdkSubstrate:
         ``asyncio.wait_for`` timeout OR any driver exception is converted into a
         single ``driver_error`` event and the stream ends. The session is never left
         hanging waiting on the SDK.
+
+        **P6/H2/RB2 — the liveness timeout bounds CLAUDE's responsiveness, not the
+        operator's approval time.** The ``timeout`` catches a genuinely-silent Claude
+        (the SDK stopped delivering messages). But while a permission/ask/plan hold is
+        OPEN (``can_use_tool`` is parked awaiting the operator's verdict — tracked by
+        ``_hold_depth``), the SDK legitimately delivers no further messages: the next
+        ``__anext__`` would block for the whole human-wait. Counting that against the
+        120s would fire a spurious ``driver_error`` (and, on a verified session, wedge
+        the project — see :meth:`StreamingSession._drive_turn`). So the per-message
+        bound is APPLIED only when no hold is open; while one is, the await is unbounded
+        and the engine's ~60-min answer-backstop is what bounds the human-wait. The
+        invariant: a turn must NOT ``driver_error`` solely because the operator took
+        >120s to approve — but a silent Claude with NO hold open still times out cleanly.
         """
         if self._client is None:
             raise RuntimeError("session not started; call start()/resume() first")
@@ -349,7 +385,7 @@ class SdkSubstrate:
             iterator = self._client.receive_response().__aiter__()
             while True:
                 try:
-                    msg = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+                    msg = await self._next_message(iterator, timeout)
                 except StopAsyncIteration:
                     break
                 self._capture_session_id(msg)
@@ -369,6 +405,68 @@ class SdkSubstrate:
                 is_error=True,
                 session_id=self.session_id,
             )
+
+    async def _next_message(self, iterator: Any, timeout: float) -> Any:
+        """Await the next SDK message, bounding it by ``timeout`` ONLY when no hold is open.
+
+        P6/H2/RB2. The per-message liveness bound exists to catch a SILENT Claude. A
+        decision hold (``can_use_tool`` parked on the operator) is NOT silence — it is the
+        SDK correctly waiting on us, and it can legitimately last up to the engine's
+        ~60-min answer-backstop. So:
+
+        * **No hold open** → a single ``asyncio.wait_for(__anext__, timeout)``: a genuinely
+          silent Claude trips it and the caller converts the ``TimeoutError`` to a clean
+          ``driver_error`` (the bound is preserved, not removed).
+        * **A hold is open OR opens during the wait** → each ``timeout`` tick that elapses
+          while ``_hold_depth > 0`` is SWALLOWED and the await re-armed, so the human-wait
+          is never charged against the bound. Re-checking the depth every tick (rather than
+          committing to one unbounded await) means the bound is RESTORED the instant the
+          hold closes: if Claude is still silent after the verdict, the very next tick has
+          ``_hold_depth == 0`` and times out cleanly.
+
+        **Boundary-race guard (independent-review fix 1).** ``asyncio.wait_for`` can take its
+        ``TimeoutError`` branch in the SAME event-loop tick that ``pending`` resolves — both
+        the timeout handle and the awaitable's done-callback are scheduled, and ``wait_for``
+        picks the timeout. ``pending`` then holds a real, ready message (most often the
+        terminal ``ResultMessage``, which lands right as a freshly-closed hold un-suspends the
+        bound). So before cancelling + raising, re-check ``pending``: if it is already done
+        (and not cancelled) we RETURN its result rather than dropping it. Dropping it would
+        cancel a ready ``ResultMessage`` and surface a COMPLETED turn as a spurious
+        ``driver_error`` + a needless engine rebuild (see :meth:`StreamingSession._drive_turn`);
+        it also produces the cosmetic "StopAsyncIteration ... in shielded future" asyncio log
+        noise for the normal end-of-stream case. The guard makes the timeout branch only fire
+        for a genuinely-not-yet-resolved await.
+
+        A single ``ClaudeSDKClient.receive_response()`` drives ``can_use_tool`` from inside
+        the same ``__anext__`` it is producing, on one asyncio task (the substrate
+        contract), so the depth read is race-free and ``__anext__`` is polled (re-awaited)
+        only across timeout boundaries — never duplicated within one.
+        """
+        step = iterator.__anext__()
+        # Wrap once in a Task so the SAME pending awaitable survives across re-armed
+        # wait_for windows (re-calling __anext__ would drop an already-arrived message).
+        pending = asyncio.ensure_future(step)
+        try:
+            while True:
+                try:
+                    return await asyncio.wait_for(asyncio.shield(pending), timeout=timeout)
+                except asyncio.TimeoutError:
+                    # Boundary race (fix 1): the timeout branch can win the tick in which
+                    # ``pending`` already resolved. Don't drop a ready message — return it.
+                    if pending.done() and not pending.cancelled():
+                        return pending.result()
+                    # A hold open during this window means the operator is still deciding —
+                    # don't count it as silence; re-arm. No hold → genuine silence → raise.
+                    if self._hold_depth > 0:
+                        continue
+                    pending.cancel()
+                    raise
+        except BaseException:
+            # On any exit other than a clean return (timeout-raise, cancel, StopAsyncIteration
+            # propagating from the awaitable), make sure the wrapped task isn't orphaned.
+            if not pending.done():
+                pending.cancel()
+            raise
 
     def _events_from(self, msg: Any) -> list[Event]:
         """Fan one SDK message out to all its operator-facing events.

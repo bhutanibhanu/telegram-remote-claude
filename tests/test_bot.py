@@ -185,6 +185,27 @@ async def test_cmd_pwd():
     assert "/some/dir" in upd.message.reply_text.await_args.args[0]
 
 
+async def test_cmd_pwd_path_is_code_wrapped_not_bare():
+    """R6 (auto-linkify): the cwd shown to the operator MUST be wrapped in <code>…</code>
+    and sent with parse_mode="HTML", so Telegram renders it as inert monospace instead of
+    auto-linkifying each "/segment" of the path as a tappable fake command-link
+    (a bare "/some/dir" otherwise becomes tappable "/some" "/dir" "commands"). Guards the
+    one-shot /pwd reply: the path appears ONLY inside <code> tags, never bare.
+    """
+    runner = FakeRunner()
+    runner.cwd = "/some/dir"
+    bot = TelegramClaudeBot(make_config(), runner)
+    upd = make_update(1, "")
+    await bot.cmd_pwd(upd, make_ctx())
+    text = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert "<code>/some/dir</code>" in text
+    assert kwargs.get("parse_mode") == "HTML"
+    # The path must NOT also appear bare (outside the <code> wrapper) — a bare copy would
+    # still linkify. Stripping the one wrapped occurrence leaves no other "/some/dir".
+    assert "/some/dir" not in text.replace("<code>/some/dir</code>", "")
+
+
 def test_authorized():
     bot = TelegramClaudeBot(make_config(allowed=(1, 2)), FakeRunner())
     assert bot._authorized(make_update(1)) is True

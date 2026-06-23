@@ -15,6 +15,7 @@ The decision -> substrate [FLAG] mapping lives in test_engine_types.py.
 """
 
 import asyncio
+import logging
 import os
 
 import claude_agent_sdk as sdk
@@ -39,6 +40,7 @@ from claude_tg.engine import (
     ToolUseEvent,
 )
 from claude_tg.engine.adapter_sdk import SdkSubstrate, normalize
+from claude_tg.util import _redact_sid
 
 # ---------------------------------------------------------------------------
 # A mock substrate: yields scripted events; records lifecycle + decisions.
@@ -122,6 +124,41 @@ async def test_resume_reattaches_and_carries_session_id():
 
     assert ("resume", "S-prev") in sub.calls
     assert out[0].text == "resumed"
+
+
+# A UUID-shaped session id (Claude's real format) so the redaction is unambiguous.
+_REAL_SID = "8f14e45f-ceea-467d-9f0a-1234567890ab"
+
+
+async def test_sb3_start_and_resume_logs_redact_the_session_id(caplog):
+    """SB3/H1: the engine's start/resume DEBUG logs carry a REDACTED tag, never the raw id.
+
+    The raw ``claude_session_id`` is a credential (``--resume <id>`` re-attaches a live
+    session), so it must never appear verbatim in a log line. We drive a real ``Engine``
+    over a fake substrate with a known UUID-shaped id and assert the captured log contains
+    the short ``sid:…`` tag and NOT the raw id.
+    """
+    caplog.set_level(logging.DEBUG)
+    sub = FakeSubstrate(script={"x": []})
+    eng = Engine(sub)
+
+    await eng.resume(_REAL_SID)  # logs "engine resumed sid:…"
+    await eng.start()  # also logs a redacted tag (no id yet on a fresh start)
+
+    assert _REAL_SID not in caplog.text  # the raw resumable id never lands in a log
+    assert "8f14e45f" not in caplog.text  # not even a leading chunk of it
+    assert _redact_sid(_REAL_SID) in caplog.text  # the correlatable short tag IS there
+
+
+def test_sb3_redactor_mutation_probe_raw_id_would_be_caught():
+    """Mutation-probe (highest-value: raw-id-in-log). If a refactor reverted a log site to
+    interpolate the RAW id, this pins that the redactor's output is DISTINCT from the raw id
+    (so the assertion ``raw not in log`` in the test above can actually fail on a regression).
+    A redactor that returned its input unchanged (the mutation) would make this fail.
+    """
+    redacted = _redact_sid(_REAL_SID)
+    assert _REAL_SID not in redacted  # the tag shares no full-id substring with the raw id
+    assert redacted != _REAL_SID
 
 
 async def test_send_passes_configured_timeout_through():
@@ -413,6 +450,267 @@ def test_sdk_send_before_start_raises():
     with pytest.raises(RuntimeError):
         # Consuming the generator triggers the not-started guard.
         asyncio.run(drain(sub.send("go")))
+
+
+# ---------------------------------------------------------------------------
+# P6 H2/RB2: the per-message liveness timeout must NOT count the operator's
+# approval wait. While a decision hold is OPEN (the SDK's can_use_tool is
+# outstanding awaiting the engine's answer-hold), the receive loop must not
+# apply the 120s liveness bound — the answer-backstop bounds the human-wait.
+# A genuinely-silent Claude (no hold open) STILL times out cleanly.
+#
+# These drive the substrate directly with a controllable decision callback +
+# a fake SDK client that invokes can_use_tool from inside the receive stream
+# (faithful to the real SDK, which awaits can_use_tool with no fail_after and
+# delivers no further messages until it returns — see engine/pending.py).
+# No real sleeps: the hold is gated on an asyncio.Event the test sets.
+# ---------------------------------------------------------------------------
+
+
+class _HoldingClient:
+    """Fake SDK client: on the FIRST message it calls ``can_use_tool`` (parking on
+    the engine hold), then — only after the callback returns — yields the result.
+
+    Mirrors the real ``ClaudeSDKClient``: ``can_use_tool`` is the permission control
+    request the SDK awaits before delivering the next message, so while the operator
+    is deciding, ``receive_response()`` yields nothing. The decision callback is the
+    substrate's own ``_make_can_use_tool()`` output (the real wiring).
+
+    ``post_decision_delay`` (seconds) optionally sleeps AFTER the hold resolves and
+    BEFORE the result, simulating Claude going silent once it has its tool verdict —
+    used to prove the liveness bound is restored the instant the hold closes.
+    """
+
+    def __init__(self, can_use_tool, *, tool_name="Write", post_decision_delay=0.0):
+        self._can_use_tool = can_use_tool
+        self._tool_name = tool_name
+        self._post_decision_delay = post_decision_delay
+        self.connected = False
+
+    async def connect(self):
+        self.connected = True
+
+    async def query(self, prompt):
+        pass
+
+    def receive_response(self):
+        async def _gen():
+            # The SDK fires can_use_tool and BLOCKS the stream until it returns
+            # (the operator hold). A bare object() stands in for the SDK's context.
+            ctx = type("Ctx", (), {"tool_use_id": "tu-hold-1"})()
+            await self._can_use_tool(self._tool_name, {"file_path": "/tmp/x"}, ctx)
+            if self._post_decision_delay:
+                await asyncio.sleep(self._post_decision_delay)
+            # After the verdict, Claude finishes the turn.
+            yield sdk.ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="S-hold",
+                total_cost_usd=0.0,
+                result="done",
+            )
+
+        return _gen()
+
+    async def disconnect(self):
+        self.connected = False
+
+
+async def test_liveness_timeout_suspended_while_decision_hold_open():
+    """RED on current code: a hold longer than the liveness timeout fires driver_error.
+
+    GREEN: with the hold open the 120s (here 0.05s) bound is suspended, so the turn
+    waits for the operator and then completes with the ResultEvent — no driver_error.
+    """
+    release = asyncio.Event()
+
+    async def decision_callback(tool_name, tool_input, tool_use_id):
+        # The engine's answer-hold: parks until the operator resolves. Here, gated on
+        # an Event the test sets AFTER a span that exceeds the tiny liveness timeout.
+        await release.wait()
+        return SubstrateDecision(allow=True, updated_input=dict(tool_input))
+
+    sub = SdkSubstrate(decision_callback=decision_callback)
+    sub._client = _HoldingClient(sub._make_can_use_tool())
+
+    async def _run():
+        out = []
+        # Tiny liveness timeout; the hold below outlives it by design.
+        agen = sub.send("go", timeout=0.05)
+        # Let the receive loop reach the hold, then wait WELL past the 0.05s bound
+        # before releasing — on current (buggy) code the wait_for trips here.
+        async def _release_after():
+            await asyncio.sleep(0.2)  # > 0.05 liveness bound; bounded so test is fast
+            release.set()
+
+        releaser = asyncio.create_task(_release_after())
+        async for ev in agen:
+            out.append(ev)
+        await releaser
+        return out
+
+    out = await _run()
+
+    # The turn completed via the operator resolving the hold — NO driver_error.
+    assert all(
+        not (isinstance(e, ErrorEvent) and e.kind_of_error == "driver_error")
+        for e in out
+    ), f"a long hold must not produce a driver_error; got {out}"
+    assert any(isinstance(e, ResultEvent) for e in out), out
+
+
+async def test_liveness_timeout_still_fires_when_silent_and_no_hold_open():
+    """The bound is SUSPENDED, not removed: a silent Claude with no hold still times out.
+
+    Guards Fix 1 against over-reach — if the implementation simply dropped the 120s
+    bound (or never restored it), this genuine-wedge case would hang/pass-through. It
+    must still surface a driver_error.
+    """
+    sub = SdkSubstrate()
+    sub._client = _HangingClient()  # never yields, never opens a hold
+    out = await drain(sub.send("go", timeout=0.05))
+    assert len(out) == 1
+    assert isinstance(out[0], ErrorEvent) and out[0].kind_of_error == "driver_error"
+    assert "timed out" in out[0].message
+
+
+async def test_liveness_bound_restored_after_hold_closes():
+    """The bound returns the instant the hold resolves: a post-verdict silent Claude times out.
+
+    The hold resolves promptly (operator answers), but Claude then goes silent past the
+    liveness bound before the result. The bound — re-applied once the hold closed — must
+    fire a driver_error rather than hanging forever.
+    """
+
+    async def decision_callback(tool_name, tool_input, tool_use_id):
+        return SubstrateDecision(allow=True, updated_input=dict(tool_input))
+
+    sub = SdkSubstrate(decision_callback=decision_callback)
+    # Hold resolves immediately; then a 0.3s silent gap > the 0.05s bound before result.
+    sub._client = _HoldingClient(sub._make_can_use_tool(), post_decision_delay=0.3)
+    out = await drain(sub.send("go", timeout=0.05))
+    assert any(
+        isinstance(e, ErrorEvent) and e.kind_of_error == "driver_error" for e in out
+    ), f"a silent Claude AFTER the hold closes must still time out; got {out}"
+
+
+# ---------------------------------------------------------------------------
+# P6 H2/RB2 fix 1: boundary race. ``asyncio.wait_for`` can take its TimeoutError
+# branch in the SAME event-loop tick that ``pending`` resolves. The timeout
+# branch must NOT then cancel + drop the already-ready message (most often the
+# terminal ResultMessage right as a closed hold un-suspends the bound): it must
+# RETURN it. Otherwise a COMPLETED turn surfaces as a spurious driver_error.
+# ---------------------------------------------------------------------------
+
+
+class _RaceyIterator:
+    """An async iterator whose FIRST ``__anext__`` resolves in the SAME loop tick the
+    ``wait_for(timeout=race_at)`` elapses, then yields a terminal ResultMessage.
+
+    Scheduling ``set_result`` via ``call_later(race_at, …)`` — the SAME delay ``send``
+    passes to ``wait_for`` — lands the future's done-callback and the timeout handle in
+    one tick; ``wait_for`` deterministically observes the timeout (the timer fires first)
+    while ``pending.done()`` is already True. That is exactly the boundary race fix 1
+    guards: the message is ready but the timeout branch ran. A second ``__anext__`` raises
+    StopAsyncIteration to end the stream cleanly.
+    """
+
+    def __init__(self, race_at: float):
+        self._race_at = race_at
+        self._emitted = False
+
+    def __aiter__(self):
+        return self
+
+    def __anext__(self):
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        if self._emitted:
+            fut.set_exception(StopAsyncIteration())
+            return fut
+        self._emitted = True
+        msg = sdk.ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="S-race",
+            total_cost_usd=0.0,
+            result="raced-done",
+        )
+        # Resolve at the SAME delay as the liveness timeout → same-tick boundary race.
+        loop.call_later(self._race_at, fut.set_result, msg)
+        return fut
+
+
+class _RaceyClient:
+    """Fake SDK client whose receive_response() returns a :class:`_RaceyIterator`."""
+
+    def __init__(self, race_at: float):
+        self._race_at = race_at
+
+    async def connect(self):
+        pass
+
+    async def query(self, prompt):
+        pass
+
+    def receive_response(self):
+        return _RaceyIterator(self._race_at)
+
+    async def disconnect(self):
+        pass
+
+
+async def test_timeout_branch_returns_ready_message_not_dropped():
+    """RED on pre-fix code: a message that resolves in the same tick the timeout fires is
+    cancelled + dropped, surfacing the COMPLETED turn as a driver_error. GREEN: the timeout
+    branch re-checks ``pending`` and RETURNS the ready ResultMessage — a clean ResultEvent,
+    no driver_error, no dropped terminal."""
+    sub = SdkSubstrate()
+    # No hold is ever open here (_hold_depth stays 0), so the pre-fix timeout branch would
+    # cancel + raise; the ready message survives only via the fix-1 guard.
+    sub._client = _RaceyClient(race_at=0.02)
+    out = await drain(sub.send("go", timeout=0.02))
+
+    assert all(
+        not (isinstance(e, ErrorEvent) and e.kind_of_error == "driver_error")
+        for e in out
+    ), f"a message ready in the timeout tick must NOT become a driver_error; got {out}"
+    results = [e for e in out if isinstance(e, ResultEvent)]
+    assert results, f"the ready ResultMessage must be returned (not dropped); got {out}"
+    assert results[0].result_text == "raced-done"
+
+
+async def test_timeout_branch_guard_targets_pending_done_directly():
+    """Unit-level proof of the fix-1 guard against the exact race, decoupled from the SDK
+    iterator: a pre-resolved ``pending`` observed in the TimeoutError branch (``_hold_depth
+    == 0``) is RETURNED, not dropped. Forces one same-tick timeout tick and asserts the
+    ready sentinel comes back rather than a TimeoutError propagating."""
+    sub = SdkSubstrate()
+    assert sub._hold_depth == 0
+    loop = asyncio.get_event_loop()
+    sentinel = object()
+
+    class _OneShot:
+        def __init__(self):
+            self._done = False
+
+        def __anext__(self):
+            fut: asyncio.Future = loop.create_future()
+            if self._done:
+                fut.set_exception(StopAsyncIteration())
+            else:
+                self._done = True
+                loop.call_later(0.02, fut.set_result, sentinel)
+            return fut
+
+    got = await sub._next_message(_OneShot(), 0.02)
+    assert got is sentinel, "the fix-1 guard must return the ready message from the timeout branch"
 
 
 # ---------------------------------------------------------------------------

@@ -3,12 +3,14 @@ import os
 import pytest
 
 from claude_tg.config import (
+    DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS,
     Config,
     load_dotenv,
     parse_allowed_roots,
     parse_chat_ids,
     parse_chat_send_interval_seconds,
     parse_max_concurrent_runs,
+    parse_stream_message_timeout_seconds,
 )
 
 
@@ -26,6 +28,9 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("MAX_CONCURRENT_RUNS", raising=False)
     # RENDER_CHAT_SEND_INTERVAL_SECONDS (P5/T8) likewise has no TELEGRAM_/CLAUDE_ prefix.
     monkeypatch.delenv("RENDER_CHAT_SEND_INTERVAL_SECONDS", raising=False)
+    # STREAM_MESSAGE_TIMEOUT_SECONDS (P6/H2/RB2) has no TELEGRAM_/CLAUDE_ prefix either —
+    # clear it so a host/CI value can't leak into the liveness-bound parse matrix below.
+    monkeypatch.delenv("STREAM_MESSAGE_TIMEOUT_SECONDS", raising=False)
 
 
 def test_parse_chat_ids():
@@ -55,8 +60,66 @@ def test_defaults(monkeypatch):
     assert cfg.allowed_chat_ids == frozenset({42, 43})
     assert cfg.claude_bin == "claude"
     assert cfg.model is None
-    assert cfg.skip_permissions is True
+    # SB5 / C1: the operator approval gate is ON by default — an unset
+    # CLAUDE_SKIP_PERMISSIONS must NOT silently bypass the permission prompt.
+    # (Was `is True` pre-C1, which shipped a fail-open default; the secure
+    # default is False = gate.) See test_skip_permissions_* below.
+    assert cfg.skip_permissions is False
     assert cfg.timeout_seconds == 600
+
+
+# --- SB5 / C1: the permission bypass is OFF by default, opt-in only -------------
+
+
+def test_config_dataclass_default_skip_permissions_is_false():
+    """SB5/C1: a bare ``Config(...)`` (no env) GATES — the dataclass default is the
+    safe state. A regression flipping the field default back to ``True`` (the pre-C1
+    fail-open default that ran Claude's tools with no approval prompt on a fresh
+    install) trips this. Construct with only the required fields so the assertion is
+    purely about the *default* value of ``skip_permissions``.
+    """
+    from pathlib import Path
+
+    cfg = Config(
+        bot_token="t",
+        allowed_chat_ids=frozenset({1}),
+        workdir=Path("/tmp"),
+    )
+    assert cfg.skip_permissions is False  # the unset/default config gates
+
+
+def test_skip_permissions_unset_defaults_to_gate(monkeypatch):
+    """SB5/C1: ``CLAUDE_SKIP_PERMISSIONS`` unset → False (gate). The fresh-install
+    posture must be the SAFE one. RED on the pre-C1 code where ``from_env`` parsed
+    this with ``_env_bool(..., True)``.
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.delenv("CLAUDE_SKIP_PERMISSIONS", raising=False)
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.skip_permissions is False
+
+
+def test_skip_permissions_explicit_true_opts_in(monkeypatch):
+    """SB5/C1: the bypass is reachable, but ONLY by an explicit opt-in
+    (``CLAUDE_SKIP_PERMISSIONS=true``). Confirms the secure default did not break the
+    documented escape hatch.
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_SKIP_PERMISSIONS", "true")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.skip_permissions is True
+
+
+def test_skip_permissions_explicit_false_gates(monkeypatch):
+    """SB5/C1: an explicit ``=false`` also gates (the value is honored, not just the
+    unset case)."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_SKIP_PERMISSIONS", "false")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.skip_permissions is False
 
 
 def test_overrides(monkeypatch, tmp_path):
@@ -254,5 +317,64 @@ def test_config_bad_chat_send_interval_fails_loud(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
     monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
     monkeypatch.setenv("RENDER_CHAT_SEND_INTERVAL_SECONDS", "nope")
+    with pytest.raises(ValueError):
+        Config.from_env(dotenv_path=None)
+
+
+# --- P6/H2/RB2: STREAM_MESSAGE_TIMEOUT_SECONDS (per-message liveness bound) ----------
+
+
+def test_parse_stream_message_timeout_unset_and_empty_default():
+    # Unset / empty / whitespace → the generous 300 s default (no new REQUIRED env — main
+    # stays runnable). The default is deliberately generous so an approved multi-minute tool
+    # (build/test/install) that emits no intermediate message does not trip a driver_error.
+    assert parse_stream_message_timeout_seconds(None) == DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS
+    assert parse_stream_message_timeout_seconds(None) == 300.0
+    assert parse_stream_message_timeout_seconds("") == 300.0
+    assert parse_stream_message_timeout_seconds("   ") == 300.0
+
+
+def test_parse_stream_message_timeout_accepts_positive_floats():
+    # A positive number passes through (a small value is valid — used to bound a silent gap
+    # tightly in tests / a deployment that wants a snappier wedge-detect).
+    assert parse_stream_message_timeout_seconds("600") == 600.0
+    assert parse_stream_message_timeout_seconds("0.05") == 0.05
+    assert parse_stream_message_timeout_seconds(" 120 ") == 120.0  # whitespace tolerated
+
+
+def test_parse_stream_message_timeout_zero_negative_or_non_numeric_raise():
+    # Unlike the send interval (where 0 validly disables spacing), a 0/negative liveness
+    # bound would time out EVERY message instantly — nothing could ever complete — so it is
+    # a configuration error and fails loud at startup (a typo must not silently wedge turns).
+    with pytest.raises(ValueError):
+        parse_stream_message_timeout_seconds("0")
+    with pytest.raises(ValueError):
+        parse_stream_message_timeout_seconds("-1")
+    with pytest.raises(ValueError):
+        parse_stream_message_timeout_seconds("x")
+
+
+def test_config_default_stream_message_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.stream_message_timeout_seconds == 300.0  # unset → generous default
+
+
+def test_config_stream_message_timeout_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("STREAM_MESSAGE_TIMEOUT_SECONDS", "600")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.stream_message_timeout_seconds == 600.0
+
+
+def test_config_bad_stream_message_timeout_fails_loud(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("STREAM_MESSAGE_TIMEOUT_SECONDS", "0")
     with pytest.raises(ValueError):
         Config.from_env(dotenv_path=None)

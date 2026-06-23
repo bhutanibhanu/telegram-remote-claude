@@ -1,6 +1,6 @@
 import pytest
 
-from claude_tg.util import split_message
+from claude_tg.util import _redact_sid, _redact_sid_in_text, split_message
 
 
 def test_short_text_single_chunk():
@@ -55,4 +55,54 @@ def test_astral_char_wider_than_tiny_limit_makes_progress():
     assert "".join(chunks) == text  # lossless
     assert all(c for c in chunks)  # no empty chunks
     assert len(chunks) == 3  # one emoji per chunk
+
+
+# ---------------------------------------------------------------------------
+# _redact_sid (P6/R3 / H1 / SB3): session ids must never appear raw in logs.
+# A correlated short hash keeps logs debuggable without exposing the *resumable*
+# id (the raw id is a credential — it re-attaches to a live Claude session).
+# ---------------------------------------------------------------------------
+
+# A representative Claude session id (the SDK/CLI emit UUID-shaped ids).
+_SID = "8f14e45f-ceea-467d-9f0a-1234567890ab"
+
+
+def test_redact_sid_omits_the_raw_id():
+    out = _redact_sid(_SID)
+    assert _SID not in out  # the whole id never appears
+    # No long contiguous run of the raw id leaks either (defensive against a partial dump).
+    assert "8f14e45f" not in out
+
+
+def test_redact_sid_is_short_stable_and_correlated():
+    a = _redact_sid(_SID)
+    b = _redact_sid(_SID)
+    assert a == b  # stable: the SAME id always maps to the SAME tag (correlatable in logs)
+    assert a.startswith("sid:")  # recognizable prefix
+    assert len(a) <= 16  # short — a tag, not a payload
+    # Different ids → different tags (so two sessions don't collide in the log).
+    assert _redact_sid("00000000-0000-0000-0000-000000000000") != a
+
+
+def test_redact_sid_handles_none_and_empty_without_leaking():
+    # No id yet (engine hadn't reported one) → a fixed sentinel, never "None"-as-a-secret.
+    assert _redact_sid(None) == "sid:none"
+    assert _redact_sid("") == "sid:none"
+
+
+def test_redact_sid_in_text_scrubs_embedded_uuid_keeps_rest():
+    # A raw error body that EMBEDS a session id (e.g. CLI echoing --resume <uuid>): the
+    # scrubber replaces the id with its tag and leaves the surrounding text intact (useful).
+    body = f"resume failed: no conversation found for --resume {_SID} (exit 1)"
+    out = _redact_sid_in_text(body)
+    assert _SID not in out  # the embedded resumable id is gone
+    assert _redact_sid(_SID) in out  # replaced by its correlatable tag
+    assert "no conversation found" in out  # the rest of the body is preserved
+    assert "exit 1" in out
+
+
+def test_redact_sid_in_text_passes_through_non_uuid_and_empty():
+    assert _redact_sid_in_text("plain error, no ids here") == "plain error, no ids here"
+    assert _redact_sid_in_text(None) == ""
+    assert _redact_sid_in_text("") == ""
 

@@ -36,6 +36,7 @@ from claude_tg.engine.types import (
     ToolUseEvent,
 )
 from claude_tg.render import (
+    BODY_FREE_ERROR_LINE,
     CALLBACK_LIMIT,
     KIND_PERMISSION,
     ChatSendGate,
@@ -46,6 +47,7 @@ from claude_tg.render import (
     ask_question_body,
     ask_question_keyboard,
     coalesce_stream,
+    code_path,
     decode_callback,
     encode_callback,
     free_text_prompt,
@@ -192,12 +194,26 @@ def test_permission_keyboard_requires_tool_use_id():
 
 
 def test_error_renders_verbatim_no_keyboard():
+    # P6/R3 (SB3/H1): a tool_error wraps RAW tool output, so it now renders BODY-FREE — the
+    # raw "boom" is NOT in the chat text; a safe summary (kind + fixed line) is. (The raw
+    # body still reaches the local debug log via the driver; see test_stream_session.)
     err = ErrorEvent(kind_of_error="tool_error", message="boom")
     action = render_event(err)
     assert action.op == "new"
     assert action.verbatim is True
-    assert "boom" in action.text
+    assert "boom" not in action.text  # body-free: the raw body is gone
+    assert "tool_error" in action.text  # but the error KIND is still shown
+    assert BODY_FREE_ERROR_LINE in action.text
     assert action.reply_markup is None
+
+
+def test_driver_error_stays_readable():
+    # P6/R3 classification: a driver_error is BOT-AUTHORED (a timeout / transport label),
+    # not raw external output — so it stays readable (good UX, no secret risk).
+    err = ErrorEvent(kind_of_error="driver_error", message="send timed out after 120s")
+    action = render_event(err)
+    assert "send timed out after 120s" in action.text  # bot-authored detail kept
+    assert BODY_FREE_ERROR_LINE not in action.text
 
 
 def test_result_with_text_renders_verbatim_final_answer():
@@ -689,6 +705,34 @@ def test_free_text_prompt_is_pure_and_body_free():
 
 
 # ============================================================================
+# code_path — path wrapped in <code> for the auto-linkify fix (R6)
+# ============================================================================
+
+
+def test_code_path_wraps_in_code_so_telegram_does_not_linkify():
+    # R6: an ordinary path is wrapped verbatim in <code>…</code> so Telegram renders it as
+    # inert monospace instead of auto-linkifying each "/segment" as a fake command-link.
+    assert code_path("/tmp/p5verify/a") == "<code>/tmp/p5verify/a</code>"
+
+
+def test_code_path_html_escapes_metacharacters_exactly_once():
+    # A path containing HTML metacharacters (& < >) is escaped EXACTLY once so it can't
+    # break the HTML message or inject a tag — and not double-escaped (no &amp;amp;).
+    assert code_path("/a&b/<x>/c") == "<code>/a&amp;b/&lt;x&gt;/c</code>"
+    # The "&" became "&amp;" (single escape), not "&amp;amp;".
+    assert "&amp;amp;" not in code_path("/a&b")
+
+
+def test_code_path_is_pure_and_accepts_non_str():
+    # Pure / deterministic; tolerates a non-str (e.g. a Path) via str() so callers need not
+    # pre-stringify. (The reply must still be sent with parse_mode="HTML".)
+    from pathlib import Path
+
+    assert code_path("/x") == code_path("/x")
+    assert code_path(Path("/x/y")) == "<code>/x/y</code>"
+
+
+# ============================================================================
 # Per-project status labels for /projects (P5 / ADR-005 D7) — pure label map
 # ============================================================================
 
@@ -792,7 +836,10 @@ def test_verbatim_event_flushes_immediately_and_after_status():
     result = coalescer.offer(ErrorEvent(kind_of_error="turn_error", message="bad"))
     ops = [(a.op, a.text) for a in result.actions]
     assert ops[0][0] == "edit_status" and ops[0][1] == "status2"  # pending flushed
-    assert ops[1][0] == "new" and "bad" in ops[1][1]  # verbatim, immediate
+    # P6/R3: a turn_error renders body-free now (raw "bad" is gone) — the ordering/flush
+    # behavior under test is unchanged; assert the error block by its KIND, not the body.
+    assert ops[1][0] == "new" and "turn_error" in ops[1][1]  # verbatim, immediate
+    assert "bad" not in ops[1][1]
 
 
 def test_verbatim_ask_and_plan_flush_immediately():
@@ -972,7 +1019,10 @@ def test_done_footer_stays_plain_text_no_html():
 
 def test_error_block_stays_plain_text():
     # Error blocks are bot scaffolding, shown exactly -> plain text (no HTML conversion).
-    action = render_event(ErrorEvent(kind_of_error="tool_error", message="boom <x>"))
+    # Use a driver_error (bot-authored, rendered readably) so a literal "<x>" is present to
+    # prove no HTML escaping. A tool_error would render body-free (covered above) — the
+    # plain-text/no-escape property under test is the same for both.
+    action = render_event(ErrorEvent(kind_of_error="driver_error", message="boom <x>"))
     assert action.parse_mode is None
     assert action.plain_chunks == ()
     assert "boom <x>" in action.text  # verbatim, not escaped
