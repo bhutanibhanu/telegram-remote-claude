@@ -1,7 +1,7 @@
--r requirements.txt
-pytest>=8
-pytest-asyncio>=0.23
-# Lint + type-check for CI (added in P1/T3). Pinned to a compatible floor with a
-# major upper bound so CI is reproducible but still gets patch/minor fixes.
-ruff>=0.15,<1.0
-mypy>=1.11,<2.0
+# Dev/CI dependencies — SINGLE SOURCE OF TRUTH is pyproject.toml ([project.optional-dependencies] dev).
+#
+# As of P7/T1 this installs THIS project plus its `dev` extra (pytest, pytest-asyncio,
+# ruff, mypy) in editable mode. `pip install -r requirements-dev.txt` stays the CI /
+# local gate flow and is equivalent to `pip install -e ".[dev]"`. Edit the pins in
+# pyproject.toml, not here.
+-e .[dev]
