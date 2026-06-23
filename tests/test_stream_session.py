@@ -188,13 +188,27 @@ def prime_pending(
 def active_policy(session: StreamingSession, chat_id: int = 1) -> PermissionPolicy:
     """The ACTIVE project's :class:`PermissionPolicy` (P4: policy moved chat→project).
 
-    The live-turn state (pending ask/plan, free-text marker, status line) still lives on
-    ``session._chat(chat_id)``; the engine + cwd + policy moved to the per-project
-    ``_ProjectRuntime``. This resolves the active project (auto-creating ``default`` like
-    a real turn) and returns its policy — the object ``/yolo`` and ``/reset`` mutate."""
+    P5/T4: the live-turn state (status line + free-text-capture marker + status enum) ALSO
+    moved off the chat down to the per-project ``_ProjectRuntime`` (ADR-005 D7) — see
+    :func:`active_rt`. This resolves the active project (auto-creating ``default`` like a
+    real turn) and returns its policy — the object ``/yolo`` and ``/reset`` mutate."""
     _name, rt = session._active_runtime(chat_id, create_default=True)
     assert rt is not None
     return rt.policy
+
+
+def active_rt(session: StreamingSession, chat_id: int = 1):
+    """The ACTIVE project's ``_ProjectRuntime`` (P5/T4: live-turn state lives HERE now).
+
+    T4 relocated the status line (``status_message_id``/``status_text``), the free-text
+    capture marker (``awaiting_text_*``), and the per-project ``status`` enum from the chat
+    down to the per-project runtime (ADR-005 D7). Tests that used to read
+    ``session._chat(chat_id).<field>`` now read ``active_rt(session, chat_id).<field>``.
+    Auto-creates ``default`` like a real turn so a single-project test reads naturally.
+    """
+    _name, rt = session._active_runtime(chat_id, create_default=True)
+    assert rt is not None
+    return rt
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +340,7 @@ async def test_plan_reject_then_free_text_resolves_with_feedback():
     outcome = session.resolve_callback(1, encode_callback("p", "pid", plan_action="r"))
     assert outcome.handled is True and outcome.expects_text is True
     assert engine.resolve_calls == []
-    assert session._chat(1).awaiting_text_for == "pid"
+    assert active_rt(session).awaiting_text_for == "pid"  # marker on the owning runtime (D7)
 
     # The NEXT message is captured as the reject feedback (NOT a new turn).
     rec = Recorder()
@@ -336,7 +350,7 @@ async def test_plan_reject_then_free_text_resolves_with_feedback():
     ]
     # No new turn was started (no sends), and capture is cleared.
     assert rec.sends == []
-    assert session._chat(1).awaiting_text_for is None
+    assert active_rt(session).awaiting_text_for is None
 
 
 async def test_ask_other_then_free_text_resolves_with_answer():
@@ -502,17 +516,17 @@ async def test_identical_status_line_is_not_resent():
     errors, and the old fallback re-sent a duplicate message (the status-line spam)."""
     engine = FakeEngine([])
     session = make_session(engine)
-    state = session._chat(1)
+    rt = active_rt(session)  # T4: the status line lives on the per-project runtime (D7)
     rec = Recorder()
     thinking = RenderAction(op="edit_status", chunks=("💭 Claude is thinking…",))
-    await session._perform(state, thinking, send=rec.send, edit=rec.edit)  # first → one send
-    await session._perform(state, thinking, send=rec.send, edit=rec.edit)  # identical → skip
-    await session._perform(state, thinking, send=rec.send, edit=rec.edit)  # identical → skip
+    await session._perform(rt, thinking, send=rec.send, edit=rec.edit)  # first → one send
+    await session._perform(rt, thinking, send=rec.send, edit=rec.edit)  # identical → skip
+    await session._perform(rt, thinking, send=rec.send, edit=rec.edit)  # identical → skip
     assert len(rec.sends) == 1  # ONE status message, not three
     assert rec.edits == []  # no edit attempted for identical text
     # A CHANGED line edits the existing message in place (no new message).
     await session._perform(
-        state, RenderAction(op="edit_status", chunks=("⏳ rate limited",)), send=rec.send, edit=rec.edit
+        rt, RenderAction(op="edit_status", chunks=("⏳ rate limited",)), send=rec.send, edit=rec.edit
     )
     assert len(rec.sends) == 1 and len(rec.edits) == 1
 
@@ -955,8 +969,8 @@ async def test_status_message_deleted_at_turn_end():
     )
     # A status line was created, then deleted at the end of the turn.
     assert rec.deletes, "the transient status line must be deleted at turn end"
-    assert session._chat(1).status_message_id is None
-    assert session._chat(1).status_text is None
+    assert active_rt(session).status_message_id is None  # T4: line on the runtime (D7)
+    assert active_rt(session).status_text is None
 
 
 async def test_no_status_message_means_no_delete():
@@ -1011,7 +1025,7 @@ async def test_status_delete_failure_does_not_kill_turn():
         timeout=2.0,
     )
     assert any("done" in s["text"] for s in rec.sends)  # turn completed cleanly
-    assert session._chat(1).status_message_id is None  # still reset
+    assert active_rt(session).status_message_id is None  # still reset (on the runtime, D7)
 
 
 async def test_keyboard_attaches_to_first_non_empty_chunk():
@@ -1022,11 +1036,11 @@ async def test_keyboard_attaches_to_first_non_empty_chunk():
 
     engine = FakeEngine([])
     session = make_session(engine)
-    state = session._chat(1)
+    rt = active_rt(session)  # _perform folds a status edit into THIS runtime's line (D7)
     rec = Recorder()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Yes", callback_data="x")]])
     action = RenderAction(op="new", chunks=("   ", "real content"), reply_markup=kb)
-    await session._perform(state, action, send=rec.send, edit=rec.edit)
+    await session._perform(rt, action, send=rec.send, edit=rec.edit)
     # Only the non-empty chunk is sent, and it carries the keyboard.
     assert [s["text"] for s in rec.sends] == ["real content"]
     assert rec.sends[0]["reply_markup"] is kb
@@ -2364,7 +2378,9 @@ async def test_free_text_routes_to_owning_project_not_active(tmp_path):
 
     out = session.resolve_callback(1, encode_callback("o", "alpha-ask", question_index=0))
     assert out.expects_text is True
-    assert session._chat(1).awaiting_text_for == "alpha-ask"
+    # T4/D7: the free-text marker is armed on the OWNING project's runtime (alpha), even
+    # though beta is the active/foreground project — not a chat-global slot.
+    assert session._chat(1).runtimes["alpha"].awaiting_text_for == "alpha-ask"
 
     rec = Recorder()
     await session.handle_message(1, "Charlie", send=rec.send, edit=rec.edit)
@@ -2471,3 +2487,277 @@ async def test_turn_end_clears_only_that_projects_pending(tmp_path):
     # Alpha's unanswered ask was dropped at turn-end (no leak); beta's plan survives.
     assert "alpha-ask" not in session._chat(1).pending_index
     assert "b-plan" in session._chat(1).pending_index
+
+
+# ===========================================================================
+# P5 / ADR-005 D7 (T4) — live-turn state lifted from _ChatState to _ProjectRuntime
+# + per-project run status. Each running project owns its OWN status line + free-text
+# marker + status enum, so two projects never clash; the lock-free resolve still finds
+# the held event on the owning project's runtime (via the pending index → project).
+# ===========================================================================
+
+
+async def test_status_transitions_idle_running_awaiting_answer_running_idle():
+    # The per-project status enum walks idle -> running (turn start) -> awaiting_answer
+    # (an ask hold) -> running (resolve unblocks the held turn) -> idle (turn end), all on
+    # the project's OWN _ProjectRuntime (ADR-005 D7).
+    ask = AskEvent(
+        questions=[{"question": "Q", "options": [{"label": "A"}, {"label": "B"}]}],
+        tool_use_id="tid-ask",
+    )
+    engine = FakeEngine(
+        [ask, HOLD, ResultEvent(session_id="s", is_error=False, subtype="success", result_text="done")]
+    )
+    session = make_session(engine)
+    # No runtime yet → idle (the /projects default).
+    assert session.project_status(1, "default") == "idle"
+
+    rec = Recorder()
+    turn = asyncio.create_task(session.handle_message(1, "go", send=rec.send, edit=rec.edit))
+    # Let the turn run up to the HOLD: it injected the ask, so the active project's status
+    # is now awaiting_answer (parked awaiting the operator).
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert active_rt(session).status == "awaiting_answer"
+    assert session.project_status(1, "default") == "awaiting_answer"
+
+    # Resolving the ask flips the status back to running (the held turn resumes); the turn
+    # has not yet advanced (resolve_callback is synchronous), so we observe running here.
+    out = session.resolve_callback(1, encode_callback("a", "tid-ask", question_index=0, option_index=0))
+    assert out.handled is True
+    assert active_rt(session).status == "running"
+
+    # The turn now drains to completion → idle.
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert active_rt(session).status == "idle"
+    assert session.project_status(1, "default") == "idle"
+
+
+async def test_status_awaiting_approval_for_permission_hold():
+    # A held PermissionEvent flips the project's status to awaiting_approval; resolving it
+    # (allow once) returns it to running, then idle at turn end.
+    perm = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(command=ls)", tool_use_id="tid-perm"
+    )
+    engine = FakeEngine(
+        [perm, HOLD, ResultEvent(session_id="s", is_error=False, subtype="success")]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    turn = asyncio.create_task(session.handle_message(1, "go", send=rec.send, edit=rec.edit))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert active_rt(session).status == "awaiting_approval"
+
+    out = session.resolve_callback(1, encode_callback("m", "tid-perm", payload="o"))
+    assert out.handled is True
+    assert active_rt(session).status == "running"
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert active_rt(session).status == "idle"
+
+
+async def test_status_awaiting_plan_for_plan_hold():
+    # A held PlanEvent flips the project's status to awaiting_plan; approving it returns it
+    # to running, then idle at turn end.
+    plan = PlanEvent(plan="the plan", tool_use_id="tid-plan")
+    engine = FakeEngine(
+        [plan, HOLD, ResultEvent(session_id="s", is_error=False, subtype="success")]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    turn = asyncio.create_task(session.handle_message(1, "go", send=rec.send, edit=rec.edit))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert active_rt(session).status == "awaiting_plan"
+
+    out = session.resolve_callback(1, encode_callback("p", "tid-plan", plan_action="a"))
+    assert out.handled is True
+    assert active_rt(session).status == "running"
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert active_rt(session).status == "idle"
+
+
+async def test_multi_question_intermediate_tap_keeps_awaiting_answer():
+    # A multi-question ask stays awaiting_answer until EVERY question is answered — an
+    # intermediate tap (1 of 2) does not flip the project back to running.
+    ask = AskEvent(
+        questions=[
+            {"question": "Q1", "options": [{"label": "A1"}, {"label": "B1"}]},
+            {"question": "Q2", "options": [{"label": "A2"}, {"label": "B2"}]},
+        ],
+        tool_use_id="multi-st",
+    )
+    engine = FakeEngine(
+        [ask, HOLD, ResultEvent(session_id="s", is_error=False, subtype="success")]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    turn = asyncio.create_task(session.handle_message(1, "go", send=rec.send, edit=rec.edit))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert active_rt(session).status == "awaiting_answer"
+
+    # First tap (1 of 2): accepted but NOT resolved → still awaiting_answer.
+    session.resolve_callback(1, encode_callback("a", "multi-st", question_index=0, option_index=0))
+    assert active_rt(session).status == "awaiting_answer"
+
+    # Final tap (2 of 2): resolves the whole ask → running, then idle at turn end.
+    session.resolve_callback(1, encode_callback("a", "multi-st", question_index=1, option_index=1))
+    assert active_rt(session).status == "running"
+    await asyncio.wait_for(turn, timeout=2.0)
+    assert active_rt(session).status == "idle"
+
+
+async def test_two_projects_status_lines_are_independent(tmp_path):
+    # ADR-005 D7: each project's status line (id/text) lives on its OWN _ProjectRuntime, so
+    # a status edit for one project NEVER touches the other's line. (Driven directly via
+    # _perform against each runtime — under T4 the chat still allows one turn at a time;
+    # T5 adds the per-project lock so two real turns overlap.)
+    session, _store, _eng_a, _eng_b = await make_two_project_session(tmp_path, active="alpha")
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rt_beta = session._chat(1).runtimes["beta"]
+    rec = Recorder()
+
+    # Alpha gets a status line.
+    await session._perform(
+        rt_alpha, RenderAction(op="edit_status", chunks=("💭 alpha thinking…",)),
+        send=rec.send, edit=rec.edit,
+    )
+    # Beta gets its OWN, different status line.
+    await session._perform(
+        rt_beta, RenderAction(op="edit_status", chunks=("⏳ beta rate limited",)),
+        send=rec.send, edit=rec.edit,
+    )
+    # Two distinct message ids — one per project — and the texts don't bleed across.
+    assert rt_alpha.status_message_id is not None
+    assert rt_beta.status_message_id is not None
+    assert rt_alpha.status_message_id != rt_beta.status_message_id
+    assert rt_alpha.status_text == "💭 alpha thinking…"
+    assert rt_beta.status_text == "⏳ beta rate limited"
+
+    # Editing alpha's line again does not disturb beta's text/id.
+    beta_mid, beta_text = rt_beta.status_message_id, rt_beta.status_text
+    await session._perform(
+        rt_alpha, RenderAction(op="edit_status", chunks=("ℹ️ alpha update",)),
+        send=rec.send, edit=rec.edit,
+    )
+    assert rt_alpha.status_text == "ℹ️ alpha update"
+    assert rt_beta.status_message_id == beta_mid and rt_beta.status_text == beta_text
+
+
+async def test_two_projects_pending_holds_resolve_independently_via_runtimes(tmp_path):
+    # Two projects each hold a pending ask (the accumulator rides each id's index entry, the
+    # owning runtime carries each status). Resolving alpha's ask resolves ONLY alpha's engine
+    # and flips ONLY alpha's status; beta's held ask + awaiting_answer status are untouched —
+    # the lock-free resolve finds each held event on the OWNING project's runtime (D3/D7).
+    session, _store, eng_alpha, eng_beta = await make_two_project_session(tmp_path, active="alpha")
+    ask_a = AskEvent(
+        questions=[{"question": "QA", "options": [{"label": "A"}]}],
+        tool_use_id="a-ask", session_id="alpha-sid",
+    )
+    ask_b = AskEvent(
+        questions=[{"question": "QB", "options": [{"label": "B"}]}],
+        tool_use_id="b-ask", session_id="beta-sid",
+    )
+    prime_pending(session, ask_a, project="alpha")
+    prime_pending(session, ask_b, project="beta")
+    # Simulate each turn having parked awaiting its answer (what _drive_turn would set).
+    session._chat(1).runtimes["alpha"].status = "awaiting_answer"
+    session._chat(1).runtimes["beta"].status = "awaiting_answer"
+
+    # Resolve ALPHA's single-question ask → alpha's engine only; alpha back to running.
+    out = session.resolve_callback(1, encode_callback("a", "a-ask", question_index=0, option_index=0))
+    assert out.handled is True
+    assert eng_alpha.resolve_calls == [("a-ask", QuestionAnswer(answers={"QA": "A"}))]
+    assert eng_beta.resolve_calls == []  # beta's concurrent hold untouched
+    assert session._chat(1).runtimes["alpha"].status == "running"
+    # Beta's held ask + its awaiting_answer status both survive (a separate run).
+    assert session._chat(1).runtimes["beta"].status == "awaiting_answer"
+    assert "b-ask" in session._chat(1).pending_index
+
+
+async def test_free_text_marker_is_per_project_not_a_chat_slot(tmp_path):
+    # ADR-005 D7: arming "Other" on a project sets the free-text marker on THAT project's
+    # runtime — not a chat-global slot and not on a different project's runtime.
+    session, _store, _eng_a, _eng_b = await make_two_project_session(tmp_path, active="alpha")
+    ask = AskEvent(
+        questions=[{"question": "Name?", "options": [{"label": "A"}]}],
+        tool_use_id="a-ask", session_id="alpha-sid",
+    )
+    prime_pending(session, ask, project="alpha")
+
+    out = session.resolve_callback(1, encode_callback("o", "a-ask", question_index=0))
+    assert out.expects_text is True
+    # Marker armed on ALPHA's runtime…
+    assert session._chat(1).runtimes["alpha"].awaiting_text_for == "a-ask"
+    assert session._chat(1).runtimes["alpha"].awaiting_text_mode == "ask_other"
+    # …and NOT on beta's runtime, and the chat itself has no such attribute (it moved, D7).
+    assert session._chat(1).runtimes["beta"].awaiting_text_for is None
+    assert not hasattr(session._chat(1), "awaiting_text_for")
+
+
+async def test_reset_clears_only_active_projects_live_turn_state(tmp_path):
+    # ADR-005 D7: /reset clears the ACTIVE project's runtime live-turn state (status line +
+    # free-text marker + status→idle) and its pending entries, leaving a CONCURRENT project's
+    # runtime (status line + held request + status) untouched.
+    session, _store, _eng_a, _eng_b = await make_two_project_session(tmp_path, active="alpha")
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rt_beta = session._chat(1).runtimes["beta"]
+    # Active (alpha) has live-turn state + a held ask; beta is a separate concurrent run.
+    rt_alpha.status_message_id = 11
+    rt_alpha.status_text = "💭 alpha thinking…"
+    rt_alpha.status = "awaiting_answer"
+    rt_alpha.awaiting_text_for = "a-ask"
+    rt_alpha.awaiting_text_mode = "ask_other"
+    prime_pending(
+        session,
+        AskEvent(questions=[{"question": "Q", "options": [{"label": "A"}]}],
+                 tool_use_id="a-ask", session_id="alpha-sid"),
+        project="alpha",
+    )
+    rt_beta.status_message_id = 22
+    rt_beta.status_text = "⏳ beta working…"
+    rt_beta.status = "running"
+    prime_pending(
+        session,
+        PlanEvent(plan="beta plan", tool_use_id="b-plan", session_id="beta-sid"),
+        project="beta",
+    )
+
+    session.reset(1)  # active == alpha
+
+    # Alpha's live-turn state is wiped; status back to idle; its pending entry dropped.
+    assert rt_alpha.status_message_id is None
+    assert rt_alpha.status_text is None
+    assert rt_alpha.status == "idle"
+    assert rt_alpha.awaiting_text_for is None
+    assert "a-ask" not in session._chat(1).pending_index
+    # Beta (a concurrent run) is fully untouched by the active project's reset.
+    assert rt_beta.status_message_id == 22
+    assert rt_beta.status_text == "⏳ beta working…"
+    assert rt_beta.status == "running"
+    assert "b-plan" in session._chat(1).pending_index
+
+
+async def test_project_status_no_runtime_is_idle(tmp_path):
+    # ADR-005 D7: a project with NO in-memory runtime (e.g. just after restart, never run a
+    # turn this process) reads as idle — read-only, creates nothing (RB1).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", "/work/api", make_active=True)
+    session = make_session(FakeEngine([]), store=store)
+    assert session.project_status(1, "api") == "idle"  # no runtime yet
+    assert session.project_status(1, "nonexistent") == "idle"  # unknown name
+    assert session.project_status(999, "api") == "idle"  # unknown chat
+    # Read-only: still no runtime created for "api".
+    assert "api" not in session._chat(1).runtimes
+
+
+async def test_project_status_reader_is_case_insensitive(tmp_path):
+    # The /projects status reader matches the runtime key case-insensitively (mirroring the
+    # store's name match), so /projects and /switch WORK agree on a project's status.
+    session, _store, _eng_a, _eng_b = await make_two_project_session(tmp_path, active="alpha")
+    session._chat(1).runtimes["alpha"].status = "running"
+    assert session.project_status(1, "ALPHA") == "running"
+    assert session.project_status(1, "Alpha") == "running"

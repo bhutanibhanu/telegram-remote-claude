@@ -83,6 +83,7 @@ from .permissions import PermissionPolicy
 from .render import (
     Callback,
     Coalescer,
+    ProjectStatus,
     RenderAction,
     answers_from_ask,
     ask_question_body,
@@ -173,7 +174,7 @@ def _default_engine_factory(
 
 @dataclass
 class _ProjectRuntime:
-    """In-memory runtime for ONE project (engine + cwd + its permission policy).
+    """In-memory runtime for ONE project (engine + cwd + policy + its live-turn state).
 
     Per ADR-004: the durable identity (name, cwd, ``session_id``, timestamps) lives in
     the persisted registry; **this** is the transient runtime — created lazily in memory
@@ -184,6 +185,15 @@ class _ProjectRuntime:
     (fail-closed: no grants, yolo off) — the SAME object handed to that project's engine
     and mutated by the session (``/yolo`` via :meth:`set_yolo`, dropped by ``policy.clear()``
     on ``/reset``).
+
+    **P5 / ADR-005 D7 — live-turn state lives HERE (one level down from the chat).** P4
+    held the status line + free-text-capture marker on :class:`_ChatState` *because* there
+    was one turn per chat. With N concurrent runs each project's turn owns its OWN status
+    line (``status_message_id``/``status_text``) and its OWN free-text-capture marker
+    (``awaiting_text_*``), so a status edit / pending answer for one project never touches
+    another's. A per-project :data:`~claude_tg.render.ProjectStatus` (``status``) feeds the
+    ``/projects`` status column (T7). T4 relocates the fields + adds ``status``; behavior
+    stays single-active-run until T5 adds the per-project lock + concurrent runs.
     """
 
     cwd: str
@@ -199,10 +209,58 @@ class _ProjectRuntime:
     # session erroring is never mistaken for a resume failure. Reset on the in-memory
     # runtime only (never persisted).
     resumed_unverified: bool = False
+    # P5 / ADR-005 D7: THIS project's status line for in-place coalesced edits (created on
+    # the first edit of its turn). Each project's turn has its OWN line so two concurrent
+    # turns' status updates never clash (moved off _ChatState).
+    status_message_id: Optional[int] = None
+    # The text currently shown on THIS project's status line — used to SKIP an edit when
+    # the new status is identical (editing a Telegram message to the same text raises
+    # "message is not modified", whose fallback used to send a fresh message → spam).
+    status_text: Optional[str] = None
+    # P5 / ADR-005 D7: THIS project's free-text capture. When set, the NEXT plain message
+    # is the answer/feedback for this tool_use_id, in this mode ("ask_other" ->
+    # QuestionAnswer; "plan_reject" -> PlanVerdict(approve=False)). Question index is kept
+    # for an "Other" answer. The owning project IS this runtime (the marker is per-project,
+    # not a chat-global slot), so a free-text reply resolves the project that prompted it.
+    awaiting_text_for: Optional[str] = None
+    awaiting_text_mode: Optional[str] = None  # "ask_other" | "plan_reject"
+    awaiting_text_question_index: Optional[int] = None
+    # P5 / ADR-005 D7: this project's run status for the /projects column (T7). Defaults to
+    # "idle"; _drive_turn drives it idle->running->awaiting_<kind>->running->idle across a
+    # turn (T6 sets "queued" for a queued turn). A project with no runtime reads as "idle".
+    status: ProjectStatus = "idle"
 
 
 #: The kind of interactive request a pending-index entry holds open.
 PendingKind = Literal["ask", "plan", "permission"]
+
+
+def _pending_kind_of(event: Event) -> Optional[PendingKind]:
+    """The :data:`PendingKind` an event holds open, or ``None`` if it holds nothing.
+
+    Ask/Plan/Permission are the three interactive holds (D3); every other event
+    (text/tool_use/status/error/result) carries no held request. Used by both the
+    pending-index registration and the per-project status wiring (ADR-005 D7) so the two
+    classify a held event identically.
+    """
+    if isinstance(event, AskEvent):
+        return "ask"
+    if isinstance(event, PlanEvent):
+        return "plan"
+    if isinstance(event, PermissionEvent):
+        return "permission"
+    return None
+
+
+#: A held request of each kind maps the OWNING project's status to the matching
+#: ``awaiting_<kind>`` for the /projects column (ADR-005 D7). These values MUST match the
+#: render-layer :data:`~claude_tg.render.ProjectStatus` enum (permission->awaiting_approval,
+#: ask->awaiting_answer, plan->awaiting_plan).
+_AWAITING_STATUS: dict[PendingKind, ProjectStatus] = {
+    "permission": "awaiting_approval",
+    "ask": "awaiting_answer",
+    "plan": "awaiting_plan",
+}
 
 
 @dataclass
@@ -251,31 +309,27 @@ class _ChatState:
     project's** engine regardless of which project is currently active — closing the
     ADR-001 correlation-envelope gap at the relay. The index is populated when a project's
     stream injects an ask/plan/permission (keyed off the project the turn runs on) and
-    cleared on resolve/cancel/turn-end. *(Scope, T2: the index lives HERE on the chat;
-    T4 later relocates live-turn state into ``_ProjectRuntime``.)*
+    cleared on resolve/cancel/turn-end. The index is the **cross-project router**, keyed by
+    ``tool_use_id -> project``, so it correctly lives on the chat (not a project).
+
+    **P5 / ADR-005 D7 — live-turn state moved OUT, to :class:`_ProjectRuntime`.** P4 also
+    held the status line + free-text-capture marker here (one turn per chat). T4 relocates
+    those into the per-project runtime (each running project owns its own status line +
+    free-text marker), so this shrinks to the coordinator it is: the turn ``lock``, the
+    per-project ``runtimes``, and the ``pending_index`` router.
     """
 
     lock: asyncio.Lock = None  # type: ignore[assignment]
     # Per-project in-memory runtimes, keyed by the project's STORED (as-created) name.
-    # Created lazily by _active_runtime; never persisted (D3 — transient bypass).
+    # Created lazily by _active_runtime; never persisted (D3 — transient bypass). Each
+    # runtime now also carries THIS project's live-turn state (status line + free-text
+    # capture marker + status enum — ADR-005 D7).
     runtimes: dict[str, _ProjectRuntime] = field(default_factory=dict)
-    # The status-line message id for in-place coalesced edits (created on first edit).
-    status_message_id: Optional[int] = None
-    # The text currently shown on that status line — used to SKIP an edit when the new
-    # status is identical. Editing a Telegram message to the same text raises "message is
-    # not modified", whose fallback used to send a fresh message → status-line spam.
-    status_text: Optional[str] = None
     # The pending-request index (ADR-005 D3): tool_use_id -> the owning project + kind +
     # held event (+ the per-id ask accumulator). Replaces P4's single pending_ask/
-    # pending_plan slots; every resolve/cancel/free-text routes through it by id.
+    # pending_plan slots; every resolve/cancel/free-text routes through it by id. The
+    # cross-project router (id -> project) — correctly on the chat, not a project (D7).
     pending_index: dict[str, _PendingRef] = field(default_factory=dict)
-    # Free-text capture: when set, the NEXT text message is the answer/feedback for
-    # this tool_use_id, in this mode ("ask_other" -> QuestionAnswer; "plan_reject" ->
-    # PlanVerdict(approve=False)). Question index is kept for an "Other" answer. The
-    # owning project is found via pending_index[awaiting_text_for] (id-routed).
-    awaiting_text_for: Optional[str] = None
-    awaiting_text_mode: Optional[str] = None  # "ask_other" | "plan_reject"
-    awaiting_text_question_index: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.lock is None:
@@ -684,20 +738,28 @@ class StreamingSession:
         grant and turns ``/yolo`` off — D7) so the next session restarts **fail-closed**.
         A running turn (holding the lock) is not force-killed here; ``/cancel`` aborts a
         live turn. With no active project there is nothing to reset (no side effects).
+
+        **P5 / ADR-005 D7.** Live-turn state now lives on the per-project runtime, so reset
+        clears **the active project's** runtime live-turn state (its status line + free-text
+        marker + status, set back to ``idle``) — NOT a chat-global slot — and drops the
+        active project's pending-index entries. A concurrent project's runtime + held
+        requests are untouched (reset is scoped to the active project, D2/D7).
         """
-        # Live-turn state is per-chat → always cleared.
-        state = self._chats.get(chat_id)
-        if state is not None:
-            state.status_message_id = None
-            state.status_text = None
-            self._clear_pending(state)
         # Resolve the active project WITHOUT creating one (reset is not a turn): if there
         # is no active project there is no session to clear.
         name, rt = self._active_runtime(chat_id, create_default=False)
+        state = self._chats.get(chat_id)
         if rt is not None:
             rt.engine = None
             rt.started = False
             rt.policy.clear()  # D7: drop grants + yolo so the next session is fail-closed.
+            # D7: clear THIS project's live-turn state (status line + free-text marker +
+            # status), not a chat-global slot.
+            self._clear_runtime_turn_state(rt)
+        if state is not None and name is not None:
+            # Drop the active project's pending-index entries (+ a free-text marker aimed at
+            # one of them); a concurrent project's held requests survive (scoped by name).
+            self._clear_project_pending(state, name)
         if name is not None:
             # Clear the persisted session_id for the active project (keep cwd — D4 — and
             # the project record itself). update() writes the active project's fields.
@@ -726,6 +788,25 @@ class StreamingSession:
         """
         state = self._chats.get(chat_id)
         return state is not None and state.lock.locked()
+
+    def project_status(self, chat_id: int, name: str) -> ProjectStatus:
+        """The per-project run status for ``/projects`` (ADR-005 D7; read by T7's render).
+
+        Read-only (RB1): a project with **no in-memory runtime** (never run a turn this
+        process, e.g. just after restart) reads as ``idle`` — the D7 default — without
+        creating anything. A live runtime reports its current ``status`` enum
+        (``running`` / ``awaiting_approval`` / ``awaiting_answer`` / ``awaiting_plan`` /
+        ``queued`` / ``idle``), which :func:`~claude_tg.render.project_status_label` maps
+        to the column label. Matched case-insensitively against the stored runtime key
+        (mirroring the store's name match) so ``/projects`` and ``/switch WORK`` agree.
+        """
+        state = self._chats.get(chat_id)
+        if state is None:
+            return "idle"
+        key = self._resolve_runtime_key(state.runtimes, name)
+        if key is None:
+            return "idle"
+        return state.runtimes[key].status
 
     # -- the turn driver (LOCK-GUARDED: one turn per chat) -------------------
 
@@ -763,11 +844,14 @@ class StreamingSession:
         state = self._chat(chat_id)
 
         # Free-text capture for a prior "Other"/reject tap routes to resolve(), not a
-        # new turn — and must NOT take the turn lock (the awaiting turn holds it). It
-        # resolves against the engine of whatever project is active (the same one the
-        # held turn is running on).
-        if state.awaiting_text_for is not None:
-            self._resolve_free_text(state, chat_id, text)
+        # new turn — and must NOT take the turn lock (the awaiting turn holds it). The
+        # capture marker now lives on the OWNING project's runtime (ADR-005 D7), so we
+        # look for a runtime that is armed for free text (the project that prompted it) and
+        # resolve against ITS engine — even if a different project is currently active
+        # (the cross-project free-text routing T2 already proved at the chat level).
+        armed_name, armed_rt = self._armed_text_runtime(state)
+        if armed_rt is not None:
+            self._resolve_free_text(state, chat_id, armed_name, armed_rt, text)
             return
 
         if state.lock.locked():
@@ -843,16 +927,22 @@ class StreamingSession:
         # turn's project, not "whatever is active when the turn ends".
         turn_name, turn_rt = self._active_runtime(chat_id, create_default=True)
         assert turn_name is not None  # create_default=True always yields a project name
+        assert turn_rt is not None  # create_default=True always yields a runtime too
         # This first turn applies the resume-failure heuristic iff the session was resumed
         # (not freshly started) and is not yet confirmed good.
-        check_resume = turn_rt is not None and turn_rt.resumed_unverified
+        check_resume = turn_rt.resumed_unverified
         resume_failure_detected = False
 
         coalescer = Coalescer(now=self._clock, min_interval=self._min_edit_interval)
-        # Status line for THIS turn starts unset; create on first edit_status.
-        state.status_message_id = None
-        state.status_text = None
-        if self._active_policy(chat_id).yolo:
+        # P5 / ADR-005 D7: THIS project's status line + status enum (per-project, not a
+        # chat-global slot). Status line starts unset (create on first edit_status); the
+        # status enum goes idle -> running at turn start, awaiting_<kind> on a hold, back to
+        # running on resolve, idle at turn end. Two concurrent turns each drive their OWN
+        # runtime's line + status, so they never clash.
+        turn_rt.status_message_id = None
+        turn_rt.status_text = None
+        turn_rt.status = "running"
+        if turn_rt.policy.yolo:
             await send(text=yolo_indicator(), reply_markup=None, parse_mode=None)
         async for event in engine.send(prompt):
             # QF3: on the first turn of a resumed session, flag a resume-failure-shaped
@@ -866,6 +956,12 @@ class StreamingSession:
             # index must own every held request so the foreground-vs-notify decision (T3) and
             # the cross-project routing (this task) cover it).
             self._register_pending(state, turn_name, event)
+            # ADR-005 D7: a held request flips THIS project's status to the matching
+            # awaiting_<kind> for /projects; it returns to running when the resolve path
+            # unblocks the held turn (set in the resolve/cancel methods, which own the ref).
+            held_kind = _pending_kind_of(event)
+            if held_kind is not None:
+                turn_rt.status = _AWAITING_STATUS[held_kind]
             # Remember an ask so a tap can reconstruct the native answer.
             if isinstance(event, AskEvent):
                 # Render each question as its OWN message + option keyboard so a question's
@@ -874,7 +970,7 @@ class StreamingSession:
                 # tell which buttons belong to which question). Flush any buffered status
                 # first so the questions appear after it, in order.
                 for action in coalescer.flush().actions:
-                    await self._perform(state, action, send=send, edit=edit)
+                    await self._perform(turn_rt, action, send=send, edit=edit)
                 for q_idx in range(len(event.questions)):
                     keyboard = ask_question_keyboard(event, q_idx)
                     # The question text is Claude-authored CommonMark -> render as HTML so
@@ -900,21 +996,24 @@ class StreamingSession:
                 if not resume_failure_detected:
                     self._persist(chat_id, session_id=event.session_id or engine.session_id)
             for action in coalescer.offer(event).actions:
-                await self._perform(state, action, send=send, edit=edit)
+                await self._perform(turn_rt, action, send=send, edit=edit)
         # End of turn: flush any trailing coalesced status line, then DELETE the transient
         # status message ("💭 Claude is thinking…") so a stale thinking-line never lingers
         # after the turn's real content. Best-effort (RB1): a failed delete must never kill
         # the turn — the content is already sent. Optional `delete` so existing callers that
         # don't pass one keep working (the status line just stays, as before).
         for action in coalescer.flush().actions:
-            await self._perform(state, action, send=send, edit=edit)
-        if delete is not None and state.status_message_id is not None:
+            await self._perform(turn_rt, action, send=send, edit=edit)
+        if delete is not None and turn_rt.status_message_id is not None:
             try:
-                await delete(message_id=state.status_message_id)
+                await delete(message_id=turn_rt.status_message_id)
             except Exception:
                 log.debug("status-line delete failed at turn end", exc_info=True)
-            state.status_message_id = None
-            state.status_text = None
+            turn_rt.status_message_id = None
+            turn_rt.status_text = None
+        # ADR-005 D7: the turn is over → this project is idle again (no runtime → idle is the
+        # /projects default; a running/awaiting project that just ended returns to idle).
+        turn_rt.status = "idle"
 
         # ADR-005 D3: drop any pending-index entries this turn's project left open (an ask/
         # plan/permission the operator never answered — the engine has stopped awaiting it
@@ -990,28 +1089,24 @@ class StreamingSession:
             parse_mode=None,
         )
 
-    def _active_policy(self, chat_id: int) -> PermissionPolicy:
-        """The active project's :class:`PermissionPolicy` (auto-create ``default`` if needed).
-
-        Used by :meth:`_drive_turn` for the loud-yolo marker; a turn always has an active
-        project (``_ensure_engine`` created one), so this resolves the same runtime.
-        """
-        _name, rt = self._active_runtime(chat_id, create_default=True)
-        return rt.policy if rt is not None else PermissionPolicy()
-
     async def _perform(
         self,
-        state: _ChatState,
+        rt: _ProjectRuntime,
         action: RenderAction,
         *,
         send: SendFn,
         edit: EditFn,
     ) -> None:
-        """Execute ONE :class:`RenderAction` against Telegram (the deferred I/O)."""
+        """Execute ONE :class:`RenderAction` against Telegram (the deferred I/O).
+
+        ``rt`` is the runtime of the project whose turn produced the action — a status
+        edit folds into THAT project's status line (ADR-005 D7), so two concurrent turns'
+        status lines never clash.
+        """
         if action.op == "none" or not action.chunks:
             return
         if action.op == "edit_status":
-            await self._edit_status(state, action, send=send, edit=edit)
+            await self._edit_status(rt, action, send=send, edit=edit)
             return
         # op == "new": one message per chunk. The keyboard rides the FIRST NON-EMPTY chunk —
         # whitespace-only chunks are skipped, so if the head chunk is whitespace the buttons
@@ -1049,37 +1144,42 @@ class StreamingSession:
 
     async def _edit_status(
         self,
-        state: _ChatState,
+        rt: _ProjectRuntime,
         action: RenderAction,
         *,
         send: SendFn,
         edit: EditFn,
     ) -> None:
-        """Edit the chat's single coalesced status line in place (create on first use)."""
+        """Edit THIS project's coalesced status line in place (create on first use).
+
+        The status line id/text live on the per-project :class:`_ProjectRuntime` (ADR-005
+        D7), so each running project edits its OWN line — a status burst in one project
+        never touches another's.
+        """
         body = action.text
         if not body.strip():
             return
-        if body == state.status_text:
+        if body == rt.status_text:
             # Identical to what's already shown — skip. Editing a Telegram message to the
             # same text raises "message is not modified"; the old fallback then sent a fresh
             # message, which is exactly the status-line spam we must avoid.
             return
-        if state.status_message_id is None:
+        if rt.status_message_id is None:
             mid = await send(text=body, reply_markup=None, parse_mode=action.parse_mode)
-            state.status_message_id = mid
-            state.status_text = body
+            rt.status_message_id = mid
+            rt.status_text = body
             return
         try:
-            await edit(message_id=state.status_message_id, text=body, parse_mode=action.parse_mode)
-            state.status_text = body
+            await edit(message_id=rt.status_message_id, text=body, parse_mode=action.parse_mode)
+            rt.status_text = body
         except Exception:
             # A genuine edit failure (message gone / too old) must never kill the turn
             # (RB1/RB2); fall back to a fresh status message. Identical-text edits are
             # already skipped above, so this is a real failure, not a no-op edit.
             log.debug("status edit failed for chat; sending a fresh status line", exc_info=True)
             mid = await send(text=body, reply_markup=None, parse_mode=action.parse_mode)
-            state.status_message_id = mid
-            state.status_text = body
+            rt.status_message_id = mid
+            rt.status_text = body
 
     # -- the callback resolve path (LOCK-FREE: SB1 enforced at the bot) ------
 
@@ -1240,6 +1340,9 @@ class StreamingSession:
             return CallbackOutcome(handled=False, note="no question id")
         resolved = engine.resolve(tuid, QuestionAnswer(answers=answers))
         if resolved:
+            # ADR-005 D7: the held turn resumes → the owning project is running again (the
+            # awaiting_answer status reverts). Intermediate taps stayed awaiting_answer.
+            self._resume_pending_status(state, ref)
             return CallbackOutcome(handled=True, note=f"All {total} answered ✓")
         return CallbackOutcome(handled=False, note="already answered")
 
@@ -1248,9 +1351,17 @@ class StreamingSession:
     ) -> "CallbackOutcome":
         if ref.kind != "ask" or not isinstance(ref.event, AskEvent):
             return CallbackOutcome(handled=False, note="no matching question")
-        state.awaiting_text_for = decoded.tool_use_id
-        state.awaiting_text_mode = "ask_other"
-        state.awaiting_text_question_index = decoded.question_index
+        # ADR-005 D7: arm free-text capture on the OWNING project's runtime (not a chat
+        # slot), so the next plain message resolves THIS project even while another is
+        # active. A prior armed marker (on any runtime) is cleared first so at most one
+        # project is armed at a time (single-active free-text; T9 adds newest-wins routing).
+        rt = self._runtime_for_pending(state, ref)
+        if rt is None:
+            return CallbackOutcome(handled=False, note="no pending request")
+        self._clear_armed_text(state)
+        rt.awaiting_text_for = decoded.tool_use_id
+        rt.awaiting_text_mode = "ask_other"
+        rt.awaiting_text_question_index = decoded.question_index
         return CallbackOutcome(handled=True, note="Type your answer", expects_text=True)
 
     def _resolve_plan(
@@ -1262,12 +1373,18 @@ class StreamingSession:
             resolved = engine.resolve(decoded.tool_use_id, PlanVerdict(approve=True))
             if resolved:
                 self._drop_pending(state, decoded.tool_use_id)
+                # ADR-005 D7: the held turn resumes → owning project running again.
+                self._resume_pending_status(state, ref)
                 return CallbackOutcome(handled=True, note="Plan approved")
             return CallbackOutcome(handled=False, note="already decided")
-        # reject → capture feedback as the next message.
-        state.awaiting_text_for = decoded.tool_use_id
-        state.awaiting_text_mode = "plan_reject"
-        state.awaiting_text_question_index = None
+        # reject → capture feedback as the next message, on the OWNING project's runtime.
+        rt = self._runtime_for_pending(state, ref)
+        if rt is None:
+            return CallbackOutcome(handled=False, note="no pending request")
+        self._clear_armed_text(state)
+        rt.awaiting_text_for = decoded.tool_use_id
+        rt.awaiting_text_mode = "plan_reject"
+        rt.awaiting_text_question_index = None
         return CallbackOutcome(handled=True, note="Type your feedback", expects_text=True)
 
     def _resolve_permission(
@@ -1299,11 +1416,20 @@ class StreamingSession:
         resolved = engine.resolve(decoded.tool_use_id, PermissionDecision(verdict=verdict))
         if resolved:
             self._drop_pending(state, decoded.tool_use_id)
+            # ADR-005 D7: the held turn resumes → owning project running again.
+            self._resume_pending_status(state, ref)
             return CallbackOutcome(handled=True, note=_PERMISSION_NOTES[verdict])
         # Nothing pending for this id — already decided / backstopped / cancelled.
         return CallbackOutcome(handled=False, note="no pending request")
 
-    def _resolve_free_text(self, state: _ChatState, chat_id: int, text: str) -> None:
+    def _resolve_free_text(
+        self,
+        state: _ChatState,
+        chat_id: int,
+        armed_name: Optional[str],
+        armed_rt: _ProjectRuntime,
+        text: str,
+    ) -> None:
         """Resolve a pending "Other"/reject with the just-typed ``text``; clear the marker.
 
         Routed from :meth:`handle_message` (free-text capture takes precedence over a new
@@ -1311,20 +1437,22 @@ class StreamingSession:
         question text; reject feedback becomes :class:`PlanVerdict` ``approve=False`` with
         the feedback on the deny channel.
 
-        **Id-routed (ADR-005 D3).** The free-text TARGET id (set when the operator tapped
-        "Other"/"Reject") is looked up in the pending index → the owning project → THAT
-        project's engine — **not** ``_active_engine``. So a free-text reply resolves the
-        project that prompted it even while a different project is active. If the id is no
-        longer in the index (turn ended / cancelled), or the owning project has no live
-        engine / a mismatched session, this is a harmless no-op (the marker is cleared
-        first so the chat is never wedged in capture mode, RB1).
+        **Per-project marker + id-routed engine (ADR-005 D7/D3).** ``armed_rt`` is the
+        runtime whose turn armed free-text capture (its ``awaiting_text_*`` marker, found by
+        :meth:`_armed_text_runtime`); the held id is then looked up in the pending index →
+        the owning project → THAT project's engine — **not** ``_active_engine``. So a
+        free-text reply resolves the project that prompted it even while a different project
+        is active. If the id is no longer in the index (turn ended / cancelled), or the
+        owning project has no live engine / a mismatched session, this is a harmless no-op
+        (the marker is cleared first so the chat is never wedged in capture mode, RB1).
         """
-        tool_use_id = state.awaiting_text_for
-        mode = state.awaiting_text_mode
-        q_idx = state.awaiting_text_question_index
-        # Clear the capture marker FIRST so a failure can't wedge the chat (RB1). The index
-        # entry itself is dropped by _record_ask_answer (on full resolve) / below.
-        self._clear_pending_text(state)
+        tool_use_id = armed_rt.awaiting_text_for
+        mode = armed_rt.awaiting_text_mode
+        q_idx = armed_rt.awaiting_text_question_index
+        # Clear the capture marker FIRST (on the armed runtime) so a failure can't wedge the
+        # chat (RB1). The index entry itself is dropped by _record_ask_answer (on full
+        # resolve) / below.
+        self._clear_runtime_text(armed_rt)
         if tool_use_id is None:
             return
         ref = state.pending_index.get(tool_use_id)
@@ -1344,6 +1472,8 @@ class StreamingSession:
         elif mode == "plan_reject" and ref.kind == "plan":
             self._drop_pending(state, tool_use_id)
             engine.resolve(tool_use_id, PlanVerdict(approve=False, feedback=text))
+            # ADR-005 D7: the held turn resumes → owning project running again.
+            self._resume_pending_status(state, ref)
 
     # -- cancel --------------------------------------------------------------
 
@@ -1398,13 +1528,7 @@ class StreamingSession:
         A re-register for the same id replaces the entry (last writer wins; a fresh
         accumulator), matching the per-turn ``pending_ask = event`` reset P4 did.
         """
-        kind: Optional[PendingKind] = None
-        if isinstance(event, AskEvent):
-            kind = "ask"
-        elif isinstance(event, PlanEvent):
-            kind = "plan"
-        elif isinstance(event, PermissionEvent):
-            kind = "permission"
+        kind = _pending_kind_of(event)
         if kind is None:
             return
         tuid = getattr(event, "tool_use_id", None)
@@ -1416,19 +1540,27 @@ class StreamingSession:
 
     @staticmethod
     def _drop_pending(state: _ChatState, tool_use_id: Optional[str]) -> None:
-        """Remove one index entry by id (on resolve); also clear a free-text marker on it."""
+        """Remove one index entry by id (on resolve); also clear a free-text marker on it.
+
+        The free-text marker now lives on the OWNING project's runtime (ADR-005 D7), so if
+        that project's runtime is armed for THIS id, its marker is cleared too.
+        """
         if tool_use_id is None:
             return
-        state.pending_index.pop(tool_use_id, None)
-        if state.awaiting_text_for == tool_use_id:
-            StreamingSession._clear_pending_text(state)
+        ref = state.pending_index.pop(tool_use_id, None)
+        if ref is None:
+            return
+        rt = state.runtimes.get(ref.project_name)
+        if rt is not None and rt.awaiting_text_for == tool_use_id:
+            StreamingSession._clear_runtime_text(rt)
 
     @staticmethod
     def _clear_project_pending(state: _ChatState, project_name: str) -> None:
-        """Drop every index entry OWNED by ``project_name`` (turn-end / cancel).
+        """Drop every index entry OWNED by ``project_name`` (turn-end / cancel / reset).
 
         Scoped to one project so a concurrent project's still-open holds survive (T5); the
-        free-text marker is cleared iff it pointed at one of the dropped ids.
+        owning runtime's free-text marker is cleared iff it pointed at one of the dropped
+        ids (the marker is now per-project — ADR-005 D7).
         """
         doomed = [
             tuid
@@ -1437,25 +1569,79 @@ class StreamingSession:
         ]
         for tuid in doomed:
             del state.pending_index[tuid]
-        if state.awaiting_text_for in doomed:
-            StreamingSession._clear_pending_text(state)
+        rt = state.runtimes.get(project_name)
+        if rt is not None and rt.awaiting_text_for in doomed:
+            StreamingSession._clear_runtime_text(rt)
+
+    @staticmethod
+    def _runtime_for_pending(
+        state: _ChatState, ref: _PendingRef
+    ) -> Optional[_ProjectRuntime]:
+        """The runtime of the project that owns ``ref`` (or ``None``) — ADR-005 D3/D7."""
+        return state.runtimes.get(ref.project_name)
+
+    @staticmethod
+    def _resume_pending_status(state: _ChatState, ref: _PendingRef) -> None:
+        """A held request was resolved → the owning project's turn resumes (status running).
+
+        ADR-005 D7: a successful resolve unblocks the held turn parked inside
+        ``engine.send`` (the turn loop continues), so the project goes back from
+        ``awaiting_<kind>`` to ``running``; the turn's own end will set it ``idle``.
+        Best-effort (RB1): a missing runtime simply no-ops.
+        """
+        rt = state.runtimes.get(ref.project_name)
+        if rt is not None:
+            rt.status = "running"
+
+    @staticmethod
+    def _armed_text_runtime(
+        state: _ChatState,
+    ) -> tuple[Optional[str], Optional[_ProjectRuntime]]:
+        """The (name, runtime) of a project currently armed for free-text capture, or
+        ``(None, None)``.
+
+        The free-text marker lives per-project (ADR-005 D7); a plain message's
+        free-text-vs-new-turn decision (``handle_message``) finds the armed runtime here.
+        At most one project is armed at a time in T4 (``_arm_ask_other``/``_resolve_plan``
+        clear any prior armed marker first); T9 adds full newest-wins routing across several
+        armed projects.
+        """
+        for name, rt in state.runtimes.items():
+            if rt.awaiting_text_for is not None:
+                return name, rt
+        return None, None
 
     # -- internals -----------------------------------------------------------
 
     @staticmethod
-    def _clear_pending_text(state: _ChatState) -> None:
-        state.awaiting_text_for = None
-        state.awaiting_text_mode = None
-        state.awaiting_text_question_index = None
+    def _clear_runtime_text(rt: _ProjectRuntime) -> None:
+        """Clear ONE runtime's free-text capture marker (ADR-005 D7)."""
+        rt.awaiting_text_for = None
+        rt.awaiting_text_mode = None
+        rt.awaiting_text_question_index = None
 
-    def _clear_pending(self, state: _ChatState) -> None:
-        """Clear ALL pending state for the chat (the index + a free-text marker).
+    @staticmethod
+    def _clear_armed_text(state: _ChatState) -> None:
+        """Clear whichever runtime (if any) is currently armed for free-text capture.
 
-        Used by :meth:`reset` (which, for the active project, drops its engine + session).
-        T2 scope: this clears the whole chat's index; T4 makes ``reset`` per-project.
+        Used before arming a new free-text target so at most one project is armed at a time
+        (the single-active free-text invariant T4 keeps; T9 generalizes to newest-wins).
         """
-        self._clear_pending_text(state)
-        state.pending_index.clear()
+        _name, rt = StreamingSession._armed_text_runtime(state)
+        if rt is not None:
+            StreamingSession._clear_runtime_text(rt)
+
+    @staticmethod
+    def _clear_runtime_turn_state(rt: _ProjectRuntime) -> None:
+        """Clear ONE runtime's live-turn UI/capture state + reset status to idle (D7).
+
+        Used by :meth:`reset` for the active project: drop its status line id/text, its
+        free-text marker, and set ``status`` back to ``idle`` (a reset project is idle).
+        """
+        rt.status_message_id = None
+        rt.status_text = None
+        rt.status = "idle"
+        StreamingSession._clear_runtime_text(rt)
 
 
 def _resume_failure_text(event: Event) -> Optional[str]:
