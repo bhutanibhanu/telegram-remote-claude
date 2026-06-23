@@ -3,11 +3,13 @@
 _Audit done (`findings.md`); owner directive 2026-06-23: **fix all four (C1,C2,H1,H2) now, don't stop.** C2 posture decision (owner deferred to my recommendation): **prompt-on-out-of-root** — out-of-root tool targets become an approval prompt; in-root stays frictionless; `ALLOW_ANY_PATH` opts out. Supervised build: Implementer → independent reviewer → commit on green+AGREE._
 
 ## Task list
-- [ ] R1 — C1/SB5: operator permission gate ON by default (bypass opt-in + loud)
-- [ ] R2 — C2/SB2: confine the SDK's tool execution to ALLOWED_ROOTS (prompt-on-out-of-root)
+- [x] R1 — C1/SB5: operator permission gate ON by default (bypass opt-in + loud) (b695dc8) — _UX note for verdict: oneshot is non-interactive (`claude -p`), so gated-default means it can't run risky tools without opt-in; use streaming for interactive approval._
+- [x] R2 — C2/SB2: confine the SDK's tool execution to ALLOWED_ROOTS (prompt-on-out-of-root) (78cfccd)
 - [ ] R3 — H1/SB3: scrub session ids in logs + body-free error rendering by default
 - [ ] R4 — H2/RB2: open hold doesn't trip the per-message liveness timeout + rebuild engine on verified-session driver_error
-- [ ] R5 — Re-audit (Codex) to SHIP + live re-verify (>120s hold recovers; default-gated prompts; out-of-root prompts) → verdict update → merge
+- [x] R5 — Duplicate-message bug (owner-reported in P5 verify): some Telegram messages displayed twice — find root cause + fix + regression test (e77b1f3) — root cause: `result_text` re-renders the assistant prose (every normal turn); also fixed orphaned status-line + double error block; foreground↔bg flip (#4) left for R7 live-verify
+- [ ] R6 — Telegram UX polish (owner-requested): fix `/segment` path auto-linkify (wrap cwds in `<code>`) + any other rough edges found; broader polish continues in P8
+- [ ] R7 — Re-audit (Codex) to SHIP + **fully self-driven** live re-verify (browser-driven by me: default-gated prompt, out-of-root prompt, >120s hold recovers, no duplicate messages) → verdict update → merge
 
 Legend: `[ ]` todo · `[x]` done (sha) · `[!]` blocked
 
