@@ -86,6 +86,7 @@ from .paths import PathNotAllowed, resolve_within_roots
 from .permissions import PermissionPolicy
 from .render import (
     Callback,
+    ChatSendGate,
     Coalescer,
     ProjectStatus,
     RenderAction,
@@ -94,6 +95,11 @@ from .render import (
     ask_question_body_html,
     ask_question_keyboard,
     decode_callback,
+    notify_attention,
+    notify_done,
+    notify_error,
+    permission_keyboard,
+    plan_keyboard,
     strip_telegram_html,
     yolo_indicator,
 )
@@ -371,6 +377,20 @@ class _ChatState:
     # per-deployment). Transient in-memory, like everything else on _ChatState (RB3 — no
     # in-flight runs survive a restart).
     run_queue: "deque[asyncio.Future[None]]" = field(default_factory=deque)
+    # P5 / ADR-005 D8 (T8): the per-chat send-rate gate. ALL outbound for this chat (every
+    # project's status edits + verbatim messages + the proactive notifications) funnels
+    # through it so N concurrent projects flushing at once never burst past Telegram's
+    # ~1 msg/s/chat ceiling (RB5 under concurrency). Verbatim is prioritized over coalesced
+    # status churn (never starved / dropped — D8). Built lazily by the session (it needs the
+    # injected clock + the configured interval); transient in-memory like the rest.
+    send_gate: "Optional[ChatSendGate]" = None
+    # P5 / ADR-005 D4 (T8): per-(project, notification-kind) throttle for the proactive
+    # background pings, so a project bursting holds does not spam the chat with duplicate
+    # 🔔 pings. Maps (project_name, ping_kind) -> the monotonic time the last such ping was
+    # SENT; a duplicate within the gate interval is suppressed (the operator already knows
+    # that project needs attention — the keyboard from the first ping still routes the tap).
+    # Transient in-memory (RB3).
+    notify_last: dict[tuple[str, str], float] = field(default_factory=dict)
 
 
 class StreamingBusy(Exception):
@@ -415,12 +435,26 @@ class StreamingSession:
         engine_factory: Optional[EngineFactory] = None,
         clock: Callable[[], float] = time.monotonic,
         min_edit_interval: Optional[float] = None,
+        chat_send_interval: Optional[float] = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.config = config
         self.store = session_store
         self._engine_factory = engine_factory or _default_engine_factory
         self._clock = clock
         self._min_edit_interval = min_edit_interval
+        # P5 / ADR-005 D8 (T8): the per-chat send-rate budget (seconds between any two
+        # outbound for one chat) + the awaitable used to honor a gate's computed wait. The
+        # gate (render.ChatSendGate) is PURE (decides the wait); the SESSION does the actual
+        # awaiting via ``_sleep`` — exactly as the Coalescer leaves the real edit-waiting to
+        # the consumer. ``sleep`` is injected so tests can pass a recorder/no-op and stay
+        # deterministic with no real time. The interval falls back to config (default ~1 s).
+        self._chat_send_interval = (
+            chat_send_interval
+            if chat_send_interval is not None
+            else float(config.render_chat_send_interval_seconds)
+        )
+        self._sleep = sleep
         self._chats: dict[int, _ChatState] = {}
         # NOTE (P4 / D3): no __init__ harvest of persisted (session_id, cwd). Resume now
         # resolves PER ACTIVE PROJECT from the registry at _ensure_engine time, and the
@@ -443,6 +477,240 @@ class StreamingSession:
             state = _ChatState()
             self._chats[chat_id] = state
         return state
+
+    # -- per-chat send-rate gate (RB5 under concurrency, ADR-005 D8) ---------
+
+    def _gate(self, state: _ChatState) -> ChatSendGate:
+        """The chat's :class:`~claude_tg.render.ChatSendGate` (built lazily, D8).
+
+        ALL outbound for a chat funnels through one gate so the COMBINED cross-project
+        send rate stays bounded (RB5/D8). Built lazily here because the gate needs the
+        session's injected clock + the configured per-chat interval; transient in-memory
+        on :class:`_ChatState` (reset on restart, RB3).
+        """
+        if state.send_gate is None:
+            state.send_gate = ChatSendGate(
+                now=self._clock, interval=self._chat_send_interval
+            )
+        return state.send_gate
+
+    async def _gated_send(
+        self, state: _ChatState, send: SendFn, *, verbatim: bool, **kwargs
+    ) -> Optional[int]:
+        """Send through the per-chat gate: reserve a slot, await the wait, then send (D8).
+
+        Reserves the next send slot from the chat's :class:`~claude_tg.render.ChatSendGate`
+        (``verbatim`` prioritizes a final answer / error / prompt / notification over
+        coalesced status churn — D8), awaits the gate's computed wait via the injected
+        ``self._sleep`` (the gate decides timing; the session does the awaiting — the
+        Coalescer pattern), then performs the real ``send``. Returns the sent message id.
+        """
+        wait = self._gate(state).reserve(verbatim=verbatim)
+        if wait > 0:
+            await self._sleep(wait)
+        return await send(**kwargs)
+
+    async def _gated_edit(
+        self, state: _ChatState, edit: EditFn, **kwargs
+    ) -> None:
+        """Edit through the per-chat gate (a status-line edit is NON-verbatim — D8).
+
+        A status-line edit is the low-priority kind: it yields to verbatim through the
+        gate (so a concurrent project's status churn never starves a prompt). Reserves +
+        awaits like :meth:`_gated_send`, then performs the real ``edit``.
+        """
+        wait = self._gate(state).reserve(verbatim=False)
+        if wait > 0:
+            await self._sleep(wait)
+        await edit(**kwargs)
+
+    # -- foreground (inline-vs-notify decision, ADR-005 D4) ------------------
+
+    def _is_foreground(self, chat_id: int, name: Optional[str]) -> bool:
+        """Whether ``name`` is the chat's current foreground (the store's active) project.
+
+        The notification send-decision (D4): an event for the **foreground** project
+        renders inline (as P4); a **background** (non-foreground) project's hold/terminal
+        becomes a name-prefixed 🔔/✅/⚠️ ping instead. "Foreground" is the store's
+        ``active`` (a per-chat marker); reading it is **read-only** (never creates a
+        project — RB1). With no store there is a single implicit project, so it is always
+        foreground (one-project deployments never notify — no behavior change). Matched
+        case-insensitively (mirroring the store's name match) so it agrees with
+        ``/projects``/``/switch``.
+        """
+        if name is None:
+            return True
+        if self.store is None:
+            return True  # single implicit project — always the foreground.
+        active = self.store.get_active(chat_id)
+        if active is None:
+            return True  # nothing active yet → treat the turn's project as foreground.
+        return isinstance(active, str) and active.casefold() == name.casefold()
+
+    # -- proactive notifications for a BACKGROUND project (ADR-005 D4) -------
+
+    def _should_notify(self, state: _ChatState, name: str, ping_kind: str) -> bool:
+        """Throttle duplicate pings of one ``ping_kind`` for one project (D4 coalescing).
+
+        A background project bursting holds (or re-emitting the same kind) must not spam
+        the chat with duplicate 🔔 pings — the operator already knows that project needs
+        attention, and the keyboard from the FIRST ping still routes the tap (D3). So a
+        ping of the same ``(project, kind)`` within the per-chat send interval is
+        suppressed. Records the send time on the way through (so the first ping of a kind
+        always goes). ``ping_kind`` is the notification class — the held :data:`PendingKind`
+        (``permission``/``ask``/``plan``) for an attention ping, or ``done``/``error`` for a
+        terminal — so e.g. a permission ping never suppresses a later error ping.
+        """
+        now = self._clock()
+        last = state.notify_last.get((name, ping_kind))
+        if last is not None and (now - last) < self._chat_send_interval:
+            return False
+        state.notify_last[(name, ping_kind)] = now
+        return True
+
+    @staticmethod
+    def _keyboard_for(event: Event):
+        """The inline keyboard the inline render would attach for a held event, or ``None``.
+
+        A background ping for a hold (permission/ask/plan) must carry the SAME keyboard the
+        inline render would (so the tap routes by the D3 index regardless of which project
+        is foreground — D4). For a multi-question ask there is one keyboard PER question
+        (the inline path sends one message each), so this returns ``None`` for an ask and
+        the caller sends per-question (see :meth:`_notify_background_ask`). Non-hold events
+        carry no keyboard.
+        """
+        if isinstance(event, PermissionEvent):
+            return permission_keyboard(event)
+        if isinstance(event, PlanEvent):
+            return plan_keyboard(event)
+        return None
+
+    async def _notify_background(
+        self,
+        state: _ChatState,
+        chat_id: int,
+        name: str,
+        event: Event,
+        kind: PendingKind,
+        *,
+        send: SendFn,
+    ) -> None:
+        """Send a body-free ``🔔 <name> — …`` attention ping for a BACKGROUND hold (D4/SB3).
+
+        The operator is not watching ``name`` (it is not the foreground), so a held
+        permission/ask/plan becomes a name-prefixed ping carrying the SAME keyboard the
+        inline render would (the tap routes by the D3 index). **SB3 body-free:**
+        :func:`~claude_tg.render.notify_attention` interpolates only the project name + a
+        fixed per-kind phrase — never the event body. Throttled per ``(project, kind)`` (D4)
+        and rate-gated as **verbatim** (priority — a prompt the operator must answer must
+        not be starved by status churn, D8). A multi-question ask sends one keyboard per
+        question so every question stays answerable.
+        """
+        if isinstance(event, AskEvent):
+            await self._notify_background_ask(state, chat_id, name, event, send=send)
+            return
+        if not self._should_notify(state, name, kind):
+            return
+        await self._gated_send(
+            state, send, verbatim=True,
+            text=notify_attention(name, kind),
+            reply_markup=self._keyboard_for(event),
+            parse_mode=None,
+        )
+
+    async def _notify_background_ask(
+        self,
+        state: _ChatState,
+        chat_id: int,
+        name: str,
+        ask: AskEvent,
+        *,
+        send: SendFn,
+    ) -> None:
+        """Background ask ping: the ``🔔 <name> — asks a question`` line + each question's
+        keyboard (so a multi-question ask stays fully answerable while backgrounded, D4).
+
+        The first message carries the bell line (throttled per ``(project, "ask")``); every
+        question's option keyboard is then sent (each its own message) so the operator can
+        answer each one via the D3 index regardless of foreground. SB3: only the project
+        name + the fixed "asks a question" phrase are interpolated by ``notify_attention`` —
+        the question TEXT rides the keyboard's own (already-safe) body, exactly as inline.
+        """
+        if self._should_notify(state, name, "ask"):
+            await self._gated_send(
+                state, send, verbatim=True,
+                text=notify_attention(name, "ask"),
+                reply_markup=None,
+                parse_mode=None,
+            )
+        for q_idx in range(len(ask.questions)):
+            keyboard = ask_question_keyboard(ask, q_idx)
+            try:
+                await self._gated_send(
+                    state, send, verbatim=True,
+                    text=ask_question_body_html(ask, q_idx),
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                await self._gated_send(
+                    state, send, verbatim=True,
+                    text=ask_question_body(ask, q_idx),
+                    reply_markup=keyboard,
+                    parse_mode=None,
+                )
+
+    async def _notify_terminal(
+        self,
+        state: _ChatState,
+        name: str,
+        event: Event,
+        *,
+        send: SendFn,
+    ) -> None:
+        """Send a body-free terminal ping for a BACKGROUND project (D4/SB3).
+
+        A background project's clean ``ResultEvent`` → ``✅ <name> — done``; an
+        ``ErrorEvent`` → ``⚠️ <name> — <ErrorKind>``. **The load-bearing SB3 check
+        (T3-review):** the error ping passes the engine's **body-free**
+        :data:`~claude_tg.engine.types.ErrorEvent.kind_of_error` (``tool_error`` /
+        ``turn_error`` / ``driver_error``) — **NEVER** ``event.message`` (which can carry a
+        raw tool body / secret). Rate-gated as verbatim (priority) and throttled per
+        ``(project, done|error)``.
+        """
+        if isinstance(event, ErrorEvent):
+            if not self._should_notify(state, name, "error"):
+                return
+            # SB3 (T3-review SB3 check): the body-free ErrorKind, NEVER event.message.
+            await self._gated_send(
+                state, send, verbatim=True,
+                text=notify_error(name, event.kind_of_error),
+                reply_markup=None,
+                parse_mode=None,
+            )
+            return
+        if isinstance(event, ResultEvent):
+            # An is_error ResultEvent is a failed turn — ping it as an error too (its
+            # ErrorKind isn't available on a ResultEvent, so use a generic body-free label;
+            # the result_text is NEVER sent — SB3). A clean result → ✅ done.
+            if event.is_error:
+                if not self._should_notify(state, name, "error"):
+                    return
+                await self._gated_send(
+                    state, send, verbatim=True,
+                    text=notify_error(name, "turn_error"),
+                    reply_markup=None,
+                    parse_mode=None,
+                )
+                return
+            if not self._should_notify(state, name, "done"):
+                return
+            await self._gated_send(
+                state, send, verbatim=True,
+                text=notify_done(name),
+                reply_markup=None,
+                parse_mode=None,
+            )
 
     # -- active-project resolution (the store is the source of truth) --------
 
@@ -1006,7 +1274,9 @@ class StreamingSession:
                     # roots (config narrowed, or a path component became an out-of-root
                     # symlink). Refuse the turn fail-closed WITHOUT starting the engine; the
                     # lock releases on return AND the finally releases the slot (no leak).
-                    await send(
+                    # Operator-facing refusal → verbatim priority through the D8 gate.
+                    await self._gated_send(
+                        state, send, verbatim=True,
                         text=(
                             f"❌ This project's directory {self.get_cwd(chat_id)} is no "
                             "longer within the permitted roots — use /new <name> <path> to "
@@ -1019,7 +1289,8 @@ class StreamingSession:
                 if resume_failed:
                     # RB3: the persisted session could not be resumed; a fresh one was
                     # started. Tell the operator BEFORE driving the turn (it still completes).
-                    await send(
+                    await self._gated_send(
+                        state, send, verbatim=True,
                         text="⚠️ Couldn't resume this project's previous session; started a fresh one.",
                         reply_markup=None,
                         parse_mode=None,
@@ -1075,8 +1346,10 @@ class StreamingSession:
         state.run_queue.append(waiter)
         # One-time queued notice (D6). Best-effort: a failed notice must not strand the turn
         # in the queue (the wait below is what actually gates it), so swallow a send error.
+        # Operator-facing → verbatim priority through the D8 send gate.
         try:
-            await send(
+            await self._gated_send(
+                state, send, verbatim=True,
                 text=f"⏳ Queued behind {ahead} run(s) — it'll start when a slot frees.",
                 reply_markup=None,
                 parse_mode=None,
@@ -1214,8 +1487,15 @@ class StreamingSession:
         turn_rt.status_message_id = None
         turn_rt.status_text = None
         turn_rt.status = "running"
-        if turn_rt.policy.yolo:
-            await send(text=yolo_indicator(), reply_markup=None, parse_mode=None)
+        # D6 "loud throughout" — but only inline for a FOREGROUND turn (a backgrounded run is
+        # silent inline, D4; its yolo posture still shows on each foreground turn + via
+        # /projects is not yolo-aware, so this is the loud surface when watched). Verbatim
+        # priority through the D8 gate so the marker is never starved by status churn.
+        if turn_rt.policy.yolo and self._is_foreground(chat_id, turn_name):
+            await self._gated_send(
+                state, send, verbatim=True,
+                text=yolo_indicator(), reply_markup=None, parse_mode=None,
+            )
         # P5 / ADR-005 D1 + T4-review: now runs are CONCURRENT and per-project ``status``
         # feeds /projects, a mid-stream exception in the loop below must NOT leave this
         # project stuck at running/awaiting_* (a stale status would mislead /projects and a
@@ -1243,37 +1523,11 @@ class StreamingSession:
                 held_kind = _pending_kind_of(event)
                 if held_kind is not None:
                     turn_rt.status = _AWAITING_STATUS[held_kind]
-                # Remember an ask so a tap can reconstruct the native answer.
-                if isinstance(event, AskEvent):
-                    # Render each question as its OWN message + option keyboard so a
-                    # question's choices sit directly beneath it. A single stacked keyboard
-                    # for a multi-question ask is an unreadable wall of buttons (the operator
-                    # can't tell which buttons belong to which question). Flush any buffered
-                    # status first so the questions appear after it, in order.
-                    for action in coalescer.flush().actions:
-                        await self._perform(turn_rt, action, send=send, edit=edit)
-                    for q_idx in range(len(event.questions)):
-                        keyboard = ask_question_keyboard(event, q_idx)
-                        # The question text is Claude-authored CommonMark -> render as HTML
-                        # so **bold** etc. show and a stray < / & can't break the message; on
-                        # a Telegram HTML rejection, resend the plain body (raw fallback —
-                        # never a dropped question).
-                        try:
-                            await send(
-                                text=ask_question_body_html(event, q_idx),
-                                reply_markup=keyboard,
-                                parse_mode="HTML",
-                            )
-                        except Exception:
-                            await send(
-                                text=ask_question_body(event, q_idx),
-                                reply_markup=keyboard,
-                                parse_mode=None,
-                            )
-                    continue
                 if isinstance(event, ResultEvent):
                     # QF3: do NOT re-persist the dead session_id on a resume-failure result
                     # — it would just re-arm the same broken resume. Recovery below clears it.
+                    # (Foreground-INDEPENDENT — the session_id must persist whether the turn
+                    # rendered inline or pinged in the background.)
                     if not resume_failure_detected:
                         # ADR-005 D2: persist to THIS turn's CAPTURED project (turn_name), not
                         # the active one — once /switch is free the active project can change
@@ -1285,15 +1539,63 @@ class StreamingSession:
                             session_id=event.session_id or engine.session_id,
                             name=turn_name,
                         )
+                # ADR-005 D4: the inline-vs-notify send-decision. Re-read foreground PER
+                # EVENT — /switch is free (T7), so the foreground can change mid-turn; an
+                # event for the foreground project renders inline (as P4), an event for a
+                # BACKGROUND project becomes a name-prefixed 🔔/✅/⚠️ ping (the operator is
+                # not watching that project). A backgrounded run does NOT spam its verbose
+                # status inline — its progress is summarized by the ping + the /projects
+                # status column (D4) — so non-hold, non-terminal events are dropped for a
+                # background turn (they never reach the coalescer/status line).
+                if not self._is_foreground(chat_id, turn_name):
+                    if held_kind is not None:
+                        await self._notify_background(
+                            state, chat_id, turn_name, event, held_kind, send=send
+                        )
+                    elif isinstance(event, (ResultEvent, ErrorEvent)):
+                        await self._notify_terminal(state, turn_name, event, send=send)
+                    # else (text/tool_use/status/incremental): a background run is silent —
+                    # no inline status spam (D4). Skip the inline render entirely.
+                    continue
+                # --- foreground: render inline exactly as P4 (through the D8 send gate) ---
+                if isinstance(event, AskEvent):
+                    # Render each question as its OWN message + option keyboard so a
+                    # question's choices sit directly beneath it. A single stacked keyboard
+                    # for a multi-question ask is an unreadable wall of buttons (the operator
+                    # can't tell which buttons belong to which question). Flush any buffered
+                    # status first so the questions appear after it, in order.
+                    for action in coalescer.flush().actions:
+                        await self._perform(state, turn_rt, action, send=send, edit=edit)
+                    for q_idx in range(len(event.questions)):
+                        keyboard = ask_question_keyboard(event, q_idx)
+                        # The question text is Claude-authored CommonMark -> render as HTML
+                        # so **bold** etc. show and a stray < / & can't break the message; on
+                        # a Telegram HTML rejection, resend the plain body (raw fallback —
+                        # never a dropped question). Verbatim priority in the D8 gate.
+                        try:
+                            await self._gated_send(
+                                state, send, verbatim=True,
+                                text=ask_question_body_html(event, q_idx),
+                                reply_markup=keyboard,
+                                parse_mode="HTML",
+                            )
+                        except Exception:
+                            await self._gated_send(
+                                state, send, verbatim=True,
+                                text=ask_question_body(event, q_idx),
+                                reply_markup=keyboard,
+                                parse_mode=None,
+                            )
+                    continue
                 for action in coalescer.offer(event).actions:
-                    await self._perform(turn_rt, action, send=send, edit=edit)
+                    await self._perform(state, turn_rt, action, send=send, edit=edit)
             # End of turn: flush any trailing coalesced status line, then DELETE the
             # transient status message ("💭 Claude is thinking…") so a stale thinking-line
             # never lingers after the turn's real content. Best-effort (RB1): a failed delete
             # must never kill the turn — the content is already sent. Optional `delete` so
             # existing callers that don't pass one keep working (the status line just stays).
             for action in coalescer.flush().actions:
-                await self._perform(turn_rt, action, send=send, edit=edit)
+                await self._perform(state, turn_rt, action, send=send, edit=edit)
         finally:
             # T4-review: ALWAYS clear this project's transient status line + set status idle,
             # even if the loop above raised mid-stream — so a concurrent project is never
@@ -1381,7 +1683,9 @@ class StreamingSession:
             rt.started = False
             rt.resumed_unverified = False
         # 3) Tell the operator (the turn already rendered the underlying error).
-        await send(
+        #    Operator-facing → verbatim priority through the D8 send gate.
+        await self._gated_send(
+            self._chat(chat_id), send, verbatim=True,
             text=(
                 "⚠️ Couldn't resume this project's previous session (it may be expired) — "
                 "cleared it. Send your message again to start fresh."
@@ -1392,6 +1696,7 @@ class StreamingSession:
 
     async def _perform(
         self,
+        state: _ChatState,
         rt: _ProjectRuntime,
         action: RenderAction,
         *,
@@ -1402,12 +1707,15 @@ class StreamingSession:
 
         ``rt`` is the runtime of the project whose turn produced the action — a status
         edit folds into THAT project's status line (ADR-005 D7), so two concurrent turns'
-        status lines never clash.
+        status lines never clash. All I/O funnels through the chat's send-rate gate
+        (``state`` carries it — ADR-005 D8): an ``op="new"`` (verbatim) send is PRIORITY,
+        an ``op="edit_status"`` is the low-priority status line that yields to it (so a
+        concurrent project's status churn never starves this verbatim message).
         """
         if action.op == "none" or not action.chunks:
             return
         if action.op == "edit_status":
-            await self._edit_status(rt, action, send=send, edit=edit)
+            await self._edit_status(state, rt, action, send=send, edit=edit)
             return
         # op == "new": one message per chunk. The keyboard rides the FIRST NON-EMPTY chunk —
         # whitespace-only chunks are skipped, so if the head chunk is whitespace the buttons
@@ -1419,7 +1727,12 @@ class StreamingSession:
             markup = action.reply_markup if first else None
             first = False
             try:
-                await send(text=chunk, reply_markup=markup, parse_mode=action.parse_mode)
+                # Verbatim (final answer / error / ask / plan / permission) is PRIORITY in
+                # the per-chat gate (D8) so it is never starved by coalesced status churn.
+                await self._gated_send(
+                    state, send, verbatim=True,
+                    text=chunk, reply_markup=markup, parse_mode=action.parse_mode,
+                )
             except Exception:
                 # HTML render fallback (CRITICAL): a chunk Telegram rejects as HTML (a bad
                 # entity from a converter edge case) must NEVER drop the message. Resend the
@@ -1429,7 +1742,10 @@ class StreamingSession:
                 if action.parse_mode is None:
                     raise
                 plain = self._plain_fallback(action, i, chunk)
-                await send(text=plain, reply_markup=markup, parse_mode=None)
+                await self._gated_send(
+                    state, send, verbatim=True,
+                    text=plain, reply_markup=markup, parse_mode=None,
+                )
 
     @staticmethod
     def _plain_fallback(action: RenderAction, i: int, html_chunk: str) -> str:
@@ -1445,6 +1761,7 @@ class StreamingSession:
 
     async def _edit_status(
         self,
+        state: _ChatState,
         rt: _ProjectRuntime,
         action: RenderAction,
         *,
@@ -1455,7 +1772,9 @@ class StreamingSession:
 
         The status line id/text live on the per-project :class:`_ProjectRuntime` (ADR-005
         D7), so each running project edits its OWN line — a status burst in one project
-        never touches another's.
+        never touches another's. The actual create/edit funnels through the chat's
+        send-rate gate as the **non-verbatim** (low-priority) kind (ADR-005 D8), so this
+        status churn yields to verbatim and the combined cross-project rate stays bounded.
         """
         body = action.text
         if not body.strip():
@@ -1463,22 +1782,32 @@ class StreamingSession:
         if body == rt.status_text:
             # Identical to what's already shown — skip. Editing a Telegram message to the
             # same text raises "message is not modified"; the old fallback then sent a fresh
-            # message, which is exactly the status-line spam we must avoid.
+            # message, which is exactly the status-line spam we must avoid. Skipping BEFORE
+            # the gate also means an unchanged status never consumes a send slot.
             return
         if rt.status_message_id is None:
-            mid = await send(text=body, reply_markup=None, parse_mode=action.parse_mode)
+            mid = await self._gated_send(
+                state, send, verbatim=False,
+                text=body, reply_markup=None, parse_mode=action.parse_mode,
+            )
             rt.status_message_id = mid
             rt.status_text = body
             return
         try:
-            await edit(message_id=rt.status_message_id, text=body, parse_mode=action.parse_mode)
+            await self._gated_edit(
+                state, edit,
+                message_id=rt.status_message_id, text=body, parse_mode=action.parse_mode,
+            )
             rt.status_text = body
         except Exception:
             # A genuine edit failure (message gone / too old) must never kill the turn
             # (RB1/RB2); fall back to a fresh status message. Identical-text edits are
             # already skipped above, so this is a real failure, not a no-op edit.
             log.debug("status edit failed for chat; sending a fresh status line", exc_info=True)
-            mid = await send(text=body, reply_markup=None, parse_mode=action.parse_mode)
+            mid = await self._gated_send(
+                state, send, verbatim=False,
+                text=body, reply_markup=None, parse_mode=action.parse_mode,
+            )
             rt.status_message_id = mid
             rt.status_text = body
 

@@ -256,6 +256,10 @@ def make_streaming_session(engine: FakeEngine, *, config=None, store=None) -> St
         session_store=store,
         engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
         clock=lambda: 0.0,  # frozen clock: status edits are always "due"
+        # P5/T8: 0 interval so the per-chat send gate never sleeps under the frozen clock
+        # (these tests assert send/edit CONTENT, not RB5 rate timing). Production defaults
+        # to ~1 s; the gate's timing has its own injected-clock tests.
+        chat_send_interval=0.0,
     )
 
 

@@ -1297,6 +1297,137 @@ def coalesce_stream(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Per-chat send-rate gate (RB5 under concurrency, P5 / ADR-005 D8)
+# ---------------------------------------------------------------------------
+#
+# The Coalescer (above) throttles ONE project's status line. Under concurrency (P5)
+# N projects in one chat each run their own Coalescer, so a status burst in A never
+# resets B's throttle — but N projects flushing at once (plus the proactive
+# notifications, D4) can still burst PAST Telegram's ~1 msg/s/chat ceiling. The
+# ChatSendGate is the per-chat backstop: ALL outbound for a chat (every status edit,
+# verbatim message, and notification) funnels through it, and it spaces sends at a
+# minimum interval so the COMBINED cross-project rate stays bounded.
+#
+# Like the Coalescer it is a PURE class over an INJECTED clock: it only *decides* how
+# long to wait before a send may proceed (the actual awaiting stays in the session/bot,
+# exactly as the Coalescer leaves the real edit-waiting to T7). So it is unit-testable
+# with no real sleeps.
+#
+# **Verbatim is PRIORITY over coalesced status churn (the load-bearing D8 rule).** A
+# starved status line is fine (it is noise — the newest wins); a starved ask/plan/error/
+# result is NOT (the operator can't answer a prompt they never receive — a deadlock).
+# So the gate gives verbatim sends precedence: a verbatim is spaced off the last ACTUAL
+# send, and a backlog of FUTURE-dated status reservations does NOT advance that cursor —
+# so a verbatim arriving amid K coalesced status edits waits ~1 interval off the last real
+# send, NOT K×interval at the back of the backlog. (Spacing verbatim off the gate's running
+# tail instead would land it behind all K — the exact starvation D8 forbids.) Status edits
+# space off the status tail (so they stay ≥interval apart) and a verbatim pushes that tail
+# to its own slot, so the next status falls in BEHIND the verbatim. Nothing is ever dropped
+# — the gate ORDERS sends (returns a wait), it never discards a body (RB6/SB3: it does not
+# touch message content at all); a verbatim is merely inserted ahead of the pending status
+# tail (in that rare case one status may share the verbatim's interval — the accepted cost
+# of never starving a prompt). It gates SENDS, never the resolve path (taking it on a
+# resolve would deadlock a held turn — the session only ever consults it around outbound
+# I/O).
+
+
+class ChatSendGate:
+    """Bound a single chat's COMBINED send/edit rate under concurrency (RB5/D8).
+
+    All outbound for a chat (status edits, verbatim messages, notifications) calls
+    :meth:`reserve` to learn how long to wait before sending; the caller does the actual
+    awaiting (the gate, like :class:`Coalescer`, decides timing only — no real sleep). A
+    minimum ``interval`` between sends keeps the combined cross-project rate under
+    Telegram's ~1 msg/s/chat ceiling even when N concurrent projects flush at once.
+
+    The **clock is injected** (``now: Callable[[], float]`` monotonic seconds) so tests
+    advance time deterministically.
+
+    Verbatim sends are **priority** (``reserve(verbatim=True)``): they are spaced only off
+    the last *actual* send, and a backlog of future-dated status reservations does NOT
+    advance that cursor — so a verbatim arriving amid K coalesced status edits waits ~1
+    interval off the last real send, never K×interval at the back of the backlog (the D8
+    invariant — a starved status line is acceptable noise, a starved prompt is a deadlock).
+    Status edits (``verbatim=False``) space off the status tail and yield to verbatim (a
+    verbatim pushes the tail to its own slot, so the next status falls in behind it). Either
+    way :meth:`reserve` returns a non-negative wait and **never drops** a send — it only
+    orders them.
+    """
+
+    def __init__(
+        self,
+        *,
+        now: Callable[[], float],
+        interval: Optional[float] = None,
+    ) -> None:
+        chosen = DEFAULT_CHAT_SEND_INTERVAL if interval is None else interval
+        if chosen < 0:
+            raise ValueError("interval must be non-negative")
+        self._now = now
+        self._interval = float(chosen)
+        # Scheduled time of the last ACTUAL send — a verbatim, or a status edit that fired
+        # at the leading edge (scheduled ≤ now, i.e. it went out immediately). Verbatim is
+        # spaced off THIS, so it is never dragged forward by a backlog of FUTURE-dated status
+        # reservations stacked ahead of it (the D8 fix: a queued status edit does NOT advance
+        # this cursor, so a verbatim arriving amid status churn waits ~1 interval off the last
+        # real send, not K×interval at the back of the backlog).
+        self._last_actual: float = float("-inf")
+        # Scheduled time of the last STATUS reservation (the coalesced-status running tail).
+        # Status edits space off this (+interval) so they stay ≥interval apart among
+        # themselves; a verbatim pushes it forward to its own slot so the NEXT status falls
+        # in behind the verbatim (never ahead of it).
+        self._status_tail: float = float("-inf")
+
+    def reserve(self, *, verbatim: bool) -> float:
+        """Reserve the next send slot; return the wait (seconds, ≥0) before it may go.
+
+        ``verbatim=True`` (priority — a final answer / error / ask / plan / permission /
+        notification) is spaced only off the last *actual* send (:attr:`_last_actual`),
+        which a FUTURE-dated status backlog never advances — so a verbatim arriving amid K
+        coalesced status reservations waits ~1 interval off the last real send, **not**
+        K×interval at the back of that backlog (D8 — verbatim must not be starved by status
+        churn). The verbatim then pushes :attr:`_status_tail` to its own slot so the next
+        status falls in behind it. ``verbatim=False`` (a status-line edit) spaces off
+        :attr:`_status_tail` (+interval), so it stays ≥interval from the prior status and
+        YIELDS to verbatim; a status that fires at the leading edge (scheduled ≤ now) IS an
+        actual send and so also advances :attr:`_last_actual`.
+
+        Keeps the COMBINED rate ≤ one send per ``interval`` in steady state. **Nothing is
+        ever dropped** — a verbatim is merely *ordered ahead* of the pending status tail
+        (both still send; in the rare verbatim-amid-churn case one status may share the
+        verbatim's interval — the accepted D8 cost of never starving a prompt). Pure
+        decision (no I/O, no sleep): the caller awaits the returned delay then sends.
+        """
+        now = self._now()
+        # Verbatim spaces off the last ACTUAL send (ignoring future status reserved ahead —
+        # it must not starve a prompt); status spaces off the running status tail.
+        base = self._last_actual if verbatim else self._status_tail
+        scheduled = max(now, base + self._interval)
+        if verbatim:
+            # A verbatim is always an actual send; the next verbatim spaces off it, and the
+            # next status falls in behind it (never shrinking an existing deeper backlog).
+            self._last_actual = scheduled
+            self._status_tail = max(self._status_tail, scheduled)
+        else:
+            self._status_tail = scheduled
+            # A leading-edge status (goes immediately) IS a real send a following verbatim
+            # must space off; a FUTURE-dated (queued) status must NOT advance _last_actual —
+            # that is precisely what would otherwise push a verbatim to the back of the churn.
+            if scheduled <= now:
+                self._last_actual = scheduled
+        wait = scheduled - now
+        return wait if wait > 0 else 0.0
+
+
+#: Default minimum interval between sends through a :class:`ChatSendGate` (seconds).
+#: Telegram's practical per-chat send ceiling is ~1 msg/s; 1 s is the conservative
+#: per-chat budget for the COMBINED cross-project rate (the per-project status
+#: Coalescer already uses a larger ``DEFAULT_MIN_EDIT_INTERVAL`` for its own line).
+#: Configurable via ``RENDER_CHAT_SEND_INTERVAL_SECONDS`` (Config, P5/T8).
+DEFAULT_CHAT_SEND_INTERVAL = 1.0
+
+
 __all__ = [
     # action
     "RenderAction",
@@ -1341,4 +1472,7 @@ __all__ = [
     "FlushResult",
     "coalesce_stream",
     "DEFAULT_MIN_EDIT_INTERVAL",
+    # per-chat send-rate gate (RB5 under concurrency, D8)
+    "ChatSendGate",
+    "DEFAULT_CHAT_SEND_INTERVAL",
 ]

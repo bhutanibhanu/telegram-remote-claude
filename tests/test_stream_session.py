@@ -31,7 +31,7 @@ from claude_tg.engine.types import (
 )
 from claude_tg.permissions import PermissionPolicy
 from claude_tg.render import RenderAction, encode_callback
-from claude_tg.stream_session import StreamingBusy, StreamingSession
+from claude_tg.stream_session import StreamingBusy, StreamingSession, _ProjectRuntime
 
 
 def make_config(
@@ -43,6 +43,7 @@ def make_config(
     allowed_roots=(),
     allow_any_path=True,
     max_concurrent_runs=3,
+    render_chat_send_interval_seconds=0.0,
 ):
     # NOTE (T7): turn-behavior tests default to ``allow_any_path=True`` so that
     # ``_ensure_engine``'s SB2 cwd re-validation (added in T7) NO-OPS — these tests are
@@ -51,6 +52,13 @@ def make_config(
     # making turns respect it is correct; we simply give these tests a config where work
     # is actually permitted. The SB2 refusal itself is exercised by focused new tests
     # below that pass REAL ``allowed_roots`` + real dirs with ``allow_any_path=False``.
+    #
+    # NOTE (T8): the per-chat send-gate interval defaults to 0.0 here so the gate never
+    # introduces a real ``asyncio.sleep`` under the frozen test clock (``clock=lambda: 0.0``
+    # in make_session) — these tests assert send/edit CONTENT + ordering, not RB5 rate
+    # timing (which has its own injected-clock tests below + in test_render). Production
+    # defaults to ~1 s; the RB7 concurrency tests pass an explicit interval + a recording
+    # clock/sleep.
     return Config(
         bot_token="t",
         allowed_chat_ids=frozenset(allowed),
@@ -63,6 +71,7 @@ def make_config(
         engine_mode=engine_mode,
         answer_backstop_seconds=3600,
         max_concurrent_runs=max_concurrent_runs,
+        render_chat_send_interval_seconds=render_chat_send_interval_seconds,
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
     )
@@ -521,15 +530,16 @@ async def test_identical_status_line_is_not_resent():
     session = make_session(engine)
     rt = active_rt(session)  # T4: the status line lives on the per-project runtime (D7)
     rec = Recorder()
+    state = session._chat(1)  # T8: _perform now takes the chat state (the send-rate gate)
     thinking = RenderAction(op="edit_status", chunks=("💭 Claude is thinking…",))
-    await session._perform(rt, thinking, send=rec.send, edit=rec.edit)  # first → one send
-    await session._perform(rt, thinking, send=rec.send, edit=rec.edit)  # identical → skip
-    await session._perform(rt, thinking, send=rec.send, edit=rec.edit)  # identical → skip
+    await session._perform(state, rt, thinking, send=rec.send, edit=rec.edit)  # first → one send
+    await session._perform(state, rt, thinking, send=rec.send, edit=rec.edit)  # identical → skip
+    await session._perform(state, rt, thinking, send=rec.send, edit=rec.edit)  # identical → skip
     assert len(rec.sends) == 1  # ONE status message, not three
     assert rec.edits == []  # no edit attempted for identical text
     # A CHANGED line edits the existing message in place (no new message).
     await session._perform(
-        rt, RenderAction(op="edit_status", chunks=("⏳ rate limited",)), send=rec.send, edit=rec.edit
+        state, rt, RenderAction(op="edit_status", chunks=("⏳ rate limited",)), send=rec.send, edit=rec.edit
     )
     assert len(rec.sends) == 1 and len(rec.edits) == 1
 
@@ -1043,7 +1053,7 @@ async def test_keyboard_attaches_to_first_non_empty_chunk():
     rec = Recorder()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Yes", callback_data="x")]])
     action = RenderAction(op="new", chunks=("   ", "real content"), reply_markup=kb)
-    await session._perform(rt, action, send=rec.send, edit=rec.edit)
+    await session._perform(session._chat(1), rt, action, send=rec.send, edit=rec.edit)
     # Only the non-empty chunk is sent, and it carries the keyboard.
     assert [s["text"] for s in rec.sends] == ["real content"]
     assert rec.sends[0]["reply_markup"] is kb
@@ -1801,7 +1811,12 @@ async def test_two_projects_run_concurrent_turns(tmp_path):
     assert out_a.handled is True
     assert eng_alpha.resolve_calls == [("tid-a", QuestionAnswer(answers={"A?": "Ya"}))]
     await asyncio.wait_for(turn_a, timeout=2.0)
-    assert any("alpha-done" in s["text"] for s in rec.sends)
+    # P5 / ADR-005 D4 (T8): alpha is now a BACKGROUND project (the store switched to beta),
+    # so alpha's completion arrives as a "✅ alpha — done" PING — NOT inline "alpha-done"
+    # (the foreground beta still rendered its own result inline above). This is the headline
+    # D4 behavior: "A's completion arrives as ✅ A — done even though B is in front."
+    assert any("alpha-done" in s["text"] for s in rec.sends) is False  # no inline result
+    assert any(s["text"] == "✅ alpha — done" for s in rec.sends)  # background ping instead
     assert session.is_busy(1) is False  # both done → nothing busy
 
 
@@ -3264,14 +3279,15 @@ async def test_two_projects_status_lines_are_independent(tmp_path):
     rt_beta = session._chat(1).runtimes["beta"]
     rec = Recorder()
 
+    state = session._chat(1)  # T8: _perform now takes the chat state (the send-rate gate)
     # Alpha gets a status line.
     await session._perform(
-        rt_alpha, RenderAction(op="edit_status", chunks=("💭 alpha thinking…",)),
+        state, rt_alpha, RenderAction(op="edit_status", chunks=("💭 alpha thinking…",)),
         send=rec.send, edit=rec.edit,
     )
     # Beta gets its OWN, different status line.
     await session._perform(
-        rt_beta, RenderAction(op="edit_status", chunks=("⏳ beta rate limited",)),
+        state, rt_beta, RenderAction(op="edit_status", chunks=("⏳ beta rate limited",)),
         send=rec.send, edit=rec.edit,
     )
     # Two distinct message ids — one per project — and the texts don't bleed across.
@@ -3284,7 +3300,7 @@ async def test_two_projects_status_lines_are_independent(tmp_path):
     # Editing alpha's line again does not disturb beta's text/id.
     beta_mid, beta_text = rt_beta.status_message_id, rt_beta.status_text
     await session._perform(
-        rt_alpha, RenderAction(op="edit_status", chunks=("ℹ️ alpha update",)),
+        state, rt_alpha, RenderAction(op="edit_status", chunks=("ℹ️ alpha update",)),
         send=rec.send, edit=rec.edit,
     )
     assert rt_alpha.status_text == "ℹ️ alpha update"
@@ -3407,3 +3423,359 @@ async def test_project_status_reader_is_case_insensitive(tmp_path):
     session._chat(1).runtimes["alpha"].status = "running"
     assert session.project_status(1, "ALPHA") == "running"
     assert session.project_status(1, "Alpha") == "running"
+
+
+# ===========================================================================
+# P5 (T8) — Notification send-decision (ADR-005 D4) + RB5 under concurrency
+# (RB7, ADR-005 D8). A BACKGROUND (non-foreground) project's hold/terminal
+# becomes a name-prefixed 🔔/✅/⚠️ ping (the operator isn't watching it); a
+# FOREGROUND project renders inline as P4. All outbound for a chat funnels
+# through a per-chat send-rate gate (verbatim prioritized, never starved).
+# ===========================================================================
+
+
+async def _drive_project(session, chat_id, name, rt, *, send, edit, prompt="go"):
+    """Drive ONE turn for a SPECIFIC project (background or foreground) to completion.
+
+    Mirrors what ``handle_message`` does for a concurrent run: pass the project as the
+    pinned ``target`` so ``_drive_turn`` acts on THAT project (its engine + foreground
+    check), regardless of which project is the store's active one. Bounded so a wiring
+    bug fails fast.
+    """
+    state = session._chat(chat_id)
+    await asyncio.wait_for(
+        session._drive_turn(
+            state, chat_id, rt.engine, prompt,
+            send=send, edit=edit, target=(name, rt),
+        ),
+        timeout=2.0,
+    )
+
+
+async def test_background_permission_hold_sends_attention_ping(tmp_path):
+    # A BACKGROUND project (alpha) hits a permission hold while beta is foreground → a
+    # "🔔 alpha — Claude needs approval" ping is sent, carrying the SAME [Allow/Deny]
+    # keyboard the inline render would (so the tap still routes by the D3 index). The
+    # foreground (beta) is undisturbed.
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="beta")
+    perm = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(command=rm -rf x)",
+        tool_use_id="a-perm", session_id="alpha-sid",
+    )
+    # alpha's engine yields the permission, parks, then resolves to a clean result.
+    eng_alpha._script = [perm, HOLD, ResultEvent(session_id="alpha-sid", is_error=False, subtype="success")]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rec = Recorder()
+
+    turn = asyncio.create_task(_drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit))
+    # Wait until the attention ping is sent (the turn then parks at the HOLD).
+    for _ in range(500):
+        if any(s["text"] == "🔔 alpha — Claude needs approval" for s in rec.sends):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("background permission ping was never sent")
+    # The ping is the name-prefixed bell, NOT the inline "🔐 Permission needed" prompt.
+    ping = next(s for s in rec.sends if s["text"].startswith("🔔"))
+    assert ping["text"] == "🔔 alpha — Claude needs approval"
+    assert ping["reply_markup"] is not None  # carries the verdict keyboard (routes by id)
+    assert not any("🔐 Permission needed" in s["text"] for s in rec.sends)  # no inline prompt
+    # The hold is in the index, owned by alpha → a tap routes to alpha (D3) and finishes it.
+    assert session._chat(1).pending_index["a-perm"].project_name == "alpha"
+    out = session.resolve_callback(1, encode_callback("m", "a-perm", payload="o"))
+    assert out.handled is True
+    assert eng_alpha.resolve_calls == [("a-perm", PermissionDecision(verdict="allow_once"))]
+    await turn
+
+
+async def test_foreground_permission_hold_renders_inline_no_ping(tmp_path):
+    # The inverse: when the SAME hold belongs to the FOREGROUND project (alpha is active),
+    # it renders inline (the "🔐 Permission needed" prompt) with NO "🔔" ping (no duplicate).
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="alpha")
+    perm = PermissionEvent(
+        tool_name="Bash", tool_input_summary="Bash(command=ls)",
+        tool_use_id="a-perm", session_id="alpha-sid",
+    )
+    eng_alpha._script = [perm, HOLD, ResultEvent(session_id="alpha-sid", is_error=False, subtype="success")]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rec = Recorder()
+
+    turn = asyncio.create_task(_drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if any("🔐 Permission needed" in s["text"] for s in rec.sends):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("foreground permission prompt was never rendered inline")
+    # Inline prompt present, NO background ping.
+    assert any("🔐 Permission needed" in s["text"] for s in rec.sends)
+    assert not any(s["text"].startswith("🔔") for s in rec.sends)
+    session.resolve_callback(1, encode_callback("m", "a-perm", payload="o"))
+    await turn
+
+
+async def test_background_ask_pings_then_sends_question_keyboards(tmp_path):
+    # A BACKGROUND ask → a "🔔 alpha — asks a question" ping + each question's option
+    # keyboard (so a multi-question ask stays answerable while backgrounded), and NO inline
+    # verbatim ask body for the foreground.
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="beta")
+    ask = AskEvent(
+        questions=[{"question": "Pick?", "options": [{"label": "X"}, {"label": "Y"}]}],
+        tool_use_id="a-ask", session_id="alpha-sid",
+    )
+    eng_alpha._script = [ask, HOLD, ResultEvent(session_id="alpha-sid", is_error=False, subtype="success")]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rec = Recorder()
+
+    turn = asyncio.create_task(_drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if any(s["text"] == "🔔 alpha — asks a question" for s in rec.sends):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("background ask ping was never sent")
+    # The bell ping is body-free; the question keyboard rides its own (safe) message.
+    assert any(s["text"] == "🔔 alpha — asks a question" for s in rec.sends)
+    assert any(s["reply_markup"] is not None for s in rec.sends)  # a question keyboard sent
+    # Resolve via the id-routed option tap (proves the keyboard routes to alpha).
+    out = session.resolve_callback(1, encode_callback("a", "a-ask", question_index=0, option_index=0))
+    assert out.handled is True
+    assert eng_alpha.resolve_calls == [("a-ask", QuestionAnswer(answers={"Pick?": "X"}))]
+    await turn
+
+
+async def test_background_done_sends_check_ping(tmp_path):
+    # A BACKGROUND project finishing cleanly → "✅ alpha — done" (NOT the inline result).
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="beta")
+    eng_alpha._script = [ResultEvent(session_id="alpha-sid", is_error=False, subtype="success", result_text="the answer")]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rec = Recorder()
+    await _drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit)
+    assert any(s["text"] == "✅ alpha — done" for s in rec.sends)
+    # The result TEXT is NOT sent inline for a background project (SB3-adjacent: only the
+    # fixed "done" word, never the result body).
+    assert not any("the answer" in s["text"] for s in rec.sends)
+
+
+async def test_background_error_ping_is_body_free_kind_only_sb3(tmp_path):
+    # ⭐ The load-bearing SB3 check (T3-review SB3): a BACKGROUND error pings the body-free
+    # ErrorKind, NEVER event.message. Feed a SECRET-bearing ErrorEvent.message and assert the
+    # secret is ABSENT from the ping and the kind label is present.
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="beta")
+    # A synthetic secret-shaped body the operator must NEVER see (built via concatenation so
+    # it is obviously a test fixture, not a real credential).
+    raw_body = "S3CR3T-" + "z" * 200
+    eng_alpha._script = [
+        ErrorEvent(kind_of_error="tool_error", message=f"boom: {raw_body}", is_error=True, session_id="alpha-sid"),
+    ]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rec = Recorder()
+    await _drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit)
+    # The error ping is "⚠️ alpha — tool_error" — the body-free ErrorKind, never the message.
+    assert any(s["text"] == "⚠️ alpha — tool_error" for s in rec.sends)
+    # The secret-bearing body (and the raw message) appears in NO send (SB3).
+    assert all(raw_body not in s["text"] for s in rec.sends)
+    assert all("S3CR3T" not in s["text"] for s in rec.sends)
+    assert all("boom" not in s["text"] for s in rec.sends)
+
+
+async def test_background_run_does_not_spam_status_inline(tmp_path):
+    # A backgrounded run is SILENT inline (D4) — its verbose status (tool_use / thinking /
+    # incremental text) does NOT spam the chat; only the terminal ✅ ping is sent. (The
+    # foreground project keeps its inline status line — covered by the existing turn tests.)
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="beta")
+    eng_alpha._script = [
+        ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=make)", session_id="alpha-sid"),
+        TextEvent(text="thinking…", incremental=True, session_id="alpha-sid"),
+        ResultEvent(session_id="alpha-sid", is_error=False, subtype="success"),
+    ]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rec = Recorder()
+    await _drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit)
+    # Only the done ping — no status line, no tool_use one-liner sent for the background run.
+    assert [s["text"] for s in rec.sends] == ["✅ alpha — done"]
+    assert rec.edits == []  # no status-line edits for a background run
+
+
+async def test_background_attention_pings_are_throttled(tmp_path):
+    # D4 coalescing: a background project bursting the SAME hold kind does not spam duplicate
+    # 🔔 pings within the send interval. Drive _notify_background directly (the throttle is
+    # per (project, kind)) with a real interval + a frozen clock, and assert the SECOND
+    # identical ping is suppressed.
+    session = StreamingSession(
+        make_config(),
+        session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+        clock=lambda: 100.0,            # frozen — both pings arrive at the same instant
+        chat_send_interval=5.0,         # a real interval so the throttle window is open
+        sleep=_no_sleep,
+    )
+    state = session._chat(1)
+    perm = PermissionEvent(tool_name="Bash", tool_input_summary="Bash(...)", tool_use_id="p1")
+    rec = Recorder()
+    await session._notify_background(state, 1, "alpha", perm, "permission", send=rec.send)
+    await session._notify_background(state, 1, "alpha", perm, "permission", send=rec.send)
+    # Only ONE 🔔 ping (the second was throttled — the operator already knows; the first
+    # ping's keyboard still routes the tap, D3/D4).
+    assert sum(1 for s in rec.sends if s["text"] == "🔔 alpha — Claude needs approval") == 1
+    # A DIFFERENT kind (an error) is NOT suppressed by the permission throttle.
+    err = ErrorEvent(kind_of_error="turn_error", message="x")
+    await session._notify_terminal(state, "alpha", err, send=rec.send)
+    assert any(s["text"] == "⚠️ alpha — turn_error" for s in rec.sends)
+
+
+# --- RB7: RB5 under concurrency — the per-chat send gate bounds the combined
+#     cross-project rate, and verbatim survives (ordered, never dropped). ------
+
+
+class _RecordingSleep:
+    """An injected sleep that RECORDS each awaited delay and advances a clock (no real
+    wait), so a test can assert the send gate spaced sends without real time."""
+
+    def __init__(self, clock):
+        self._clock = clock
+        self.waits: list[float] = []
+
+    async def __call__(self, delay: float) -> None:
+        self.waits.append(delay)
+        self._clock.advance(delay)  # honor the gate's wait on the controllable clock
+
+
+async def _no_sleep(delay: float) -> None:
+    """An injected sleep that never actually waits (for tests that don't time the gate)."""
+    return None
+
+
+class _AdvClock:
+    """A controllable monotonic clock (advanced by the recording sleep)."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+async def test_rb7_two_projects_bursting_concurrently_are_bounded_and_verbatim_survives(tmp_path):
+    # ⭐ RB7 — the headline. TWO projects (both FOREGROUND-rendered here by giving the chat
+    # no store → a single implicit foreground, so BOTH render inline and their combined
+    # output all hits the chat gate) each emit a burst of distinct status lines + a verbatim
+    # final answer, driven CONCURRENTLY through ONE chat. Assert: (a) the per-chat gate paced
+    # the combined sends (positive spacing waits were honored — the rate stayed bounded under
+    # the concurrent burst), and (b) BOTH verbatim final answers survived (ordered, never
+    # dropped — a starved status line is fine, a starved verbatim is a deadlock).
+    clock = _AdvClock()
+    sleeper = _RecordingSleep(clock)
+
+    def script(tag):
+        return [
+            TextEvent(text=f"{tag} d{i}", incremental=True, session_id=tag) for i in range(5)
+        ] + [ResultEvent(session_id=tag, is_error=False, subtype="success", result_text=f"{tag} FINAL")]
+
+    # No store → a single implicit "default" project (always foreground), but we exercise
+    # two CONCURRENT turns by driving _drive_turn twice against two runtimes sharing the gate.
+    eng_a = FakeEngine(script("alpha"), session_id="alpha")
+    eng_b = FakeEngine(script("beta"), session_id="beta")
+    session = StreamingSession(
+        make_config(),
+        session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng_a,
+        clock=clock,
+        min_edit_interval=0.0,    # no per-project coalescing → the GATE bounds the combined rate
+        chat_send_interval=1.0,   # the per-chat budget under test
+        sleep=sleeper,
+    )
+    state = session._chat(1)
+    rt_a = _ProjectRuntime(cwd="/work/a")
+    rt_a.engine = eng_a
+    rt_a.started = True
+    rt_b = _ProjectRuntime(cwd="/work/b")
+    rt_b.engine = eng_b
+    rt_b.started = True
+
+    rec = Recorder()
+    # Drive BOTH turns concurrently through the one chat + one gate.
+    t_a = asyncio.create_task(session._drive_turn(state, 1, eng_a, "ga", send=rec.send, edit=rec.edit, target=("alpha", rt_a)))
+    t_b = asyncio.create_task(session._drive_turn(state, 1, eng_b, "gb", send=rec.send, edit=rec.edit, target=("beta", rt_b)))
+    await asyncio.wait_for(asyncio.gather(t_a, t_b), timeout=3.0)
+
+    texts = [s["text"] for s in rec.sends]
+    # BOTH verbatim final answers survived (never dropped by the gate).
+    assert any("alpha FINAL" in t for t in texts)
+    assert any("beta FINAL" in t for t in texts)
+    # The gate paced the combined cross-project sends (it inserted positive spacing waits) —
+    # so the chat's send rate stayed bounded under two concurrent bursts (RB5/RB7).
+    assert any(w > 0 for w in sleeper.waits)
+    assert clock.t > 0.0
+
+
+async def test_rb7_combined_send_rate_is_bounded(tmp_path):
+    # Two concurrent FOREGROUND-rendered bursts in one chat: assert the gate inserted a
+    # spacing wait for the sends so they did not all fire at the same instant (RB5 under
+    # concurrency). We use a controllable clock + a recording sleep that honors the wait.
+    from claude_tg.session_store import JsonSessionStore
+
+    class _Clock:
+        def __init__(self):
+            self.t = 0.0
+        def __call__(self):
+            return self.t
+        def advance(self, dt):
+            self.t += dt
+
+    clock = _Clock()
+    sleeper = _RecordingSleep(clock)
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "solo", "/work/solo", make_active=True)
+    # A burst of status edits (each a DISTINCT line so none is deduped) + a verbatim result.
+    script = [
+        TextEvent(text=f"delta {i}", incremental=True, session_id="s") for i in range(6)
+    ] + [ResultEvent(session_id="s", is_error=False, subtype="success", result_text="FINAL ANSWER")]
+    eng = FakeEngine(script, session_id="s")
+    session = StreamingSession(
+        make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng,
+        clock=clock,
+        min_edit_interval=0.0,        # let every status delta through to the gate (no per-
+                                      # project coalescing) so the GATE is what bounds them
+        chat_send_interval=1.0,       # the per-chat budget under test
+        sleep=sleeper,
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The verbatim final answer SURVIVED (it is rate-ordered, never dropped).
+    assert any("FINAL ANSWER" in s["text"] for s in rec.sends)
+    # The gate inserted spacing waits (the combined rate was bounded — sends did not all
+    # fire at t=0). At least one positive wait was honored.
+    assert any(w > 0 for w in sleeper.waits)
+    # The clock advanced by the cumulative spacing (proof the gate actually paced the chat).
+    assert clock.t > 0.0
+
+
+async def test_rb7_per_project_coalescers_are_independent(tmp_path):
+    # Each running project keeps its OWN Coalescer — a status burst in alpha does NOT reset
+    # beta's status throttle (the per-project independence the gate sits ON TOP of). Driven
+    # via the two-project setup; we assert each project edits its OWN status line id.
+    session, _store, _eng_a, _eng_b = await make_two_project_session(tmp_path, active="alpha")
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rt_beta = session._chat(1).runtimes["beta"]
+    rec = Recorder()
+    state = session._chat(1)
+    # Alpha emits a status line; beta emits its OWN — distinct ids, no cross-talk (the per-
+    # project status lines the Coalescers feed are independent — ADR-005 D7/D8).
+    await session._perform(
+        state, rt_alpha, RenderAction(op="edit_status", chunks=("alpha s1",)),
+        send=rec.send, edit=rec.edit,
+    )
+    await session._perform(
+        state, rt_beta, RenderAction(op="edit_status", chunks=("beta s1",)),
+        send=rec.send, edit=rec.edit,
+    )
+    assert rt_alpha.status_message_id != rt_beta.status_message_id
+    assert rt_alpha.status_text == "alpha s1" and rt_beta.status_text == "beta s1"

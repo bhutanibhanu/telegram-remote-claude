@@ -7,6 +7,7 @@ from claude_tg.config import (
     load_dotenv,
     parse_allowed_roots,
     parse_chat_ids,
+    parse_chat_send_interval_seconds,
     parse_max_concurrent_runs,
 )
 
@@ -23,6 +24,8 @@ def clean_env(monkeypatch):
     # MAX_CONCURRENT_RUNS (P5/T6) has no TELEGRAM_/CLAUDE_ prefix either — clear it so a
     # host/CI value can't leak into the cap parse matrix below.
     monkeypatch.delenv("MAX_CONCURRENT_RUNS", raising=False)
+    # RENDER_CHAT_SEND_INTERVAL_SECONDS (P5/T8) likewise has no TELEGRAM_/CLAUDE_ prefix.
+    monkeypatch.delenv("RENDER_CHAT_SEND_INTERVAL_SECONDS", raising=False)
 
 
 def test_parse_chat_ids():
@@ -196,5 +199,60 @@ def test_config_bad_max_concurrent_runs_fails_loud(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
     monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
     monkeypatch.setenv("MAX_CONCURRENT_RUNS", "-2")
+    with pytest.raises(ValueError):
+        Config.from_env(dotenv_path=None)
+
+
+# --- D8: RENDER_CHAT_SEND_INTERVAL_SECONDS (the per-chat send budget, P5/T8) ----
+
+
+def test_parse_chat_send_interval_unset_and_empty_default():
+    # Unset / empty / whitespace → the ~1 s default (no new REQUIRED env — main stays
+    # runnable). Note: unlike the cap, "0" is a VALID value (disables spacing), so it is
+    # NOT folded into the default — see the next test.
+    assert parse_chat_send_interval_seconds(None) == 1.0
+    assert parse_chat_send_interval_seconds("") == 1.0
+    assert parse_chat_send_interval_seconds("   ") == 1.0
+
+
+def test_parse_chat_send_interval_accepts_zero_and_positive_floats():
+    # 0 is a deliberate valid choice (every send goes immediately — fine for a low-traffic
+    # deployment), unlike the cap where 0 would deadlock. Positive floats pass through.
+    assert parse_chat_send_interval_seconds("0") == 0.0
+    assert parse_chat_send_interval_seconds("2.5") == 2.5
+    assert parse_chat_send_interval_seconds(" 1 ") == 1.0  # whitespace tolerated
+
+
+def test_parse_chat_send_interval_negative_or_non_numeric_raise():
+    # Negative or non-numeric → fail loud at startup (a typo must not silently change the
+    # budget). Mirrors the other numeric keys' fail-loud posture.
+    with pytest.raises(ValueError):
+        parse_chat_send_interval_seconds("-1")
+    with pytest.raises(ValueError):
+        parse_chat_send_interval_seconds("x")
+
+
+def test_config_default_chat_send_interval(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.render_chat_send_interval_seconds == 1.0  # unset → default
+
+
+def test_config_chat_send_interval_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RENDER_CHAT_SEND_INTERVAL_SECONDS", "2")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.render_chat_send_interval_seconds == 2.0
+
+
+def test_config_bad_chat_send_interval_fails_loud(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("CLAUDE_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RENDER_CHAT_SEND_INTERVAL_SECONDS", "nope")
     with pytest.raises(ValueError):
         Config.from_env(dotenv_path=None)

@@ -29,7 +29,12 @@ def make_config(
     allowed_roots=(),
     allow_any_path=False,
     max_concurrent_runs=3,
+    render_chat_send_interval_seconds=0.0,
 ):
+    # P5/T8: default the per-chat send-gate interval to 0.0 in tests so the gate never
+    # introduces a real ``asyncio.sleep`` under the frozen test clock (these tests assert
+    # send/edit CONTENT + ordering, not rate timing — the RB5 gate timing has its own
+    # injected-clock tests). Production defaults to ~1 s.
     return Config(
         bot_token="t",
         allowed_chat_ids=frozenset(allowed),
@@ -42,6 +47,7 @@ def make_config(
         engine_mode=engine_mode,
         answer_backstop_seconds=3600,
         max_concurrent_runs=max_concurrent_runs,
+        render_chat_send_interval_seconds=render_chat_send_interval_seconds,
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
     )

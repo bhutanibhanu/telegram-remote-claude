@@ -38,6 +38,7 @@ from claude_tg.engine.types import (
 from claude_tg.render import (
     CALLBACK_LIMIT,
     KIND_PERMISSION,
+    ChatSendGate,
     Coalescer,
     RenderAction,
     answers_from_ask,
@@ -997,3 +998,106 @@ def test_ask_question_body_html_escapes_question_and_converts_markdown():
     assert "Storage" in html_body  # the scaffolding header label survives
     # The plain variant is unchanged (the raw fallback the send path resends on rejection).
     assert ask_question_body(ask, 0) == "❓ Storage: Use **JSON** or <raw> ?"
+
+
+# ============================================================================
+# ChatSendGate (RB5 under concurrency, P5 / ADR-005 D8) — pure timing decisions
+# over an injected clock, mirroring the Coalescer test style (no real sleeps).
+# The gate decides the WAIT before a send may proceed; the session does the
+# awaiting. Verbatim is PRIORITY over coalesced status churn (never starved).
+# ============================================================================
+
+
+def test_chat_send_gate_leading_edge_is_immediate():
+    # The first send through an idle gate goes immediately (no artificial lag), whether it
+    # is verbatim or a status edit — the leading edge, exactly like the Coalescer.
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=1.0)
+    assert gate.reserve(verbatim=True) == 0.0
+    clock.advance(5.0)  # idle long past the interval
+    assert gate.reserve(verbatim=False) == 0.0
+
+
+def test_chat_send_gate_spaces_subsequent_sends_by_interval():
+    # Two sends in quick succession through one gate are spaced by the interval: the first
+    # goes now (wait 0), the second must wait the remaining interval (bounded rate).
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=1.0)
+    assert gate.reserve(verbatim=True) == 0.0  # send #1 now
+    # No time has passed; send #2 must wait ~1 s (the per-chat budget).
+    assert gate.reserve(verbatim=True) == pytest.approx(1.0)
+    # After the clock advances past that reservation, the next send is immediate again.
+    clock.advance(2.0)
+    assert gate.reserve(verbatim=True) == 0.0
+
+
+def test_chat_send_gate_n_sends_are_bounded_not_simultaneous():
+    # ⭐ The RB5 property at the unit level: N back-to-back sends (the worst case — N
+    # concurrent projects flushing at the same instant) do NOT all go at once; their
+    # cumulative scheduled offsets grow by the interval, so the COMBINED rate is bounded.
+    clock = FakeClock()  # frozen — every send arrives at the same instant
+    gate = ChatSendGate(now=clock, interval=1.0)
+    waits = [gate.reserve(verbatim=True) for _ in range(5)]
+    # 0, 1, 2, 3, 4 — strictly increasing by the interval (≤ one send per interval).
+    assert waits == [pytest.approx(i * 1.0) for i in range(5)]
+
+
+def test_chat_send_gate_verbatim_is_not_starved_by_status_churn():
+    # ⭐ The load-bearing D8 priority rule. A burst of status edits reserves slots stretching
+    # into the future; a verbatim send (an ask/error/result) arriving amid that churn must
+    # NOT be pushed to the BACK of that backlog — it is spaced ~1 interval off the last
+    # ACTUAL send (the one leading-edge status that already fired this instant), independent
+    # of how DEEP the status backlog is (a starved status line is fine; a starved prompt is a
+    # deadlock). This is the case the priority actually has to handle, and it has TEETH:
+    # spacing the verbatim off the running tail instead (the priority-breaking mutation —
+    # base=_last_actual → base=_status_tail) would make the verbatim wait ~K, so the
+    # assertion below would FAIL. (Mutation-verified: confirmed the test goes red under that
+    # change, then restored.)
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=1.0)
+    # A DEEP status backlog: 30 status edits at the same instant stack reservations
+    # 0,1,..,29. Only the FIRST fires at the leading edge (this instant); the other 29 are
+    # future-dated and must NOT drag the "last actual send" cursor forward.
+    k = 30
+    status_waits = [gate.reserve(verbatim=False) for _ in range(k)]
+    assert status_waits == [pytest.approx(i * 1.0) for i in range(k)]
+    # Now a verbatim arrives (still the same instant). It jumps ahead of the 29 queued status
+    # edits: spaced ~1 interval off the last actual send (the leading-edge status at +0), NOT
+    # ~30 at the tail of the backlog. The wait is bounded by the interval, NOT the churn
+    # depth — the whole point of the D8 priority.
+    verbatim_wait = gate.reserve(verbatim=True)
+    assert verbatim_wait == pytest.approx(1.0)
+    # Strictly: far below the depth-K wait the priority-breaking mutation would yield.
+    assert verbatim_wait < (k - 1) * 1.0
+    assert verbatim_wait >= 0.0
+
+
+def test_chat_send_gate_verbatim_wait_is_independent_of_status_backlog_depth():
+    # Companion teeth test from a different angle: the verbatim's wait is BOUNDED BY THE
+    # INTERVAL, not by how deep the status backlog is. A 5-deep churn and a 50-deep churn
+    # both yield the SAME ~1-interval verbatim wait (off the single leading-edge status that
+    # fired this instant). The priority-breaking mutation (base=_last_actual -> _status_tail)
+    # would make the wait scale with the depth (~5 vs ~50), so this equality would FAIL.
+    def verbatim_wait_after_status_burst(depth: int) -> float:
+        clock = FakeClock()
+        gate = ChatSendGate(now=clock, interval=1.0)
+        for _ in range(depth):  # depth status edits at one instant -> a deep backlog tail
+            gate.reserve(verbatim=False)
+        return gate.reserve(verbatim=True)  # verbatim jumps ahead of the queued tail
+
+    shallow = verbatim_wait_after_status_burst(5)
+    deep = verbatim_wait_after_status_burst(50)
+    assert shallow == pytest.approx(1.0)
+    assert deep == pytest.approx(shallow)  # depth-invariant: NOT 5 vs 50
+
+
+def test_chat_send_gate_zero_interval_never_waits():
+    # interval=0 disables spacing (a valid low-traffic choice) — every send is immediate.
+    clock = FakeClock()
+    gate = ChatSendGate(now=clock, interval=0.0)
+    assert [gate.reserve(verbatim=v) for v in (True, False, True, False)] == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_chat_send_gate_rejects_negative_interval():
+    with pytest.raises(ValueError):
+        ChatSendGate(now=FakeClock(), interval=-1.0)
