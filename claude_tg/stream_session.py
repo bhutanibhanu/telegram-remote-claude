@@ -680,8 +680,10 @@ class StreamingSession:
                     )
                 # (b) Clear the persisted dead id so it is NOT re-resumed on any future
                 #     turn (the wedge fix). Done BEFORE the fresh start so even if the
-                #     fresh start were to raise, the dead id is already gone.
-                self._persist(chat_id, session_id=None)
+                #     fresh start were to raise, the dead id is already gone. ADR-005 D2:
+                #     clear it on the project being BUILT (``name`` — the captured target),
+                #     not "active", so a concurrent /switch can't redirect the clear.
+                self._persist(chat_id, session_id=None, name=name)
                 # (c) Build a FRESH engine instance (its _client is None, so its start()
                 #     cannot hit the "already started" guard) and adopt it as the runtime
                 #     engine, replacing the failed one.
@@ -812,17 +814,37 @@ class StreamingSession:
             # the project record itself). update() writes the active project's fields.
             self._persist(chat_id, session_id=None)
 
-    def _persist(self, chat_id: int, *, session_id: Optional[str]) -> None:
-        """Write ``session_id`` to the chat's ACTIVE project (flat update, cwd untouched).
+    def _persist(
+        self, chat_id: int, *, session_id: Optional[str], name: Optional[str] = None
+    ) -> None:
+        """Write ``session_id`` to a project (cwd untouched); ``session_id=None`` clears it.
 
-        The flat :meth:`~JsonSessionStore.update` writes the active project's fields;
-        ``cwd=None`` leaves the project's fixed cwd untouched (D4). ``session_id=None``
-        clears it (a reset / fresh conversation).
+        ``name`` selects which project (P5 / ADR-005 D2, the load-bearing per-project
+        persist now that ``/switch`` is free):
+
+        * ``name`` given → write to **that** project via
+          :meth:`~JsonSessionStore.set_session_id` (case-insensitive). ``_drive_turn``
+          passes the project it **captured at message time** so a turn's result-``session_id``
+          (and any QF3 dead-id clear) lands on the project the turn ran **on**, NOT
+          "whatever is active now" — because the active project can change mid-turn once
+          ``/switch`` no longer waits for the run to finish (the lock-P-drive-Q /
+          persist-drift hazard). An :class:`~claude_tg.session_store.UnknownProject` (the
+          project was ``/rm``'d mid-turn) is swallowed like any other persist failure (RB1
+          — never crash the turn over a write).
+        * ``name`` omitted → fall back to the flat :meth:`~JsonSessionStore.update` over the
+          chat's **active** project (the pre-P5 contract — used by ``reset`` and the
+          ``_ensure_engine`` dead-resume clear, both of which act on the active project).
+
+        ``cwd`` is always left untouched (D4): a project's cwd is fixed for the life of its
+        session.
         """
         if self.store is None:
             return
         try:
-            self.store.update(chat_id, session_id=session_id, cwd=None)
+            if name is not None:
+                self.store.set_session_id(chat_id, name, session_id)
+            else:
+                self.store.update(chat_id, session_id=session_id, cwd=None)
         except Exception:
             log.exception("failed to persist streaming session state for chat %s", chat_id)
 
@@ -1253,7 +1275,16 @@ class StreamingSession:
                     # QF3: do NOT re-persist the dead session_id on a resume-failure result
                     # — it would just re-arm the same broken resume. Recovery below clears it.
                     if not resume_failure_detected:
-                        self._persist(chat_id, session_id=event.session_id or engine.session_id)
+                        # ADR-005 D2: persist to THIS turn's CAPTURED project (turn_name), not
+                        # the active one — once /switch is free the active project can change
+                        # mid-turn, so writing to "active" would clobber a different project's
+                        # session_id (the lock-P-drive-Q / persist-drift hazard). turn_name is
+                        # the project handle_message pinned at message time.
+                        self._persist(
+                            chat_id,
+                            session_id=event.session_id or engine.session_id,
+                            name=turn_name,
+                        )
                 for action in coalescer.offer(event).actions:
                     await self._perform(turn_rt, action, send=send, edit=edit)
             # End of turn: flush any trailing coalesced status line, then DELETE the
@@ -1325,8 +1356,10 @@ class StreamingSession:
             name,
         )
         # 1) Clear the persisted dead id FIRST so even if the notice send fails the stale
-        #    session is gone (the next turn will start fresh, not re-resume it).
-        self._persist(chat_id, session_id=None)
+        #    session is gone (the next turn will start fresh, not re-resume it). ADR-005 D2:
+        #    clear it on the CAPTURED project (``name`` — the project whose turn just failed
+        #    to resume), not the active one, since /switch may have moved active mid-turn.
+        self._persist(chat_id, session_id=None, name=name)
         # 2) Drop the in-memory engine so the next turn rebuilds + starts fresh. Best-effort
         #    stop() the connected-but-dead engine BEFORE dropping the reference so its SDK
         #    client is closed rather than orphaned (QF3-review non-blocker, same pattern as

@@ -300,25 +300,37 @@ async def test_full_project_lifecycle_via_bot(tmp_path):
 
 
 # ===========================================================================
-# 4. ⭐ Busy-guard during an ANSWER-HOLD (the highest-value test).
+# 4. ⭐ FREE /switch + /new during an ANSWER-HOLD, then the held turn STILL resolves
+#    (the highest-value P5 regression — the INVERSE of P4's busy-guard ⭐ test).
 #
 # A turn parks awaiting an interactive answer (an AskEvent → the turn loop is inside
-# engine.send, lock held, is_busy True). WHILE parked, /switch AND /new are REFUSED and
-# neither store.switch nor store.create is called. THEN the hold is resolved via the
-# real callback path (resolve_callback, lock-free) and the held turn COMPLETES — proving
-# the relay is NOT deadlocked. If the busy-guard were dropped (a mid-hold active-project
-# change), this fails loudly: the spy would record the store mutation and the active
-# project would move out from under the parked turn.
+# engine.send, alpha's lock held, is_busy True). WHILE parked, /switch to beta AND /new
+# gamma now SUCCEED (the D2 relaxation): store.switch / store.create ARE called and the
+# active project moves OFF alpha. THEN alpha's hold is resolved via the REAL callback
+# path (resolve_callback, lock-free, id-routed by tool_use_id) and alpha's held turn
+# COMPLETES — proving that switching away did NOT strand the parked turn (id-routing,
+# ADR-005 D3, is the correctness guarantee that makes the relaxation safe). This is the
+# load-bearing inverse of the P4 ⭐ test (which asserted the refusal): a tap for alpha
+# resolves alpha even though beta/gamma became active. The cross-project never-resolve-B
+# property is exhaustively pinned end-to-end in T10.
 # ===========================================================================
 
 
-async def test_busy_guard_holds_during_answer_hold_then_resolves(tmp_path):
+async def test_free_switch_and_new_during_answer_hold_then_alpha_still_resolves(tmp_path):
     store = JsonSessionStore(tmp_path / "state.json")
+    # beta + gamma cwds are REAL dirs inside the bot's permitted roots so /switch's and
+    # /new's SB2 cwd re-validation passes (those gates survive the busy-guard relaxation).
+    # alpha's cwd can stay out-of-roots: its turn is driven by the session (allow_any_path),
+    # not re-validated by the bot.
+    beta_dir = tmp_path / "beta"
+    beta_dir.mkdir()
+    gamma_dir = tmp_path / "gamma"
+    gamma_dir.mkdir()
     store.create(1, "alpha", "/work/alpha", make_active=True)
-    store.create(1, "beta", "/work/beta", make_active=False)
+    store.create(1, "beta", str(beta_dir), make_active=False)
 
     # The turn yields an ask, then PARKS (HOLD) awaiting the operator's answer, then
-    # finishes once resolved. This is a genuine answer-hold (lock held throughout).
+    # finishes once resolved. This is a genuine answer-hold (alpha's lock held throughout).
     ask = AskEvent(
         questions=[{"question": "Proceed?", "options": [{"label": "Yes"}, {"label": "No"}]}],
         tool_use_id="hold-tid",
@@ -327,51 +339,51 @@ async def test_busy_guard_holds_during_answer_hold_then_resolves(tmp_path):
         store,
         script=[ask, HOLD, ResultEvent(session_id="alpha-sid", is_error=False, subtype="success", result_text="done")],
     )
-    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    # allow_any_path=True on the SESSION (make_streaming default) so the driver's turn path
+    # is not SB2-blocked; the BOT gets real roots so /new's SB2 confinement is exercised.
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
 
-    # Drive the turn; it parks at the answer-hold holding the per-chat lock.
+    # Drive the turn; it parks at the answer-hold holding alpha's lock.
     ctx = make_ctx()
     ctx.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
     turn = asyncio.create_task(bot.on_message(make_update(1, "go"), ctx))
     for _ in range(500):
-        if session.is_busy(1):
+        if session.is_busy(1, "alpha"):
             break
         await asyncio.sleep(0)
-    assert session.is_busy(1), "the held turn must hold the lock during the answer-hold"
+    assert session.is_busy(1, "alpha"), "the held turn must hold alpha's lock during the hold"
     # The held turn rendered the ask (its tool_use_id is in the pending index, routed to
     # the owning project) — a real answer-hold (P5 / ADR-005 D3).
     assert "hold-tid" in session._chat(1).pending_index
     assert session._chat(1).pending_index["hold-tid"].project_name == "alpha"
 
-    # Spy on BOTH store mutations to prove neither is called while busy.
-    switch_calls: list = []
-    create_calls: list = []
-    orig_switch, orig_create = store.switch, store.create
-    store.switch = lambda *a, **k: switch_calls.append((a, k))  # type: ignore[assignment]
-    store.create = lambda *a, **k: create_calls.append((a, k))  # type: ignore[assignment]
-
-    # /switch beta → REFUSED, store.switch NOT called, active unchanged.
+    # /switch beta WHILE alpha is parked → SUCCEEDS (the relaxation), active moves to beta.
     up_sw = make_update(1, "/switch beta")
     await bot.cmd_switch(up_sw, make_cmd_ctx(args=["beta"]))
     sw_reply = up_sw.message.reply_text.await_args.args[0]
-    assert "/cancel" in sw_reply and ("flight" in sw_reply.lower() or "finish" in sw_reply.lower())
+    assert "switched to beta" in sw_reply.lower(), sw_reply
+    assert store.get_active(1) == "beta"
 
-    # /new gamma → REFUSED, store.create NOT called.
-    up_new = make_update(1, "/new gamma /tmp")
-    await bot.cmd_new(up_new, make_cmd_ctx(args=["gamma", "/tmp"]))
+    # /new gamma WHILE alpha is parked → SUCCEEDS, gamma created + active.
+    up_new = make_update(1, "/new gamma " + str(gamma_dir))
+    await bot.cmd_new(up_new, make_cmd_ctx(args=["gamma", str(gamma_dir)]))
     new_reply = up_new.message.reply_text.await_args.args[0]
-    assert "/cancel" in new_reply and ("flight" in new_reply.lower() or "finish" in new_reply.lower())
+    assert "created gamma" in new_reply.lower(), new_reply
+    assert store.get_active(1) == "gamma"
 
-    store.switch, store.create = orig_switch, orig_create  # type: ignore[assignment]
+    # alpha is STILL parked + busy — switching/creating did NOT disturb its run.
+    assert session.is_busy(1, "alpha"), "alpha's held turn must survive the switch + new"
+    assert not turn.done()
 
-    assert switch_calls == [], "store.switch must NOT be called during an answer-hold"
-    assert create_calls == [], "store.create must NOT be called during an answer-hold"
-    # The active project did not move out from under the parked turn.
-    assert store.get_active(1) == "alpha"
-
-    # THEN resolve the hold via the REAL callback path (lock-free) — the held turn must
-    # unblock and complete (the relay is NOT deadlocked). resolve_callback runs
-    # concurrently with the held turn (no lock), mirroring the live tap.
+    # THEN resolve ALPHA's hold via the REAL callback path (lock-free, id-routed) — even
+    # though GAMMA is now the active/foreground project. The held turn must unblock and
+    # complete: switching away did NOT strand it (id-routing resolves alpha by tool_use_id,
+    # not _active_engine). This is the precise behavior the P4 busy-guard existed to avoid
+    # and that P5 makes safe.
     from claude_tg.render import encode_callback
 
     outcome = session.resolve_callback(
@@ -380,18 +392,21 @@ async def test_busy_guard_holds_during_answer_hold_then_resolves(tmp_path):
     assert outcome.handled is True
     # The parked turn now runs to completion — bounded so a deadlock regression fails fast.
     await asyncio.wait_for(turn, timeout=2.0)
-    assert session.is_busy(1) is False  # lock released cleanly at turn end
+    assert session.is_busy(1, "alpha") is False  # alpha's lock released cleanly at turn end
 
 
-async def test_busy_guard_false_pass_switch_succeeds_when_idle(tmp_path):
-    """False-pass guard for the ⭐ test: the SAME /switch that is refused mid-hold must
-    SUCCEED once the chat is idle — proving the refusal is gated on is_busy, not blanket."""
+async def test_switch_succeeds_when_idle(tmp_path):
+    """Sanity companion to the ⭐ test: /switch SUCCEEDS on an idle chat (it always did).
+
+    Was the P4 ``test_busy_guard_false_pass_switch_succeeds_when_idle`` false-pass guard
+    (idle → switch succeeds, proving the refusal was gated on is_busy not blanket). The
+    refusal is gone in P5, so this now just pins that an idle /switch still works — the
+    busy case is covered by the ⭐ test above (switch succeeds mid-hold too)."""
     store = JsonSessionStore(tmp_path / "state.json")
     store.create(1, "alpha", "/work/alpha", make_active=True)
     store.create(1, "beta", "/work/beta", make_active=False)
     session, _ = make_streaming(store)  # no turn driven → idle
-    # allow_any_path=True so the QF2 SB2 cwd re-validation no-ops for the fake /work/beta
-    # cwd — this guards the busy-gate false-pass (idle → switch succeeds), not SB2.
+    # allow_any_path=True so the SB2 cwd re-validation no-ops for the fake /work/beta cwd.
     bot = TelegramClaudeBot(
         make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
     )

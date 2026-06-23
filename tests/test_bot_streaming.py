@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 from claude_tg.bot import TelegramClaudeBot
 from claude_tg.claude_runner import ClaudeResult, ClaudeRunner
 from claude_tg.config import Config
-from claude_tg.engine.types import ResultEvent
+from claude_tg.engine.types import AskEvent, ResultEvent
 from claude_tg.session_store import JsonSessionStore
 from claude_tg.stream_session import CallbackOutcome, StreamingBusy, StreamingSession
 
@@ -28,6 +28,7 @@ def make_config(
     *,
     allowed_roots=(),
     allow_any_path=False,
+    max_concurrent_runs=3,
 ):
     return Config(
         bot_token="t",
@@ -40,6 +41,7 @@ def make_config(
         state_file=None,
         engine_mode=engine_mode,
         answer_backstop_seconds=3600,
+        max_concurrent_runs=max_concurrent_runs,
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
     )
@@ -75,6 +77,12 @@ class FakeStreaming:
         self.yolo_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
         self._busy = busy
+        # P5/T7: cmd_reset now reads streaming.store.get_active to scope its busy-guard to
+        # the ACTIVE project. This lightweight stand-in carries no registry (store=None), so
+        # the active name resolves to None and the guard is skipped — exactly the pre-P5
+        # behavior the wiring tests here assert (they exercise delegation, not concurrency;
+        # the per-project busy-guard semantics are covered against a REAL session below).
+        self.store = None
 
     async def handle_message(self, chat_id, text, *, send, edit, delete=None):
         self.handle_message_calls.append((chat_id, text))
@@ -89,9 +97,10 @@ class FakeStreaming:
         self.cancel_calls.append(chat_id)
         return 1
 
-    def is_busy(self, chat_id):
-        # Mirror StreamingSession.is_busy so the bot's busy-guards (/switch, /new, /reset)
-        # can be exercised against this lightweight stand-in.
+    def is_busy(self, chat_id, name=None):
+        # Mirror StreamingSession.is_busy (now (chat_id, name=None) — P5/T5) so the bot's
+        # busy-guards can be exercised against this lightweight stand-in. This stand-in has
+        # one notional run, so both the chat-level and per-project queries return _busy.
         return self._busy
 
     def reset(self, chat_id):
@@ -718,11 +727,17 @@ async def test_cmd_switch_missing_cwd_refused_fail_closed(tmp_path):
     assert store.get_active(1) == "alpha"  # fail-closed: active unchanged
 
 
-async def test_cmd_switch_busy_guard_precedes_revalidation(tmp_path):
-    """QF2 ordering: the busy-guard still fires FIRST — a /switch (even to an out-of-root
-    target) while a turn is in flight is refused with the busy message, BEFORE the cwd
-    re-validation, and the store is never touched (busy-guard is load-bearing for relay
-    correctness, D2). Pins the QF2 restructure didn't reorder the guards.
+async def test_cmd_switch_sb2_revalidation_still_fires_while_busy(tmp_path):
+    """P5/T7 (D2 relaxed): /switch no longer has a busy-guard, so the FIRST gate a busy
+    /switch hits is the SB2 cwd re-validation (it used to be shadowed by the busy refusal).
+    A /switch to an OUT-OF-ROOT target while a turn is in flight is now refused for the
+    RIGHT reason — the out-of-root message, not a busy message — and the active project is
+    left unchanged (SB2 fail-closed is preserved under the relaxation). The held turn keeps
+    running throughout (background concurrency).
+
+    (Was ``test_cmd_switch_busy_guard_precedes_revalidation``, which asserted the busy-guard
+    fired FIRST. The guard is gone in P5; this re-points the same scenario at the surviving
+    SB2 gate so the out-of-root refusal is not lost — coverage moved, not deleted.)
     """
     root = tmp_path / "root"
     root.mkdir()
@@ -750,46 +765,65 @@ async def test_cmd_switch_busy_guard_precedes_revalidation(tmp_path):
     upd = make_update(1, "/switch evil")
     await bot.cmd_switch(upd, make_cmd_ctx(args=["evil"]))
     reply = upd.message.reply_text.await_args.args[0]
-    # The BUSY message (not the out-of-root message) — the guard fired first.
-    assert "/cancel" in reply and ("flight" in reply.lower() or "finish" in reply.lower())
-    assert store.get_active(1) == "alpha"
+    # The OUT-OF-ROOT message (SB2), NOT a busy message — the relaxed /switch reached SB2.
+    assert "permitted roots" in reply.lower()
+    assert "/cancel" not in reply  # no busy refusal anymore
+    assert store.get_active(1) == "alpha"  # out-of-root target refused → active unchanged
+    assert session.is_busy(1), "the held turn keeps running (switch did not disturb it)"
 
     engine.cancel()
     await asyncio.wait_for(turn, timeout=2.0)
 
 
-async def test_cmd_switch_while_busy_refused_store_untouched(tmp_path):
-    # LOAD-BEARING busy-guard (D2): while a turn holds the lock, /switch must refuse and
-    # NOT call store.switch — a mid-hold active-project change deadlocks the parked turn.
+async def test_cmd_switch_while_busy_succeeds_prior_run_untouched(tmp_path):
+    # P5/T7 — THE HEADLINE RELAXATION (D2). While a turn holds project alpha's lock, /switch
+    # to beta now SUCCEEDS (no busy refusal): store.switch IS called, active becomes beta,
+    # and alpha's held turn is UNTOUCHED — it keeps holding its lock in the background
+    # (id-routing, ADR-005 D3, makes this safe: alpha's prompt still resolves by tool_use_id
+    # regardless of which project is foreground).
+    #
+    # MUTATION PROBE: this is the exact inverse of the P4 busy-guard test it replaces
+    # (was ``test_cmd_switch_while_busy_refused_store_untouched``). If the is_busy refusal is
+    # re-added to cmd_switch, store.switch is no longer called and this fails — so the
+    # relaxation is pinned, not merely uncovered.
     store = JsonSessionStore(tmp_path / "state.json")
     store.create(1, "alpha", "/work/alpha", make_active=True)
     store.create(1, "beta", "/work/beta", make_active=False)
     session, engine = make_streaming(store, script=[HOLD])  # the turn parks holding the lock
-    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    # allow_any_path=True so /switch's SB2 cwd re-validation no-ops for the fake /work/beta
+    # cwd — this test exercises the busy-guard relaxation, not SB2 (its own test below).
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
 
-    # Drive a turn that parks on HOLD (acquires + holds the per-chat turn lock).
+    # Drive a turn that parks on HOLD (acquires + holds alpha's per-project turn lock).
     rec = make_ctx()
     rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
     turn = asyncio.create_task(bot.on_message(make_update(1, "go"), rec))
-    # Wait until the turn is actually in flight (lock held).
+    # Wait until the turn is actually in flight (alpha's lock held).
     for _ in range(200):
-        if session.is_busy(1):
+        if session.is_busy(1, "alpha"):
             break
         await asyncio.sleep(0)
-    assert session.is_busy(1), "the held turn should hold the lock"
+    assert session.is_busy(1, "alpha"), "the held turn should hold alpha's lock"
 
-    # Spy on store.switch to prove it is NOT called while busy.
+    # /switch beta WHILE alpha is mid-run → SUCCEEDS (the relaxation). Spy store.switch to
+    # prove it IS now called (the inverse of the P4 assertion).
     switch_calls = []
     orig_switch = store.switch
-    store.switch = lambda *a, **k: switch_calls.append((a, k))  # type: ignore[assignment]
+    store.switch = lambda *a, **k: (switch_calls.append((a, k)), orig_switch(*a, **k))[1]  # type: ignore[assignment]
     upd = make_update(1, "/switch beta")
     await bot.cmd_switch(upd, make_cmd_ctx(args=["beta"]))
     store.switch = orig_switch  # type: ignore[assignment]
 
     reply = upd.message.reply_text.await_args.args[0]
-    assert "/cancel" in reply and ("flight" in reply.lower() or "finish" in reply.lower())
-    assert switch_calls == [], "store.switch must NOT be called while a turn is in flight"
-    assert store.get_active(1) == "alpha"  # active unchanged
+    assert "switched to beta" in reply.lower(), reply  # success, not a busy refusal
+    assert "/cancel" not in reply
+    assert switch_calls, "store.switch MUST be called now that /switch is free mid-run"
+    assert store.get_active(1) == "beta"  # active moved
+    # alpha's held turn is untouched — still parked + holding its lock (background run).
+    assert session.is_busy(1, "alpha"), "the prior run must keep running after the switch"
+    assert not turn.done()
 
     # Release the held turn so the task completes cleanly (no leaked task).
     engine.cancel()
@@ -1407,10 +1441,15 @@ async def test_cmd_new_duplicate_refused(tmp_path):
     assert list(store.list_projects(1)) == ["dup"]  # still exactly one
 
 
-async def test_cmd_new_while_busy_refused_store_untouched(tmp_path):
-    # LOAD-BEARING busy-guard (D2): /new auto-switches the active project, so while a turn
-    # holds the lock it must refuse and NOT call store.create — a mid-hold active-project
-    # change deadlocks the parked turn (same invariant as /switch).
+async def test_cmd_new_while_busy_succeeds_prior_run_untouched(tmp_path):
+    # P5/T7 — THE HEADLINE RELAXATION (D2), /new arm. While alpha's turn holds its lock,
+    # /new work <path> now SUCCEEDS (no busy refusal): store.create IS called, the new
+    # project is created + made active, and alpha's held turn is UNTOUCHED (it keeps holding
+    # its lock in the background). Same id-routing safety as /switch (ADR-005 D3).
+    #
+    # MUTATION PROBE: inverse of the P4 busy-guard test it replaces
+    # (was ``test_cmd_new_while_busy_refused_store_untouched``). Re-adding the is_busy
+    # refusal to cmd_new makes store.create not fire → this fails. Coverage pinned.
     proj = tmp_path / "work"
     proj.mkdir()
     store = JsonSessionStore(tmp_path / "state.json")
@@ -1422,28 +1461,34 @@ async def test_cmd_new_while_busy_refused_store_untouched(tmp_path):
         streaming=session,
     )
 
-    # Drive a turn that parks on HOLD (acquires + holds the per-chat turn lock).
+    # Drive a turn that parks on HOLD (acquires + holds alpha's per-project turn lock).
     rec = make_ctx()
     rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
     turn = asyncio.create_task(bot.on_message(make_update(1, "go"), rec))
     for _ in range(200):
-        if session.is_busy(1):
+        if session.is_busy(1, "alpha"):
             break
         await asyncio.sleep(0)
-    assert session.is_busy(1), "the held turn should hold the lock"
+    assert session.is_busy(1, "alpha"), "the held turn should hold alpha's lock"
 
-    # Spy on store.create to prove it is NOT called while busy.
+    # /new work <path> WHILE alpha is mid-run → SUCCEEDS. Spy store.create to prove it IS
+    # now called (the inverse of the P4 assertion).
     create_calls = []
     orig_create = store.create
-    store.create = lambda *a, **k: create_calls.append((a, k))  # type: ignore[assignment]
+    store.create = lambda *a, **k: (create_calls.append((a, k)), orig_create(*a, **k))[1]  # type: ignore[assignment]
     upd = make_update(1, "/new work " + str(proj))
     await bot.cmd_new(upd, make_cmd_ctx(args=["work", str(proj)]))
     store.create = orig_create  # type: ignore[assignment]
 
     reply = upd.message.reply_text.await_args.args[0]
-    assert "/cancel" in reply and ("flight" in reply.lower() or "finish" in reply.lower())
-    assert create_calls == [], "store.create must NOT be called while a turn is in flight"
-    assert list(store.list_projects(1)) == ["alpha"]  # registry unchanged
+    assert "created work" in reply.lower(), reply  # success, not a busy refusal
+    assert "/cancel" not in reply
+    assert create_calls, "store.create MUST be called now that /new is free mid-run"
+    assert set(store.list_projects(1)) == {"alpha", "work"}  # new project added
+    assert store.get_active(1) == "work"  # /new auto-switched
+    # alpha's held turn is untouched — still parked + holding its lock (background run).
+    assert session.is_busy(1, "alpha"), "the prior run must keep running after /new"
+    assert not turn.done()
 
     # Release the held turn so the task completes cleanly (no leaked task).
     engine.cancel()
@@ -1634,3 +1679,210 @@ async def test_cmd_reset_while_busy_refused_then_cancel_recovers(tmp_path):
     await bot.cmd_cancel(make_update(1, "/cancel"), make_ctx())
     await asyncio.wait_for(turn, timeout=2.0)
     assert session.is_busy(1) is False, "/cancel must release the held turn (recovery works)"
+
+
+# ===========================================================================
+# P5 / T7 — the busy-guard relaxation + per-project /reset + /projects status, at the
+# BOT boundary over a REAL StreamingSession (multi-engine). These complement the
+# session-level concurrency tests in test_stream_session.py / test_multi_project.py.
+# ===========================================================================
+
+
+def make_multi_streaming(store, engines_by_cwd, *, workdir="/work"):
+    """A real StreamingSession whose factory returns a DISTINCT HoldEngine per cwd.
+
+    Mirrors test_stream_session.make_multi_session but for the bot-boundary tests here:
+    lets two projects each hold a parked turn so the per-project busy-guard + the
+    /reset-of-idle-active-while-other-busy behavior can be driven through the bot. The
+    session config uses allow_any_path=True so the driver's turn path is not SB2-blocked
+    (these exercise concurrency/guards, not path confinement).
+    """
+    session = StreamingSession(
+        make_config(engine_mode="streaming", workdir=workdir, allow_any_path=True),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engines_by_cwd[cwd],
+        clock=lambda: 0.0,
+    )
+    return session
+
+
+async def _wait(predicate, *, tries=500):
+    for _ in range(tries):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never became true")
+
+
+async def test_cmd_switch_to_idle_project_while_another_busy_succeeds(tmp_path):
+    # P5/T7: /switch to an IDLE project while a DIFFERENT project (alpha) is mid-run
+    # SUCCEEDS — background concurrency at the bot boundary. alpha keeps running.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    eng_a = HoldEngine([HOLD])
+    eng_b = HoldEngine([])
+    session = make_multi_streaming(store, {"/work/alpha": eng_a, "/work/beta": eng_b})
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    turn_a = asyncio.create_task(bot.on_message(make_update(1, "go"), rec))
+    await _wait(lambda: session.is_busy(1, "alpha"))
+
+    await bot.cmd_switch(make_update(1, "/switch beta"), make_cmd_ctx(args=["beta"]))
+    assert store.get_active(1) == "beta"  # switched while alpha busy
+    assert session.is_busy(1, "alpha"), "alpha keeps running in the background"
+
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+
+
+async def test_cmd_reset_idle_active_while_other_project_busy_succeeds(tmp_path):
+    # P5/T7 (D2): the per-project /reset guard. A BACKGROUND run in project beta must NOT
+    # block /reset of the IDLE active project alpha — reset only touches alpha's session, so
+    # beta's concurrent run is irrelevant. (Was blocked by the P4 "any project busy" guard.)
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    store.set_session_id(1, "alpha", "alpha-live")  # alpha has a session to clear on reset
+    eng_a = HoldEngine([])
+    eng_b = HoldEngine([HOLD])
+    session = make_multi_streaming(store, {"/work/alpha": eng_a, "/work/beta": eng_b})
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+
+    # Drive BETA busy while alpha (the active project) is idle: switch to beta, start its
+    # turn (parks), then switch BACK so alpha is active + idle while beta runs in background.
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(bot.on_message(make_update(1, "go beta"), rec))
+    await _wait(lambda: session.is_busy(1, "beta"))
+    store.switch(1, "alpha")  # alpha is now the active project, and it is idle
+    assert session.is_busy(1, "alpha") is False
+    assert session.is_busy(1, "beta") is True
+
+    # /reset → SUCCEEDS (active alpha is idle); alpha's session is cleared; beta untouched.
+    up_reset = make_update(1, "/reset")
+    await bot.cmd_reset(up_reset, make_cmd_ctx())
+    assert "fresh" in up_reset.message.reply_text.await_args.args[0].lower()
+    assert store.get_project(1, "alpha")["session_id"] is None  # alpha reset
+    assert session.is_busy(1, "beta"), "beta's background run is untouched by /reset of alpha"
+
+    eng_b.cancel()
+    await asyncio.wait_for(turn_b, timeout=2.0)
+
+
+async def test_cmd_reset_refused_when_active_project_itself_busy(tmp_path):
+    # P5/T7 (D2): /reset IS refused when the ACTIVE project's own turn is in flight (real
+    # session, real per-project busy state) — resetting would orphan its parked hold.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, engine = make_streaming(store, script=[HOLD])
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    turn = asyncio.create_task(bot.on_message(make_update(1, "go"), rec))
+    await _wait(lambda: session.is_busy(1, "alpha"))
+
+    reset_calls: list = []
+    orig_reset = session.reset
+    session.reset = lambda *a, **k: reset_calls.append((a, k))  # type: ignore[assignment]
+    up_reset = make_update(1, "/reset")
+    await bot.cmd_reset(up_reset, make_cmd_ctx())
+    session.reset = orig_reset  # type: ignore[assignment]
+    assert "/cancel" in up_reset.message.reply_text.await_args.args[0]
+    assert reset_calls == [], "reset must NOT run while the ACTIVE project is busy"
+
+    engine.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+
+
+async def test_cmd_projects_shows_per_project_status(tmp_path):
+    # P5/T7 (D7): /projects renders each project's run status. alpha is mid-run (running),
+    # beta is awaiting an answer (an ask hold → awaiting answer), gamma never ran (idle).
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    store.create(1, "gamma", "/work/gamma", make_active=False)
+    ask_b = AskEvent(
+        questions=[{"question": "B?", "options": [{"label": "Yb"}, {"label": "Nb"}]}],
+        tool_use_id="tid-b",
+    )
+    eng_a = HoldEngine([HOLD])  # parks → running (no held request)
+    eng_b = HoldEngine([ask_b, HOLD])  # emits an ask then parks → awaiting_answer
+    eng_g = HoldEngine([])
+    session = make_multi_streaming(
+        store, {"/work/alpha": eng_a, "/work/beta": eng_b, "/work/gamma": eng_g}
+    )
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+
+    turn_a = asyncio.create_task(bot.on_message(make_update(1, "go a"), rec))
+    await _wait(lambda: session.is_busy(1, "alpha"))
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(bot.on_message(make_update(1, "go b"), rec))
+    await _wait(lambda: session.project_status(1, "beta") == "awaiting_answer")
+    store.switch(1, "alpha")  # restore alpha active (cosmetic; status is per-project)
+
+    upd = make_update(1, "/projects")
+    await bot.cmd_projects(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    alpha_line = next(line for line in reply.splitlines() if "alpha" in line)
+    beta_line = next(line for line in reply.splitlines() if "beta" in line)
+    gamma_line = next(line for line in reply.splitlines() if "gamma" in line)
+    assert "(running)" in alpha_line, alpha_line
+    assert "(awaiting answer)" in beta_line, beta_line
+    assert "(idle)" in gamma_line, gamma_line
+
+    eng_a.cancel()
+    eng_b.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    await asyncio.wait_for(turn_b, timeout=2.0)
+
+
+async def test_cmd_projects_shows_queued_status(tmp_path):
+    # P5/T7 (D7): a turn QUEUED behind the cap reports "queued" on /projects.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    eng_a = HoldEngine([HOLD])
+    eng_b = HoldEngine([HOLD])
+    session = StreamingSession(
+        make_config(engine_mode="streaming", allow_any_path=True, max_concurrent_runs=1),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: {
+            "/work/alpha": eng_a, "/work/beta": eng_b
+        }[cwd],
+        clock=lambda: 0.0,
+    )
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    turn_a = asyncio.create_task(bot.on_message(make_update(1, "a"), rec))
+    await _wait(lambda: session.is_busy(1, "alpha"))
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(bot.on_message(make_update(1, "b"), rec))
+    await _wait(lambda: session.project_status(1, "beta") == "queued")
+
+    upd = make_update(1, "/projects")
+    await bot.cmd_projects(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    beta_line = next(line for line in reply.splitlines() if "beta" in line)
+    assert "(queued)" in beta_line, beta_line
+
+    eng_a.cancel()
+    await _wait(lambda: session.is_busy(1, "beta"))
+    eng_b.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    await asyncio.wait_for(turn_b, timeout=2.0)

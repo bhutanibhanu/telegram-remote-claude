@@ -1191,6 +1191,57 @@ async def test_per_project_session_id_persists_to_active_only(tmp_path):
     assert store.get_project(1, "beta")["cwd"] == "/work/beta"  # fixed cwd untouched
 
 
+async def test_result_persists_to_captured_project_not_active_after_mid_turn_switch(tmp_path):
+    # ⭐ P5/T7 — the LOCK-P-DRIVE-Q / persist-drift guard (ADR-005 D2, the load-bearing
+    # per-project persist now that /switch is free). Drive a turn in ALPHA that parks at a
+    # HOLD *before* its ResultEvent; WHILE parked, /switch the active project to BETA (now
+    # legal — the relaxed busy-guard); THEN release the HOLD so alpha's result (carrying
+    # alpha-new) lands while BETA is the active project. The session_id MUST persist to
+    # ALPHA (the project the turn ran on = the captured target), NOT to beta (active now).
+    #
+    # MUTATION PROBE: the prior code persisted via store.update, which always writes the
+    # *active* project — so a mid-turn switch would clobber BETA with alpha-new and leave
+    # alpha None. With the per-project persist (set_session_id keyed on the captured
+    # turn_name) alpha gets alpha-new and beta stays pristine. If _drive_turn's result
+    # persist reverts to the active project, this fails loudly on BOTH assertions.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+
+    eng_alpha = FakeEngine(
+        # park BEFORE the result so we can switch active to beta mid-turn, then land it.
+        [HOLD, ResultEvent(session_id="alpha-new", is_error=False, subtype="success", result_text="a-done")],
+        session_id="alpha-new",
+    )
+    eng_beta = FakeEngine([], session_id="beta-sess")
+    session = make_multi_session(
+        {"/work/alpha": eng_alpha, "/work/beta": eng_beta}, store=store
+    )
+    rec = Recorder()
+
+    # Turn on ALPHA (active) → parks at the HOLD holding alpha's lock, BEFORE its result.
+    turn_a = asyncio.create_task(session.handle_message(1, "go alpha", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    assert store.get_active(1) == "alpha"
+
+    # Operator SWITCHES active to beta WHILE alpha's turn is parked (the freed /switch).
+    store.switch(1, "beta")
+    assert store.get_active(1) == "beta"
+
+    # Release alpha's HOLD → its ResultEvent lands while BETA is active. The id-routed
+    # release would normally come from a tap; here cancel() releases the gate so the
+    # scripted result is yielded and the turn completes.
+    eng_alpha.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+
+    # ⭐ alpha-new persisted to ALPHA (the captured project), NOT beta (active at land time).
+    assert store.get_project(1, "alpha")["session_id"] == "alpha-new", "result must persist to the turn's project"
+    assert store.get_project(1, "beta")["session_id"] is None, "active-at-land beta must NOT be clobbered"
+    assert store.get_active(1) == "beta"  # the switch stands
+
+
 async def test_reset_clears_active_project_session_but_keeps_project(tmp_path):
     # /reset clears the ACTIVE project's persisted session_id (a fresh conversation) but
     # KEEPS the project in the registry (reset ≠ delete), and clears its policy (D3/D7).
