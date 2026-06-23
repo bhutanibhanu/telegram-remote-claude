@@ -57,7 +57,7 @@ import html
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Final, Literal, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -638,6 +638,153 @@ def yolo_indicator() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Proactive background-project notifications (P5 / ADR-005 D4) — pure strings
+# ---------------------------------------------------------------------------
+#
+# When a project that is NOT the chat's current foreground needs the operator
+# (a held permission/ask/plan) or terminates (result/error), the relay (T5/T7)
+# sends a name-prefixed ping so the operator knows WHICH project and can answer
+# it. A foreground project renders inline as today (no ping). **T3 only provides
+# the strings**; the relay decides *when* to send them (inline-vs-notify by
+# foreground) in T5/T7.
+#
+# SB3 (body-free). These builders carry ONLY the project name + a fixed,
+# kind-specific phrase (for needs-attention) or a short, caller-supplied status
+# word (for done/error). They take **no tool input** and **never re-derive a
+# summary** — there is nothing here from which a Write body / Bash secret could
+# leak. The needs-attention strings are entirely fixed phrases; the only
+# interpolated values are the (SB4-validated) project name and, for the error
+# ping, a short error label the caller already produced body-free (e.g. the
+# engine's ``ErrorEvent.kind_of_error`` / a clipped message — never raw input).
+#
+# Project names are SB4-constrained upstream (``^[A-Za-z0-9_-]{1,32}$`` —
+# session_store._NAME_RE), so the name is safe to interpolate with no escaping;
+# these helpers do not validate (the relay only ever passes a stored name) and
+# do not interpolate anything else unvalidated.
+
+#: Bell glyph for a background project that needs the operator's attention (D4).
+_NOTIFY_ATTENTION_GLYPH: Final = "🔔"
+#: Done glyph for a background project that finished cleanly (D4).
+_NOTIFY_DONE_GLYPH: Final = "✅"
+#: Warning glyph for a background project that errored (D4) — matches ``_render_error``.
+_NOTIFY_ERROR_GLYPH: Final = "⚠️"
+
+#: Fixed, body-free phrase per pending kind (the needs-attention triggers, D4). Keyed by
+#: the SAME :data:`PendingKind` the relay's pending index already holds, so T5/T7 map a
+#: held request straight to its ping with no extra branching. The phrases are constant —
+#: no event field is interpolated (SB3): a permission/ask/plan ping reveals only that the
+#: project needs approval / asks a question / proposes a plan, never *what* it wants.
+_NOTIFY_ATTENTION_PHRASE: Final[dict[str, str]] = {
+    "permission": "Claude needs approval",
+    "ask": "asks a question",
+    "plan": "proposes a plan",
+}
+
+#: Fallback phrase for an unknown pending kind (RB1 — never crash on a value the relay
+#: did not expect; degrade to a generic, still body-free "needs attention" ping).
+_NOTIFY_ATTENTION_FALLBACK: Final = "needs attention"
+
+
+def notify_attention(name: str, kind: str) -> str:
+    """Body-free ping for a BACKGROUND project that needs the operator (D4; SB3).
+
+    ``kind`` is the held request's :data:`PendingKind` (``"permission"`` / ``"ask"`` /
+    ``"plan"``) — the same value the relay's pending index already carries — and selects
+    a **fixed phrase**:
+
+    * ``permission`` → ``🔔 <name> — Claude needs approval``
+    * ``ask``        → ``🔔 <name> — asks a question``
+    * ``plan``       → ``🔔 <name> — proposes a plan``
+
+    An **unknown** kind degrades to ``🔔 <name> — needs attention`` (RB1) rather than
+    raising. Pure string; no I/O. **SB3:** the phrase is constant per kind — no event
+    field (no question text, plan body, or tool input) is ever interpolated, so a ping
+    cannot leak content. ``name`` is an SB4-validated project name (safe to interpolate
+    unescaped); nothing else unvalidated is interpolated.
+    """
+    phrase = _NOTIFY_ATTENTION_PHRASE.get(kind, _NOTIFY_ATTENTION_FALLBACK)
+    return f"{_NOTIFY_ATTENTION_GLYPH} {name} — {phrase}"
+
+
+def notify_done(name: str) -> str:
+    """Body-free ping for a BACKGROUND project that finished cleanly (D4; SB3).
+
+    ``✅ <name> — done``. Pure string; no I/O. Carries only the project name + a fixed
+    ``done`` word — never the result text (SB3); the foreground project still renders its
+    full :class:`ResultEvent` inline (T5/T7 decides inline-vs-notify).
+    """
+    return f"{_NOTIFY_DONE_GLYPH} {name} — done"
+
+
+def notify_error(name: str, short_error: str) -> str:
+    """Body-free ping for a BACKGROUND project that errored (D4; SB3).
+
+    ``⚠️ <name> — <short_error>``. ``short_error`` is a **short, already-body-free** error
+    label the relay supplies — e.g. the engine's :data:`~claude_tg.engine.types.ErrorKind`
+    (``tool_error`` / ``turn_error`` / ``driver_error``) — **never** raw tool input or an
+    untrimmed dump. This builder neither re-derives nor expands it (SB3); it only prefixes
+    the glyph + the (SB4-validated) name. A blank ``short_error`` degrades to a generic
+    ``error`` so the ping is never an empty tail (RB1). Pure string; no I/O.
+    """
+    label = short_error.strip() or "error"
+    return f"{_NOTIFY_ERROR_GLYPH} {name} — {label}"
+
+
+# ---------------------------------------------------------------------------
+# Per-project status labels for /projects (P5 / ADR-005 D7) — pure label map
+# ---------------------------------------------------------------------------
+#
+# T4 adds a per-project ``status`` enum on ``_ProjectRuntime`` and T7 renders a
+# status column on ``/projects``. T3 provides ONLY the value→label mapping the
+# column will consume. The enum VALUES below MUST match what T4/T7 set — they
+# are the exact set fixed by design D7 / ADR-005 §D7:
+#     idle · running · awaiting_approval · awaiting_answer · awaiting_plan · queued
+# (``awaiting_*`` mirrors the three :data:`PendingKind`s the project can hold:
+#  permission→awaiting_approval, ask→awaiting_answer, plan→awaiting_plan.)
+
+#: Per-project status enum values (the keys T4 sets on ``_ProjectRuntime.status``; D7).
+ProjectStatus = Literal[
+    "idle",
+    "running",
+    "awaiting_approval",
+    "awaiting_answer",
+    "awaiting_plan",
+    "queued",
+]
+
+#: Status enum value → human label for the ``/projects`` status column (D7). The labels
+#: spell out the ``awaiting_*`` states (design D7 / T7 acceptance: "awaiting approval" /
+#: "awaiting answer" / "awaiting plan"). Keep the keys in lock-step with T4's enum.
+_STATUS_LABELS: Final[dict[str, str]] = {
+    "idle": "idle",
+    "running": "running",
+    "awaiting_approval": "awaiting approval",
+    "awaiting_answer": "awaiting answer",
+    "awaiting_plan": "awaiting plan",
+    "queued": "queued",
+}
+
+#: Fallback label for an unknown/missing status value (RB1 — a project with no runtime, or
+#: a value T7 did not expect, never crashes the /projects render; it reads as ``idle``,
+#: matching D7's "a project with no runtime defaults to idle").
+_STATUS_FALLBACK: Final = "idle"
+
+
+def project_status_label(status: object) -> str:
+    """Map a per-project ``status`` enum value to its ``/projects`` column label (D7).
+
+    Pure mapping, no I/O. ``running`` → ``"running"``, ``awaiting_approval`` →
+    ``"awaiting approval"``, etc. Anything **not** a known value (an unexpected enum,
+    ``None`` for a project with no runtime, a stray string) falls back to ``"idle"``
+    (**RB1** — the status column never crashes on an unknown value, mirroring D7's
+    "no runtime → idle" default). T4 sets the enum; T7 calls this to render the column.
+    """
+    if isinstance(status, str):
+        return _STATUS_LABELS.get(status, _STATUS_FALLBACK)
+    return _STATUS_FALLBACK
+
+
+# ---------------------------------------------------------------------------
 # Event -> RenderAction (the verbatim-vs-one-liner split)
 # ---------------------------------------------------------------------------
 
@@ -1182,6 +1329,13 @@ __all__ = [
     # /yolo loud indicator (D6)
     "yolo_banner",
     "yolo_indicator",
+    # proactive background-project notifications (D4)
+    "notify_attention",
+    "notify_done",
+    "notify_error",
+    # per-project status labels for /projects (D7)
+    "ProjectStatus",
+    "project_status_label",
     # coalesce / throttle
     "Coalescer",
     "FlushResult",

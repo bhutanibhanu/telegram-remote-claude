@@ -47,8 +47,12 @@ from claude_tg.render import (
     coalesce_stream,
     decode_callback,
     encode_callback,
+    notify_attention,
+    notify_done,
+    notify_error,
     permission_keyboard,
     plan_keyboard,
+    project_status_label,
     render_event,
     yolo_banner,
     yolo_indicator,
@@ -582,6 +586,121 @@ def test_yolo_indicator_is_loud_nonempty_marker():
     indicator = yolo_indicator()
     assert indicator  # non-empty
     assert "⚠️" in indicator  # loud prefix for each auto-allowed action (D6)
+
+
+# ============================================================================
+# Proactive background-project notifications (P5 / ADR-005 D4) — pure strings
+# ============================================================================
+
+
+def test_notify_attention_permission_is_name_prefixed_bell():
+    msg = notify_attention("work", "permission")
+    assert msg == "🔔 work — Claude needs approval"
+    assert msg.startswith("🔔 ")  # bell glyph (D4)
+    assert "work" in msg  # name-prefixed so the operator knows WHICH project
+
+
+def test_notify_attention_ask_and_plan_have_their_own_phrases():
+    assert notify_attention("bot", "ask") == "🔔 bot — asks a question"
+    assert notify_attention("bot", "plan") == "🔔 bot — proposes a plan"
+
+
+def test_notify_attention_unknown_kind_falls_back_safely():
+    # RB1: a pending kind the relay did not expect degrades to a generic, still
+    # body-free "needs attention" ping rather than raising / leaking the raw kind.
+    msg = notify_attention("work", "totally-unknown-kind")
+    assert msg == "🔔 work — needs attention"
+    assert "totally-unknown-kind" not in msg  # the stray value is never echoed
+
+
+def test_notify_done_is_name_prefixed_check():
+    msg = notify_done("work")
+    assert msg == "✅ work — done"
+    assert msg.startswith("✅ ")  # done glyph (D4)
+
+
+def test_notify_error_is_name_prefixed_warning_with_short_label():
+    msg = notify_error("work", "tool_error")
+    assert msg == "⚠️ work — tool_error"
+    assert msg.startswith("⚠️ ")  # warning glyph (D4)
+
+
+def test_notify_error_blank_label_falls_back():
+    # RB1: a blank/whitespace short_error never leaves an empty tail.
+    assert notify_error("work", "") == "⚠️ work — error"
+    assert notify_error("work", "   ") == "⚠️ work — error"
+
+
+def test_notify_attention_is_body_free_sb3():
+    # SB3 mutation-probe: a held PermissionEvent whose summary carried a secret-bearing
+    # tool_input must NEVER surface in the ping — the attention phrase is FIXED, so even
+    # if a caller had the event in hand, the body cannot leak through this builder.
+    secret = "S3CR3T-" + "x" * 200
+    leaky_summary = f"Write(file_path=/tmp/x, content={secret})"
+    ev = make_permission(tool_name="Write", tool_input_summary=leaky_summary)
+    # The builder takes only (name, kind) — it cannot even SEE the event's body.
+    msg = notify_attention("work", ev.kind)  # PendingKind == event.kind == "permission"
+    assert msg == "🔔 work — Claude needs approval"
+    assert secret not in msg
+    assert "S3CR3T" not in msg
+    assert leaky_summary not in msg
+
+
+def test_notify_error_is_body_free_sb3():
+    # SB3: only the SHORT, body-free label the relay supplies appears — never a raw body.
+    # A caller that wrongly handed raw content would still only get its (stripped) text,
+    # but the relay supplies the body-free ErrorKind; we assert a secret-bearing body
+    # passed as the label is not silently expanded into anything else and a real raw
+    # tool body never reaches this builder (it takes a short label, not an event/input).
+    raw_body = "S3CR3T-" + "y" * 300
+    # The relay passes the body-free kind, NOT the raw body:
+    msg = notify_error("work", "tool_error")
+    assert raw_body not in msg
+    assert msg == "⚠️ work — tool_error"
+
+
+def test_notification_builders_are_pure_no_io():
+    # Purity / determinism: same inputs -> identical output, no side effects, no I/O.
+    assert notify_attention("p", "ask") == notify_attention("p", "ask")
+    assert notify_done("p") == notify_done("p")
+    assert notify_error("p", "boom") == notify_error("p", "boom")
+
+
+# ============================================================================
+# Per-project status labels for /projects (P5 / ADR-005 D7) — pure label map
+# ============================================================================
+
+
+def test_project_status_label_covers_every_status_value():
+    # Every enum value design D7 / ADR-005 fixes (the set T4/T7 will set) maps to its
+    # human /projects label. If T4 adds/renames a value, this is where it surfaces.
+    expected = {
+        "idle": "idle",
+        "running": "running",
+        "awaiting_approval": "awaiting approval",
+        "awaiting_answer": "awaiting answer",
+        "awaiting_plan": "awaiting plan",
+        "queued": "queued",
+    }
+    for value, label in expected.items():
+        assert project_status_label(value) == label
+
+
+def test_project_status_label_unknown_value_falls_back_to_idle():
+    # RB1: an unexpected enum / a stray string / None (a project with no runtime) reads
+    # as "idle" rather than crashing the /projects render (D7: no runtime -> idle).
+    assert project_status_label("nonsense") == "idle"
+    assert project_status_label("") == "idle"
+    assert project_status_label(None) == "idle"
+    assert project_status_label(123) == "idle"  # type: ignore[arg-type]
+
+
+def test_awaiting_labels_are_human_readable_spaced():
+    # The awaiting_* enum keys are snake_case; the labels are spelled out for the column.
+    for value in ("awaiting_approval", "awaiting_answer", "awaiting_plan"):
+        label = project_status_label(value)
+        assert "_" not in label  # rendered, not the raw enum key
+        assert label.startswith("awaiting ")
 
 
 # ============================================================================
