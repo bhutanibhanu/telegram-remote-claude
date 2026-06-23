@@ -1,7 +1,8 @@
 {
   "slug": "p7-packaging",
-  "phase": "approved",
+  "phase": "built",
   "branch": "feat/p7-packaging",
   "worktree": "/Users/ray/dev/claude-telegram-bot-p7",
-  "updated": "2026-06-23T23:45:00Z"
+  "updated": "2026-06-24T00:00:00Z",
+  "note": "Built + functional-verified (T5 live launchd PASS); Codex QA NO_SHIP with 2 fixable blockers (see qa.md). NOT merged. Fix B1/B2 → re-QA → merge, then P8."
 }
