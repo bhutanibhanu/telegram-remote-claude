@@ -1087,6 +1087,57 @@ async def test_transfer_window_rm_aborts_queued_turn_no_zombie_run(tmp_path):
     assert "p2" not in session._chats[1].runtimes
 
 
+async def test_transfer_window_cancel_named_reports_cancelled_not_nothing_in_flight(tmp_path):
+    """Codex NB (round-3): ``/cancel p2`` fired in p2's slot-transfer window must tell the
+    operator the turn was CANCELLED — not "Nothing in flight" — while STILL never letting the
+    turn zombie-run. Drives the REAL bot ``cmd_cancel`` so the operator-facing reply is asserted.
+
+    RED (pre-fix): the abort genuinely cancels the windowed turn (it never starts), but
+    ``_cancel_project`` returned 0 — the turn was popped from the queue (``_drain_queued`` sees
+    nothing) and had no live engine yet (``engine.cancel`` finds none), so neither counted unit
+    fired. ``cmd_cancel`` then replied "Nothing in flight to cancel for p2" for a turn it DID
+    cancel. GREEN: a window-abort (inflight, nothing drained, no live engine) counts as one
+    cancelled unit, so the reply says "Cancelled" — and the safety property is unchanged.
+    """
+    session, store, rec, eng1, eng2, turn1, turn2 = await _park_running_plus_queued(tmp_path)
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+
+    # /cancel p2 fired in the transfer window via the REAL bot command (async; schedule it as a
+    # task from the sync hook so the operator reply is captured on the update's reply_text mock).
+    cancel_update = make_update(1, "/cancel p2")
+    cancel_task: dict = {"t": None}
+
+    def fire_cancel():
+        cancel_task["t"] = asyncio.create_task(
+            bot.cmd_cancel(cancel_update, make_cmd_ctx(args=["p2"]))
+        )
+
+    _fire_at_transfer_window(session, fire_cancel)
+
+    eng1.release()  # finish p1 → _release_slot pops p2 (our hook fires /cancel p2 here)
+    await asyncio.wait_for(turn1, timeout=2.0)
+    await asyncio.wait_for(turn2, timeout=2.0)
+    assert cancel_task["t"] is not None
+    await asyncio.wait_for(cancel_task["t"], timeout=2.0)
+
+    # (a) OPERATOR FEEDBACK: the reply says the turn was cancelled, NOT "nothing in flight".
+    reply = cancel_update.message.reply_text.await_args.args[0]
+    assert "cancelled" in reply.lower(), reply
+    assert "nothing in flight" not in reply.lower(), reply
+
+    # (b) SAFETY (unchanged — Codex SHIP must hold): the turn STILL never started, the slot
+    # returned to 0 (no leak), inflight cleared, the queue drained, and NO session persisted.
+    assert eng2.send_started is False, "p2 must NOT have started — /cancel hit it in the transfer window"
+    assert not eng2.resolve_calls and not eng2.cancel_calls
+    assert session._running == 0, "the slot returned to 0 (no leak from the cancelled transfer)"
+    assert session.is_busy(1) is False
+    assert session._chats[1].runtimes["p2"].inflight is False, "p2's inflight cleared"
+    assert len(session._chats[1].run_queue) == 0
+    assert (store.get_project(1, "p2") or {}).get("session_id") is None
+
+
 async def test_transfer_window_abort_does_not_wedge_project_next_turn_runs(tmp_path):
     """After a transfer-window /cancel aborts p2's queued turn, p2 is NOT wedged: a FRESH
     message to p2 clears the (stale) abort and runs normally.

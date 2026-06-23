@@ -2523,8 +2523,10 @@ class StreamingSession:
         Returns the number of **cancelled units** across the targeted project(s): pending
         requests aborted by the engine PLUS any drained queued-not-yet-running turn (NB1 — a
         queued-only turn aborts 0 pending requests but the operator DID cancel a turn, so it
-        counts, letting ``cmd_cancel`` report it truthfully instead of "nothing in flight").
-        0 only when nothing was running AND nothing was queued for the target(s).
+        counts, letting ``cmd_cancel`` report it truthfully instead of "nothing in flight")
+        PLUS a slot-transfer-window abort (NB round-3 — a turn popped but not yet started is in
+        neither bucket, yet the abort cancels it, so it counts as one too). 0 only when nothing
+        was running, queued, OR in the transfer window for the target(s).
         """
         state = self._chats.get(chat_id)
         if state is None:
@@ -2564,8 +2566,11 @@ class StreamingSession:
         Returns the number of **cancelled units**: the pending requests the engine aborted
         PLUS any drained queued-not-yet-running turn (NB1 — a queued-only turn has no live
         engine, so it aborts 0 pending requests, but the operator DID cancel a turn; counting
-        it lets ``cmd_cancel`` tell the truth instead of "nothing was in flight"). 0 only when
-        the project was genuinely idle (not running and not queued).
+        it lets ``cmd_cancel`` tell the truth instead of "nothing was in flight") PLUS a
+        SLOT-TRANSFER-WINDOW abort (NB round-3 — a turn popped from the queue but not yet
+        started is in neither bucket: nothing to drain, no live engine, but the ``abort`` we
+        set genuinely cancels it, so it counts as one). 0 only when the project was genuinely
+        idle (not running, not queued, not in the transfer window).
         """
         rt = state.runtimes.get(project_name)
         if rt is None:
@@ -2592,7 +2597,24 @@ class StreamingSession:
         # (3) Drop this project's pending-index entries (+ a free-text marker aimed at them)
         #     so a late tap on a cancelled request is a stale-id no-op.
         self._clear_project_pending(state, project_name)
-        return aborted + drained
+        # (4) NB (round-3 Codex): count a SLOT-TRANSFER-WINDOW abort as one cancelled unit.
+        #     A turn that was popped from the queue but has not yet started (the pop→lock window)
+        #     is in NEITHER counted bucket — ``_drain_queued`` found nothing (already popped, so
+        #     ``drained == 0``) and no engine is live yet (``rt.engine is None``, so ``aborted == 0``)
+        #     — yet the ``abort`` we set in (0) genuinely cancels it (the woken turn honors it and
+        #     never runs). Without this, ``cmd_cancel`` would wrongly tell the operator "nothing in
+        #     flight" for a turn it DID cancel. Predicate = the turn is in flight AND neither other
+        #     mechanism reached it: ``rt.inflight and drained == 0 and rt.engine is None``. This
+        #     CANNOT double-count — it is mutually exclusive with both other buckets by construction:
+        #       * a RUNNING turn has a live engine (set by ``_ensure_engine`` before ``_drive_turn``),
+        #         so ``rt.engine is None`` is False here → counted only via ``aborted`` (its pending
+        #         requests), never here;
+        #       * a still-QUEUED turn is drained by (1), so ``drained >= 1`` → counted only via
+        #         ``drained`` (NB1), never here;
+        #       * an IDLE project is not in flight (``rt.inflight`` False) → not counted at all.
+        #     Mirrors NB1 (the queued-only count): a turn the operator really aborted reports as one.
+        window_abort = 1 if (rt.inflight and drained == 0 and rt.engine is None) else 0
+        return aborted + drained + window_abort
 
     @staticmethod
     def _drain_queued(state: _ChatState, rt: _ProjectRuntime) -> int:

@@ -4559,6 +4559,20 @@ async def test_cancel_unknown_name_is_noop(tmp_path):
     assert eng_a.cancel_calls == [] and eng_b.cancel_calls == []
 
 
+async def test_cancel_idle_runtime_no_engine_counts_zero():
+    # NB (round-3): the window-abort count must NOT fire for an IDLE runtime. A project with a
+    # runtime but no in-flight turn (engine never started → engine is None, nothing drained) is
+    # genuinely idle: /cancel must return 0 so cmd_cancel says "nothing in flight" (truthfully).
+    # This pins the ``rt.inflight`` term of the window-abort predicate — without it, an idle
+    # /cancel would wrongly report a cancelled turn (drained==0 and engine is None both hold).
+    engine = FakeEngine([])
+    session = make_session(engine)
+    name, rt = session._active_runtime(1, create_default=True)  # idle runtime: no turn, no engine
+    assert name is not None and rt.engine is None and rt.inflight is False
+    assert session.handle_cancel(1, name) == 0  # idle → not a window-abort → 0
+    assert engine.cancel_calls == []
+
+
 # -- the queued-waiter DRAIN: /cancel + /rm of a QUEUED project (T6-review) ---
 
 
