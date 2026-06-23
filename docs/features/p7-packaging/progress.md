@@ -3,11 +3,11 @@
 _From design.md · packaging & keep-alive, no bot-behavior change · supervised build. Baseline 854 tests._
 
 ## Task list
-- [ ] T1 — Fix `pyproject` packaging (deterministic discovery) + `claude-telegram-bot` console entry (`cli.py`) → `pip install .` and `pip install -e .` both work
-- [ ] T2 — `.env.example` completeness (every config from `config.py from_env`, secure defaults, comments)
-- [ ] T3 — macOS launchd keep-alive (LaunchAgent plist template/generator + docs; one-instance; logs; load/unload)
-- [ ] T4 — `run.sh` reconcile (idempotent; uses the console entry / `python -m`) + optional `__version__`/`--version`
-- [ ] T5 — Verify: clean-venv `pip install .` smoke + live launchd load/start/restart-on-kill (bot survives a kill, no Conflict) → merge
+- [x] T1 — Fix `pyproject` packaging (deterministic discovery) + `claude-telegram-bot` console entry (`cli.py`) → `pip install .` and `pip install -e .` both work (706536e)
+- [x] T2 — `.env.example` completeness (every config from `config.py from_env`, secure defaults, comments) + AST drift-guard test (2c2b49c)
+- [x] T3 — macOS launchd keep-alive (LaunchAgent plist template + `install-launchd.sh` + `deploy/README.md`; one-instance label; logs; no token) (2c2b49c)
+- [x] T4 — `run.sh` idempotent + `python -m claude_tg` (`__main__.py`) + `--version` (2c2b49c)
+- [x] T5 — Verify: clean-venv `pip install .` + `--version` PASS; live launchd load → start (no Conflict) → kill → **KeepAlive respawned new PID** → clean uninstall (system left as found). 861 tests green.
 
 Legend: `[ ]` todo · `[x]` done (sha) · `[!]` blocked
 
