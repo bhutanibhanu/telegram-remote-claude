@@ -4890,3 +4890,200 @@ async def test_rm_drains_queued_projects_waiter(tmp_path):
         await asyncio.sleep(0)
     assert eng_b.started is False
     assert session._running == 0
+
+
+# ===========================================================================
+# P5 (T6/T7-review): the OUTER end-of-turn ``inflight=False`` finally must clear the
+# in-flight marker on the ERROR / REFUSAL exit paths too — not just the happy /
+# drain-cancel paths (which already have committed regressions above:
+# ``test_inflight_marker_cleared_after_turn_so_next_message_accepted``, the distinct-
+# project guard, and ``test_cancel_queued_project_drains_waiter_no_zombie_run``).
+#
+# ``inflight`` is the busy-guard's SINGLE source of "a turn is in flight" — set the
+# instant a turn is accepted (right after the busy-guard passes, BEFORE ``_acquire_slot``)
+# and cleared ONLY in the outer finally in ``handle_message``. If ANY exit path fails to
+# clear it, that project is WEDGED forever (every future message → StreamingBusy with no
+# turn actually running). Each test below drives one error/refusal exit, then asserts BOTH
+# ``rt.inflight is False`` AND that a SUBSEQUENT same-project message is ACCEPTED (the real
+# proof of no-wedge — a leaked marker would re-raise StreamingBusy on that second message).
+# All three paths set ``inflight=True`` BEFORE the failure (the mark is at the top of the
+# try; the failures happen inside ``_acquire_slot``'s try / inside the lock), so the full
+# no-wedge invariant is asserted for each. Deterministic — no real sleeps; every wait is a
+# bounded loop or ``asyncio.wait_for``. (Previously these paths were verified only by a
+# throwaway probe; this commits them.)
+# ===========================================================================
+
+
+async def test_mid_stream_engine_raise_clears_inflight_project_usable_again(tmp_path):
+    # PATH 1 — mid-stream engine raise (RB2). A turn whose engine raises PARTWAY through
+    # ``send()`` (after ``inflight=True``, inside ``_drive_turn``) must clear ``inflight``
+    # in the outer finally and leave the project USABLE — not wedged busy forever. The
+    # ``test_slot_leak_safety_*`` test above pins the SLOT side of this raise; this pins
+    # the INFLIGHT side + the no-wedge (a second message runs to completion).
+    store = _three_project_store(tmp_path)
+
+    class BoomMidStreamEngine(FakeEngine):
+        # Raises mid-stream on the FIRST turn only; subsequent turns fall back to the
+        # scripted path (set on ``_script``) so the no-wedge recovery turn can complete.
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.boom = True
+
+        async def send(self, prompt, *, timeout=None):
+            if self.boom:
+                self.boom = False
+                yield ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)")
+                raise RuntimeError("engine exploded mid-stream")
+            async for event in super().send(prompt, timeout=timeout):
+                yield event
+
+    eng_a = BoomMidStreamEngine([], session_id="alpha-sess")
+    session = make_multi_session({"/work/alpha": eng_a}, store=store, config=make_config())
+    rec = Recorder()
+
+    # Turn 1 raises mid-stream; the RuntimeError must surface (clean-fail, RB2).
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(
+            session.handle_message(1, "boom", send=rec.send, edit=rec.edit, delete=rec.delete),
+            timeout=2.0,
+        )
+    rt = session._chat(1).runtimes["alpha"]
+    assert rt.inflight is False  # the outer finally cleared it despite the raise
+    assert session._running == 0  # slot freed too (no leak)
+    assert session.is_busy(1, "alpha") is False  # lock released
+
+    # NO-WEDGE PROOF: a SECOND message to the same project is ACCEPTED and runs to
+    # completion (a leaked marker would re-raise StreamingBusy here instead).
+    eng_a._script = [
+        ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="recovered")
+    ]
+    await asyncio.wait_for(
+        session.handle_message(1, "again", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert any("recovered" in s["text"] for s in rec.sends)
+    assert rt.inflight is False
+
+
+async def test_post_wait_lock_recheck_streaming_busy_clears_inflight_on_dequeue(tmp_path):
+    # PATH 2 — the post-wait ``if target_rt.lock.locked(): raise StreamingBusy`` re-check
+    # AFTER a queued wait / slot grant. That raise happens INSIDE the outer try (after
+    # ``inflight=True`` and after ``_acquire_slot`` returned), so its OWN raise must not
+    # leave the marker set. ``test_post_acquire_same_project_recheck`` exercises the same
+    # synchronous re-check but does NOT assert the inflight invariant — this drives the REAL
+    # post-wait re-raise on a DEQUEUED turn and pins that its marker is cleared. cap=1.
+    #
+    # Sequence that forces the inner re-raise on a dequeued turn:
+    #   * gamma takes the only slot and holds it (parked at HOLD).
+    #   * beta message #1 QUEUES behind the cap (parks on a waiter; inflight=True; lock NOT held).
+    #   * we manually ACQUIRE beta's lock (simulating "a 2nd beta message started running it
+    #     while #1 was parked") — now beta.lock.locked() is True.
+    #   * gamma finishes → its freed slot is TRANSFERRED to beta #1, which wakes, returns from
+    #     ``_acquire_slot``, hits the post-wait ``lock.locked()`` re-check → raises StreamingBusy.
+    #   * that StreamingBusy propagates out of beta #1's task; the OUTER finally must clear
+    #     beta.inflight (the slot it momentarily held is released by the inner finally first).
+    store = _three_project_store(tmp_path)
+    eng_g = _holding_engine("gamma")
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/gamma": eng_g, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+
+    # gamma takes the only slot.
+    store.switch(1, "gamma")
+    turn_g = asyncio.create_task(session.handle_message(1, "g", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "gamma", want=True)
+
+    # beta #1 queues behind the cap (parks on a waiter; not yet running).
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    beta_rt = session._chat(1).runtimes["beta"]
+    assert len(session._chat(1).run_queue) == 1
+    assert beta_rt.inflight is True  # queued turn is in-flight
+    assert beta_rt.lock.locked() is False  # but not yet holding its lock
+
+    # Simulate "a concurrent beta turn started running while #1 was parked": grab beta's lock
+    # so the dequeued #1 must hit the post-wait ``lock.locked()`` re-check and re-raise.
+    await beta_rt.lock.acquire()
+    try:
+        # gamma finishes → transfers its freed slot to the parked beta #1, which wakes,
+        # finds its lock held, and raises StreamingBusy out of the post-wait re-check.
+        eng_g.cancel()
+        await asyncio.wait_for(turn_g, timeout=2.0)
+        with pytest.raises(StreamingBusy):
+            await asyncio.wait_for(turn_b, timeout=2.0)
+        # ⭐ THE INVARIANT: beta #1's OWN post-wait StreamingBusy raise cleared its marker via
+        # the outer finally — the project is NOT wedged in-flight forever.
+        assert beta_rt.inflight is False
+    finally:
+        beta_rt.lock.release()
+    # The slot beta #1 momentarily held was released by the inner finally (no leak).
+    await _wait_running(session, 0)
+
+    # NO-WEDGE PROOF: a fresh beta message is ACCEPTED and runs to completion.
+    eng_b._script = [
+        ResultEvent(session_id="beta-sess", is_error=False, subtype="success", result_text="beta-recovered")
+    ]
+    eng_b._gate = asyncio.Event()  # fresh gate (the prior cancel had set it)
+    await asyncio.wait_for(
+        session.handle_message(1, "b-again", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert any("beta-recovered" in s["text"] for s in rec.sends)
+    assert beta_rt.inflight is False
+
+
+async def test_sb2_path_not_allowed_refusal_clears_inflight_project_usable_again(tmp_path):
+    # PATH 3 — SB2 cwd-refusal. ``_ensure_engine`` raises ``PathNotAllowed`` (the project's
+    # stored cwd drifted OUT of the permitted roots) INSIDE the lock, AFTER ``inflight=True``.
+    # The turn is refused via send + returns; the outer finally must still clear ``inflight``
+    # so the project is not wedged busy. ``test_turn_refused_when_cwd_no_longer_within_roots``
+    # asserts the refusal text + ``is_busy`` (lock) side; this pins the INFLIGHT side + the
+    # no-wedge (the project still accepts messages — it re-refuses rather than wedging).
+    from claude_tg.session_store import JsonSessionStore
+
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"  # a real dir, but OUTSIDE the permitted root
+    outside.mkdir()
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "drifted", str(outside), make_active=True)
+
+    engine = FakeEngine(
+        [ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")]
+    )
+    session = StreamingSession(
+        make_roots_config(tmp_path, root=root),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: engine,
+        clock=lambda: 0.0,
+    )
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The SB2 refusal fired (engine never started) ...
+    assert engine.started is False
+    assert any("permitted roots" in s["text"] for s in rec.sends)
+    # ... and the in-flight marker for the refused project was cleared by the outer finally.
+    rt = session._chat(1).runtimes["drifted"]
+    assert rt.inflight is False
+    assert session.is_busy(1, "drifted") is False  # lock released too (not wedged)
+
+    # NO-WEDGE PROOF: a SECOND message to the SAME (still-drifted) project is ACCEPTED by the
+    # busy-guard — it reaches the SB2 refusal AGAIN rather than being rejected as busy (a
+    # leaked ``inflight`` would raise StreamingBusy here instead of re-refusing). Two refusals,
+    # not a wedge.
+    before = len([s for s in rec.sends if "permitted roots" in s["text"]])
+    await asyncio.wait_for(
+        session.handle_message(1, "go-again", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    after = len([s for s in rec.sends if "permitted roots" in s["text"]])
+    assert after == before + 1, "the 2nd message must re-refuse (reach SB2), not be rejected as busy"
+    assert rt.inflight is False
