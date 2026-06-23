@@ -3779,3 +3779,453 @@ async def test_rb7_per_project_coalescers_are_independent(tmp_path):
     )
     assert rt_alpha.status_message_id != rt_beta.status_message_id
     assert rt_alpha.status_text == "alpha s1" and rt_beta.status_text == "beta s1"
+
+
+# ===========================================================================
+# P5 / ADR-005 D5 + D9 (T9) — free-text routing precedence (reply-to / /to /
+# most-recent) + concurrency-aware /cancel <name>|all + /rm-running-refused +
+# the queued-waiter DRAIN (no zombie run). All session-level (mock engine).
+# The bar: "never silently misroute" a free-text reply; "never zombie-run" a
+# cancelled/removed QUEUED project.
+# ===========================================================================
+
+
+def _arm_other(session, eng_owner, *, project, tool_use_id, chat_id=1):
+    """Prime an ask for ``project`` + tap its "Other" so ``project`` is armed for free text.
+
+    Returns the CallbackOutcome of the "Other" tap (so a test can read its project_name /
+    tool_use_id — the name-echo + reply-to-map inputs)."""
+    ask = AskEvent(
+        questions=[{"question": "Q?", "options": [{"label": "A"}]}],
+        tool_use_id=tool_use_id,
+        session_id=f"{project}-sid",
+    )
+    prime_pending(session, ask, project=project, chat_id=chat_id)
+    return session.resolve_callback(
+        chat_id, encode_callback("o", tool_use_id, question_index=0)
+    )
+
+
+async def test_free_text_most_recent_wins_with_two_armed_projects(tmp_path):
+    # D5 default: with BOTH projects armed for free text, the NEXT plain message resolves the
+    # MOST-RECENTLY-armed one (newest wins — the name-echoed prompt said which). Arm alpha,
+    # then beta → a plain reply resolves BETA, never alpha.
+    session, _store, eng_a, eng_b = await make_two_project_session(tmp_path, active="alpha")
+    _arm_other(session, eng_a, project="alpha", tool_use_id="a-ask")
+    _arm_other(session, eng_b, project="beta", tool_use_id="b-ask")  # newest
+
+    rec = Recorder()
+    await session.handle_message(1, "the answer", send=rec.send, edit=rec.edit)
+    # Resolved BETA (newest), never alpha. Mutation probe: most-recent → first-armed would
+    # resolve alpha here and fail.
+    assert eng_b.resolve_calls == [("b-ask", QuestionAnswer(answers={"Q?": "the answer"}))]
+    assert eng_a.resolve_calls == []
+    assert rec.sends == []  # no new turn opened
+    # alpha is still armed (only beta resolved); beta's marker cleared.
+    assert session._chat(1).runtimes["alpha"].awaiting_text_for == "a-ask"
+    assert session._chat(1).runtimes["beta"].awaiting_text_for is None
+
+
+async def test_free_text_reply_to_overrides_most_recent(tmp_path):
+    # D5 escape hatch (a): a reply-to ALPHA's free-text prompt routes the answer to ALPHA
+    # even though BETA is the most-recently-armed default. Arm alpha (record its prompt's
+    # message_id), arm beta (newest), then reply-to alpha's prompt → resolves ALPHA.
+    session, _store, eng_a, eng_b = await make_two_project_session(tmp_path, active="alpha")
+    out_a = _arm_other(session, eng_a, project="alpha", tool_use_id="a-ask")
+    # The bot would send alpha's prompt and register message_id -> tool_use_id; simulate it.
+    session.register_reply_prompt(1, 9001, out_a.tool_use_id)
+    _arm_other(session, eng_b, project="beta", tool_use_id="b-ask")  # newest default
+
+    rec = Recorder()
+    await session.handle_message(
+        1, "alpha answer", send=rec.send, edit=rec.edit, reply_to_message_id=9001
+    )
+    # Reply-to alpha's prompt → resolved ALPHA, never the most-recent beta. Mutation probe:
+    # ignoring reply-to would resolve beta here and fail.
+    assert eng_a.resolve_calls == [("a-ask", QuestionAnswer(answers={"Q?": "alpha answer"}))]
+    assert eng_b.resolve_calls == []
+    assert rec.sends == []
+
+
+async def test_free_text_reply_to_stale_prompt_no_misroute(tmp_path):
+    # "Never silently misroute": a reply-to a free-text prompt whose request is GONE (its
+    # turn ended / it was answered) must NOT silently fall through to the most-recent default
+    # — it no-ops. Arm beta (the most-recent), map a stale message_id to a now-absent id, then
+    # reply-to that stale prompt → resolves NOTHING (not beta), opens no new turn.
+    session, _store, eng_a, eng_b = await make_two_project_session(tmp_path, active="alpha")
+    _arm_other(session, eng_b, project="beta", tool_use_id="b-ask")  # most-recent default
+    # A reply-to prompt whose id "gone-ask" is not in the index (request resolved/ended).
+    session._chat(1).reply_to_index[9009] = "gone-ask"
+
+    rec = Recorder()
+    await session.handle_message(
+        1, "stale reply", send=rec.send, edit=rec.edit, reply_to_message_id=9009
+    )
+    # Misroute bar: neither beta (the default) nor anyone else is resolved; no new turn.
+    assert eng_a.resolve_calls == [] and eng_b.resolve_calls == []
+    assert rec.sends == []  # NOT opened as a new turn either
+    # beta is still armed (untouched) — the stale reply-to did not steal its answer.
+    assert session._chat(1).runtimes["beta"].awaiting_text_for == "b-ask"
+
+
+async def test_free_text_reply_to_unmapped_message_falls_through_to_default(tmp_path):
+    # A reply-to a message that is NOT one of our free-text prompts (not in the reply-to map)
+    # falls through to the most-recent default (it is an ordinary reply that happens to carry
+    # a reply_to_message_id). Arm beta; reply with an UNMAPPED message_id → resolves beta.
+    session, _store, _eng_a, eng_b = await make_two_project_session(tmp_path, active="alpha")
+    _arm_other(session, eng_b, project="beta", tool_use_id="b-ask")
+
+    rec = Recorder()
+    await session.handle_message(
+        1, "an answer", send=rec.send, edit=rec.edit, reply_to_message_id=12345
+    )
+    assert eng_b.resolve_calls == [("b-ask", QuestionAnswer(answers={"Q?": "an answer"}))]
+    assert rec.sends == []
+
+
+async def test_no_project_armed_plain_message_is_a_normal_turn(tmp_path):
+    # When NO project is armed for free text, a plain message is a normal NEW turn (unchanged
+    # behavior) — even one carrying a reply_to_message_id that isn't a free-text prompt.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    eng = FakeEngine(
+        [ResultEvent(session_id="alpha-sess", is_error=False, subtype="success", result_text="ok")],
+        session_id="alpha-sess",
+    )
+    session = make_multi_session({"/work/alpha": eng}, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "do a thing", send=rec.send, edit=rec.edit, reply_to_message_id=42),
+        timeout=2.0,
+    )
+    # A real turn ran (the engine produced output), no resolve happened.
+    assert eng.resolve_calls == []
+    assert any("ok" in s["text"] for s in rec.sends)
+
+
+async def test_arm_other_outcome_carries_name_and_id_for_name_echo(tmp_path):
+    # D5 name-echo + reply-to-map inputs: the "Other" tap's CallbackOutcome carries the owning
+    # project name (so the bot can name-echo "✏️ <name>: …") and the tool_use_id (so the bot
+    # can map the prompt's message_id -> id). Proven for both ask-"Other" and plan-"Reject".
+    session, _store, eng_a, _eng_b = await make_two_project_session(tmp_path, active="alpha")
+    out = _arm_other(session, eng_a, project="alpha", tool_use_id="a-ask")
+    assert out.expects_text is True
+    assert out.project_name == "alpha" and out.tool_use_id == "a-ask"
+
+    plan = PlanEvent(plan="P", tool_use_id="a-plan", session_id="alpha-sid")
+    prime_pending(session, plan, project="alpha")
+    out_p = session.resolve_callback(1, encode_callback("p", "a-plan", plan_action="r"))
+    assert out_p.expects_text is True
+    assert out_p.project_name == "alpha" and out_p.tool_use_id == "a-plan"
+
+
+async def test_reply_to_map_pruned_on_resolve(tmp_path):
+    # D5 map lifecycle: the reply-to entry is pruned when its request resolves, so a later
+    # reply to that (now-resolved) prompt cannot misroute and the map cannot grow unbounded.
+    session, _store, eng_a, _eng_b = await make_two_project_session(tmp_path, active="alpha")
+    out = _arm_other(session, eng_a, project="alpha", tool_use_id="a-ask")
+    session.register_reply_prompt(1, 7001, out.tool_use_id)
+    assert 7001 in session._chat(1).reply_to_index
+
+    rec = Recorder()
+    await session.handle_message(1, "answer", send=rec.send, edit=rec.edit)  # resolves alpha
+    assert eng_a.resolve_calls and "a-ask" not in session._chat(1).pending_index
+    # The map entry for the now-resolved prompt was pruned.
+    assert 7001 not in session._chat(1).reply_to_index
+
+
+async def test_resolve_to_routes_to_named_project(tmp_path):
+    # /to <name> (D5 escape hatch c): routes the free text to the NAMED project's pending
+    # free-text request regardless of which is the most-recent default. Arm alpha; /to alpha →
+    # resolves ALPHA. (beta is the most-recent here only to prove /to overrides it.)
+    session, _store, eng_a, eng_b = await make_two_project_session(tmp_path, active="beta")
+    _arm_other(session, eng_a, project="alpha", tool_use_id="a-ask")
+    _arm_other(session, eng_b, project="beta", tool_use_id="b-ask")  # newest default
+
+    reply = session.resolve_to(1, "alpha", "explicit answer")
+    assert "alpha" in reply
+    assert eng_a.resolve_calls == [("a-ask", QuestionAnswer(answers={"Q?": "explicit answer"}))]
+    assert eng_b.resolve_calls == []  # the most-recent default was NOT used (/to overrode it)
+
+
+async def test_resolve_to_case_insensitive(tmp_path):
+    # /to matches the project name case-insensitively (mirroring the store's match).
+    session, _store, eng_a, _eng_b = await make_two_project_session(tmp_path, active="alpha")
+    _arm_other(session, eng_a, project="alpha", tool_use_id="a-ask")
+    reply = session.resolve_to(1, "ALPHA", "hi")
+    assert "alpha" in reply
+    assert eng_a.resolve_calls == [("a-ask", QuestionAnswer(answers={"Q?": "hi"}))]
+
+
+async def test_resolve_to_not_awaiting_is_clear_noop(tmp_path):
+    # /to a project that is NOT awaiting free text → a clear no-op message, never a misroute.
+    # alpha is armed but we /to beta (not armed) → beta is untouched, alpha is untouched.
+    session, _store, eng_a, eng_b = await make_two_project_session(tmp_path, active="alpha")
+    _arm_other(session, eng_a, project="alpha", tool_use_id="a-ask")
+    reply = session.resolve_to(1, "beta", "wrong target")
+    assert "not awaiting" in reply.lower()
+    assert eng_a.resolve_calls == [] and eng_b.resolve_calls == []  # nothing resolved
+    assert session._chat(1).runtimes["alpha"].awaiting_text_for == "a-ask"  # alpha still armed
+
+
+async def test_resolve_to_unknown_project_is_clear_noop(tmp_path):
+    # /to an unknown project name → a clear no-op message (RB1), never a crash / misroute.
+    session, _store, eng_a, _eng_b = await make_two_project_session(tmp_path, active="alpha")
+    _arm_other(session, eng_a, project="alpha", tool_use_id="a-ask")
+    reply = session.resolve_to(1, "nope", "text")
+    assert "not awaiting" in reply.lower()
+    assert eng_a.resolve_calls == []
+
+
+# -- /cancel <name> | all | active (D9) --------------------------------------
+
+
+async def test_cancel_named_aborts_only_that_run(tmp_path):
+    # /cancel <name> aborts ONLY that project's run; a concurrent run survives. Both alpha and
+    # beta have live engines; cancel beta → beta cancelled, alpha untouched.
+    session, _store, eng_a, eng_b = await make_two_project_session(tmp_path, active="alpha")
+    prime_pending(
+        session,
+        PermissionEvent(tool_name="B", tool_input_summary="B(...)", tool_use_id="a-perm", session_id="alpha-sid"),
+        project="alpha",
+    )
+    prime_pending(
+        session,
+        PlanEvent(plan="bp", tool_use_id="b-plan", session_id="beta-sid"),
+        project="beta",
+    )
+    aborted = session.handle_cancel(1, "beta")
+    assert aborted == 1
+    assert eng_b.cancel_calls == [None] and eng_a.cancel_calls == []
+    # beta's pending cleared; alpha's survives (a separate concurrent run).
+    assert "b-plan" not in session._chat(1).pending_index
+    assert "a-perm" in session._chat(1).pending_index
+
+
+async def test_cancel_all_aborts_every_run(tmp_path):
+    # /cancel all aborts EVERY running project for the chat.
+    session, _store, eng_a, eng_b = await make_two_project_session(tmp_path, active="alpha")
+    prime_pending(
+        session,
+        PermissionEvent(tool_name="B", tool_input_summary="B(...)", tool_use_id="a-perm", session_id="alpha-sid"),
+        project="alpha",
+    )
+    prime_pending(
+        session,
+        PlanEvent(plan="bp", tool_use_id="b-plan", session_id="beta-sid"),
+        project="beta",
+    )
+    aborted = session.handle_cancel(1, "all")
+    assert aborted == 2  # both engines cancelled (1 each)
+    assert eng_a.cancel_calls == [None] and eng_b.cancel_calls == [None]
+    assert session._chat(1).pending_index == {}  # all entries cleared
+
+
+async def test_cancel_active_default_targets_active_only(tmp_path):
+    # /cancel (no arg) targets the ACTIVE project only. alpha active → cancel alpha; beta's
+    # concurrent run is untouched.
+    session, _store, eng_a, eng_b = await make_two_project_session(tmp_path, active="alpha")
+    prime_pending(
+        session,
+        PlanEvent(plan="bp", tool_use_id="b-plan", session_id="beta-sid"),
+        project="beta",
+    )
+    aborted = session.handle_cancel(1)  # active == alpha
+    assert aborted == 1 and eng_a.cancel_calls == [None] and eng_b.cancel_calls == []
+    assert "b-plan" in session._chat(1).pending_index  # beta untouched
+
+
+async def test_cancel_unknown_name_is_noop(tmp_path):
+    # /cancel <unknown> → no-op (RB1): nothing cancelled, no crash.
+    session, _store, eng_a, eng_b = await make_two_project_session(tmp_path, active="alpha")
+    assert session.handle_cancel(1, "ghost") == 0
+    assert eng_a.cancel_calls == [] and eng_b.cancel_calls == []
+
+
+# -- the queued-waiter DRAIN: /cancel + /rm of a QUEUED project (T6-review) ---
+
+
+async def test_cancel_queued_project_drains_waiter_no_zombie_run(tmp_path):
+    # ⭐ The T6-review hazard: /cancel of a QUEUED-not-yet-running project must DRAIN its
+    # parked waiter so it never springs to a "zombie run" when a slot frees. cap=1: alpha
+    # holds the only slot, beta is queued. /cancel beta → beta's waiter drained. THEN alpha
+    # finishes → its freed slot must NOT start beta (it was cancelled).
+    store = _three_project_store(tmp_path)
+    eng_a = _holding_engine("alpha")
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(50):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    assert len(session._chat(1).run_queue) == 1
+    assert session.project_status(1, "beta") == "queued"
+
+    # /cancel beta → drain its parked waiter (it never ran).
+    aborted = session.handle_cancel(1, "beta")
+    assert aborted == 0  # queued-only: no pending requests, but the waiter is drained
+    # beta's queued turn is cancelled → its task raises CancelledError.
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(turn_b, timeout=2.0)
+    assert session._chat(1).run_queue == deque()  # waiter removed from the queue
+    assert eng_b.started is False  # beta NEVER started
+
+    # Now alpha finishes → its freed slot must NOT zombie-start beta.
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    # Give the loop a chance to (wrongly) start beta if the drain failed.
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert eng_b.started is False, "cancelled queued project must NOT zombie-run on a freed slot"
+    assert session._running == 0  # back to zero — no leaked / zombie slot
+
+
+async def test_cancel_all_drains_queued_and_cancels_running(tmp_path):
+    # /cancel all: cancels the RUNNING project AND drains the QUEUED one (no zombie run).
+    store = _three_project_store(tmp_path)
+    eng_a = _holding_engine("alpha")
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(50):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    assert len(session._chat(1).run_queue) == 1
+
+    session.handle_cancel(1, "all")
+    # alpha (running) unblocks + ends; beta (queued) is drained.
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(turn_b, timeout=2.0)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert eng_b.started is False  # beta never ran
+    assert session._running == 0 and session._chat(1).run_queue == deque()
+
+
+async def test_reset_while_queued_then_cancel_no_zombie(tmp_path):
+    # Deferred-T6 case: /reset while a turn is QUEUED. The bot refuses /reset of a busy ACTIVE
+    # project, but a QUEUED active project (lock not yet held) is "not busy" — reset proceeds
+    # and clears its session; the still-queued turn must then be cancellable without a zombie
+    # run. Here we drive it at the session level: beta queued, reset (clears beta's session),
+    # then /cancel beta drains it; alpha's freed slot does not zombie-start beta.
+    store = _three_project_store(tmp_path)
+    store.set_session_id(1, "beta", "beta-old")
+    eng_a = _holding_engine("alpha")
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(50):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    assert session.project_status(1, "beta") == "queued"
+
+    # reset the (queued, lock-free) active beta → clears its session_id (no crash).
+    session.reset(1)
+    assert store.get_project(1, "beta")["session_id"] is None
+
+    # cancel the still-queued beta → drained, no zombie run when alpha's slot frees.
+    session.handle_cancel(1, "beta")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(turn_b, timeout=2.0)
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert eng_b.started is False
+    assert session._running == 0
+
+
+async def test_post_acquire_same_project_recheck(tmp_path):
+    # Deferred-T6: the post-acquire same-project re-check. A turn that QUEUED behind the cap
+    # parks; while parked, a SECOND message to the SAME project could start running it once a
+    # slot frees. When the queued turn's slot is finally granted it must re-check that its
+    # project isn't already running — else two turns would drive ONE project concurrently
+    # (violating the one-run-per-project invariant). We exercise the re-check directly: hold
+    # alpha's lock, then call the post-slot path → it must raise StreamingBusy.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    eng = _holding_engine("alpha")
+    session = make_multi_session({"/work/alpha": eng}, store=store)
+    rec = Recorder()
+    turn = asyncio.create_task(session.handle_message(1, "first", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    # alpha's lock is held by the running first turn. A SECOND message to alpha is refused
+    # (StreamingBusy) — this is exactly the re-check that protects a just-dequeued turn whose
+    # project started running while it was parked (the same guard fires before and after the
+    # slot grant). Proven here via the synchronous same-project busy refusal.
+    with pytest.raises(StreamingBusy):
+        await session.handle_message(1, "second", send=rec.send, edit=rec.edit)
+    eng.cancel()
+    await asyncio.wait_for(turn, timeout=2.0)
+
+
+async def test_rm_drains_queued_projects_waiter(tmp_path):
+    # /rm (forget_project) of a QUEUED project drains its parked waiter so it never zombie-runs.
+    # cap=1: alpha holds the slot, beta queued. forget_project(beta) → its waiter drained;
+    # alpha's freed slot does not start beta.
+    store = _three_project_store(tmp_path)
+    eng_a = _holding_engine("alpha")
+    eng_b = _holding_engine("beta")
+    session = make_multi_session(
+        {"/work/alpha": eng_a, "/work/beta": eng_b},
+        store=store,
+        config=make_config(max_concurrent_runs=1),
+    )
+    rec = Recorder()
+    turn_a = asyncio.create_task(session.handle_message(1, "a", send=rec.send, edit=rec.edit))
+    await _wait_busy(session, 1, "alpha", want=True)
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(session.handle_message(1, "b", send=rec.send, edit=rec.edit))
+    for _ in range(50):
+        if session._chat(1).run_queue:
+            break
+        await asyncio.sleep(0)
+    assert len(session._chat(1).run_queue) == 1
+
+    # Switch active away from beta (so it is removable in the real bot path) and forget it.
+    store.switch(1, "alpha")
+    await session.forget_project(1, "beta")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(turn_b, timeout=2.0)
+    assert "beta" not in session._chat(1).runtimes  # runtime purged
+    assert session._chat(1).run_queue == deque()
+
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert eng_b.started is False
+    assert session._running == 0

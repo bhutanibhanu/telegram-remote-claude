@@ -20,7 +20,7 @@ from telegram.ext import (
 from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
 from .paths import PathNotAllowed, resolve_within_roots
-from .render import project_status_label, yolo_banner
+from .render import free_text_prompt, project_status_label, yolo_banner
 from .session_store import (
     DuplicateProject,
     InvalidProjectName,
@@ -38,7 +38,10 @@ HELP_TEXT = (
     "Commands:\n"
     "/help — this help\n"
     "/reset — start a fresh Claude session (forget context)\n"
-    "/cancel — abort the in-flight run (streaming mode)\n"
+    "/cancel [name|all] — abort the in-flight run: the active project, a named project, "
+    "or every running/queued project (streaming mode)\n"
+    "/to <name> <text> — send a free-text answer/feedback to a named project's pending "
+    "“Other”/“Reject” prompt (streaming mode; or just reply to the prompt)\n"
     "/yolo — run every tool with NO approval prompt this session (streaming mode)\n"
     "/unyolo — restore the per-tool permission gate (streaming mode)\n"
     "/projects — list your projects and which one is active (streaming mode)\n"
@@ -122,8 +125,21 @@ class TelegramClaudeBot:
             self.runner.reset(chat_id)
         await update.message.reply_text("🔄 Fresh Claude session started.")
 
-    async def cmd_cancel(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Abort the in-flight run cleanly (RB4). Streaming mode only; oneshot is a no-op."""
+    async def cmd_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Abort a run cleanly (RB4/D9). Streaming mode only; oneshot is a no-op.
+
+        **Concurrency-aware target (P5 / ADR-005 D9):**
+
+        * ``/cancel`` (no arg) → the **active** project's run.
+        * ``/cancel <name>`` → **that** project's run (case-insensitive, like the store).
+        * ``/cancel all`` → **every** running/queued project for the chat.
+
+        Delegates to ``streaming.handle_cancel(chat_id, name)`` which cancels a RUNNING
+        engine AND drains a QUEUED-not-yet-running project's parked waiter (no zombie run —
+        D9), returning the count of pending requests aborted. ``all`` is a reserved arg
+        (a project can never be named ``all`` — SB4 allows it lexically, but the cancel-all
+        intent wins; the help spells this out). SB1: allowlist-gated like every command.
+        """
         if not await self._ok(update) or update.message is None:
             return
         if self.streaming is None:
@@ -131,9 +147,18 @@ class TelegramClaudeBot:
                 "Nothing to cancel — one-shot mode runs each message to completion."
             )
             return
-        aborted = self.streaming.handle_cancel(update.effective_chat.id)
+        arg = " ".join(ctx.args).strip() if ctx.args else ""
+        # No arg → active project (name=None); "all" → every run; else the named project.
+        name = arg or None
+        aborted = self.streaming.handle_cancel(update.effective_chat.id, name)
         if aborted:
             await update.message.reply_text(f"🛑 Cancelled ({aborted} pending request(s) aborted).")
+        elif name and name.casefold() != "all":
+            # A named target that aborted nothing: either it was queued-only (drained, no
+            # pending requests) or it was not running. A clear, honest message either way.
+            await update.message.reply_text(
+                f"Nothing in flight to cancel for {name} (it may have already finished)."
+            )
         else:
             await update.message.reply_text("Nothing in flight to cancel.")
 
@@ -368,10 +393,14 @@ class TelegramClaudeBot:
 
         No arg → usage. **Refuse if ``name`` resolves to the ACTIVE project** (D5;
         compared case-insensitively against ``store.get_active``) — the operator must
-        ``/switch`` away first. Unknown name → error. On success the project is dropped
-        from the registry; its Claude transcript is left on disk. Not busy-guarded: ``/rm``
-        of a NON-active project does not touch the held turn's active project (the active
-        case is already refused), so it is safe mid-turn.
+        ``/switch`` away first. **Refuse a currently-RUNNING project too (P5 / ADR-005 D9):**
+        a non-active project may have its own in-flight turn now that runs are concurrent;
+        tearing down a live engine mid-turn would orphan its parked hold, so the operator
+        must ``/cancel`` it first. Unknown name → error. On success the project is dropped
+        from the registry (its Claude transcript left on disk) and its in-memory runtime is
+        purged — a QUEUED-not-yet-running turn for it is **drained** first (no zombie run,
+        D9 — handled inside ``forget_project``). Safe mid-turn for OTHER projects (the active
+        + running cases are refused, so the purged runtime is never a live turn's).
         """
         if not await self._ok(update) or update.message is None:
             return
@@ -393,6 +422,15 @@ class TelegramClaudeBot:
         if active is not None and name.casefold() == active.casefold():
             await update.message.reply_text(
                 f"❌ {name} is the active project — /switch to another project first."
+            )
+            return
+        # P5 / ADR-005 D9: refuse a currently-RUNNING project (its per-project turn lock is
+        # held). Removing it would tear down a live engine mid-turn and orphan its parked
+        # hold — /cancel it first. A QUEUED-not-yet-running project's lock is NOT held, so it
+        # is not refused here; forget_project drains its waiter (no zombie run).
+        if self.streaming.is_busy(chat_id, name):
+            await update.message.reply_text(
+                f"❌ {name} has a turn in flight — /cancel {name} first, then /rm it."
             )
             return
         try:
@@ -495,14 +533,67 @@ class TelegramClaudeBot:
             "your next message runs there."
         )
 
+    async def cmd_to(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Route a free-text answer/feedback to a NAMED project (``/to <name> <text>`` — D5).
+
+        The explicit free-text escape hatch (P5 / ADR-005 D5): when several projects are
+        awaiting an "Other" answer / plan-reject feedback, ``/to work use the staging URL``
+        resolves **work**'s pending free-text request regardless of which is the
+        most-recent default — disambiguation without needing a Telegram reply-to. Streaming
+        mode only. Order:
+
+        1. ``_ok`` allowlist recheck (SB1) + ``_require_streaming`` notice — **no new
+           callback surface**; this rides the same ``allowed``-filtered command path.
+        2. Parse ``name`` (first arg) + ``text`` (the rest, so the answer may contain
+           spaces); missing either → usage (RB1).
+        3. Delegate to ``streaming.resolve_to(chat_id, name, text)`` which resolves the
+           named project's pending free-text request (lock-free; unblocks the held turn) or
+           returns a clear no-op message if that project is not awaiting free text — it
+           **never** silently routes to the wrong project (the D5 "never misroute" bar). The
+           returned string is the operator-facing reply.
+
+        SB4: ``text`` is the answer verbatim (the engine's free-text answer), never
+        interpolated into a shell command/argument.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_streaming(update):
+            return
+        assert self.streaming is not None
+        chat_id = update.effective_chat.id
+        name = ctx.args[0] if ctx.args else ""
+        text = " ".join(ctx.args[1:]).strip() if ctx.args and len(ctx.args) > 1 else ""
+        if not name or not text:
+            await update.message.reply_text("Usage: /to <name> <your answer>")
+            return
+        reply = self.streaming.resolve_to(chat_id, name, text)
+        await update.message.reply_text(reply)
+
     # ---- messages -----------------------------------------------------------
+    @staticmethod
+    def _reply_to_id(update: Update) -> int | None:
+        """The message_id this message is a reply-to, or ``None`` (D5 free-text routing).
+
+        A plain message that is a Telegram reply-to carries the replied-to message under
+        ``update.message.reply_to_message``; its ``message_id`` lets the streaming session
+        route a free-text answer to the project that owns the replied-to prompt (the D5
+        reply-to escape hatch). ``None`` when the message is not a reply (the common case).
+        Defensive (RB1): any missing attribute → ``None``.
+        """
+        msg = getattr(update, "message", None)
+        replied = getattr(msg, "reply_to_message", None) if msg is not None else None
+        return getattr(replied, "message_id", None) if replied is not None else None
+
     async def on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
             return
         text = (update.message.text or "").strip()
         if not text:
             return
-        await self._run_turn(update, ctx, update.effective_chat.id, text)
+        await self._run_turn(
+            update, ctx, update.effective_chat.id, text,
+            reply_to_message_id=self._reply_to_id(update),
+        )
 
     async def on_skill_command(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward any *unregistered* slash-command verbatim to the active session (P3, D1).
@@ -530,17 +621,27 @@ class TelegramClaudeBot:
         await self._run_turn(update, ctx, update.effective_chat.id, text)
 
     async def _run_turn(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
     ) -> None:
         """Run ``text`` as one turn for ``chat_id`` — the shared dispatch both the message
         handler and the skill-launch passthrough route through (one path, no duplication).
 
         Streaming mode hands the turn to the :class:`StreamingSession`; one-shot mode runs
         it through the runner and replies (chunked). Callers MUST have already done the
-        ``_ok`` allowlist recheck and the empty-text guard.
+        ``_ok`` allowlist recheck and the empty-text guard. ``reply_to_message_id`` (D5) is
+        forwarded to the streaming session for free-text reply-to routing; it is ignored in
+        one-shot mode (no interactive holds there).
         """
         if self.streaming is not None:
-            await self._on_message_streaming(update, ctx, chat_id, text)
+            await self._on_message_streaming(
+                update, ctx, chat_id, text, reply_to_message_id=reply_to_message_id
+            )
             return
 
         stop = asyncio.Event()
@@ -586,15 +687,23 @@ class TelegramClaudeBot:
 
     # ---- streaming mode (ENGINE_MODE=streaming) -----------------------------
     async def _on_message_streaming(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
     ) -> None:
         """Drive the streaming engine for one message (delegates to StreamingSession).
 
         Binds send/edit closures to this chat (the actual Telegram I/O the render layer
-        deferred), then hands the turn to the driver. A second concurrent message raises
-        :class:`StreamingBusy` (one active turn per chat — the harvested ClaudeBusy
-        invariant) and we reply the same "still working" notice as one-shot mode. SB4: the
-        text is the engine's prompt, never interpolated into a shell command/argument.
+        deferred), then hands the turn to the driver. A second concurrent message to the
+        SAME running project raises :class:`StreamingBusy` (one turn per project) and we
+        reply the same "still working" notice as one-shot mode. SB4: the text is the
+        engine's prompt, never interpolated into a shell command/argument.
+        ``reply_to_message_id`` (D5) is forwarded so a reply to a free-text prompt routes
+        the answer to the project that owns that prompt.
         """
         assert self.streaming is not None
         bot = ctx.bot
@@ -617,7 +726,8 @@ class TelegramClaudeBot:
 
         try:
             await self.streaming.handle_message(
-                chat_id, text, send=send, edit=edit, delete=delete
+                chat_id, text, send=send, edit=edit, delete=delete,
+                reply_to_message_id=reply_to_message_id,
             )
         except StreamingBusy:
             await update.message.reply_text(
@@ -639,6 +749,14 @@ class TelegramClaudeBot:
         any ``callback_data`` that fails to decode (foreign/stale/malformed → None) and
         resolves nothing in that case (RB1). The callback query is ALWAYS answered (so the
         client's spinner stops), even when ignored.
+
+        **Free-text prompt (P5 / ADR-005 D5).** When the tap arms free-text capture (an
+        "Other"/"Reject" → ``outcome.expects_text``), the bot replies a **name-echoed**
+        prompt (``✏️ <name>: reply with your answer…`` — ``render.free_text_prompt``) so the
+        operator can tell WHICH project the next plain message resolves (several may be
+        awaiting at once). It then maps that prompt's ``message_id -> tool_use_id``
+        (``register_reply_prompt``) so a **reply-to** that prompt routes the answer by id
+        (the reply-to escape hatch overriding the most-recent default).
         """
         query = update.callback_query
         if query is None:
@@ -657,11 +775,23 @@ class TelegramClaudeBot:
             await self._answer_callback(query)
             return
         await self._answer_callback(query, outcome.note if outcome.handled else None)
-        if outcome.expects_text and outcome.note:
+        if outcome.expects_text:
+            # D5: name-echo the free-text prompt so the operator knows which project the
+            # next message resolves; capture the prompt's message_id -> tool_use_id so a
+            # reply-to it routes by id (the reply-to escape hatch). A missing project_name
+            # (defensive) falls back to the plain toast note so the prompt is never empty.
+            prompt = (
+                free_text_prompt(outcome.project_name)
+                if outcome.project_name
+                else f"✏️ {outcome.note}…"
+            )
             try:
-                await query.message.reply_text(f"✏️ {outcome.note}…")
+                sent = await query.message.reply_text(prompt)
             except Exception:
-                pass
+                sent = None
+            self.streaming.register_reply_prompt(
+                chat.id, getattr(sent, "message_id", None), outcome.tool_use_id
+            )
 
     @staticmethod
     async def _answer_callback(query, text: str | None = None) -> None:
@@ -711,6 +841,11 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("new", self.cmd_new, filters=allowed))
         app.add_handler(CommandHandler("switch", self.cmd_switch, filters=allowed))
         app.add_handler(CommandHandler("rm", self.cmd_rm, filters=allowed))
+        # P5 /to <name> <text> (D5 free-text escape hatch): routes a free-text answer to a
+        # named project's pending "Other"/reject. Same `allowed` chat filter (SB1) +
+        # registered BEFORE the skill passthrough (first-match-wins) — no new callback
+        # surface.
+        app.add_handler(CommandHandler("to", self.cmd_to, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))
         # P3 skill-launch passthrough (D1): forward any *unregistered* slash-command verbatim
         # to the session. Registered AFTER the specific CommandHandlers above so PTB's

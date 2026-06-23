@@ -48,6 +48,7 @@ from claude_tg.render import (
     coalesce_stream,
     decode_callback,
     encode_callback,
+    free_text_prompt,
     notify_attention,
     notify_done,
     notify_error,
@@ -665,6 +666,26 @@ def test_notification_builders_are_pure_no_io():
     assert notify_attention("p", "ask") == notify_attention("p", "ask")
     assert notify_done("p") == notify_done("p")
     assert notify_error("p", "boom") == notify_error("p", "boom")
+
+
+# ============================================================================
+# Name-echoed free-text prompt (P5 / ADR-005 D5) — pure string
+# ============================================================================
+
+
+def test_free_text_prompt_is_name_echoed():
+    # D5 name-echo: the prompt carries the project name so the operator knows WHICH project
+    # the next plain message (or a reply to this prompt) resolves when several are awaiting.
+    msg = free_text_prompt("work")
+    assert msg == "✏️ work: reply with your answer…"
+    assert "work" in msg and msg.startswith("✏️")
+
+
+def test_free_text_prompt_is_pure_and_body_free():
+    # Pure / deterministic, and carries ONLY the (SB4-validated) name + a fixed phrase — no
+    # event body (SB3): there is nothing here from which a question/plan/tool body could leak.
+    assert free_text_prompt("bot") == free_text_prompt("bot")
+    assert free_text_prompt("a-b_C9") == "✏️ a-b_C9: reply with your answer…"
 
 
 # ============================================================================

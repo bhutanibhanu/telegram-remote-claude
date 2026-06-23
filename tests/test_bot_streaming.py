@@ -81,6 +81,8 @@ class FakeStreaming:
         self.cancel_calls = []
         self.reset_calls = []
         self.yolo_calls = []
+        self.reply_prompt_calls = []
+        self.to_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
         self._busy = busy
         # P5/T7: cmd_reset now reads streaming.store.get_active to scope its busy-guard to
@@ -90,8 +92,12 @@ class FakeStreaming:
         # the per-project busy-guard semantics are covered against a REAL session below).
         self.store = None
 
-    async def handle_message(self, chat_id, text, *, send, edit, delete=None):
-        self.handle_message_calls.append((chat_id, text))
+    async def handle_message(
+        self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None
+    ):
+        # P5/T9: handle_message gained reply_to_message_id (the D5 reply-to escape hatch);
+        # record it so the wiring test can assert it is threaded through from on_message.
+        self.handle_message_calls.append((chat_id, text, reply_to_message_id))
         if self._busy:
             raise StreamingBusy()
 
@@ -99,8 +105,9 @@ class FakeStreaming:
         self.resolve_calls.append((chat_id, data))
         return self._outcome
 
-    def handle_cancel(self, chat_id):
-        self.cancel_calls.append(chat_id)
+    def handle_cancel(self, chat_id, name=None):
+        # P5/T9: handle_cancel gained an optional name (None=active / "all" / <name>).
+        self.cancel_calls.append((chat_id, name))
         return 1
 
     def is_busy(self, chat_id, name=None):
@@ -109,6 +116,15 @@ class FakeStreaming:
         # one notional run, so both the chat-level and per-project queries return _busy.
         return self._busy
 
+    def register_reply_prompt(self, chat_id, message_id, tool_use_id):
+        # P5/T9: the bot calls this after sending a free-text prompt (D5 reply-to map).
+        self.reply_prompt_calls.append((chat_id, message_id, tool_use_id))
+
+    def resolve_to(self, chat_id, name, text):
+        # P5/T9: the /to <name> <text> escape hatch (D5). Return a confirmation string.
+        self.to_calls.append((chat_id, name, text))
+        return f"✅ Sent your reply to {name}."
+
     def reset(self, chat_id):
         self.reset_calls.append(chat_id)
 
@@ -116,12 +132,19 @@ class FakeStreaming:
         self.yolo_calls.append((chat_id, on))
 
 
-def make_update(chat_id=1, text="hello"):
+def make_update(chat_id=1, text="hello", *, reply_to_message_id=None):
     upd = MagicMock()
     upd.effective_chat.id = chat_id
     upd.message.text = text
     upd.message.reply_text = AsyncMock()
     upd.effective_message = upd.message
+    # P5/T9 (D5): a plain message is NOT a reply unless reply_to_message_id is given (else
+    # the MagicMock would auto-create a truthy reply_to_message.message_id and every message
+    # would look like a reply). When set, build a reply_to_message carrying that id.
+    if reply_to_message_id is None:
+        upd.message.reply_to_message = None
+    else:
+        upd.message.reply_to_message = MagicMock(message_id=reply_to_message_id)
     return upd
 
 
@@ -187,7 +210,8 @@ async def test_streaming_mode_delegates_to_driver():
     bot = TelegramClaudeBot(make_config(engine_mode="streaming"), runner, streaming=streaming)
     assert bot.streaming is streaming
     await bot.on_message(make_update(1, "build it"), make_ctx())
-    assert streaming.handle_message_calls == [(1, "build it")]
+    # P5/T9: the third tuple element is the reply-to message_id (None — not a reply).
+    assert streaming.handle_message_calls == [(1, "build it", None)]
     assert runner.run_calls == []  # one-shot runner NOT used in streaming mode
 
 
@@ -205,8 +229,10 @@ async def test_streaming_passes_working_delete_closure():
     captured: dict = {}
 
     class CapturingStreaming(FakeStreaming):
-        async def handle_message(self, chat_id, text, *, send, edit, delete=None):
-            self.handle_message_calls.append((chat_id, text))
+        async def handle_message(
+            self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None
+        ):
+            self.handle_message_calls.append((chat_id, text, reply_to_message_id))
             captured["delete"] = delete
 
     streaming = CapturingStreaming()
@@ -306,7 +332,7 @@ async def test_cmd_cancel_streaming_calls_handle_cancel():
     bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
     upd = make_update(1, "/cancel")
     await bot.cmd_cancel(upd, make_ctx())
-    assert streaming.cancel_calls == [1]
+    assert streaming.cancel_calls == [(1, None)]  # P5/T9: (chat_id, name=None → active)
     assert "cancelled" in upd.message.reply_text.await_args.args[0].lower()
 
 
@@ -1892,3 +1918,177 @@ async def test_cmd_projects_shows_queued_status(tmp_path):
     eng_b.cancel()
     await asyncio.wait_for(turn_a, timeout=2.0)
     await asyncio.wait_for(turn_b, timeout=2.0)
+
+
+# ===========================================================================
+# P5 / ADR-005 D5 + D9 (T9) — bot-level wiring: /cancel <name>|all, /to,
+# reply-to threading, the name-echoed free-text prompt + reply-to-map capture,
+# /rm-running-refused. The FakeStreaming-boundary tests assert the bot parses +
+# delegates; the real-session tests assert end-to-end behavior.
+# ===========================================================================
+
+
+async def test_cmd_cancel_named_delegates_with_name():
+    # /cancel work → handle_cancel(chat_id, "work").
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.cmd_cancel(make_update(1, "/cancel work"), make_cmd_ctx(args=["work"]))
+    assert streaming.cancel_calls == [(1, "work")]
+
+
+async def test_cmd_cancel_all_delegates_with_all():
+    # /cancel all → handle_cancel(chat_id, "all").
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.cmd_cancel(make_update(1, "/cancel all"), make_cmd_ctx(args=["all"]))
+    assert streaming.cancel_calls == [(1, "all")]
+
+
+async def test_cmd_cancel_no_arg_delegates_active():
+    # /cancel (no arg) → handle_cancel(chat_id, None) (the active project).
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.cmd_cancel(make_update(1, "/cancel"), make_cmd_ctx(args=[]))
+    assert streaming.cancel_calls == [(1, None)]
+
+
+async def test_cmd_to_delegates_name_and_text():
+    # /to work use the staging URL → resolve_to(chat_id, "work", "use the staging URL").
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/to work use the staging URL")
+    await bot.cmd_to(upd, make_cmd_ctx(args=["work", "use", "the", "staging", "URL"]))
+    assert streaming.to_calls == [(1, "work", "use the staging URL")]
+    # The session's confirmation string is relayed to the operator.
+    assert "work" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_to_usage_on_missing_text():
+    # /to with a name but no text → usage (RB1), no routing.
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/to work")
+    await bot.cmd_to(upd, make_cmd_ctx(args=["work"]))
+    assert streaming.to_calls == []
+    assert "usage" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_to_oneshot_is_streaming_only_notice():
+    # /to in one-shot mode → the streaming-only notice (no streaming session).
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/to work hi")
+    await bot.cmd_to(upd, make_cmd_ctx(args=["work", "hi"]))
+    assert "streaming mode only" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_to_unauthorized_ignored():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.cmd_to(make_update(999, "/to work hi"), make_cmd_ctx(args=["work", "hi"]))
+    assert streaming.to_calls == []
+
+
+async def test_on_message_threads_reply_to_id():
+    # D5: a plain message that is a reply-to carries its reply_to_message_id through to
+    # handle_message (so free-text reply-to routing can use it).
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.on_message(make_update(1, "the answer", reply_to_message_id=5150), make_ctx())
+    assert streaming.handle_message_calls == [(1, "the answer", 5150)]
+
+
+async def test_on_callback_name_echoes_prompt_and_registers_reply_map():
+    # D5: when a tap arms free text, the bot replies a NAME-echoed prompt ("✏️ work: …") and
+    # registers the prompt's message_id -> tool_use_id (the reply-to map).
+    streaming = FakeStreaming(
+        outcome=CallbackOutcome(
+            handled=True, note="Type your answer", expects_text=True,
+            project_name="work", tool_use_id="tid-7",
+        )
+    )
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_callback_update(chat_id=1, data="o|tid-7|0")
+    # The prompt reply returns a message with id 808 (so the map records 808 -> tid-7).
+    upd.callback_query.message.reply_text = AsyncMock(return_value=MagicMock(message_id=808))
+    await bot.on_callback(upd, make_ctx())
+    # Name-echoed prompt (carries the project name, not the bare toast).
+    sent_text = upd.callback_query.message.reply_text.await_args.args[0]
+    assert "work" in sent_text and sent_text.startswith("✏️")
+    # The reply-to map was populated with the sent prompt's id -> the armed tool_use_id.
+    assert streaming.reply_prompt_calls == [(1, 808, "tid-7")]
+
+
+async def test_cmd_rm_refuses_running_project(tmp_path):
+    # P5/T9 (D9): /rm of a currently-RUNNING (non-active) project is REFUSED ("cancel it
+    # first") — tearing down a live engine mid-turn would orphan its parked hold. beta runs
+    # in the background while alpha is active; /rm beta is refused and beta keeps running.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    eng_a = HoldEngine([])
+    eng_b = HoldEngine([HOLD])
+    session = make_multi_streaming(store, {"/work/alpha": eng_a, "/work/beta": eng_b})
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    # Drive beta busy in the background, alpha active + idle.
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(bot.on_message(make_update(1, "go beta"), rec))
+    await _wait(lambda: session.is_busy(1, "beta"))
+    store.switch(1, "alpha")
+
+    up_rm = make_update(1, "/rm beta")
+    await bot.cmd_rm(up_rm, make_cmd_ctx(args=["beta"]))
+    reply = up_rm.message.reply_text.await_args.args[0]
+    assert "/cancel" in reply and "beta" in reply  # refused, told to cancel first
+    assert "beta" in store.list_projects(1), "a refused /rm must NOT remove the project"
+    assert session.is_busy(1, "beta"), "beta's run is untouched by the refused /rm"
+
+    eng_b.cancel()
+    await asyncio.wait_for(turn_b, timeout=2.0)
+
+
+async def test_cmd_rm_idle_non_active_project_still_removed(tmp_path):
+    # Regression (existing behavior holds): /rm of an IDLE non-active project still purges it
+    # (the running-refusal only fires for a busy project).
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)  # idle, never run
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    up_rm = make_update(1, "/rm beta")
+    await bot.cmd_rm(up_rm, make_cmd_ctx(args=["beta"]))
+    assert "beta" not in store.list_projects(1)
+    assert "removed" in up_rm.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_cancel_named_aborts_only_that_run_end_to_end(tmp_path):
+    # End-to-end (real session): /cancel beta aborts beta's background run while alpha keeps
+    # running — concurrency-aware cancel at the bot boundary.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    eng_a = HoldEngine([HOLD])
+    eng_b = HoldEngine([HOLD])
+    session = make_multi_streaming(store, {"/work/alpha": eng_a, "/work/beta": eng_b})
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    turn_a = asyncio.create_task(bot.on_message(make_update(1, "a"), rec))
+    await _wait(lambda: session.is_busy(1, "alpha"))
+    store.switch(1, "beta")
+    turn_b = asyncio.create_task(bot.on_message(make_update(1, "b"), rec))
+    await _wait(lambda: session.is_busy(1, "beta"))
+
+    # /cancel beta → only beta's run aborts; alpha keeps running.
+    await bot.cmd_cancel(make_update(1, "/cancel beta"), make_cmd_ctx(args=["beta"]))
+    await asyncio.wait_for(turn_b, timeout=2.0)
+    assert session.is_busy(1, "beta") is False
+    assert session.is_busy(1, "alpha"), "alpha's concurrent run is untouched by /cancel beta"
+
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)

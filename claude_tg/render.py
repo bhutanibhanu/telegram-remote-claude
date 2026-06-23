@@ -731,6 +731,37 @@ def notify_error(name: str, short_error: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Free-text prompt (the "Other" / plan-reject follow-up) — name-echoed (D5)
+# ---------------------------------------------------------------------------
+#
+# When the operator taps "Other"/"Reject" on a project's prompt, the bot replies a
+# follow-up asking for the free-text answer. Under concurrency several projects can be
+# awaiting free text at once, so the prompt is NAME-ECHOED (D5) — the operator can tell
+# WHICH project the next plain message will resolve (the most-recently-armed is the
+# default; reply-to-message / `/to <name>` override). The free-text prompt is the
+# reply-to anchor: the relay maps that prompt's message_id -> tool_use_id, so a reply to
+# it routes by id (an explicit disambiguation over the most-recent default).
+#
+# SB3/SB4: carries ONLY the (SB4-validated) project name + a fixed phrase — no event body
+# (the question/plan text is never re-echoed here). Pure string; no I/O.
+
+#: Pencil glyph for a free-text prompt (matches the "✏️ Other (free text)" button).
+_FREE_TEXT_GLYPH: Final = "✏️"
+
+
+def free_text_prompt(name: str) -> str:
+    """Name-echoed prompt for a pending "Other" answer / plan-reject feedback (D5).
+
+    ``✏️ <name>: reply with your answer…`` — so with several projects awaiting free text
+    the operator knows WHICH project the next plain message (or a reply to THIS prompt)
+    resolves (the most-recently-armed project is the default; a reply-to / ``/to <name>``
+    overrides it). ``name`` is an SB4-validated project name (safe to interpolate); the
+    phrase is fixed (SB3 — no event body). Pure string; no I/O.
+    """
+    return f"{_FREE_TEXT_GLYPH} {name}: reply with your answer…"
+
+
+# ---------------------------------------------------------------------------
 # Per-project status labels for /projects (P5 / ADR-005 D7) — pure label map
 # ---------------------------------------------------------------------------
 #
@@ -1464,6 +1495,8 @@ __all__ = [
     "notify_attention",
     "notify_done",
     "notify_error",
+    # free-text prompt (name-echoed; D5)
+    "free_text_prompt",
     # per-project status labels for /projects (D7)
     "ProjectStatus",
     "project_status_label",

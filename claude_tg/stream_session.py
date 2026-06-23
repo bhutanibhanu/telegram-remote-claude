@@ -252,6 +252,13 @@ class _ProjectRuntime:
     awaiting_text_for: Optional[str] = None
     awaiting_text_mode: Optional[str] = None  # "ask_other" | "plan_reject"
     awaiting_text_question_index: Optional[int] = None
+    # P5 / ADR-005 D5 (T9): the monotonic arm sequence (from _ChatState.armed_seq) at which
+    # THIS project was armed for free-text capture. With several projects awaiting free text
+    # the **most-recently-armed** is the default target (the name-echoed prompt said which);
+    # the resolver picks the runtime with the HIGHEST armed_at. 0 = never armed. Reset to 0
+    # when the marker is cleared (_clear_runtime_text) so a stale value can't win a later
+    # routing decision.
+    awaiting_text_armed_at: int = 0
     # P5 / ADR-005 D7: this project's run status for the /projects column (T7). Defaults to
     # "idle"; _drive_turn drives it idle->running->awaiting_<kind>->running->idle across a
     # turn (T6 sets "queued" for a queued turn). A project with no runtime reads as "idle".
@@ -329,6 +336,27 @@ class _PendingRef:
 
 
 @dataclass
+class _QueuedTurn:
+    """One parked turn in a chat's FIFO run queue (P5 / ADR-005 D6 + T9 drain).
+
+    A turn that would start AT the concurrency cap parks on ``future`` inside
+    :meth:`StreamingSession._acquire_slot` instead of running; a finishing run pops the
+    oldest queued turn and transfers it the freed slot by resolving ``future``. ``runtime``
+    is the project the parked turn belongs to — recorded so :meth:`StreamingSession.handle_cancel`
+    / ``/rm`` can find and **drain** a queued-not-yet-running project's waiter (cancel its
+    ``future``) before its turn ever starts: else cancelling/removing a queued project would
+    leave a "zombie run" that springs to life when a slot frees (the T6-review hazard). The
+    parked turn has no live engine + no pending-index entries yet (it never reached
+    ``_drive_turn``), so draining is purely: cancel the future → its ``_acquire_slot`` unwinds
+    (dropping the entry + releasing any transferred slot) → the turn task raises
+    ``CancelledError`` and ``handle_message``'s ``finally`` releases nothing it didn't hold.
+    """
+
+    runtime: "_ProjectRuntime"
+    future: "asyncio.Future[None]"
+
+
+@dataclass
 class _ChatState:
     """Per-chat coordinator: the per-project runtimes + the pending-request index.
 
@@ -371,12 +399,14 @@ class _ChatState:
     pending_index: dict[str, _PendingRef] = field(default_factory=dict)
     # P5 / ADR-005 D6 (T6): the per-chat FIFO run queue. When a turn would start but the
     # process is AT the concurrency cap (StreamingSession._running >= cap), handle_message
-    # appends a waiter Future here and parks on it instead of running; a finishing run pops
-    # the OLDEST waiter (FIFO) and hands it the freed slot. The QUEUE is per-chat (no
-    # cross-chat semantics — the anti-goal); the run COUNTER is process-global (the cap is
-    # per-deployment). Transient in-memory, like everything else on _ChatState (RB3 — no
-    # in-flight runs survive a restart).
-    run_queue: "deque[asyncio.Future[None]]" = field(default_factory=deque)
+    # appends a queued turn here (its target runtime + a waiter Future) and parks on the
+    # future instead of running; a finishing run pops the OLDEST queued turn (FIFO) and
+    # hands it the freed slot. Each entry carries its ``runtime`` so /cancel + /rm can DRAIN
+    # a queued-not-yet-running project's waiter (T9 — else a zombie run when a slot frees).
+    # The QUEUE is per-chat (no cross-chat semantics — the anti-goal); the run COUNTER is
+    # process-global (the cap is per-deployment). Transient in-memory, like everything else
+    # on _ChatState (RB3 — no in-flight runs survive a restart).
+    run_queue: "deque[_QueuedTurn]" = field(default_factory=deque)
     # P5 / ADR-005 D8 (T8): the per-chat send-rate gate. ALL outbound for this chat (every
     # project's status edits + verbatim messages + the proactive notifications) funnels
     # through it so N concurrent projects flushing at once never burst past Telegram's
@@ -391,6 +421,21 @@ class _ChatState:
     # that project needs attention — the keyboard from the first ping still routes the tap).
     # Transient in-memory (RB3).
     notify_last: dict[tuple[str, str], float] = field(default_factory=dict)
+    # P5 / ADR-005 D5 (T9): the reply-to map for free-text disambiguation.
+    # ``message_id -> tool_use_id`` — populated by the bot when it sends a free-text-
+    # eliciting prompt (the ``✏️ <name>: reply…`` follow-up to an "Other"/"Reject" tap),
+    # so when the operator REPLIES-TO that prompt the relay routes the answer by its
+    # ``tool_use_id`` (the index then maps id -> owning project), overriding the
+    # most-recent default. Pruned on resolve / turn-end (so it can't grow unboundedly and a
+    # stale entry can't misroute). Transient in-memory (RB3) — the message ids are
+    # Telegram's, valid only for the live process.
+    reply_to_index: dict[int, str] = field(default_factory=dict)
+    # P5 / ADR-005 D5 (T9): a monotonic counter stamped onto a runtime's
+    # ``awaiting_text_armed_at`` each time it arms free-text capture, so the resolver can
+    # pick the **most-recently-armed** project when several are awaiting free text (newest
+    # wins — the name-echoed prompt said which). Bumped by :meth:`_next_armed_seq`; never
+    # reset (strictly increasing within the process is all the ordering needs).
+    armed_seq: int = 0
 
 
 class StreamingBusy(Exception):
@@ -423,8 +468,9 @@ class StreamingSession:
     project A resolves A's request even while B is the active/foreground project; an id
     absent from the index resolves nothing (a benign no-op, RB1). The held event's
     ``session_id`` is checked against the owning engine's current ``session_id`` as
-    defense-in-depth (a stale id after a resume never resolves the wrong session). T2 only
-    changes ROUTING — at most one project runs until T5 enables concurrent runs.
+    defense-in-depth (a stale id after a resume never resolves the wrong session).
+    **Concurrency is ON (T5+):** N projects' engines may be live at once and a tap routes by
+    id to whichever project owns the request, regardless of which project is foreground.
     """
 
     def __init__(
@@ -1003,8 +1049,15 @@ class StreamingSession:
         (try/except — a stop failure must not break the purge), then drop it from
         ``state.runtimes``. A subsequent ``/new <name>`` then
         builds a FRESH runtime from the store's record (new cwd, fail-closed policy) — no
-        leak. ``cmd_rm`` already refuses the ACTIVE project, so the purged runtime is never
-        the live one.
+        leak. ``cmd_rm`` already refuses the ACTIVE project **and a currently-RUNNING one**
+        (D9), so the purged runtime is never a live turn's.
+
+        **P5 / ADR-005 D9 (T9) — drain a QUEUED turn first.** If the removed project has a
+        turn parked in the run queue (queued behind the cap, not yet running), its waiter is
+        cancelled (:meth:`_drain_queued`) BEFORE the runtime is dropped — else that turn would
+        spring to a "zombie run" of a now-removed project when a slot frees (the T6-review
+        hazard). Also drop any pending-index entries the project owns. ``cmd_rm`` refuses a
+        RUNNING project (its lock held), so here the runtime is at most queued or idle.
         """
         state = self._chats.get(chat_id)
         if state is None:
@@ -1013,6 +1066,10 @@ class StreamingSession:
         if key is None:
             return  # no in-memory runtime for that name — clean no-op.
         rt = state.runtimes[key]
+        # D9 (T9): drain a queued-not-yet-running turn for this project (no zombie run) and
+        # drop its pending-index entries, before tearing the runtime down.
+        self._drain_queued(state, rt)
+        self._clear_project_pending(state, key)
         if rt.engine is not None:
             try:
                 await rt.engine.stop()
@@ -1163,6 +1220,24 @@ class StreamingSession:
             return "idle"
         return state.runtimes[key].status
 
+    def register_reply_prompt(
+        self, chat_id: int, message_id: Optional[int], tool_use_id: Optional[str]
+    ) -> None:
+        """Map a sent free-text prompt's ``message_id -> tool_use_id`` (D5 reply-to hatch).
+
+        The bot calls this AFTER it sends the ``✏️ <name>: reply…`` follow-up to an
+        "Other"/"Reject" tap, passing the prompt message's id + the armed request's id (both
+        from the :class:`CallbackOutcome`). A later reply-to **that** prompt then routes the
+        answer by ``tool_use_id`` (overriding the most-recent default — :meth:`handle_message`
+        precedence (a)). No-op if either id is missing (a send that returned no id, or a
+        non-arming outcome). The entry is pruned on resolve / turn-end / cancel
+        (:meth:`_prune_reply_to`) so the map stays bounded (D5) and a reply to a stale prompt
+        can't misroute.
+        """
+        if message_id is None or not tool_use_id:
+            return
+        self._chat(chat_id).reply_to_index[message_id] = tool_use_id
+
     # -- the turn driver (LOCK-GUARDED: one turn per PROJECT) ----------------
 
     async def handle_message(
@@ -1173,14 +1248,29 @@ class StreamingSession:
         send: SendFn,
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
+        reply_to_message_id: Optional[int] = None,
     ) -> None:
         """Drive ONE operator turn (or capture a free-text answer) for ``chat_id``.
 
-        Free-text capture takes precedence: if the chat is awaiting an "Other" answer /
+        Free-text capture takes precedence: if any project is awaiting an "Other" answer /
         plan-reject feedback, this text is routed to ``engine.resolve`` (NOT a new turn)
         and the held turn — still inside ``engine.send`` — continues. Otherwise it opens
         a new turn via ``engine.send`` and renders the event stream against the **active
         project's** engine (auto-creating ``default`` on the first turn — ADR-004 D6).
+
+        **Free-text routing under concurrency (P5 / ADR-005 D5; T9).** Several projects can
+        be awaiting free text at once, so the target is chosen by this precedence (in one
+        small resolver, :meth:`_route_free_text_target`, so the rule is a one-spot edit):
+        (a) **reply-to** — if ``reply_to_message_id`` is a reply to a free-text prompt the
+        relay sent (the ``message_id -> tool_use_id`` map), route to THAT request's project;
+        (b) otherwise the **most-recently-armed** project (the default; the name-echoed
+        prompt said which). The explicit ``/to <name> <text>`` escape hatch routes via
+        :meth:`resolve_to` at the bot, not here. If NO project is armed → this is a normal
+        new turn for the active project (unchanged). The relay **never silently misroutes**:
+        a reply-to whose request is gone finds no live armed target and falls through to the
+        normal-turn path only when nothing is armed at all — a reply-to that does not match
+        a live armed request while OTHERS are armed resolves nothing (it does not silently
+        hit the most-recent default).
 
         **Per-project lock — CONCURRENT runs (P5 / ADR-005 D1; T5).** The turn lock now
         lives on the TARGET project's runtime (the active project at message time), not the
@@ -1212,15 +1302,22 @@ class StreamingSession:
         """
         state = self._chat(chat_id)
 
-        # Free-text capture for a prior "Other"/reject tap routes to resolve(), not a
-        # new turn — and must NOT take the turn lock (the awaiting turn holds it). The
-        # capture marker now lives on the OWNING project's runtime (ADR-005 D7), so we
-        # look for a runtime that is armed for free text (the project that prompted it) and
-        # resolve against ITS engine — even if a different project is currently active
-        # (the cross-project free-text routing T2 already proved at the chat level).
-        armed_name, armed_rt = self._armed_text_runtime(state)
-        if armed_rt is not None:
-            self._resolve_free_text(state, chat_id, armed_name, armed_rt, text)
+        # Free-text capture for a prior "Other"/reject tap routes to resolve(), not a new
+        # turn — and must NOT take the turn lock (the awaiting turn holds it). The capture
+        # marker lives on the OWNING project's runtime (ADR-005 D7); under concurrency
+        # several projects can be armed, so the target is chosen by the D5 precedence
+        # (reply-to > most-recent) in one resolver. ``routed`` is True iff free-text routing
+        # CLAIMED this message (it was a free-text reply, even if the target turned out gone
+        # — so a stale reply-to never silently falls through to a NEW turn / a misroute).
+        armed_name, armed_rt, routed = self._route_free_text_target(
+            state, reply_to_message_id
+        )
+        if routed:
+            if armed_rt is not None:
+                self._resolve_free_text(state, chat_id, armed_name, armed_rt, text)
+            # else: a free-text reply whose target is gone/ambiguous — no-op (never a
+            # misroute, never silently a new turn). The marker (if any) was already cleared
+            # by _resolve_free_text on a prior attempt; nothing else to do.
             return
 
         # P5 / ADR-005 D1 (T5): lock the TARGET project — the active project at message
@@ -1343,7 +1440,9 @@ class StreamingSession:
         target_rt.status = "queued"
         ahead = self._running  # slot-holders ahead of this turn (== the cap when full).
         waiter: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
-        state.run_queue.append(waiter)
+        # Record the parked turn WITH its target runtime so /cancel + /rm can drain it (T9).
+        queued = _QueuedTurn(runtime=target_rt, future=waiter)
+        state.run_queue.append(queued)
         # One-time queued notice (D6). Best-effort: a failed notice must not strand the turn
         # in the queue (the wait below is what actually gates it), so swallow a send error.
         # Operator-facing → verbatim priority through the D8 send gate.
@@ -1357,8 +1456,10 @@ class StreamingSession:
         except Exception:
             log.debug("queued-notice send failed (turn still queued)", exc_info=True)
         # Park until a finishing run hands us the slot (it re-incremented _running for us).
-        # If the wait is cancelled (shutdown / the awaiting task is torn down) we must not
-        # leak: either we were still queued (drop our entry — we never held a slot), or a
+        # If the wait is cancelled — shutdown, the awaiting task torn down, OR a /cancel|/rm
+        # DRAIN of this queued project (T9: handle_cancel/_drain_queued cancels this future
+        # before the turn ever runs, so no zombie run when a slot frees) — we must not leak:
+        # either we were still queued (drop our entry — we never held a slot), or a
         # _release_slot had ALREADY transferred us the slot (our future is resolved, the
         # counter holds it for us) — in which case hand that slot straight back on
         # (_release_slot transfers it to the next waiter or decrements). Either way the
@@ -1366,14 +1467,11 @@ class StreamingSession:
         try:
             await waiter
         except asyncio.CancelledError:
-            try:
-                state.run_queue.remove(waiter)
-            except ValueError:
-                # Not in the queue → it was popped by a transfer that resolved our future a
-                # tick before the cancel landed; that slot is counted as held for us, so
-                # release it rather than leak it.
-                if waiter.done() and not waiter.cancelled():
-                    self._release_slot(state)
+            removed = self._remove_queued(state, waiter)
+            if not removed and waiter.done() and not waiter.cancelled():
+                # Not in the queue → a transfer resolved our future a tick before the cancel
+                # landed; that slot is counted as held for us, so release it (not leak it).
+                self._release_slot(state)
             raise
 
     def _release_slot(self, state: _ChatState) -> None:
@@ -1394,36 +1492,50 @@ class StreamingSession:
         decrement (the slot is now free). Pure + non-awaiting + never raises, so it cannot
         itself leak a slot or mask the turn's exception.
         """
-        waiter = self._pop_next_waiter(state)
-        if waiter is not None:
+        queued = self._pop_next_waiter(state)
+        if queued is not None:
             # Transfer: the freed slot stays counted (now held by the woken turn). Do NOT
             # decrement — set the waiter's result so its parked _acquire_slot returns.
-            waiter.set_result(None)
+            queued.future.set_result(None)
             return
         # No one waiting → the slot is free. Decrement, clamped at 0 (defensive: a double
         # release must never drive the count negative and wrongly grant extra capacity).
         if self._running > 0:
             self._running -= 1
 
-    def _pop_next_waiter(
-        self, state: _ChatState
-    ) -> "Optional[asyncio.Future[None]]":
-        """Pop the oldest still-pending queued waiter (this chat first, then any), FIFO.
+    def _pop_next_waiter(self, state: _ChatState) -> "Optional[_QueuedTurn]":
+        """Pop the oldest still-pending queued turn (this chat first, then any), FIFO.
 
-        Skips any already-cancelled/done futures (a queued turn whose task was torn down —
-        its CancelledError handler removes it, but a race could leave a settled future), so
-        a transferred slot always goes to a LIVE waiter. Returns ``None`` when no chat has a
-        pending waiter (the slot is then freed by the caller).
+        Skips any already-cancelled/done futures (a queued turn whose task was torn down or
+        DRAINED by /cancel|/rm — its CancelledError handler removes it, but a race could
+        leave a settled future), so a transferred slot always goes to a LIVE waiter. Returns
+        ``None`` when no chat has a pending waiter (the slot is then freed by the caller).
         """
         # This chat's queue first (preserve its FIFO order), then every other chat's.
         queues = [state.run_queue]
         queues.extend(s.run_queue for s in self._chats.values() if s is not state)
         for q in queues:
             while q:
-                waiter = q.popleft()
-                if not waiter.done():
-                    return waiter
+                queued = q.popleft()
+                if not queued.future.done():
+                    return queued
         return None
+
+    @staticmethod
+    def _remove_queued(
+        state: _ChatState, waiter: "asyncio.Future[None]"
+    ) -> bool:
+        """Remove the queue entry whose future is ``waiter``; return whether one was found.
+
+        Used by :meth:`_acquire_slot`'s CancelledError handler (the parked turn was torn
+        down / drained) to drop its own entry. ``False`` means it was not queued (a transfer
+        already popped it), telling the caller to release the slot it now implicitly holds.
+        """
+        for i, queued in enumerate(state.run_queue):
+            if queued.future is waiter:
+                del state.run_queue[i]
+                return True
+        return False
 
     async def _drive_turn(
         self,
@@ -1983,16 +2095,25 @@ class StreamingSession:
             return CallbackOutcome(handled=False, note="no matching question")
         # ADR-005 D7: arm free-text capture on the OWNING project's runtime (not a chat
         # slot), so the next plain message resolves THIS project even while another is
-        # active. A prior armed marker (on any runtime) is cleared first so at most one
-        # project is armed at a time (single-active free-text; T9 adds newest-wins routing).
+        # active. P5 / ADR-005 D5 (T9): SEVERAL projects may be armed at once now — the
+        # most-recently-armed wins (the name-echoed prompt said which). We no longer clear a
+        # prior armed marker; instead each arm is stamped with a monotonic sequence
+        # (``awaiting_text_armed_at``) so the resolver can pick the newest. Re-arming the
+        # SAME runtime simply re-stamps it (it becomes the newest again).
         rt = self._runtime_for_pending(state, ref)
         if rt is None:
             return CallbackOutcome(handled=False, note="no pending request")
-        self._clear_armed_text(state)
         rt.awaiting_text_for = decoded.tool_use_id
         rt.awaiting_text_mode = "ask_other"
         rt.awaiting_text_question_index = decoded.question_index
-        return CallbackOutcome(handled=True, note="Type your answer", expects_text=True)
+        rt.awaiting_text_armed_at = self._next_armed_seq(state)
+        return CallbackOutcome(
+            handled=True,
+            note="Type your answer",
+            expects_text=True,
+            project_name=ref.project_name,
+            tool_use_id=decoded.tool_use_id,
+        )
 
     def _resolve_plan(
         self, state: _ChatState, engine: Engine, ref: _PendingRef, decoded: Callback
@@ -2008,14 +2129,23 @@ class StreamingSession:
                 return CallbackOutcome(handled=True, note="Plan approved")
             return CallbackOutcome(handled=False, note="already decided")
         # reject → capture feedback as the next message, on the OWNING project's runtime.
+        # P5 / ADR-005 D5 (T9): newest-wins — stamp the arm sequence rather than clearing a
+        # prior armed marker, so several projects can be awaiting free text and the most-
+        # recently-armed is the default target (the name-echoed prompt said which).
         rt = self._runtime_for_pending(state, ref)
         if rt is None:
             return CallbackOutcome(handled=False, note="no pending request")
-        self._clear_armed_text(state)
         rt.awaiting_text_for = decoded.tool_use_id
         rt.awaiting_text_mode = "plan_reject"
         rt.awaiting_text_question_index = None
-        return CallbackOutcome(handled=True, note="Type your feedback", expects_text=True)
+        rt.awaiting_text_armed_at = self._next_armed_seq(state)
+        return CallbackOutcome(
+            handled=True,
+            note="Type your feedback",
+            expects_text=True,
+            project_name=ref.project_name,
+            tool_use_id=decoded.tool_use_id,
+        )
 
     def _resolve_permission(
         self, state: _ChatState, engine: Engine, ref: _PendingRef, decoded: Callback
@@ -2105,34 +2235,134 @@ class StreamingSession:
             # ADR-005 D7: the held turn resumes → owning project running again.
             self._resume_pending_status(state, ref)
 
+    def resolve_to(self, chat_id: int, name: str, text: str) -> str:
+        """Route ``text`` as the free-text answer/feedback to ``name`` (``/to`` — D5).
+
+        The explicit escape hatch (D5): ``/to <name> <text>`` resolves the named project's
+        pending free-text request regardless of which project is the most-recent default or
+        what a reply-to points at. Allowlist-gated at the bot like every command (no new
+        callback surface). Returns the operator-facing reply string:
+
+        * unknown ``name`` (no runtime) **or** the project is not awaiting free text → a
+          clear no-op message (RB1) — **never** silently route to the wrong project (the D5
+          "never misroute" bar).
+        * armed → resolve via the same :meth:`_resolve_free_text` path the most-recent /
+          reply-to routes use (lock-free; it unblocks the held turn) and confirm.
+
+        ``text`` is the answer/feedback verbatim (SB4 — never interpolated into a shell).
+        """
+        state = self._chats.get(chat_id)
+        if state is None:
+            return f"❌ No project named {name!r} is awaiting a reply."
+        key = self._resolve_runtime_key(state.runtimes, name)
+        rt = state.runtimes.get(key) if key is not None else None
+        if rt is None or rt.awaiting_text_for is None:
+            # Unknown name, or the project has no pending "Other"/reject to answer. Clear,
+            # body-free no-op — do NOT fall back to the most-recent default (never misroute).
+            return (
+                f"❌ {name} is not awaiting a free-text reply "
+                "(tap “Other”/“Reject” on its prompt first)."
+            )
+        self._resolve_free_text(state, chat_id, key, rt, text)
+        return f"✅ Sent your reply to {key}."
+
     # -- cancel --------------------------------------------------------------
 
-    def handle_cancel(self, chat_id: int) -> int:
-        """Abort the active project's in-flight turn cleanly (RB4); clear its pending state.
+    def handle_cancel(self, chat_id: int, name: Optional[str] = None) -> int:
+        """Abort a project's in-flight (or queued) turn cleanly (RB4/D9); clear its state.
 
-        Delegates to ``engine.cancel()`` on the ACTIVE project's engine (cancels every
-        pending interactive request as a clean deny, so a held turn unblocks and the
-        session stays usable) and clears **that project's** pending-index entries + any
-        free-text capture aimed at them (ADR-005 D3). Lock-free for the same reason as
-        :meth:`resolve_callback` — the turn being cancelled holds the lock; taking it would
-        deadlock the very turn ``cancel()`` must unblock. Returns the number of pending
-        requests aborted (0 if there is no active engine / it is idle).
+        **Concurrency-aware target (P5 / ADR-005 D9; T9):**
 
-        *(T2 scope: cancels the ACTIVE project. ``/cancel <name>`` / ``/cancel all`` —
-        per-project cancel under concurrency — is T9.)*
+        * ``name=None`` → the **active** project (``/cancel``).
+        * ``name="all"`` → **every** running/queued project in the chat (``/cancel all``).
+        * ``name=<project>`` → **that** project (``/cancel <name>``).
+
+        For each targeted project this cancels its RUNNING engine (``engine.cancel()`` —
+        every pending interactive request resolved as a clean deny, so a held turn unblocks
+        and the session stays usable) AND **drains a QUEUED-not-yet-running turn** (cancels
+        its parked waiter so it never springs to a "zombie run" when a slot frees — the
+        T6-review hazard), and clears that project's pending-index entries + any free-text
+        capture aimed at them (ADR-005 D3). Lock-free for the same reason as
+        :meth:`resolve_callback` — a cancelled RUNNING turn holds its lock and ``cancel()``
+        unblocks it (taking the lock would deadlock the very turn it must release).
+
+        Returns the number of pending requests aborted across the targeted project(s) (0
+        when nothing was running; a drained queued-only turn aborts 0 pending requests but
+        is still removed — the count is the *pending-request* tally, as in T2).
         """
         state = self._chats.get(chat_id)
         if state is None:
             return 0
-        name, rt = self._active_runtime(chat_id, create_default=False)
-        engine = rt.engine if rt is not None else None
-        if engine is None or name is None:
+
+        if isinstance(name, str) and name.casefold() == "all":
+            # /cancel all → every project with a runtime: cancel its engine + drain its
+            # queued waiter. Snapshot the names first (draining mutates the queue / clears
+            # pending; cancelling a held turn does not add runtimes synchronously).
+            total = 0
+            for pname in list(state.runtimes.keys()):
+                total += self._cancel_project(state, pname)
+            return total
+
+        if name is None:
+            # /cancel (no arg) → the ACTIVE project (do not auto-create one — nothing to
+            # cancel for a chat that never ran a turn).
+            active, _rt = self._active_runtime(chat_id, create_default=False)
+            if active is None:
+                return 0
+            return self._cancel_project(state, active)
+
+        # /cancel <name> → that project (case-insensitive, mirroring the store match).
+        key = self._resolve_runtime_key(state.runtimes, name)
+        if key is None:
+            return 0  # unknown / no-runtime project — nothing to cancel (RB1 no-op).
+        return self._cancel_project(state, key)
+
+    def _cancel_project(self, state: _ChatState, project_name: str) -> int:
+        """Cancel ONE project's run/queued turn + clear its pending state (D9 helper).
+
+        ``project_name`` is the exact ``runtimes`` key. Drains a queued-not-yet-running
+        waiter for it first (no zombie run), then cancels a RUNNING engine, then clears the
+        project's pending-index entries (so a late tap on a cancelled request no-ops). A
+        concurrent project's still-open holds / queued turn survive (scoped by name, T5).
+        Returns the count of pending requests the engine aborted (0 if idle / queued-only).
+        """
+        rt = state.runtimes.get(project_name)
+        if rt is None:
             return 0
-        # Drop the active project's pending-index entries (+ a free-text marker aimed at one
-        # of them) so a late tap on a cancelled request is a stale-id no-op. A concurrent
-        # project's still-open holds survive (scoped by project name, T5).
-        self._clear_project_pending(state, name)
-        return engine.cancel()
+        # (1) Drain a QUEUED-not-yet-running turn for this project (T9): cancel its parked
+        #     waiter so it never starts when a slot frees. The waiter's CancelledError
+        #     handler removes it from the queue + releases any transferred slot (no leak).
+        self._drain_queued(state, rt)
+        # (2) Cancel a RUNNING engine (lock-free — unblocks the held turn).
+        aborted = 0
+        if rt.engine is not None:
+            aborted = rt.engine.cancel()
+        # (3) Drop this project's pending-index entries (+ a free-text marker aimed at them)
+        #     so a late tap on a cancelled request is a stale-id no-op.
+        self._clear_project_pending(state, project_name)
+        return aborted
+
+    @staticmethod
+    def _drain_queued(state: _ChatState, rt: _ProjectRuntime) -> None:
+        """Cancel every QUEUED (not-yet-running) waiter belonging to ``rt`` (T9 drain).
+
+        A queued turn parks on its waiter inside :meth:`_acquire_slot` before it ever
+        reaches ``_drive_turn`` — it has no live engine and no pending-index entries yet, so
+        the ONLY thing holding it is the future. Cancelling that future wakes its
+        ``_acquire_slot`` into the CancelledError path, which removes the entry from the
+        queue and releases any slot already transferred to it — so a cancelled/removed
+        queued project can never spring to a "zombie run" when a slot frees (the T6-review
+        hazard). We cancel the future and leave the queue mutation to that handler (so the
+        slot-accounting stays in one place); a defensive ``status`` reset to ``idle`` covers
+        the case where the parked task has not yet been scheduled to run its handler.
+        """
+        drained = False
+        for queued in list(state.run_queue):
+            if queued.runtime is rt and not queued.future.done():
+                queued.future.cancel()
+                drained = True
+        if drained and rt.status == "queued":
+            rt.status = "idle"
 
     # -- shutdown ------------------------------------------------------------
 
@@ -2173,10 +2403,13 @@ class StreamingSession:
         """Remove one index entry by id (on resolve); also clear a free-text marker on it.
 
         The free-text marker now lives on the OWNING project's runtime (ADR-005 D7), so if
-        that project's runtime is armed for THIS id, its marker is cleared too.
+        that project's runtime is armed for THIS id, its marker is cleared too. Any reply-to
+        map entries pointing at this id are pruned (D5) so a reply to a now-resolved prompt
+        can't misroute and the map can't grow unboundedly.
         """
         if tool_use_id is None:
             return
+        StreamingSession._prune_reply_to(state, tool_use_id)
         ref = state.pending_index.pop(tool_use_id, None)
         if ref is None:
             return
@@ -2199,9 +2432,25 @@ class StreamingSession:
         ]
         for tuid in doomed:
             del state.pending_index[tuid]
+            # D5: prune any reply-to map entries aimed at this dropped id (so a reply to a
+            # now-gone prompt no-ops rather than misroutes, and the map can't grow unbounded).
+            StreamingSession._prune_reply_to(state, tuid)
         rt = state.runtimes.get(project_name)
         if rt is not None and rt.awaiting_text_for in doomed:
             StreamingSession._clear_runtime_text(rt)
+
+    @staticmethod
+    def _prune_reply_to(state: _ChatState, tool_use_id: str) -> None:
+        """Drop every reply-to map entry (message_id -> id) pointing at ``tool_use_id`` (D5).
+
+        Called whenever a held request is resolved / its turn ends / it is cancelled, so the
+        ``message_id -> tool_use_id`` map (populated when a free-text prompt is sent) stays
+        bounded and a reply to a stale prompt can never resolve the wrong (or a gone)
+        request — it simply finds no live armed runtime and no-ops.
+        """
+        stale = [mid for mid, tuid in state.reply_to_index.items() if tuid == tool_use_id]
+        for mid in stale:
+            del state.reply_to_index[mid]
 
     @staticmethod
     def _runtime_for_pending(
@@ -2227,39 +2476,110 @@ class StreamingSession:
     def _armed_text_runtime(
         state: _ChatState,
     ) -> tuple[Optional[str], Optional[_ProjectRuntime]]:
-        """The (name, runtime) of a project currently armed for free-text capture, or
-        ``(None, None)``.
+        """The MOST-RECENTLY-ARMED project's (name, runtime), or ``(None, None)`` (D5).
 
-        The free-text marker lives per-project (ADR-005 D7); a plain message's
-        free-text-vs-new-turn decision (``handle_message``) finds the armed runtime here.
-        At most one project is armed at a time in T4 (``_arm_ask_other``/``_resolve_plan``
-        clear any prior armed marker first); T9 adds full newest-wins routing across several
-        armed projects.
+        The free-text marker lives per-project (ADR-005 D7), and under concurrency SEVERAL
+        projects can be armed at once (an "Other"/"Reject" tapped on each). The default
+        free-text target is the **most-recently-armed** project (D5 — the name-echoed prompt
+        said which), so this returns the armed runtime with the HIGHEST
+        ``awaiting_text_armed_at`` (newest wins). ``handle_message``'s free-text-vs-new-turn
+        decision uses this as the default; a reply-to / ``/to`` overrides it. ``(None, None)``
+        when no project is armed (then a plain message is a normal new turn).
         """
+        best_name: Optional[str] = None
+        best_rt: Optional[_ProjectRuntime] = None
+        best_seq = -1
         for name, rt in state.runtimes.items():
-            if rt.awaiting_text_for is not None:
-                return name, rt
+            if rt.awaiting_text_for is not None and rt.awaiting_text_armed_at > best_seq:
+                best_name, best_rt, best_seq = name, rt, rt.awaiting_text_armed_at
+        return best_name, best_rt
+
+    @staticmethod
+    def _next_armed_seq(state: _ChatState) -> int:
+        """The next monotonic arm sequence for a free-text capture (D5 newest-wins)."""
+        state.armed_seq += 1
+        return state.armed_seq
+
+    def _route_free_text_target(
+        self, state: _ChatState, reply_to_message_id: Optional[int]
+    ) -> tuple[Optional[str], Optional[_ProjectRuntime], bool]:
+        """Pick the free-text target by the D5 precedence — the ONE routing-rule spot.
+
+        Returns ``(name, runtime, routed)``:
+
+        * ``routed`` — True iff this plain message is a free-text REPLY that free-text
+          routing claims (so ``handle_message`` resolves it / no-ops, never opens a new
+          turn over it). False means "not a free-text reply" → a normal new turn.
+        * ``(name, runtime)`` — the target to resolve against (``runtime`` may be ``None``
+          even when ``routed`` is True: a free-text reply whose request is gone — we claim
+          it and no-op rather than misroute).
+
+        Precedence (D5):
+
+        1. **reply-to** — if ``reply_to_message_id`` is in the reply-to map (the operator
+           replied to a free-text prompt the relay sent), we COMMIT to that id: route to its
+           project IFF it is still live-armed for that id, else ``routed=True`` with no
+           runtime (no-op — **never** fall through to the most-recent default, which would
+           be a misroute). A ``reply_to_message_id`` that is NOT one of our prompts (a reply
+           to something else, or no reply) falls through to (2).
+        2. **most-recently-armed** — the default target (the name-echoed prompt said which);
+           ``routed`` iff some project is armed. No armed project → ``(None, None, False)``
+           (a normal new turn).
+
+        ``/to <name>`` is the third escape hatch but routes via :meth:`resolve_to` at the
+        bot (an explicit command), not through here.
+        """
+        # (1) reply-to: only when the replied-to message is one of OUR free-text prompts.
+        if reply_to_message_id is not None:
+            mapped_id = state.reply_to_index.get(reply_to_message_id)
+            if mapped_id is not None:
+                name, rt = self._runtime_armed_for_id(state, mapped_id)
+                # Claim it either way (it was a reply to our prompt): route if live-armed,
+                # else no-op (never misroute to the most-recent default).
+                return name, rt, True
+        # (2) default: the most-recently-armed project (newest wins).
+        name, rt = self._armed_text_runtime(state)
+        return name, rt, rt is not None
+
+    def _runtime_armed_for_id(
+        self, state: _ChatState, tool_use_id: str
+    ) -> tuple[Optional[str], Optional[_ProjectRuntime]]:
+        """The (name, runtime) armed for ``tool_use_id`` specifically, or ``(None, None)``.
+
+        Used by the reply-to escape hatch (D5): the operator replied to a free-text prompt
+        whose ``message_id`` mapped to ``tool_use_id``; the answer must resolve THAT request,
+        not whichever project is the most-recently-armed default. We look the id up in the
+        pending index to find the owning project, then return its runtime IFF that runtime
+        is currently armed for this exact id (a stale reply-to whose request has since been
+        answered / its turn ended finds nothing → the caller no-ops, never misroutes).
+        """
+        ref = state.pending_index.get(tool_use_id)
+        if ref is None:
+            return None, None
+        rt = state.runtimes.get(ref.project_name)
+        if rt is not None and rt.awaiting_text_for == tool_use_id:
+            return ref.project_name, rt
         return None, None
 
     # -- internals -----------------------------------------------------------
 
     @staticmethod
     def _clear_runtime_text(rt: _ProjectRuntime) -> None:
-        """Clear ONE runtime's free-text capture marker (ADR-005 D7)."""
+        """Clear ONE runtime's free-text capture marker (ADR-005 D7).
+
+        Resets the arm sequence to 0 too (D5) so a cleared marker can never win a later
+        most-recent routing decision against a freshly-armed project.
+        """
         rt.awaiting_text_for = None
         rt.awaiting_text_mode = None
         rt.awaiting_text_question_index = None
+        rt.awaiting_text_armed_at = 0
 
-    @staticmethod
-    def _clear_armed_text(state: _ChatState) -> None:
-        """Clear whichever runtime (if any) is currently armed for free-text capture.
-
-        Used before arming a new free-text target so at most one project is armed at a time
-        (the single-active free-text invariant T4 keeps; T9 generalizes to newest-wins).
-        """
-        _name, rt = StreamingSession._armed_text_runtime(state)
-        if rt is not None:
-            StreamingSession._clear_runtime_text(rt)
+    # NOTE (P5 / ADR-005 D5, T9): the T4 ``_clear_armed_text`` helper (clear the single
+    # armed runtime before arming a new one) is gone — under concurrency SEVERAL projects may
+    # be armed at once and the **most-recently-armed** wins (``awaiting_text_armed_at`` +
+    # :meth:`_armed_text_runtime`), so arming no longer clears a prior marker. A resolved /
+    # ended / cancelled request clears its own marker via :meth:`_clear_runtime_text`.
 
     @staticmethod
     def _clear_runtime_turn_state(rt: _ProjectRuntime) -> None:
@@ -2326,11 +2646,22 @@ class CallbackOutcome:
                          feedback; never carries secrets).
     * ``expects_text`` — True iff the bot should prompt the operator to type the next
                          message (an "Other" answer / reject feedback).
+    * ``project_name`` — the OWNING project of an ``expects_text`` arm (D5): the bot
+                         name-echoes it in the free-text prompt (``✏️ <name>: reply…``) so
+                         the operator can tell which project the next message resolves.
+    * ``tool_use_id``  — the armed request's id (D5): the bot maps the free-text **prompt's**
+                         ``message_id -> tool_use_id`` so a reply-to that prompt routes by id
+                         (the reply-to escape hatch overriding the most-recent default).
+
+    ``project_name`` / ``tool_use_id`` are populated only for an ``expects_text`` outcome
+    (the "Other"/"Reject" arm); they are ``None`` for an immediate resolve / a no-op.
     """
 
     handled: bool
     note: str = ""
     expects_text: bool = False
+    project_name: Optional[str] = None
+    tool_use_id: Optional[str] = None
 
 
 __all__ = [
