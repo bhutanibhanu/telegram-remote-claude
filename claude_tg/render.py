@@ -1408,9 +1408,6 @@ SCHEDULES_EMPTY_NOTICE: Final = (
     "(e.g. <code>/every 1h ci run the tests and tell me if anything is red</code>)."
 )
 
-#: Max chars of a schedule's prompt shown on its row (SB3 truncation, like the /macros preview).
-_SCHEDULE_PROMPT_MAX = 60
-
 
 def _relative_next_run(next_run: object, *, now: float) -> str:
     """A compact relative ``next run`` like ``"due now"`` / ``"in 5m"`` / ``"in 2h"`` (``/schedules``).
@@ -1440,15 +1437,16 @@ def _relative_next_run(next_run: object, *, now: float) -> str:
 
 
 def schedule_listing(schedules: Iterable[object], *, now: float) -> str:
-    """Render a chat's proactive schedules as a BODY-FREE-safe HTML listing (P14 ``/schedules``).
+    """Render a chat's proactive schedules as a BODY-FREE HTML listing (P14 ``/schedules``).
 
-    Each :class:`~claude_tg.scheduler.Schedule` row shows: a ``⏸``/``⏰`` marker (paused vs
+    Each :class:`~claude_tg.scheduler.Schedule` row shows ONLY: a ``⏸``/``⏰`` marker (paused vs
     armed), the **name** (bold), the interval (``every <Nh>`` via
     :func:`~claude_tg.scheduler.format_interval`), the relative **next run**
-    (:func:`_relative_next_run`; a paused schedule shows ``paused`` instead of a next-run), the
-    pinned **project** if any, and a TRUNCATED + HTML-escaped **prompt preview** (SB3 — the
-    operator's own turn text, capped + escaped like a ``/macros`` preview, never a transcript
-    body). ``now`` is injected so the render is deterministic in tests.
+    (:func:`_relative_next_run`; a paused schedule shows ``paused`` instead of a next-run), and
+    the pinned **project** if any. ⭐ The schedule's PROMPT text is **NOT** displayed (SB3 /
+    Codex-QA: a truncated prompt is still prompt text — a body); the prompt stays persisted
+    (needed to fire) but is never rendered. The operator manages by the NAME they chose. ``now``
+    is injected so the render is deterministic in tests.
 
     Returns :data:`SCHEDULES_EMPTY_NOTICE` for an empty list (the bot sends it as the clean
     "no schedules" reply). Pure (no I/O). Defensive (RB1): a malformed schedule object missing
@@ -1474,15 +1472,14 @@ def schedule_listing(schedules: Iterable[object], *, now: float) -> str:
             if isinstance(project, str) and project
             else ""
         )
-        prompt = getattr(schedule, "prompt", "") or ""
-        prompt_str = prompt if isinstance(prompt, str) else str(prompt)
-        preview = prompt_str if len(prompt_str) <= _SCHEDULE_PROMPT_MAX else prompt_str[: _SCHEDULE_PROMPT_MAX - 1] + "…"
-        preview_html = (
-            f" — <code>{html.escape(preview, quote=False)}</code>" if preview else ""
-        )
+        # ⭐ SB3 / Codex-QA BLOCKER: the listing is BODY-FREE — name, interval, relative
+        # next-run, paused marker, and pinned project ONLY. The schedule's PROMPT text is NOT
+        # displayed (a truncated prompt is still prompt text — a body); it stays persisted
+        # (needed to fire) but is never rendered here. The operator manages by the NAME they
+        # chose; a detail view is a future fast-follow.
         rows.append(
             f"{marker} <b>{html.escape(name, quote=False)}</b> — "
-            f"every {every} ({when}){project_html}{preview_html}"
+            f"every {every} ({when}){project_html}"
         )
     if not rows:
         return SCHEDULES_EMPTY_NOTICE

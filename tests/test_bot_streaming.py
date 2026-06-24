@@ -5305,16 +5305,19 @@ async def test_cmd_every_oneshot_replies_notice():
 
 
 async def test_cmd_schedules_lists_body_free(tmp_path):
+    # ⭐ SB3 / Codex-QA BLOCKER: /schedules is BODY-FREE — it shows the name + interval + next
+    # run + project, but NEVER the prompt text (a truncated prompt is still prompt text).
     bot, store = _sched_bot(tmp_path)
     await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "secret-token-xyz", "deploy"]))
     upd = make_update(1, "/schedules")
     await bot.cmd_schedules(upd, make_cmd_ctx([]))
     reply = upd.message.reply_text.await_args.args[0]
-    assert "<b>ci</b>" in reply
-    assert "every 1h" in reply
-    # The prompt PREVIEW is the operator's own text (shown like /macros previews it) — present
-    # but inside a <code> span; this is body-free by the SB3 posture (own prompt, not a body).
-    assert "secret-token-xyz" in reply  # operator's own text, previewed (not a tool body)
+    assert "<b>ci</b>" in reply  # the name IS shown
+    assert "every 1h" in reply  # interval shown
+    # The prompt text is ABSENT (not previewed) — the schedule is managed by its name. The
+    # prompt stays persisted (needed to fire) but is never displayed.
+    assert "secret-token-xyz" not in reply
+    assert "deploy" not in reply
 
 
 async def test_cmd_schedules_empty_notice(tmp_path):
@@ -5324,16 +5327,20 @@ async def test_cmd_schedules_empty_notice(tmp_path):
     assert "No schedules yet" in upd.message.reply_text.await_args.args[0]
 
 
-async def test_cmd_schedules_escapes_html_in_prompt(tmp_path):
-    # SB3 / R6: a prompt with </>& must render INERT in the listing (HTML-escaped), never
-    # break the HTML message or inject markup.
+async def test_cmd_schedules_prompt_with_markup_not_rendered(tmp_path):
+    # ⭐ SB3: a prompt containing </>& cannot break the HTML or inject markup BECAUSE it is
+    # not rendered at all (body-free). Neither the raw nor an escaped form of the prompt
+    # appears; the only real <b> tag is the schedule NAME.
     bot, store = _sched_bot(tmp_path)
     await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "<b>x</b>", "&", "y"]))
     upd = make_update(1, "/schedules")
     await bot.cmd_schedules(upd, make_cmd_ctx([]))
     reply = upd.message.reply_text.await_args.args[0]
-    assert "&lt;b&gt;x&lt;/b&gt;" in reply and "&amp;" in reply
-    assert "<b>x</b>" not in reply.replace("<b>ci</b>", "")  # the only real <b> is the name
+    assert "<b>ci</b>" in reply  # the name (bold) IS shown
+    # The prompt is body-free: neither its raw markup nor an escaped copy appears, so it can
+    # neither inject nor break the HTML. (The only bold spans are the header + the name.)
+    assert "<b>x</b>" not in reply
+    assert "&lt;b&gt;x&lt;/b&gt;" not in reply
 
 
 async def test_cmd_unschedule_removes(tmp_path):

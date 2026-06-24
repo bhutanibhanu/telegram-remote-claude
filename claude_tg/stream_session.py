@@ -2745,6 +2745,32 @@ class StreamingSession:
 
     # -- proactive (scheduler-fired) turn (P14 T-FIRE ⭐) --------------------
 
+    async def _proactive_skip_busy(
+        self, state: "_ChatState", schedule: Schedule, send: SendFn
+    ) -> None:
+        """Body-free busy-skip for a proactive fire: ``⏰ skipped`` notice + ``proactive_skip`` audit.
+
+        Shared by the fire-ability PRE-check (before any header is sent) and the
+        :class:`StreamingBusy` RACE branch in :meth:`fire_schedule`, so a busy skip is uniform
+        whichever path hit it. The notice is verbatim through the D8 gate (best-effort, RB1);
+        the audit is body-free (the task name only, ``decision="busy"``). Never raises.
+        """
+        try:
+            await self._gated_send(
+                state, send, verbatim=True,
+                text=f"⏰ skipped <b>{html.escape(schedule.name, quote=False)}</b> — still working.",
+                reply_markup=None, parse_mode="HTML",
+            )
+        except Exception:
+            log.debug("proactive skip notice send failed for %s (ignored)", schedule.name, exc_info=True)
+        self.record_audit(
+            KIND_SESSION_EVENT,
+            chat_id=schedule.chat_id,
+            summary=f"proactive_skip ({schedule.name})",
+            decision="busy",
+            name=schedule.project,
+        )
+
     async def fire_schedule(
         self,
         schedule: Schedule,
@@ -2768,27 +2794,57 @@ class StreamingSession:
 
         Flow + posture:
 
-        1. **Notify the chat** body-free that a proactive run started — a small ``⏰ <name>
-           (scheduled)`` header through the per-chat send gate (SB3: the schedule NAME only,
-           never the prompt; SB-flood: throttled like any send). The turn's own streamed output
-           IS the result notification (it renders through the gate like any turn).
-        2. **Audit** a body-free ``proactive_fire`` ``session_event`` (the task name + chat —
-           NOT the prompt) so the owner can reconstruct what fired while away (design §5.3).
-        3. **Drive** via :meth:`handle_message`.
-        4. **No stacking (overlap policy, design §3.2):** if the target project/chat is BUSY
-           (:class:`StreamingBusy`) this does NOT queue a second turn on top — it SKIPS this
-           tick with a body-free ``⏰ skipped <name> — still working`` notice + a
-           ``proactive_skip`` audit, and returns ``False`` (the driver reschedules for the next
-           interval). **RB1-total:** ANY other exception from the turn is caught, logged
-           body-free, and audited as a ``proactive_skip`` — a single bad fire NEVER propagates
-           (so it can never kill the firing loop or the bot). Returns ``True`` iff the turn was
-           driven (not skipped/errored). The audit/notify writes are best-effort (RB1): a write
-           failure never blocks the fire.
+        0. **⭐ SB1 re-check AT FIRE TIME (§5.4).** Before anything else, re-check that
+           ``schedule.chat_id`` is STILL in the current allowlist (``config.allowed_chat_ids``).
+           SB1 is enforced at ``/every`` creation, but a chat REMOVED from
+           ``TELEGRAM_ALLOWED_CHAT_IDS`` since then must NEVER receive a proactive fire — so a
+           de-authorized chat's schedule is SKIPPED (no header, no turn) with a body-free
+           ``proactive_skip`` (``decision="unauthorized"``). SB1 holds at fire, not just create.
+        1. **Fire-ability (no-stacking) pre-check (design §3.2).** If the target project/chat is
+           already BUSY, SKIP this tick — body-free ``⏰ skipped <name> — still working`` notice
+           + a ``proactive_skip`` (``decision="busy"``) — WITHOUT sending a start header (so a
+           busy-skip shows only the skip notice, never a confusing header-then-skip pair).
+        2. **Notify + audit the fire.** Only when the turn WILL run: a small body-free
+           ``⏰ <name> (scheduled)`` header through the per-chat send gate (SB3: the schedule
+           NAME only, never the prompt) + a body-free ``proactive_fire`` ``session_event`` (the
+           task name, never the prompt) so the owner can reconstruct what fired while away (§5.3).
+        3. **Drive** via :meth:`handle_message` (the full gated path). The turn's own streamed
+           output IS the result notification (renders through the gate like any turn).
+        4. **RB1-total.** ``handle_message`` is still the AUTHORITATIVE concurrency guard: if a
+           race slips a turn past the pre-check it raises :class:`StreamingBusy`, caught here →
+           ``proactive_skip`` (busy). ANY other turn exception is caught, logged body-free, and
+           audited as a ``proactive_skip`` (``decision="error"``) — a single bad fire NEVER
+           propagates (so it can never kill the firing loop or the bot). Returns ``True`` iff the
+           turn was driven (not skipped/errored). The audit/notify writes are best-effort (RB1).
         """
         name = schedule.name
         state = self._chat(schedule.chat_id)
-        # 1) Body-free "a scheduled run started" header (the operator knows it was machine-
-        #    initiated + which task). Verbatim priority through the D8 gate; best-effort.
+        # 0) ⭐ SB1 AT FIRE TIME: a chat de-authorized since /every must NEVER receive a fire.
+        #    Re-check the live allowlist; if gone, skip (no header, no turn) + audit unauthorized.
+        if schedule.chat_id not in self.config.allowed_chat_ids:
+            log.warning(
+                "proactive fire of %s skipped — chat %s is no longer allowlisted (SB1)",
+                name,
+                schedule.chat_id,
+            )
+            self.record_audit(
+                KIND_SESSION_EVENT,
+                chat_id=schedule.chat_id,
+                summary=f"proactive_skip ({name})",
+                decision="unauthorized",
+                name=schedule.project,
+            )
+            return False
+        # 1) Fire-ability pre-check: if the target project/chat is already BUSY, skip this tick
+        #    BEFORE sending any header (so a busy-skip shows only the skip notice — not a
+        #    header-then-skip pair). ``project=None`` checks "any project busy" (conservative —
+        #    never stack a fire into a chat with a turn already in flight). handle_message's own
+        #    StreamingBusy below remains the authoritative guard for the pre-check→drive race.
+        if self.is_busy(schedule.chat_id, schedule.project):
+            await self._proactive_skip_busy(state, schedule, send)
+            return False
+        # 2) Body-free "a scheduled run started" header (only now that the turn WILL run) +
+        #    the proactive_fire audit (the task name, never the prompt). Verbatim through D8.
         try:
             await self._gated_send(
                 state, send, verbatim=True,
@@ -2797,7 +2853,6 @@ class StreamingSession:
             )
         except Exception:
             log.debug("proactive fire header send failed for %s (ignored)", name, exc_info=True)
-        # 2) Audit the fire (body-free session_event: the task name, never the prompt).
         self.record_audit(
             KIND_SESSION_EVENT,
             chat_id=schedule.chat_id,
@@ -2818,24 +2873,11 @@ class StreamingSession:
             )
             return True
         except StreamingBusy:
-            # Overlap: the project/chat is already running — do NOT stack a second turn. Skip
-            # this tick (the driver reschedules for the next interval), notice + audit body-free.
-            log.info("proactive fire of %s skipped — project busy", name)
-            try:
-                await self._gated_send(
-                    state, send, verbatim=True,
-                    text=f"⏰ skipped <b>{html.escape(name, quote=False)}</b> — still working.",
-                    reply_markup=None, parse_mode="HTML",
-                )
-            except Exception:
-                log.debug("proactive skip notice send failed for %s (ignored)", name, exc_info=True)
-            self.record_audit(
-                KIND_SESSION_EVENT,
-                chat_id=schedule.chat_id,
-                summary=f"proactive_skip ({name})",
-                decision="busy",
-                name=schedule.project,
-            )
+            # Overlap RACE: the pre-check passed but the project/chat became busy before this
+            # turn acquired (handle_message is the authoritative guard). Skip this tick (the
+            # driver reschedules), notice + audit body-free — same path as the pre-check skip.
+            log.info("proactive fire of %s skipped — project busy (race)", name)
+            await self._proactive_skip_busy(state, schedule, send)
             return False
         except Exception:
             # RB1-total: ANY other fire failure (a render bug, an engine build error, a store

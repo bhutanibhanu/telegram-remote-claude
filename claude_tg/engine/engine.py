@@ -750,6 +750,14 @@ class Engine:
         the turn continue. The consumer ends once the substrate producer signals done
         AND the queue is drained.
         """
+        # P14 T-FIRE (Codex-QA, defensive): one turn at a time per Engine. The per-turn state
+        # below (``_out_queue`` + the ``_force_gate`` flag) is single-flight — it is set here and
+        # reset in the ``finally``, so a turn must fully end before the next starts. Production
+        # guarantees this via ``StreamingSession``'s per-project turn lock (a proactive and a
+        # normal turn never overlap on one engine), but assert it locally so a future caller that
+        # tried to drive two concurrent turns on ONE engine fails LOUD here rather than silently
+        # corrupting the force-gate / stream merge. (``_out_queue is None`` between turns.)
+        assert self._out_queue is None, "Engine.send is single-flight: a turn is already in flight"
         queue: asyncio.Queue[Any] = asyncio.Queue()
         self._out_queue = queue
         # P14 T-FIRE ⭐ arm the per-turn FORCE-GATE for a proactive turn (reset in the

@@ -2053,16 +2053,18 @@ def test_schedule_listing_pinned_project_shown():
     assert "<code>proj</code>" in out
 
 
-def test_schedule_listing_html_escapes_prompt_sb3():
-    # SB3 / R6: a prompt with </>& renders INERT (escaped), never breaking the HTML.
-    out = schedule_listing([_sch(prompt="<b>x</b> & y")], now=0.0)
-    assert "&lt;b&gt;x&lt;/b&gt;" in out and "&amp;" in out
-
-
-def test_schedule_listing_truncates_long_prompt():
-    out = schedule_listing([_sch(prompt="z" * 200)], now=0.0)
-    assert "…" in out
-    assert "z" * 200 not in out  # not the full body (SB3 truncation)
+def test_schedule_listing_is_body_free_no_prompt_text():
+    # ⭐ SB3 / Codex-QA BLOCKER: the listing NEVER renders the prompt text (a truncated prompt
+    # is still prompt text — a body). A prompt with </>& or a long prompt must not appear AT
+    # ALL — only the name/interval/next-run/project. (No escaping needed: it isn't shown.)
+    out = schedule_listing([_sch(name="ci", prompt="<b>x</b> & secret-token-xyz " + "z" * 200)], now=0.0)
+    assert "<b>ci</b>" in out  # the name IS shown (bold)
+    assert "every 1h" in out  # interval shown
+    # NONE of the prompt text leaks — raw, escaped, or truncated.
+    assert "secret-token-xyz" not in out
+    assert "&lt;b&gt;x&lt;/b&gt;" not in out
+    assert "z" * 10 not in out  # not even a truncated prefix of the prompt body
+    assert "…" not in out  # no truncation marker because the prompt is not rendered at all
 
 
 def test_schedule_listing_skips_malformed_entry():

@@ -7060,3 +7060,77 @@ async def test_handle_message_project_override_pins_named_project(tmp_path):
     # The turn built alpha's runtime (the pinned project), beta stays the store's active.
     assert "alpha" in session._chat(1).runtimes
     assert store.get_active(1) == "beta"
+
+
+async def test_fire_schedule_skips_deauthorized_chat_sb1_at_fire_time(tmp_path):
+    """⭐ Codex-QA BLOCKER 2 — SB1 AT FIRE TIME: a schedule whose chat_id is NO LONGER in the
+    allowlist must NEVER fire (a chat removed from TELEGRAM_ALLOWED_CHAT_IDS since /every). The
+    fire SKIPS — no header, no turn, no proactive_fire — and audits a proactive_skip
+    (decision=unauthorized). MUTATION-PROBE companion: drop the allowlist re-check in
+    fire_schedule and this de-authorized chat would receive a proactive turn → the test fails."""
+    # The session's config allowlists ONLY chat 1; the schedule targets chat 999 (de-authorized).
+    engine = FakeEngine([ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = _make_fire_session(engine, tmp_path)  # make_config default allowed=(1,)
+    rec = Recorder()
+
+    fired = await session.fire_schedule(
+        _schedule("ci", chat_id=999), send=rec.send, edit=rec.edit, delete=rec.delete
+    )
+
+    assert fired is False  # skipped — never fired
+    assert engine.proactive_calls == []  # the turn NEVER ran (engine.send never called)
+    assert rec.sends == []  # NO header sent to the de-authorized chat
+    events = session.audit_log.tail(20)
+    # Audited as unauthorized, NOT as a proactive_fire.
+    skips = [e for e in events if e.kind == "session_event" and (e.summary or "").startswith("proactive_skip")]
+    assert len(skips) == 1 and skips[0].decision == "unauthorized"
+    assert not any((e.summary or "").startswith("proactive_fire") for e in events)
+
+
+async def test_fire_schedule_allowlisted_chat_still_fires(tmp_path):
+    """The companion to the SB1-at-fire test: an ALLOWLISTED chat (1) still fires normally —
+    the re-check only blocks de-authorized chats, it does not break legitimate fires."""
+    engine = FakeEngine([ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = _make_fire_session(engine, tmp_path)  # allowed=(1,)
+    rec = Recorder()
+
+    fired = await session.fire_schedule(
+        _schedule("ci", chat_id=1), send=rec.send, edit=rec.edit, delete=rec.delete
+    )
+    assert fired is True
+    assert engine.proactive_calls == [True]  # the gated turn ran
+    fires = [
+        e for e in session.audit_log.tail(20)
+        if e.kind == "session_event" and (e.summary or "").startswith("proactive_fire")
+    ]
+    assert len(fires) == 1
+
+
+async def test_fire_schedule_busy_skip_sends_only_skip_notice_not_header(tmp_path):
+    """⭐ Codex-QA NON-BLOCKING (header ordering): a fire skipped because the chat is BUSY
+    sends ONLY the ⏰ skipped notice — NOT a start header (the busy pre-check runs BEFORE the
+    header). So a busy-skip never shows a confusing header-then-skip pair."""
+    # A first turn that PARKS, keeping the chat busy.
+    engine = FakeEngine([HOLD, ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = _make_fire_session(engine, tmp_path)
+    rec = Recorder()
+
+    first = asyncio.create_task(session.handle_message(1, "first", send=rec.send, edit=rec.edit))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    rec.sends.clear()  # ignore anything the first turn sent; focus on the fire's sends
+
+    fired = await session.fire_schedule(_schedule("ci"), send=rec.send, edit=rec.edit, delete=rec.delete)
+    assert fired is False
+    # EXACTLY ONE send from the fire: the skip notice. No "(scheduled)…" start header.
+    assert len(rec.sends) == 1
+    assert "skipped" in rec.sends[0]["text"] and "ci" in rec.sends[0]["text"]
+    assert not any("(scheduled)" in s["text"] for s in rec.sends)
+    # Audited as busy, and NO proactive_fire was recorded for the skipped fire.
+    events = session.audit_log.tail(20)
+    assert any(e.kind == "session_event" and (e.summary or "").startswith("proactive_skip")
+               and e.decision == "busy" for e in events)
+    assert not any((e.summary or "").startswith("proactive_fire") for e in events)
+
+    engine.cancel()
+    await asyncio.wait_for(first, timeout=2.0)
