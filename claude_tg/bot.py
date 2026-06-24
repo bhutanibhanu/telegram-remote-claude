@@ -78,6 +78,9 @@ HELP_TEXT = (
     "/attach <session-id> — adopt any Mac session (from /sessions) as a project and drive "
     "it; a session that's live elsewhere is attached as a FORK so it isn't corrupted "
     "(streaming mode)\n"
+    "/watch <session-id> — live-mirror any Mac session's transcript onto this chat, "
+    "read-only (it relays text + tool activity body-free; never drives it) (streaming mode)\n"
+    "/unwatch — stop the active live-mirror (streaming mode)\n"
     "/new <name> <path> — create a project at <path> and switch to it; <path> must be an "
     "existing directory inside the permitted roots (streaming mode)\n"
     "/switch <name> — switch the active project; the next message resumes it (streaming mode)\n"
@@ -118,6 +121,8 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("projects", "List your projects and which one is active"),
     ("sessions", "List all Claude sessions on the Mac (running/idle)"),
     ("attach", "Adopt + drive any Mac session: /attach <session-id>"),
+    ("watch", "Live-mirror any Mac session (read-only): /watch <session-id>"),
+    ("unwatch", "Stop the active live-mirror"),
     ("new", "Create a project at a path and switch to it"),
     ("switch", "Switch the active project"),
     ("rm", "Drop a project from the registry"),
@@ -849,6 +854,74 @@ class TelegramClaudeBot:
             return
         outcome = self.streaming.attach_session(chat_id, session_id)
         await update.message.reply_text(outcome.message, parse_mode=outcome.parse_mode)
+
+    async def cmd_watch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Live-mirror ANY discovered Claude session's transcript onto this chat (``/watch <id>``, P11 T3).
+
+        Read-only FOLLOW (the other half of the "entirety remote" headline): ``/watch
+        <session-id>`` (the id is shown on each ``/sessions`` row) tails that session's
+        append-only transcript and relays each line — body-free (SB3) — to the chat as it is
+        written. It NEVER drives or writes the watched session (use ``/attach`` to drive).
+        Streaming mode only — the live mirror needs ``ENGINE_MODE=streaming`` (one-shot has no
+        per-chat send gate / background task surface); one-shot replies the streaming-only
+        notice rather than half-working. Order (fail-fast):
+
+        1. ``_ok`` allowlist recheck (SB1) + ``_require_streaming`` one-shot notice.
+        2. Parse the session id (all args joined — an id has no spaces, but be forgiving);
+           missing → usage (RB1).
+        3. Build a PERSISTENT per-chat ``send`` closure (it captures the long-lived
+           :class:`telegram.Bot` + the chat id, so the background watch task can send after
+           this handler returns) and delegate to
+           :meth:`~claude_tg.stream_session.StreamingSession.watch_session`, which does ALL the
+           policy — id lookup, transcript-path resolution (symlink-confined), the ONE-watch-per-
+           chat replacement, the read-only tail task, and the operator-facing reply. The bot is
+           a pure renderer of its :class:`~claude_tg.stream_session.WatchOutcome`.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_streaming(update):
+            return
+        assert self.streaming is not None
+        chat_id = update.effective_chat.id
+        session_id = " ".join(ctx.args).strip() if ctx.args else ""
+        if not session_id:
+            await update.message.reply_text("Usage: /watch <session-id>")
+            return
+        bot = ctx.bot
+
+        async def send(
+            *, text: str, reply_markup=None, parse_mode=None, link_preview_options=None
+        ) -> int | None:
+            # The persistent send closure the background watch task uses. It captures the
+            # long-lived Bot + chat id (NOT the per-update ctx), so it keeps working after this
+            # handler returns. Mirror of the _on_message_streaming send closure (same kwargs).
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                link_preview_options=link_preview_options,
+            )
+            return getattr(msg, "message_id", None)
+
+        outcome = self.streaming.watch_session(chat_id, session_id, send=send)
+        await update.message.reply_text(outcome.message, parse_mode=outcome.parse_mode)
+
+    async def cmd_unwatch(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Stop this chat's active live-mirror (``/unwatch``, P11 T3; streaming mode only).
+
+        Cancels the read-only tail task started by ``/watch`` (idempotent — a clean notice if
+        none is active). SB1 (``_ok``) + the streaming-only notice gate it, exactly like
+        ``/watch``. The bot is a pure renderer of
+        :meth:`~claude_tg.stream_session.StreamingSession.unwatch`'s reply string.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_streaming(update):
+            return
+        assert self.streaming is not None
+        chat_id = update.effective_chat.id
+        await update.message.reply_text(self.streaming.unwatch(chat_id))
 
     async def cmd_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Switch the chat's active project (streaming mode only).
@@ -2181,6 +2254,22 @@ class TelegramClaudeBot:
         except Exception:
             log.warning("failed to register the bot command menu (set_my_commands)", exc_info=True)
 
+    async def _post_shutdown(self, _app: Application) -> None:
+        """Clean shutdown: stop every engine + cancel every live-mirror watch (P11 T3).
+
+        PTB calls this as the application stops. It delegates to
+        :meth:`~claude_tg.stream_session.StreamingSession.shutdown`, which cancels all
+        read-only ``/watch`` tail tasks (so no mirror outlives the bot) and stops every
+        started engine. Best-effort (RB1): a failure here must never block the shutdown — a
+        crash on exit is logged, not raised. No-op in one-shot mode (no streaming session).
+        """
+        if self.streaming is None:
+            return
+        try:
+            await self.streaming.shutdown()
+        except Exception:
+            log.warning("error during streaming-session shutdown", exc_info=True)
+
     # ---- wiring -------------------------------------------------------------
     def build_application(self) -> Application:
         # concurrent_updates(True) is REQUIRED by the answer-hold design: a streaming turn
@@ -2200,6 +2289,7 @@ class TelegramClaudeBot:
             .token(self.config.bot_token)
             .concurrent_updates(True)
             .post_init(self._post_init)
+            .post_shutdown(self._post_shutdown)
             .build()
         )
         allowed = filters.Chat(chat_id=list(self.config.allowed_chat_ids))
@@ -2242,6 +2332,13 @@ class TelegramClaudeBot:
         # filter (SB1) + registered BEFORE the skill passthrough so it isn't forwarded as a
         # skill. Streaming mode only (cmd_attach replies the one-shot notice otherwise).
         app.add_handler(CommandHandler("attach", self.cmd_attach, filters=allowed))
+        # P11 T3: /watch <session-id> — READ-ONLY live mirror of any Mac session's transcript
+        # onto this chat (the follow half of "entirety remote"); /unwatch stops it. Streaming
+        # mode only (the per-chat send gate + background-task surface). Both reply the one-shot
+        # notice otherwise. Registered as specific CommandHandlers so PTB's first-match-wins
+        # routing keeps them off the skill-forwarding path.
+        app.add_handler(CommandHandler("watch", self.cmd_watch, filters=allowed))
+        app.add_handler(CommandHandler("unwatch", self.cmd_unwatch, filters=allowed))
         # P5 /to <name> <text> (D5 free-text escape hatch): routes a free-text answer to a
         # named project's pending "Other"/reject. Same `allowed` chat filter (SB1) +
         # registered BEFORE the skill passthrough (first-match-wins) — no new callback

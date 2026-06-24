@@ -113,6 +113,11 @@ from .render import (
     strip_telegram_html,
     yolo_indicator,
 )
+from .session_mirror import (
+    TranscriptTailer,
+    run_mirror,
+    transcript_path,
+)
 from .session_store import (
     DEFAULT_PROJECT,
     DuplicateProject,
@@ -713,6 +718,27 @@ class StreamingSession:
         # mid-stream raise, cancel, resume-failure) so a raised turn can never leak a slot
         # and permanently shrink capacity — see handle_message's try/finally + _release_slot.
         self._running = 0
+        # P11 T3 (live-mirror): the ONE active ``/watch`` per chat — chat_id -> the running
+        # read-only tail task. A new ``/watch`` REPLACES the prior (cancel the old task first,
+        # tell the operator); ``/unwatch`` cancels it; :meth:`shutdown` cancels ALL of them so
+        # no mirror task outlives the bot. Transient in-memory (RB3): a restart loses every
+        # watch (read-only — nothing to persist; the operator re-issues ``/watch``).
+        self._watches: dict[int, asyncio.Task[None]] = {}
+        # The poll cadence + the injected sleep the watch loop uses, so the live bot tails at
+        # ~0.25 s and tests drive it deterministically with the SAME injected ``sleep`` the
+        # send gate uses (no real time). The interval is small; the per-chat send gate (D8) is
+        # the hard rate limiter, so a fast-writing session never bursts past ~1 msg/s/chat.
+        self._watch_poll_interval = float(
+            getattr(config, "mirror_poll_interval_seconds", 0.25) or 0.25
+        )
+        # Flood-control budget: the max messages one poll surfaces before the mirror sheds
+        # tool-line NOISE (keeping text + result indicators) + emits a coalesced "… N events
+        # skipped" marker. The per-chat send gate (D8) is still the hard rate limiter; this
+        # bounds the burst handed to it per poll so a fast-writing session degrades gracefully.
+        from .session_mirror import DEFAULT_WATCH_QUEUE_MAX
+        self._watch_queue_max = int(
+            getattr(config, "mirror_queue_max", DEFAULT_WATCH_QUEUE_MAX) or DEFAULT_WATCH_QUEUE_MAX
+        )
 
     # -- per-chat state ------------------------------------------------------
 
@@ -1800,6 +1826,189 @@ class StreamingSession:
             if isinstance(record, dict) and record.get("session_id") == session_id:
                 return str(pname)
         return None
+
+    # -- live-mirror: /watch <id> and /unwatch (P11 T3, READ-ONLY) -----------
+
+    def watch_session(
+        self, chat_id: int, session_id: str, *, send: SendFn
+    ) -> "WatchOutcome":
+        """Start a READ-ONLY live mirror of ``session_id``'s transcript onto this chat (P11 T3).
+
+        Resolves the target id → its cwd → its append-only transcript path (via the SAME
+        machine-wide discovery ``/attach`` uses), then starts a background asyncio task that
+        TAILS that file, maps each line to the bot's body-free events
+        (:func:`~claude_tg.session_mirror.normalize_line`), renders them through the EXISTING
+        :func:`~claude_tg.render.render_event`, and SENDS them through this chat's per-chat
+        send gate (so a fast-writing session can never burst past Telegram's ~1 msg/s/chat
+        ceiling — flood control in :func:`~claude_tg.session_mirror.render_batch`). It NEVER
+        writes the watched transcript.
+
+        **ONE watch per chat.** A new ``/watch`` REPLACES any prior one for the chat (the old
+        task is cancelled first and the operator is told). ``/unwatch`` (:meth:`unwatch`)
+        stops it; :meth:`shutdown` cancels every watch on bot shutdown so no task outlives the
+        bot.
+
+        **⭐ SB3** is enforced in the normalizer (raw tool bodies never reach an event, so they
+        never reach Telegram). **SB2-ish:** :func:`~claude_tg.session_mirror.transcript_path`
+        resolves the path canonically and refuses to follow a symlink OUT of ``~/.claude/
+        projects``; mirroring is read-only so the SB2 adopt-confinement is not the driver here.
+        **SB1** is enforced by the bot (``/watch`` rides the ``allowed`` filter + ``_authorized``)
+        BEFORE this is reached.
+
+        Returns a :class:`WatchOutcome` the bot replies. RB1/RB2: an unknown/odd id, a session
+        with no cwd, or an unresolvable transcript path → a clean refusal (no task, no crash).
+        ``send`` is the bot's per-chat send closure (it captures the persistent ``Bot`` + the
+        chat id, so the background task can send after the handler returns); injected so tests
+        capture what would be sent.
+        """
+        sid = (session_id or "").strip()
+        if not sid:
+            return WatchOutcome(ok=False, message="Usage: /watch <session-id>")
+
+        discovered = self._find_discovered(sid)
+        if discovered is None:
+            # RB2: the id is not among the machine's discovered sessions (stale / mistyped).
+            return WatchOutcome(
+                ok=False,
+                message=(
+                    f"❌ No Claude session found with id <code>{html.escape(sid[:12], quote=False)}</code>. "
+                    "Use /sessions to see what's on this machine."
+                ),
+                parse_mode="HTML",
+            )
+        cwd = discovered.cwd
+        if not cwd:
+            return WatchOutcome(
+                ok=False,
+                message="❌ That session has no recorded working directory — can't mirror it.",
+            )
+        path = transcript_path(sid, cwd)
+        if path is None:
+            # No resolvable, in-tree transcript path (missing cwd, or a symlink escaping
+            # ~/.claude/projects). Refuse cleanly — never follow it.
+            return WatchOutcome(
+                ok=False,
+                message="❌ Can't locate that session's transcript to mirror it.",
+            )
+
+        # ONE watch per chat: replace any prior one (cancel the old task; tell the operator).
+        replaced = self._cancel_watch(chat_id)
+
+        state = self._chat(chat_id)
+        tailer = TranscriptTailer(path=path)
+        emit = self._make_watch_emit(state, send)
+
+        async def _on_gone() -> None:
+            # The transcript vanished (session ended / file removed) — tell the operator the
+            # mirror stopped, body-free. Drop the registry entry so a later /unwatch is a clean
+            # no-op. Best-effort through the gate (verbatim — a terminal notice).
+            self._watches.pop(chat_id, None)
+            try:
+                await self._gated_send(
+                    state, send, verbatim=True,
+                    text=f"👁 Mirror ended — session {html.escape(sid[:8], quote=False)} transcript is gone.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                log.debug("watch on_gone notice failed (ignored)", exc_info=True)
+
+        async def _runner() -> None:
+            try:
+                await run_mirror(
+                    tailer,
+                    emit=emit,
+                    sleep=self._sleep,
+                    poll_interval=self._watch_poll_interval,
+                    queue_max=self._watch_queue_max,
+                    should_stop=lambda: self._watches.get(chat_id) is not task,
+                    on_gone=_on_gone,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # a watch loop must never crash the process (RB1)
+                log.exception("live-mirror watch loop failed for chat %s", chat_id)
+
+        task: asyncio.Task[None] = asyncio.ensure_future(_runner())
+        self._watches[chat_id] = task
+        # Best-effort: drop the registry entry when the task finishes on its own (gone /
+        # error) so a stale done-task never lingers as "the active watch". ``chat_id`` is
+        # captured by closure (each call has its own); the callback gets the finished task.
+        def _done(finished: "asyncio.Future[None]") -> None:
+            self._on_watch_done(chat_id, finished)
+
+        task.add_done_callback(_done)
+
+        short = html.escape(sid[:8], quote=False)
+        prefix = "🔁 Replaced the previous mirror. " if replaced else ""
+        return WatchOutcome(
+            ok=True,
+            message=(
+                f"👁 {prefix}Now mirroring session <code>{short}</code> (read-only). "
+                "Send /unwatch to stop."
+            ),
+            parse_mode="HTML",
+            session_id=sid,
+        )
+
+    def unwatch(self, chat_id: int) -> str:
+        """Stop this chat's active live-mirror, if any (P11 T3). Returns an operator reply.
+
+        Cancels the running tail task + drops the registry entry (the task releases the file
+        as it unwinds — the tailer holds no open handle between polls anyway). Idempotent: no
+        active watch → a clean "nothing to stop" notice. Never raises (RB1).
+        """
+        if self._cancel_watch(chat_id):
+            return "🛑 Stopped mirroring."
+        return "There's no active mirror to stop (use /watch <session-id> to start one)."
+
+    def is_watching(self, chat_id: int) -> bool:
+        """Whether ``chat_id`` has a live (not-yet-finished) mirror task (read-only; RB1)."""
+        task = self._watches.get(chat_id)
+        return task is not None and not task.done()
+
+    def _make_watch_emit(self, state: _ChatState, send: SendFn) -> "Callable[..., Awaitable[Optional[int]]]":
+        """Build the watch's send-one-message-through-the-gate coroutine (D8 flood control).
+
+        Every mirror message funnels through the chat's :class:`~claude_tg.render.ChatSendGate`
+        (via :meth:`_gated_send`) so the combined per-chat rate stays bounded — the mirror can
+        never burst past Telegram's ~1 msg/s/chat ceiling even when the watched session writes
+        fast. ``verbatim`` (assistant/operator/result text) keeps gate priority; a tool-use
+        line is non-verbatim and yields. A send failure propagates to ``run_mirror`` which logs
+        + continues (one bad send never kills the mirror).
+        """
+
+        async def emit(*, text: str, parse_mode: Optional[str], verbatim: bool) -> Optional[int]:
+            return await self._gated_send(
+                state, send, verbatim=verbatim, text=text, parse_mode=parse_mode
+            )
+
+        return emit
+
+    def _cancel_watch(self, chat_id: int) -> bool:
+        """Cancel + drop this chat's watch task if present; return whether one existed.
+
+        The single place a watch is torn down (``/watch`` replacement, ``/unwatch``,
+        shutdown). Removes the registry entry FIRST (so the loop's ``should_stop`` sees it is
+        no longer the active task and the done-callback no-ops) then cancels the task. Never
+        raises (RB1).
+        """
+        task = self._watches.pop(chat_id, None)
+        if task is None:
+            return False
+        if not task.done():
+            task.cancel()
+        return True
+
+    def _on_watch_done(self, chat_id: int, task: "asyncio.Future[None]") -> None:
+        """Drop the registry entry when a watch task finishes on its own (gone / error / cancel).
+
+        Guards against clobbering a REPLACEMENT watch: only removes the entry if it is STILL
+        this exact task (a new /watch may have already replaced it). Pure bookkeeping; never
+        raises (a cancelled task's exception is intentionally not retrieved here). Takes a
+        ``Future`` (what ``add_done_callback`` passes); the ``is`` identity check is exact.
+        """
+        if self._watches.get(chat_id) is task:
+            self._watches.pop(chat_id, None)
 
     def _attach_project_name(
         self, chat_id: int, discovered: DiscoveredSession, session_id: str
@@ -3716,7 +3925,16 @@ class StreamingSession:
     # -- shutdown ------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Stop every project's engine across every chat (idempotent). For a clean exit."""
+        """Stop every project's engine + cancel every live-mirror watch (idempotent).
+
+        For a clean exit: cancels all read-only ``/watch`` tail tasks (P11 T3 — no mirror task
+        outlives the bot) and stops every started engine across every chat. Best-effort
+        throughout (RB1): a failure stopping one engine / cancelling one watch never blocks the
+        rest.
+        """
+        # P11 T3: cancel every chat's live-mirror watch so no tail task survives shutdown.
+        for chat_id in list(self._watches):
+            self._cancel_watch(chat_id)
         for state in self._chats.values():
             for rt in state.runtimes.values():
                 if rt.engine is not None:
@@ -4090,6 +4308,26 @@ class AttachOutcome:
 
 
 @dataclass(frozen=True)
+class WatchOutcome:
+    """Result of a ``/watch <id>`` start / replacement (so the bot can reply, P11 T3).
+
+    The session owns everything (id lookup, transcript-path resolution, the task lifecycle);
+    the bot is a pure renderer of this, exactly like :class:`AttachOutcome`. Fields:
+
+    * ``ok``         — True iff a read-only mirror task was started (or replaced) for the chat.
+    * ``message``    — the operator-facing reply (already styled; HTML when ``parse_mode``='HTML').
+    * ``parse_mode`` — the reply's Telegram parse mode (``"HTML"`` for the styled replies).
+    * ``session_id`` — the mirrored session's id, or ``None`` on a refusal (unknown id / no
+                       cwd / unresolvable transcript). Only meaningful when ``ok``.
+    """
+
+    ok: bool
+    message: str
+    parse_mode: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class CallbackOutcome:
     """Result of routing one inline-keyboard tap (so the bot can answer the query).
 
@@ -4132,6 +4370,7 @@ __all__ = [
     "StreamingSession",
     "StreamingBusy",
     "AttachOutcome",
+    "WatchOutcome",
     "CallbackOutcome",
     "EngineFactory",
     "SendFn",
