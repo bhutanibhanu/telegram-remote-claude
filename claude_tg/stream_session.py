@@ -216,6 +216,7 @@ def _default_engine_factory(
     allow_any_path: bool = False,
     send_timeout: float = 120.0,
     model: Optional[str] = None,
+    permission_mode: str = "default",
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
@@ -250,6 +251,16 @@ def _default_engine_factory(
     via ``_bound_factory`` at each ``_ensure_engine`` build, so a ``/fast``/``/deep`` takes
     effect on the NEXT fresh session for that project (model is a session-creation param,
     never hot-swapped mid-session).
+
+    **P12 T-PLAN-1:** ``permission_mode`` is the per-turn SDK permission mode baked into the
+    substrate's ``ClaudeAgentOptions(permission_mode=…)`` at session-creation time (mechanism
+    (a) — mirrors ``model``). The default ``"default"`` is the unchanged normal turn; the
+    session passes ``"plan"`` for exactly the ONE turn armed by ``/plan`` (the one-shot marker
+    on ``_ProjectRuntime`` — ``_ensure_engine`` builds a FRESH plan-mode session for that
+    turn, then the marker is cleared so the NEXT turn is a normal ``"default"`` session again).
+    A plan turn surfaces Claude's ``ExitPlanMode`` plan through the SHIPPED P6 hold/keyboard;
+    approving it does NOT auto-allow later tools (ADR-001 C4 — every risky tool still hits the
+    permission gate independently, unchanged here). Transient (RB3): the arming never persists.
     """
     engine: Engine
 
@@ -260,7 +271,7 @@ def _default_engine_factory(
 
     substrate = SdkSubstrate(
         cwd=cwd,
-        permission_mode="default",
+        permission_mode=permission_mode,
         decision_callback=decision_callback,
         model=model,
     )
@@ -360,6 +371,28 @@ class _ProjectRuntime:
     # session erroring is never mistaken for a resume failure. Reset on the in-memory
     # runtime only (never persisted).
     resumed_unverified: bool = False
+    # P12 T-PLAN-2 (/plan): a per-project, ONE-SHOT, in-memory marker — True from the moment
+    # ``/plan`` arms this project until the NEXT turn for it consumes it. ``_ensure_engine``
+    # reads + CLEARS it and builds that one turn's session in ``permission_mode="plan"`` (a
+    # FRESH plan-mode session — mechanism (a), mirroring how ``model`` is baked at session
+    # creation), so Claude reasons + proposes a plan and surfaces ``ExitPlanMode`` through the
+    # SHIPPED P6 hold/keyboard. The turn AFTER is a normal ``"default"`` session again (the
+    # marker is one-shot). Transient in-memory like the rest of the runtime (RB3): a process
+    # restart drops it — the supervision posture NEVER silently survives a restart, and it is
+    # never persisted to the registry. Set by :meth:`arm_plan`; consumed (read + cleared) in
+    # :meth:`_ensure_engine`. ADR-001 C4: arming plan mode greenlights NOTHING about tools —
+    # an approved plan's later risky tools still hit the permission gate independently.
+    plan_next: bool = False
+    # P12 T-PLAN: the SDK ``permission_mode`` the CURRENT live engine (``engine``) was built
+    # with — ``"default"`` for an ordinary session, ``"plan"`` for the fresh session built for
+    # an armed ``/plan`` turn. ``_ensure_engine`` records it at build time and consults it in
+    # the warm fast-path: a warm engine is reused ONLY when its mode matches the turn's
+    # requested mode, so (a) a normal turn after a plan turn rebuilds back to ``"default"``
+    # (the plan-mode session is one-shot — it never silently lingers onto the next turn), and
+    # (b) a plan turn never reuses a ``"default"`` warm engine (mechanism (a) is session-
+    # creation — the mode can't be hot-switched). Transient in-memory (RB3); a restart rebuilds
+    # the engine from the persisted id in ``"default"`` (the arming never persists).
+    engine_permission_mode: str = "default"
     # P11 T2 (attach-fork): True iff this project was ADOPTED from an external session that
     # was LIVE in another process at attach time, so its NEXT resume MUST fork (resume into a
     # fresh id, transcript copied) rather than continue the live id — two writers on one
@@ -674,6 +707,7 @@ class StreamingSession:
                 backstop_seconds: float,
                 permission_policy: PermissionPolicy,
                 model: Optional[str] = None,
+                permission_mode: str = "default",
             ) -> Engine:
                 return _default_engine_factory(
                     cwd=cwd,
@@ -683,6 +717,7 @@ class StreamingSession:
                     allow_any_path=config.allow_any_path,
                     send_timeout=float(config.stream_message_timeout_seconds),
                     model=model,
+                    permission_mode=permission_mode,
                 )
 
             self._engine_factory = _bound_factory
@@ -1283,6 +1318,28 @@ class StreamingSession:
                 log.exception("failed to persist model override for chat %s", chat_id)
         return normalized
 
+    def arm_plan(self, chat_id: int) -> None:
+        """Arm the ACTIVE project's NEXT turn as a plan turn (``/plan``; P12 T-PLAN-2).
+
+        Sets the per-project, ONE-SHOT, in-memory ``plan_next`` marker on the active project's
+        runtime: the next turn for that project is driven in ``permission_mode="plan"``, so
+        Claude reasons + proposes a plan and surfaces ``ExitPlanMode`` through the SHIPPED P6
+        hold/keyboard (Approve → execution resumes; Reject + feedback → revise). The marker is
+        consumed (read + cleared) by :meth:`_ensure_engine` on that one turn, so the turn AFTER
+        is a normal (``"default"``) session again — the operator opts in deliberately, per turn.
+
+        Auto-creates ``default`` if there is no active project (consistent with ``set_yolo`` /
+        ``set_model`` / starting a turn — a ``/plan`` before any turn arms the implicit default
+        project). **RB3 (transient):** the marker is in-memory only and NEVER persisted — a
+        process restart drops it (the supervision posture never silently survives a restart).
+        **ADR-001 C4:** arming plan mode greenlights NOTHING about tools — every risky tool the
+        approved plan later runs still hits the permission gate independently (unchanged here).
+        SB1 is enforced by the bot's ``_ok`` recheck before this is reached.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=True)
+        if rt is not None:
+            rt.plan_next = True
+
     def get_model(self, chat_id: int) -> Optional[str]:
         """The ACTIVE project's effective model id (override, else the configured default).
 
@@ -1385,39 +1442,73 @@ class StreamingSession:
             allowed_roots=self.config.allowed_roots,
             allow_any=self.config.allow_any_path,
         )
+        # P12 T-PLAN-2 (/plan): CONSUME the one-shot plan marker for this project — read it,
+        # then CLEAR it immediately so this is the only turn it affects (one-shot, RB3; even a
+        # failed/aborted turn never re-arms). When armed, this turn's session must run in
+        # ``permission_mode="plan"`` (mechanism (a) — baked at session creation), so the
+        # ``"default"``-mode warm engine below is NOT reused: we force a FRESH plan-mode
+        # session for exactly this turn. The marker is cleared HERE (not at turn end) so a
+        # ``/cancel`` / crash / SB2-refusal of the plan turn still leaves the next turn normal.
+        plan_mode = rt.plan_next
+        rt.plan_next = False
+        permission_mode = "plan" if plan_mode else "default"
         # P5 / ADR-005 D1 (T5): no cross-project stop here. A different project's started
         # engine is left running so N runs can be concurrent (T5 removed P4's
         # _stop_other_started). Only the SAME project's stale/non-started engine is handled
         # by the QF5 discard below.
-        if rt.engine is not None and rt.started:
+        #
+        # P12 T-PLAN: the warm fast-path is taken ONLY when the warm engine's permission mode
+        # already MATCHES the turn's requested mode. This rebuilds the session on a mode change
+        # in EITHER direction — a session built in ``"default"`` can't be hot-switched to plan
+        # mode (mechanism (a) is session-creation), AND a plan-mode session built for the one
+        # ``/plan`` turn must NOT linger onto the next (default) turn (the marker is one-shot).
+        # When the requested mode differs, the started engine is torn down + rebuilt fresh in
+        # the requested mode just below (the same discard the QF5 stale-engine path uses, which
+        # RESUMES the persisted id so the conversation continues). A back-to-back normal turn
+        # keeps the warm fast-path byte-for-byte: both modes are ``"default"`` → matched → reuse.
+        if rt.engine is not None and rt.started and rt.engine_permission_mode == permission_mode:
             return rt.engine, False
-        # Past the warm fast-path: rt is either fresh (engine None) OR holds a NON-started
+        # Past the warm fast-path: rt is either fresh (engine None), holds a NON-started
         # engine — a prior start()/resume() that raised AFTER the adapter allocated its
-        # client (so the engine is non-None but unusable). Never REUSE such an engine: a
-        # start()/resume() on it hits the adapter's "already started" guard → the turn
-        # wedges (the same coupling the QF4 resume-raises path recovers from). So if a
-        # non-started engine is present, best-effort stop() it (free its partial client)
-        # and build a FRESH one — a non-started engine is always discarded + replaced,
-        # never reused. This is the SAME-project QF5 hardening, kept under concurrency.
+        # client (so the engine is non-None but unusable) — OR holds a STARTED engine we are
+        # rebuilding because this is an armed plan turn (``plan_mode``; the warm fast-path was
+        # skipped above so the fresh session can be built in plan mode). Never REUSE such an
+        # engine: a start()/resume() on it hits the adapter's "already started" guard → the
+        # turn wedges (the same coupling the QF4 resume-raises path recovers from). So if ANY
+        # engine is present here, best-effort stop() it (free its client) and build a FRESH one
+        # — it is always discarded + replaced, never reused. This is the SAME-project QF5
+        # hardening, kept under concurrency, now also the plan-mode rebuild path. The plan
+        # rebuild RESUMES the persisted (session_id, cwd) below, so the conversation continues
+        # — only the permission mode of the fresh session differs.
         if rt.engine is not None:
             try:
                 await rt.engine.stop()
             except Exception:
                 log.debug(
-                    "stop of non-started engine raised for chat %s project %s "
-                    "(ignored — building fresh)",
+                    "stop of replaced engine raised for chat %s project %s "
+                    "(ignored — building fresh%s)",
                     chat_id,
                     name,
+                    " in plan mode" if plan_mode else "",
                     exc_info=True,
                 )
+            # A started engine being torn down for a plan rebuild leaves ``started`` True; drop
+            # it so a downstream failure can't mistake the discarded engine for a live one.
+            rt.started = False
         # T4 (P9): resolve THIS project's model (override → CLAUDE_MODEL → SDK default) and
         # bake it into the engine being built. Passed only to the DEFAULT factory (an injected
         # test factory keeps the 3-kwarg contract — see _factory_accepts_model). The model is
         # fixed for the life of THIS fresh session (session-creation param); a later
         # /fast·/deep·/auto takes effect on the next session this project builds.
         model = self._resolve_project_model(chat_id, name)
-        engine = self._build_engine(rt.cwd, rt.policy, model)
+        # P12 T-PLAN: build the session in the resolved permission mode (``"plan"`` for the one
+        # armed turn, else the unchanged ``"default"``). Threaded to the DEFAULT factory only,
+        # alongside ``model`` (an injected test factory keeps its 3-kwarg contract). Record the
+        # mode on the runtime so the warm fast-path reuses this engine only for a same-mode turn
+        # and rebuilds back to ``"default"`` after the one-shot plan turn (the mismatch path).
+        engine = self._build_engine(rt.cwd, rt.policy, model, permission_mode=permission_mode)
         rt.engine = engine
+        rt.engine_permission_mode = permission_mode
         resume_id = self._resume_id(chat_id, name)
         # ⭐ P11 T2 (B2+B3) — the BINDING fork-vs-continue decision, made HERE at the first
         # write from a FRESH liveness re-probe (not frozen at attach time). When this project
@@ -1489,9 +1580,14 @@ class StreamingSession:
                 #     cannot hit the "already started" guard) and adopt it as the runtime
                 #     engine, replacing the failed one. T4: same per-project model as the
                 #     first build (resolved once above) — the fresh fallback session honors
-                #     the project's /fast·/deep override too.
-                engine = self._build_engine(rt.cwd, rt.policy, model)
+                #     the project's /fast·/deep override too. P12 T-PLAN: and the SAME
+                #     permission mode — a plan turn whose resume failed still starts fresh in
+                #     plan mode (the marker was already consumed above; this re-uses the value).
+                engine = self._build_engine(
+                    rt.cwd, rt.policy, model, permission_mode=permission_mode
+                )
                 rt.engine = engine
+                rt.engine_permission_mode = permission_mode  # P12 T-PLAN: track the fresh mode
                 # (d) Start the FRESH engine — a clean fresh session (the dead id is gone).
                 await engine.start()
                 # (e) Signal the caller so handle_message posts the T7 "couldn't resume,
@@ -1526,7 +1622,12 @@ class StreamingSession:
         return engine, resume_failed
 
     def _build_engine(
-        self, cwd: str, policy: PermissionPolicy, model: Optional[str]
+        self,
+        cwd: str,
+        policy: PermissionPolicy,
+        model: Optional[str],
+        *,
+        permission_mode: str = "default",
     ) -> Engine:
         """Call the engine factory, passing the T4 per-project ``model`` only when supported.
 
@@ -1535,6 +1636,12 @@ class StreamingSession:
         (``cwd``/``backstop_seconds``/``permission_policy``) and must NOT receive ``model``
         (it would ``TypeError`` on the unexpected kwarg). ``_factory_accepts_model`` (set in
         ``__init__``) gates this so every existing test factory keeps working unchanged.
+
+        **P12 T-PLAN-1:** ``permission_mode`` rides the SAME default-factory-only gate as
+        ``model`` — mechanism (a) bakes ``"plan"`` into the FRESH session built for the one
+        armed ``/plan`` turn, ``"default"`` otherwise (a normal turn is byte-for-byte
+        unchanged: ``"default"`` was always passed). An injected test factory keeps its 3-kwarg
+        contract and never receives it, so every existing test factory is unaffected.
         """
         if self._factory_accepts_model:
             return self._engine_factory(
@@ -1542,6 +1649,7 @@ class StreamingSession:
                 backstop_seconds=float(self.config.answer_backstop_seconds),
                 permission_policy=policy,
                 model=model,  # type: ignore[call-arg]  # default factory accepts model (T4)
+                permission_mode=permission_mode,  # default factory accepts it too (P12 T-PLAN-1)
             )
         return self._engine_factory(
             cwd=cwd,

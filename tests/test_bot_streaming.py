@@ -101,6 +101,7 @@ class FakeStreaming:
         self.reset_calls = []
         self.yolo_calls = []
         self.model_calls = []
+        self.plan_calls = []
         self.reply_prompt_calls = []
         self.to_calls = []
         self.attach_calls = []
@@ -198,6 +199,10 @@ class FakeStreaming:
         # P9/T4: /fast · /deep · /auto set (or clear) the active project's model override.
         self.model_calls.append((chat_id, model))
         return model
+
+    def arm_plan(self, chat_id):
+        # P12 T-PLAN-2: /plan arms the active project's next turn as a plan turn (one-shot).
+        self.plan_calls.append(chat_id)
 
     def get_cwd(self, chat_id):
         # P9/T1: the first-run welcome reads the active cwd via this accessor.
@@ -559,6 +564,42 @@ async def test_cmd_yolo_oneshot_is_explained_not_applied():
     upd = make_update(1, "/yolo")
     await bot.cmd_yolo(upd, make_ctx())
     assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+# ---- P12 T-PLAN-2: /plan command (SB1, delegation, one-shot confirm) --------
+
+
+async def test_cmd_plan_streaming_arms_and_confirms():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/plan")
+    await bot.cmd_plan(upd, make_ctx())
+    # Delegates to arm_plan for the chat's active project.
+    assert streaming.plan_calls == [1]
+    # The confirm names plan mode + approval (the 📋 glyph, like the design's copy).
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "📋" in reply and "plan mode" in reply.lower() and "approval" in reply.lower()
+
+
+async def test_cmd_plan_oneshot_is_explained_not_applied():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/plan")
+    await bot.cmd_plan(upd, make_ctx())
+    # One-shot has no per-tool holds → a clear streaming-only notice, nothing armed.
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_plan_unauthorized_ignored():
+    # SB1: an un-allowlisted chat is rejected by _ok BEFORE any effect — arm_plan is never
+    # called and no reply is sent (mirrors test_cmd_yolo_unauthorized_ignored).
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    upd = make_update(999, "/plan")
+    await bot.cmd_plan(upd, make_ctx())
+    assert streaming.plan_calls == []
+    upd.message.reply_text.assert_not_awaited()
 
 
 async def test_cmd_yolo_unauthorized_ignored():
@@ -4594,3 +4635,158 @@ def test_build_application_registers_post_shutdown():
     bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
     app = bot.build_application()
     assert app.post_shutdown is not None
+
+
+# ===========================================================================
+# P12 T-PLAN — /plan one-shot marker drives ONE plan-mode session (RB3).
+#
+# Session-level: arm_plan sets the per-project one-shot marker; _ensure_engine consumes
+# it and builds that one turn's session in permission_mode="plan" (mechanism (a) —
+# threaded like `model`). The turn AFTER is a normal "default" session (one-shot). The
+# marker is transient: it is NEVER persisted to the registry (RB3 — supervision posture
+# never silently survives a restart). These exercise the REAL StreamingSession turn
+# driver with a recording factory that captures the permission_mode it was built with.
+# ===========================================================================
+
+
+def _make_plan_recording_session(store):
+    """A real StreamingSession whose (mode-aware) factory records each engine's permission_mode.
+
+    Returns ``(session, modes)`` where ``modes`` is the list of ``permission_mode`` values the
+    factory was called with, in build order. The factory accepts the ``model`` +
+    ``permission_mode`` kwargs the DEFAULT bound factory threads, so we flip
+    ``_factory_accepts_model`` ON to exercise the real T-PLAN-1 threading through ``_build_engine``
+    (an injected factory otherwise keeps the 3-kwarg contract). Each call returns a FRESH
+    HoldEngine so a plan→default rebuild (the warm-engine mode mismatch) yields a new instance.
+    """
+    modes: list[str] = []
+
+    def factory(*, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default"):
+        modes.append(permission_mode)
+        return HoldEngine(
+            [ResultEvent(session_id="sid-1", is_error=False, subtype="success", result_text="ok")]
+        )
+
+    session = StreamingSession(
+        make_config(engine_mode="streaming", allow_any_path=True),
+        session_store=store,
+        engine_factory=factory,
+        clock=lambda: 0.0,
+    )
+    # The DEFAULT bound factory accepts model + permission_mode; our injected factory does too,
+    # so opt into the threaded-kwargs path (T-PLAN-1) rather than the 3-kwarg test contract.
+    session._factory_accepts_model = True
+    return session, modes
+
+
+async def _drive_plan_turn(session, chat_id, text):
+    """Drive one turn to completion (bounded) — minimal send/edit closures."""
+    async def send(*, text, reply_markup=None, parse_mode=None, link_preview_options=None):
+        return 1
+
+    async def edit(*, message_id, text, parse_mode=None):
+        return None
+
+    await asyncio.wait_for(
+        session.handle_message(chat_id, text, send=send, edit=edit), timeout=2.0
+    )
+
+
+async def test_arm_plan_drives_one_plan_mode_turn_then_reverts(tmp_path):
+    # arm_plan → the NEXT turn builds in permission_mode="plan"; the turn AFTER (no re-arm)
+    # builds back in "default" (the marker is ONE-SHOT). This is the headline T-PLAN behavior.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, modes = _make_plan_recording_session(store)
+
+    session.arm_plan(1)
+    await _drive_plan_turn(session, 1, "build me X")  # the armed plan turn
+    assert modes == ["plan"]  # the one armed turn ran in plan mode
+
+    await _drive_plan_turn(session, 1, "now do Y")  # the NEXT turn — no re-arm
+    # The plan-mode session was rebuilt to "default" (one-shot consumed; never lingers).
+    assert modes == ["plan", "default"]
+
+
+async def test_normal_turn_is_default_mode_and_reuses_warm_engine(tmp_path):
+    # A plain turn (no /plan) builds in "default"; a SECOND plain turn reuses the warm engine
+    # (same mode → the warm fast-path), so the factory is called exactly ONCE. Pins that the
+    # mode-aware fast-path does NOT cause a spurious rebuild for back-to-back normal turns.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, modes = _make_plan_recording_session(store)
+
+    await _drive_plan_turn(session, 1, "hello")
+    await _drive_plan_turn(session, 1, "again")
+    assert modes == ["default"]  # built once, in default; second turn reused the warm engine
+
+
+async def test_arm_plan_marker_is_never_persisted_rb3(tmp_path):
+    # RB3: the one-shot plan marker is transient in-memory ONLY — arming it must not write any
+    # plan flag into the persisted registry record (it must never survive a restart). Assert the
+    # stored project record carries no plan-mode field after arming + after the plan turn runs.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, _modes = _make_plan_recording_session(store)
+
+    session.arm_plan(1)
+    rec_after_arm = store.get_project(1, "alpha")
+    # No plan_next / permission_mode / plan key leaked into the persisted record.
+    assert not any("plan" in str(k).lower() for k in rec_after_arm)
+    assert "permission_mode" not in rec_after_arm
+
+    await _drive_plan_turn(session, 1, "plan it")
+    # Re-read from a FRESH store instance (forces a reload from disk) — the marker is gone:
+    # there is no persisted plan posture to reload, so a "restart" starts in default mode.
+    reloaded = JsonSessionStore(tmp_path / "state.json").get_project(1, "alpha")
+    assert not any("plan" in str(k).lower() for k in reloaded)
+    # And the in-memory marker was consumed by the turn (a fresh /-less turn would be default).
+    state = session._chats.get(1)
+    assert state is not None
+    rt = state.runtimes.get("alpha")
+    assert rt is not None and rt.plan_next is False
+
+
+async def test_plan_turn_rebuild_resumes_persisted_session_for_continuity(tmp_path):
+    # A /plan turn after a prior turn rebuilds a FRESH plan-mode session (mechanism (a) can't
+    # hot-switch mode), but it must RESUME the project's persisted session_id — so the plan
+    # turn continues the existing conversation, NOT a context-less fresh session. Pins that the
+    # mode-change rebuild goes through the normal resume path (the engine's `resumed` records it).
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+
+    builds: list = []
+
+    def factory(*, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default"):
+        eng = HoldEngine(
+            [ResultEvent(session_id="sid-keep", is_error=False, subtype="success", result_text="ok")]
+        )
+        builds.append((permission_mode, eng))
+        return eng
+
+    session = StreamingSession(
+        make_config(engine_mode="streaming", allow_any_path=True),
+        session_store=store,
+        engine_factory=factory,
+        clock=lambda: 0.0,
+    )
+    session._factory_accepts_model = True
+
+    await _drive_plan_turn(session, 1, "first")  # normal turn → persists "sid-keep"
+    assert store.get_project(1, "alpha")["session_id"] == "sid-keep"
+
+    session.arm_plan(1)
+    await _drive_plan_turn(session, 1, "plan it")  # plan turn → rebuild, MUST resume "sid-keep"
+    assert builds[1][0] == "plan"  # the rebuilt session is in plan mode
+    assert builds[1][1].resumed == "sid-keep"  # …and it RESUMED (continuity), not started fresh
+
+
+async def test_arm_plan_auto_creates_default_project_when_none(tmp_path):
+    # arm_plan before any project exists auto-creates `default` (like set_yolo / set_model), so
+    # a /plan as the very first action arms the implicit default project's next turn.
+    store = JsonSessionStore(tmp_path / "state.json")  # empty — no projects yet
+    session, modes = _make_plan_recording_session(store)
+
+    session.arm_plan(1)  # no active project → auto-creates `default` and arms it
+    await _drive_plan_turn(session, 1, "first ever message")
+    assert modes == ["plan"]  # the implicit default project's first turn ran in plan mode

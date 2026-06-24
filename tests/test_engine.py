@@ -480,6 +480,25 @@ def test_sdk_build_options_no_model_omits_it():
     assert SdkSubstrate(model="   ")._build_options().model is None
 
 
+def test_sdk_build_options_threads_permission_mode_plan():
+    # P12 T-PLAN-1 (mechanism a): an armed plan turn builds the session with
+    # permission_mode="plan" baked into ClaudeAgentOptions at session-creation time — on BOTH
+    # the start and resume paths (so a resumed plan turn continues the conversation in plan
+    # mode). This is what makes Claude reason + propose a plan and surface ExitPlanMode.
+    sub = SdkSubstrate(permission_mode="plan")
+    assert sub._build_options().permission_mode == "plan"
+    assert sub._build_options(resume="sess-123").permission_mode == "plan"
+
+
+def test_sdk_build_options_default_permission_mode_unchanged():
+    # P12 T-PLAN-1: a NORMAL turn is byte-for-byte unchanged — the default substrate sets
+    # permission_mode="default" exactly as before P12 (the omit-otherwise contract: plan mode
+    # is set ONLY when armed; every other turn keeps "default"). Pins the C4-adjacent invariant
+    # that a normal turn never silently inherits plan mode.
+    assert SdkSubstrate()._build_options().permission_mode == "default"
+    assert SdkSubstrate()._build_options(resume="sess-1").permission_mode == "default"
+
+
 async def test_sdk_send_timeout_yields_driver_error_no_hang():
     sub = SdkSubstrate()
     sub._client = _HangingClient()  # inject; do NOT start a real session
