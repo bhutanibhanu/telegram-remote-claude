@@ -32,6 +32,10 @@ def make_config(
     allow_any_path=False,
     max_concurrent_runs=3,
     render_chat_send_interval_seconds=0.0,
+    image_max_bytes=5 * 1024 * 1024,
+    file_max_bytes=20 * 1024 * 1024,
+    transcribe_cmd="",
+    transcribe_timeout_seconds=120.0,
 ):
     # P5/T8: default the per-chat send-gate interval to 0.0 in tests so the gate never
     # introduces a real ``asyncio.sleep`` under the frozen test clock (these tests assert
@@ -52,6 +56,10 @@ def make_config(
         render_chat_send_interval_seconds=render_chat_send_interval_seconds,
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
+        image_max_bytes=image_max_bytes,
+        file_max_bytes=file_max_bytes,
+        transcribe_cmd=transcribe_cmd,
+        transcribe_timeout_seconds=transcribe_timeout_seconds,
     )
 
 
@@ -77,7 +85,10 @@ class FakeRunner:
 class FakeStreaming:
     """Stands in for StreamingSession at the bot boundary."""
 
-    def __init__(self, outcome=None, busy=False):
+    def __init__(self, outcome=None, busy=False, cwd="/work"):
+        # P10 T3: the active project's cwd the on_document save / cmd_get resolve against.
+        # Default "/work" (the pre-T3 fixed value); the file tests point it at a tmp dir.
+        self._cwd = cwd
         self.handle_message_calls = []
         self.resolve_calls = []
         self.cancel_calls = []
@@ -87,6 +98,7 @@ class FakeStreaming:
         self.reply_prompt_calls = []
         self.to_calls = []
         self.command_initiated_calls = []
+        self.images_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
         self._busy = busy
         # P5/T7: cmd_reset now reads streaming.store.get_active to scope its busy-guard to
@@ -98,13 +110,15 @@ class FakeStreaming:
 
     async def handle_message(
         self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
-        command_initiated=False,
+        command_initiated=False, images=None,
     ):
         # P5/T9: handle_message gained reply_to_message_id (the D5 reply-to escape hatch);
-        # P9 fix: + command_initiated (a macro /run skips free-text capture). Record both so
-        # the wiring tests can assert they are threaded through from on_message / cmd_run.
+        # P9 fix: + command_initiated (a macro /run skips free-text capture). P10 T1: + images
+        # (the multimodal photo/screenshot). Record them so the wiring tests can assert they
+        # are threaded through from on_message / cmd_run / on_photo.
         self.handle_message_calls.append((chat_id, text, reply_to_message_id))
         self.command_initiated_calls.append(command_initiated)
+        self.images_calls.append(images)
         if self._busy:
             raise StreamingBusy()
         # T6/P9: handle_message now returns whether the message was a free-text capture (the
@@ -149,7 +163,8 @@ class FakeStreaming:
 
     def get_cwd(self, chat_id):
         # P9/T1: the first-run welcome reads the active cwd via this accessor.
-        return "/work"
+        # P10/T3: on_document saves into — and /get resolves against — this cwd.
+        return self._cwd
 
     def get_yolo(self, chat_id):
         # P9/T2: /status reads the active project's yolo posture (read-only).
@@ -3012,3 +3027,1081 @@ async def test_status_runs_line_shows_queued_counter(tmp_path):
     assert "(2 more waiting)" in text
     for fut in futures:
         fut.cancel()
+
+
+# ---------------------------------------------------------------------------
+# P10 T1 — photo / image-document → native multimodal turn (SB1 / size-cap /
+# media_type / no-bytes-logged / oneshot fallback). The send-path content-block
+# build + engine threading is in test_multimodal.py; the live-verify is T4.
+# ---------------------------------------------------------------------------
+
+import base64 as _base64  # noqa: E402
+
+from claude_tg.bot import DEFAULT_IMAGE_PROMPT  # noqa: E402
+from claude_tg.engine import ImageInput  # noqa: E402
+
+
+def make_photo_update(
+    chat_id=1, *, caption=None, raw=b"\x89PNG-fake-bytes", file_size=None, kind="photo",
+    mime_type=None, file_name=None,
+):
+    """A fake Update carrying a PHOTO (size ladder) or an image DOCUMENT.
+
+    ``get_file().download_as_bytearray()`` returns ``raw`` (the fake pixels). ``file_size``
+    is the Telegram-declared size for the pre-download cap (defaults to len(raw)).
+    """
+    upd = MagicMock()
+    upd.effective_chat.id = chat_id
+    upd.message.text = None
+    upd.message.caption = caption
+    upd.message.reply_text = AsyncMock()
+    upd.message.reply_to_message = None
+    upd.effective_message = upd.message
+    size = file_size if file_size is not None else len(raw)
+
+    tg_file = MagicMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(raw))
+
+    attachment = MagicMock()
+    attachment.file_size = size
+    attachment.get_file = AsyncMock(return_value=tg_file)
+
+    if kind == "photo":
+        # Telegram sends a SIZE LADDER; the largest is last (the handler takes [-1]).
+        small = MagicMock()
+        small.file_size = 1
+        small.get_file = AsyncMock(return_value=MagicMock())
+        upd.message.photo = [small, attachment]
+        upd.message.document = None
+    else:  # image document
+        attachment.mime_type = mime_type
+        attachment.file_name = file_name
+        upd.message.photo = []
+        upd.message.document = attachment
+    return upd
+
+
+async def test_on_photo_sb1_unauthorized_chat_no_engine_no_download():
+    # SB1: a photo from a NON-allowlisted chat is dropped — no download, no turn.
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    upd = make_photo_update(chat_id=999, caption="peek")  # 999 not in the allowlist
+    await bot.on_photo(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    # The largest photo's get_file was never called (no download for an unauthorized chat).
+    upd.message.photo[-1].get_file.assert_not_awaited()
+
+
+async def test_on_photo_threads_imageinput_and_caption_as_prompt():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    bot._welcomed.add(1)  # don't perturb on the welcome
+    raw = b"\x89PNG\r\n-some-bytes"
+    upd = make_photo_update(1, caption="what is in this screenshot?", raw=raw)
+    await bot.on_photo(upd, make_ctx())
+
+    # One turn ran with the caption as the prompt and an ImageInput carrying the base64.
+    assert len(streaming.handle_message_calls) == 1
+    chat_id, prompt, _rt = streaming.handle_message_calls[0]
+    assert (chat_id, prompt) == (1, "what is in this screenshot?")
+    images = streaming.images_calls[0]
+    assert images is not None and len(images) == 1
+    img = images[0]
+    assert isinstance(img, ImageInput)
+    assert img.media_type == "image/jpeg"  # a compressed photo → JPEG
+    assert img.data == _base64.b64encode(raw).decode("ascii")
+
+
+async def test_on_photo_no_caption_uses_default_prompt():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    bot._welcomed.add(1)
+    upd = make_photo_update(1, caption=None)
+    await bot.on_photo(upd, make_ctx())
+    _chat, prompt, _rt = streaming.handle_message_calls[0]
+    assert prompt == DEFAULT_IMAGE_PROMPT
+
+
+async def test_on_photo_size_cap_rejects_oversized_before_download():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", image_max_bytes=1024),
+        FakeRunner(), streaming=streaming,
+    )
+    bot._welcomed.add(1)
+    # Declared size over the 1 KB cap → refused with a clean message, NO turn, NO download.
+    upd = make_photo_update(1, caption="big", raw=b"x" * 50, file_size=5000)
+    await bot.on_photo(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    upd.message.photo[-1].get_file.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_on_photo_size_cap_rejects_after_download_when_size_underreported():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", image_max_bytes=10),
+        FakeRunner(), streaming=streaming,
+    )
+    bot._welcomed.add(1)
+    # Declared size is None (no pre-check), but the downloaded bytes exceed the 10 B cap →
+    # the post-download cap refuses it (defense-in-depth; never reaches the engine).
+    upd = make_photo_update(1, caption="sneaky", raw=b"x" * 100, file_size=None)
+    await bot.on_photo(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_on_photo_image_document_media_type_from_mime():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    bot._welcomed.add(1)
+    upd = make_photo_update(
+        1, caption="doc", raw=b"webp-bytes", kind="document",
+        mime_type="image/webp", file_name="shot.webp",
+    )
+    await bot.on_photo(upd, make_ctx())
+    img = streaming.images_calls[0][0]
+    assert img.media_type == "image/webp"
+
+
+async def test_on_photo_non_image_document_refused_cleanly():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    bot._welcomed.add(1)
+    # An unsupported mime (e.g. a PDF that slipped past the filter) → clean refusal, no turn.
+    upd = make_photo_update(
+        1, caption="pdf", raw=b"%PDF", kind="document",
+        mime_type="application/pdf", file_name="x.pdf",
+    )
+    await bot.on_photo(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "jpeg" in reply.lower() or "image" in reply.lower()
+
+
+async def test_on_photo_never_logs_image_bytes_sb3(caplog):
+    import logging
+
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    bot._welcomed.add(1)
+    raw = b"SECRET-PIXEL-PAYLOAD-DO-NOT-LOG-1234567890"
+    b64 = _base64.b64encode(raw).decode("ascii")
+    with caplog.at_level(logging.DEBUG):
+        upd = make_photo_update(1, caption="secret", raw=raw)
+        await bot.on_photo(upd, make_ctx())
+    full_log = "\n".join(r.getMessage() for r in caplog.records)
+    # SB3: neither the raw bytes nor the base64 may appear anywhere in the logs.
+    assert b64 not in full_log
+    assert "SECRET-PIXEL-PAYLOAD" not in full_log
+    # But a size SUMMARY is logged (so an operator can see an image arrived).
+    assert "received an image" in full_log
+
+
+async def test_on_photo_oneshot_mode_refuses_images_need_streaming():
+    # Oneshot fallback (documented choice): images need streaming mode → clean refusal,
+    # never silently run the caption text-only.
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="oneshot"), runner)
+    assert bot.streaming is None
+    bot._welcomed.add(1)
+    upd = make_photo_update(1, caption="see this")
+    await bot.on_photo(upd, make_ctx())
+    # No runner turn fired, and the operator was told images need streaming mode.
+    assert runner.run_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "streaming" in reply.lower()
+
+
+def test_build_application_registers_photo_handler():
+    # The photo/image-document MessageHandler is wired with the SB1 `allowed` chat filter.
+    from telegram.ext import MessageHandler
+
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    app = bot.build_application()
+    photo_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, MessageHandler) and h.callback == bot.on_photo
+    ]
+    assert len(photo_handlers) == 1
+
+
+# ===========================================================================
+# P10 T3 — file send (out: /get) + receive (in: on_document)
+# ===========================================================================
+
+
+def make_document_update(
+    chat_id=1, *, caption=None, raw=b"print('hi')\n", file_size=None,
+    file_name="note.py", mime_type="text/x-python",
+):
+    """A fake Update carrying a NON-image ``Document`` (the on_document inbound path).
+
+    ``get_file().download_as_bytearray()`` returns ``raw`` (the fake file bytes);
+    ``file_size`` is the Telegram-declared size for the pre-download cap (defaults to
+    len(raw)). ``file_name`` is the Telegram-supplied name (may be hostile — ``../`` etc).
+    """
+    upd = MagicMock()
+    upd.effective_chat.id = chat_id
+    upd.message.text = None
+    upd.message.caption = caption
+    upd.message.reply_text = AsyncMock()
+    upd.message.reply_to_message = None
+    upd.effective_message = upd.message
+    size = file_size if file_size is not None else len(raw)
+
+    tg_file = MagicMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(raw))
+
+    document = MagicMock()
+    document.file_size = size
+    document.file_name = file_name
+    document.mime_type = mime_type
+    document.get_file = AsyncMock(return_value=tg_file)
+
+    upd.message.photo = []
+    upd.message.document = document
+    return upd
+
+
+def _file_bot(tmp_path, *, allowed=(1,), file_max_bytes=20 * 1024 * 1024, cwd=None):
+    """A streaming bot whose active-project cwd + ALLOWED_ROOTS are ``tmp_path`` (T3)."""
+    cwd = cwd if cwd is not None else str(tmp_path)
+    streaming = FakeStreaming(cwd=cwd)
+    bot = TelegramClaudeBot(
+        make_config(
+            allowed=allowed, engine_mode="streaming",
+            allowed_roots=(tmp_path,), file_max_bytes=file_max_bytes,
+        ),
+        FakeRunner(), streaming=streaming,
+    )
+    bot._welcomed.add(1)
+    return bot, streaming
+
+
+# ---- inbound: on_document saves into the project, path-confined --------------
+
+
+async def test_on_document_saves_into_project_cwd_and_offers_to_claude(tmp_path):
+    bot, streaming = _file_bot(tmp_path)
+    raw = b"def f():\n    return 42\n"
+    upd = make_document_update(1, caption="review this", raw=raw, file_name="snippet.py")
+    await bot.on_document(upd, make_ctx())
+
+    # The file landed INSIDE the project cwd with the sanitized name + exact bytes.
+    saved = tmp_path / "snippet.py"
+    assert saved.is_file()
+    assert saved.read_bytes() == raw
+    # A normal turn was fired offering the file to Claude (caption as the instruction).
+    assert len(streaming.handle_message_calls) == 1
+    _chat, prompt, _rt = streaming.handle_message_calls[0]
+    assert str(saved) in prompt
+    assert "review this" in prompt
+    # No image was threaded — this is the file path, not the multimodal path.
+    assert streaming.images_calls[0] is None
+
+
+async def test_on_document_no_caption_uses_default_instruction(tmp_path):
+    bot, streaming = _file_bot(tmp_path)
+    upd = make_document_update(1, caption=None, file_name="a.log")
+    await bot.on_document(upd, make_ctx())
+    _chat, prompt, _rt = streaming.handle_message_calls[0]
+    assert "I've added the file" in prompt
+    assert (tmp_path / "a.log").is_file()
+
+
+async def test_on_document_dotdot_filename_confined_to_cwd(tmp_path):
+    # SB2: a ``../`` traversal in the file_name CANNOT escape the project cwd. The name is
+    # sanitized to a basename AND re-confined by resolve_within_roots — the file lands
+    # INSIDE tmp_path, never in the parent.
+    bot, streaming = _file_bot(tmp_path)
+    upd = make_document_update(1, raw=b"x", file_name="../../escape.txt")
+    await bot.on_document(upd, make_ctx())
+
+    # Nothing was written above the root; the basename landed inside the cwd.
+    parent_escape = tmp_path.parent / "escape.txt"
+    assert not parent_escape.exists()
+    assert (tmp_path / "escape.txt").is_file()
+    assert len(streaming.handle_message_calls) == 1
+
+
+async def test_on_document_absolute_filename_confined_to_cwd(tmp_path):
+    # SB2: an ABSOLUTE file_name is stripped to its basename and saved inside the cwd —
+    # it never writes to the absolute location.
+    bot, streaming = _file_bot(tmp_path)
+    upd = make_document_update(1, raw=b"y", file_name="/etc/cron.d/evil")
+    await bot.on_document(upd, make_ctx())
+    assert not Path("/etc/cron.d/evil").exists()  # never touched
+    assert (tmp_path / "evil").is_file()
+
+
+async def test_on_document_part_symlink_escape_not_written_through(tmp_path):
+    # BUG B (Codex B1): the atomic save wrote ``<dest.name>.part`` then renamed it over dest.
+    # If an attacker had pre-placed an IN-ROOT symlink named ``<name>.part`` pointing OUT of the
+    # allowed roots, opening that fixed-name temp for write would FOLLOW the symlink and clobber
+    # the out-of-root target (an escape). The fix writes to a RANDOM temp name (mkstemp) in the
+    # confined parent and os.replace()s it into place — a random name can't be a pre-placed
+    # symlink, and the out-of-root target is never touched.
+    outside = tmp_path.parent / "victim_outside_root.txt"
+    outside.write_bytes(b"ORIGINAL-OUT-OF-ROOT-CONTENT")
+    # Pre-place the malicious in-root symlink the OLD code would have opened for write.
+    booby = tmp_path / "note.py.part"
+    booby.symlink_to(outside)
+    assert booby.is_symlink()
+
+    bot, streaming = _file_bot(tmp_path)
+    raw = b"def f():\n    return 7\n"
+    upd = make_document_update(1, caption="save it", raw=raw, file_name="note.py")
+    await bot.on_document(upd, make_ctx())
+
+    # The out-of-root target was NEVER written through the symlink — its bytes are untouched.
+    assert outside.read_bytes() == b"ORIGINAL-OUT-OF-ROOT-CONTENT"
+    # The real file landed INSIDE the project cwd with the exact bytes (the save still works).
+    saved = tmp_path / "note.py"
+    assert saved.is_file() and not saved.is_symlink()
+    assert saved.read_bytes() == raw
+    # And the turn was offered as normal.
+    assert len(streaming.handle_message_calls) == 1
+
+
+async def test_on_document_dest_is_symlink_out_of_root_refused_not_followed(tmp_path):
+    # Companion to BUG B: if the DESTINATION name itself is a pre-placed in-root symlink that
+    # resolves OUT of the roots, the SB2 resolve (resolve_within_roots canonicalizes symlinks)
+    # REFUSES it up front — so the save never even reaches the write, and the out-of-root target
+    # is untouched. (This is the authoritative SB2 boundary; the .part-name fix above closes the
+    # remaining temp-name write-through. Together: no path writes through an escaping symlink.)
+    outside = tmp_path.parent / "dest_victim_outside.txt"
+    outside.write_bytes(b"DEST-OUT-OF-ROOT-ORIGINAL")
+    dest_link = tmp_path / "note.py"
+    dest_link.symlink_to(outside)
+    assert dest_link.is_symlink()
+
+    bot, streaming = _file_bot(tmp_path)
+    raw = b"replaced-bytes\n"
+    upd = make_document_update(1, raw=raw, file_name="note.py")
+    await bot.on_document(upd, make_ctx())
+
+    # The out-of-root target is NEVER written through the symlink — refused at the SB2 boundary.
+    assert outside.read_bytes() == b"DEST-OUT-OF-ROOT-ORIGINAL"
+    # No turn fired; a clean "resolves outside the permitted roots" refusal was sent.
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "outside the permitted roots" in reply.lower()
+
+
+async def test_on_document_oversized_refused_before_download(tmp_path):
+    # RB2: a declared size over the cap is refused with a clean message — NO download, NO
+    # write, NO turn.
+    bot, streaming = _file_bot(tmp_path, file_max_bytes=1024)
+    upd = make_document_update(1, raw=b"x" * 10, file_size=5000, file_name="big.bin")
+    await bot.on_document(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    upd.message.document.get_file.assert_not_awaited()
+    assert not (tmp_path / "big.bin").exists()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_on_document_oversized_refused_after_download_when_underreported(tmp_path):
+    # Defense-in-depth: declared size None (no pre-check) but the downloaded bytes exceed
+    # the cap → refused post-download; never written, never offered.
+    bot, streaming = _file_bot(tmp_path, file_max_bytes=10)
+    upd = make_document_update(1, raw=b"x" * 100, file_size=None, file_name="sneaky.bin")
+    await bot.on_document(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert not (tmp_path / "sneaky.bin").exists()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_on_document_sb1_unauthorized_chat_no_download_no_write(tmp_path):
+    # SB1: a document from a NON-allowlisted chat is dropped — no download, no write, no turn.
+    bot, streaming = _file_bot(tmp_path, allowed=(1,))
+    upd = make_document_update(chat_id=999, raw=b"z", file_name="x.py")
+    await bot.on_document(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    upd.message.document.get_file.assert_not_awaited()
+    assert not (tmp_path / "x.py").exists()
+
+
+async def test_on_document_oneshot_mode_refuses_needs_streaming(tmp_path):
+    # One-shot mode has no per-project cwd → clean refusal; never silently drops the file.
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="oneshot"), runner)
+    assert bot.streaming is None
+    bot._welcomed.add(1)
+    upd = make_document_update(1, file_name="x.py")
+    await bot.on_document(upd, make_ctx())
+    assert runner.run_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "streaming" in reply.lower()
+
+
+async def test_on_document_download_failure_clean_message(tmp_path):
+    # RB1: a download exception → a clean message, no crash, no write, no turn.
+    bot, streaming = _file_bot(tmp_path)
+    upd = make_document_update(1, file_name="x.py")
+    upd.message.document.get_file = AsyncMock(side_effect=RuntimeError("boom"))
+    await bot.on_document(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert not (tmp_path / "x.py").exists()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "couldn't download" in reply.lower()
+
+
+async def test_on_document_never_logs_file_bytes_sb3(tmp_path, caplog):
+    import logging
+
+    bot, streaming = _file_bot(tmp_path)
+    secret = b"SECRET-FILE-PAYLOAD-DO-NOT-LOG-9876543210"
+    with caplog.at_level(logging.DEBUG):
+        upd = make_document_update(1, raw=secret, file_name="secret.bin")
+        await bot.on_document(upd, make_ctx())
+    full_log = "\n".join(r.getMessage() for r in caplog.records)
+    assert "SECRET-FILE-PAYLOAD" not in full_log
+    # But a size SUMMARY (name + KB) is logged.
+    assert "received a file" in full_log
+
+
+async def test_on_document_does_not_collide_with_image_document(tmp_path):
+    # An IMAGE document must route to on_photo (T1's multimodal path), NOT to on_document.
+    # The registration filters are disjoint: on_photo = PHOTO | Document.IMAGE; on_document =
+    # Document.ALL & ~Document.IMAGE. Prove an image-document message is NOT matched by the
+    # on_document handler's filter, while a non-image document IS.
+    from telegram.ext import MessageHandler
+
+    bot, _streaming = _file_bot(tmp_path)
+    app = bot.build_application()
+    doc_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, MessageHandler) and h.callback == bot.on_document
+    ]
+    assert len(doc_handlers) == 1
+    photo_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, MessageHandler) and h.callback == bot.on_photo
+    ]
+    assert len(photo_handlers) == 1
+
+
+# ---- outbound: /get <path> ---------------------------------------------------
+
+
+async def test_cmd_get_in_root_file_sends_document(tmp_path):
+    bot, _streaming = _file_bot(tmp_path)
+    f = tmp_path / "out.txt"
+    f.write_bytes(b"hello file")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["out.txt"]  # relative to the active cwd
+    upd = make_update(1, text="/get out.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_awaited_once()
+    kwargs = ctx.bot.send_document.await_args.kwargs
+    assert kwargs["chat_id"] == 1
+    assert kwargs["document"] is not None
+
+
+async def test_cmd_get_closes_file_handle_no_fd_leak(tmp_path, monkeypatch):
+    # Codex NB: /get must open the file inside a context manager so its descriptor is closed
+    # after the send (no fd leak). We capture every file the handler opens and assert each is
+    # closed once cmd_get returns.
+    import builtins
+
+    bot, _streaming = _file_bot(tmp_path)
+    f = tmp_path / "out.txt"
+    f.write_bytes(b"hello file")
+
+    opened = []
+    real_open = builtins.open
+
+    def tracking_open(file, mode="r", *a, **k):
+        fh = real_open(file, mode, *a, **k)
+        # Only track the binary read the handler does on the target file.
+        if "b" in mode and "r" in mode and str(file) == str(f):
+            opened.append(fh)
+        return fh
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["out.txt"]
+    upd = make_update(1, text="/get out.txt")
+    await bot.cmd_get(upd, ctx)
+
+    assert opened, "cmd_get should have opened the target file for reading"
+    assert all(fh.closed for fh in opened), "the /get file handle leaked (was not closed)"
+
+
+async def test_cmd_get_absolute_in_root_path_sends(tmp_path):
+    bot, _streaming = _file_bot(tmp_path)
+    f = tmp_path / "abs.txt"
+    f.write_bytes(b"data")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = [str(f)]  # absolute, but inside the root
+    upd = make_update(1, text=f"/get {f}")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_awaited_once()
+
+
+async def test_cmd_get_out_of_root_refused(tmp_path):
+    # SB2: an absolute path OUTSIDE the allowed root is refused — never read/uploaded.
+    bot, _streaming = _file_bot(tmp_path)
+    outside = tmp_path.parent / "secret.txt"
+    outside.write_bytes(b"top secret")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = [str(outside)]
+    upd = make_update(1, text="/get ...")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "outside the permitted roots" in reply.lower()
+
+
+async def test_cmd_get_dotdot_traversal_refused(tmp_path):
+    # SB2: a ``../`` relative traversal that escapes the root is refused.
+    bot, _streaming = _file_bot(tmp_path)
+    (tmp_path.parent / "escape.txt").write_bytes(b"x")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["../escape.txt"]
+    upd = make_update(1, text="/get ../escape.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "outside the permitted roots" in reply.lower()
+
+
+async def test_cmd_get_missing_file_refused(tmp_path):
+    bot, _streaming = _file_bot(tmp_path)
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["nope.txt"]
+    upd = make_update(1, text="/get nope.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "no such file" in reply.lower()
+
+
+async def test_cmd_get_directory_refused(tmp_path):
+    # A directory (in-root) is not a regular file → refused (RB2).
+    bot, _streaming = _file_bot(tmp_path)
+    (tmp_path / "subdir").mkdir()
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["subdir"]
+    upd = make_update(1, text="/get subdir")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "no such file" in reply.lower()
+
+
+async def test_cmd_get_oversized_refused(tmp_path):
+    # RB2: an in-root file over the cap is refused — never uploaded.
+    bot, _streaming = _file_bot(tmp_path, file_max_bytes=10)
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 100)
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["big.bin"]
+    upd = make_update(1, text="/get big.bin")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_cmd_get_no_arg_usage(tmp_path):
+    bot, _streaming = _file_bot(tmp_path)
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = []
+    upd = make_update(1, text="/get")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    assert "usage" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_get_sb1_unauthorized_no_send(tmp_path):
+    # SB1: a /get from a NON-allowlisted chat does nothing.
+    bot, _streaming = _file_bot(tmp_path, allowed=(1,))
+    (tmp_path / "f.txt").write_bytes(b"x")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["f.txt"]
+    upd = make_update(chat_id=999, text="/get f.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    upd.message.reply_text.assert_not_awaited()
+
+
+async def test_cmd_get_oneshot_mode_refuses(tmp_path):
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="oneshot"), runner)
+    assert bot.streaming is None
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["x.txt"]
+    upd = make_update(1, text="/get x.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+def test_build_application_registers_get_command_and_document_handler(tmp_path):
+    from telegram.ext import CommandHandler, MessageHandler
+
+    bot, _streaming = _file_bot(tmp_path)
+    app = bot.build_application()
+    get_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, CommandHandler) and "get" in {c.lower() for c in h.commands}
+    ]
+    assert len(get_handlers) == 1
+    doc_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, MessageHandler) and h.callback == bot.on_document
+    ]
+    assert len(doc_handlers) == 1
+
+
+def test_get_in_command_menu_and_help():
+    # T3: /get must be in the native menu AND documented in HELP_TEXT (the lock-step guards).
+    from claude_tg.bot import COMMAND_MENU, HELP_TEXT
+
+    assert "get" in {cmd for cmd, _desc in COMMAND_MENU}
+    assert "/get" in HELP_TEXT
+
+
+# ===========================================================================
+# P10 T2 — voice notes (pluggable transcription, graceful-off)
+# ===========================================================================
+
+import os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+from claude_tg.bot import VOICE_SETUP_MESSAGE  # noqa: E402
+from claude_tg.voice import TranscriptionError  # noqa: E402
+
+
+def make_voice_update(chat_id=1, *, raw=b"OggS-fake-opus-bytes", kind="voice"):
+    """A fake Update carrying a Telegram VOICE note (or an AUDIO file).
+
+    ``get_file().download_as_bytearray()`` returns ``raw`` (the fake audio bytes).
+    """
+    upd = MagicMock()
+    upd.effective_chat.id = chat_id
+    upd.message.text = None
+    upd.message.caption = None
+    upd.message.reply_text = AsyncMock()
+    upd.message.reply_to_message = None
+    upd.effective_message = upd.message
+
+    tg_file = MagicMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(raw))
+    attachment = MagicMock()
+    attachment.file_size = len(raw)
+    attachment.get_file = AsyncMock(return_value=tg_file)
+
+    if kind == "voice":
+        upd.message.voice = attachment
+        upd.message.audio = None
+    else:  # an audio file
+        upd.message.voice = None
+        upd.message.audio = attachment
+    upd.message.photo = []
+    upd.message.document = None
+    return upd
+
+
+def _voice_bot(*, allowed=(1,), transcribe_cmd="stt -f {audio}", streaming=True):
+    """A streaming (or one-shot) bot with TRANSCRIBE_CMD set (or empty for graceful-off)."""
+    fake_streaming = FakeStreaming() if streaming else None
+    mode = "streaming" if streaming else "oneshot"
+    bot = TelegramClaudeBot(
+        make_config(allowed=allowed, engine_mode=mode, transcribe_cmd=transcribe_cmd),
+        FakeRunner(), streaming=fake_streaming,
+    )
+    bot._welcomed.add(1)
+    return bot, fake_streaming
+
+
+# ---- graceful-off: no TRANSCRIBE_CMD configured -----------------------------
+
+
+async def test_on_voice_graceful_off_when_no_transcribe_cmd():
+    # No TRANSCRIBE_CMD → a clean setup message, NO download, NO turn (RB2, no crash).
+    bot, streaming = _voice_bot(transcribe_cmd="")
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    upd.message.voice.get_file.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert reply == VOICE_SETUP_MESSAGE
+    assert "TRANSCRIBE_CMD" in reply
+
+
+async def test_on_voice_graceful_off_whitespace_cmd():
+    bot, streaming = _voice_bot(transcribe_cmd="   ")
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert upd.message.reply_text.await_args.args[0] == VOICE_SETUP_MESSAGE
+
+
+async def test_on_voice_graceful_off_message_sent_without_markdown_parse_mode():
+    # BUG A regression (same class as the P9 `/help $*` break): VOICE_SETUP_MESSAGE embeds the
+    # literal token TRANSCRIBE_CMD. Sent with parse_mode="Markdown", the underscore opens an
+    # unterminated italic span → Telegram raises BadRequest and the operator gets NOTHING (the
+    # common no-transcriber case). The fix sends it as PLAIN TEXT (no parse_mode), so a Markdown
+    # parser is never invoked on the message.
+    bot, _streaming = _voice_bot(transcribe_cmd="")
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    kwargs = upd.message.reply_text.await_args.kwargs
+    pm = kwargs.get("parse_mode")
+    assert pm is None or str(pm).lower() != "markdown", (
+        "VOICE_SETUP_MESSAGE must NOT be sent with parse_mode=Markdown — its TRANSCRIBE_CMD "
+        "underscore is an unterminated italic → Telegram rejects the send."
+    )
+
+
+async def test_on_voice_graceful_off_via_transcription_unavailable_no_markdown():
+    # The SECOND VOICE_SETUP_MESSAGE send-site: TRANSCRIBE_CMD was set at handler entry but the
+    # transcriber raises TranscriptionUnavailable (it normalized to empty). Same Markdown-safety
+    # requirement applies to this fallback path.
+    from claude_tg.voice import TranscriptionUnavailable
+
+    bot, _streaming = _voice_bot()
+
+    async def unavailable(*, template, audio_path, work_dir, timeout):
+        raise TranscriptionUnavailable()
+
+    import claude_tg.bot as _botmod
+
+    _orig = _botmod.transcribe
+    _botmod.transcribe = unavailable
+    try:
+        upd = make_voice_update(1)
+        await bot.on_voice(upd, make_ctx())
+    finally:
+        _botmod.transcribe = _orig
+    sent = upd.message.reply_text.await_args
+    assert sent.args[0] == VOICE_SETUP_MESSAGE
+    pm = sent.kwargs.get("parse_mode")
+    assert pm is None or str(pm).lower() != "markdown"
+
+
+# ---- happy path: transcript echoed + turn fired -----------------------------
+
+
+async def test_on_voice_transcribes_echoes_and_fires_turn(monkeypatch):
+    bot, streaming = _voice_bot()
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        # The handler must hand us a real, existing temp audio path it downloaded.
+        assert os.path.isfile(audio_path)
+        return "build me a parser"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+
+    # The transcript was echoed back QUOTED before the turn ran.
+    echo = upd.message.reply_text.await_args_list[0].args[0]
+    assert "🎙️" in echo and "build me a parser" in echo
+    # And the transcript fired as a NORMAL turn (no image) against the active project.
+    assert len(streaming.handle_message_calls) == 1
+    chat_id, prompt, _rt = streaming.handle_message_calls[0]
+    assert (chat_id, prompt) == (1, "build me a parser")
+    assert streaming.images_calls[0] is None
+
+
+async def test_on_voice_audio_file_also_handled(monkeypatch):
+    bot, streaming = _voice_bot()
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        return "from an audio file"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    upd = make_voice_update(1, kind="audio")
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls[0][1] == "from an audio file"
+
+
+async def test_on_voice_echo_escapes_html(monkeypatch):
+    # A transcript with </>& is HTML-escaped in the quoted echo (it's parse_mode=HTML).
+    bot, streaming = _voice_bot()
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        return "fix <Foo> & <Bar>"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    echo = upd.message.reply_text.await_args_list[0].args[0]
+    assert "&lt;Foo&gt;" in echo and "&amp;" in echo
+    # The turn still fires the RAW transcript (Claude gets the real text).
+    assert streaming.handle_message_calls[0][1] == "fix <Foo> & <Bar>"
+
+
+# ---- transcriber fails → clean error, no turn -------------------------------
+
+
+async def test_on_voice_transcriber_failure_clean_error_no_turn(monkeypatch):
+    bot, streaming = _voice_bot()
+
+    async def boom(*, template, audio_path, work_dir, timeout):
+        raise TranscriptionError("the transcriber failed (exit 1)")
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", boom)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    # No turn fired; a clean (body-free) error message was sent.
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "transcribe" in reply.lower()
+    assert "exit 1" in reply
+
+
+async def test_on_voice_download_failure_clean_message(monkeypatch):
+    bot, streaming = _voice_bot()
+    monkeypatch.setattr("claude_tg.bot.transcribe", AsyncMock())
+    upd = make_voice_update(1)
+    upd.message.voice.get_file = AsyncMock(side_effect=RuntimeError("net down"))
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert "download" in upd.message.reply_text.await_args.args[0].lower()
+
+
+# ---- SB1: unauthorized voice → nothing --------------------------------------
+
+
+async def test_on_voice_sb1_unauthorized_chat_no_download_no_turn(monkeypatch):
+    bot, streaming = _voice_bot(allowed=(1,))
+    called = {"n": 0}
+
+    async def spy(*a, **k):
+        called["n"] += 1
+        return "x"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", spy)
+    upd = make_voice_update(chat_id=999)  # not in the allowlist
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert called["n"] == 0
+    upd.message.voice.get_file.assert_not_awaited()
+    upd.message.reply_text.assert_not_awaited()
+
+
+# ---- size caps (Codex B3): oversized audio refused cleanly, no download ------
+
+
+async def test_on_voice_oversized_refused_before_download(monkeypatch):
+    # Codex B3 (RB2): a voice note whose DECLARED file_size exceeds the cap is refused with a
+    # clean message BEFORE any download — never pull oversized audio into memory, never
+    # transcribe, never fire a turn.
+    bot, streaming = _voice_bot()
+    bot.config = make_config(allowed=(1,), engine_mode="streaming",
+                             transcribe_cmd="stt -f {audio}", file_max_bytes=1024)
+    called = {"transcribe": 0}
+
+    async def spy_transcribe(*a, **k):
+        called["transcribe"] += 1
+        return "should not run"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", spy_transcribe)
+    upd = make_voice_update(1, raw=b"x" * 10)
+    upd.message.voice.file_size = 5000  # declared over the 1024 cap
+    await bot.on_voice(upd, make_ctx())
+
+    upd.message.voice.get_file.assert_not_awaited()  # no download
+    assert called["transcribe"] == 0
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_on_voice_oversized_refused_after_download_when_underreported(monkeypatch):
+    # Defense-in-depth: a missing/under-reported declared size (no pre-check) but the downloaded
+    # bytes exceed the cap → refused post-download; never transcribed, never offered as a turn.
+    bot, streaming = _voice_bot()
+    bot.config = make_config(allowed=(1,), engine_mode="streaming",
+                             transcribe_cmd="stt -f {audio}", file_max_bytes=10)
+    called = {"transcribe": 0}
+
+    async def spy_transcribe(*a, **k):
+        called["transcribe"] += 1
+        return "should not run"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", spy_transcribe)
+    upd = make_voice_update(1, raw=b"x" * 100)
+    upd.message.voice.file_size = None  # no declared size → falls through to post-download cap
+    await bot.on_voice(upd, make_ctx())
+
+    assert called["transcribe"] == 0
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+# ---- oneshot mode → clean "needs streaming" notice --------------------------
+
+
+async def test_on_voice_oneshot_mode_refuses_needs_streaming():
+    bot, _ = _voice_bot(streaming=False)
+    assert bot.streaming is None
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    # No download even attempted; a clean streaming-only notice.
+    upd.message.voice.get_file.assert_not_awaited()
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+# ---- SB3: never log the audio bytes or the raw transcript -------------------
+
+
+async def test_on_voice_never_logs_audio_or_transcript_sb3(monkeypatch, caplog):
+    import logging
+
+    bot, _streaming = _voice_bot()
+    secret_audio = b"SECRET-AUDIO-PAYLOAD-DO-NOT-LOG-9876543210"
+    secret_transcript = "SECRET-SPOKEN-WORDS-DO-NOT-LOG"
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        return secret_transcript
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    with caplog.at_level(logging.DEBUG):
+        upd = make_voice_update(1, raw=secret_audio)
+        await bot.on_voice(upd, make_ctx())
+    full_log = "\n".join(r.getMessage() for r in caplog.records)
+    assert secret_transcript not in full_log
+    assert "SECRET-AUDIO-PAYLOAD" not in full_log
+    # But a size SUMMARY is logged (so an operator sees a voice note arrived).
+    assert "received a voice note" in full_log
+
+
+# ---- temp files cleaned (RB1) -----------------------------------------------
+
+
+async def test_on_voice_temp_files_cleaned(monkeypatch, tmp_path):
+    bot, _streaming = _voice_bot()
+    workdir = tmp_path / "tg-voice-fixed"
+
+    def fake_mkdtemp(*a, **k):
+        workdir.mkdir()
+        return str(workdir)
+
+    monkeypatch.setattr("claude_tg.bot.tempfile.mkdtemp", fake_mkdtemp)
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        # The audio is on disk under the temp dir while transcribing; we also drop a fake
+        # transcript .txt to prove EVERYTHING under the dir is swept.
+        assert os.path.isfile(audio_path)
+        (workdir / "transcript.txt").write_text("hi", encoding="utf-8")
+        return "ok"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    # The whole temp dir (audio + any .txt) is gone after the handler returns.
+    assert not workdir.exists()
+
+
+async def test_on_voice_temp_cleaned_even_on_failure(monkeypatch, tmp_path):
+    bot, _streaming = _voice_bot()
+    workdir = tmp_path / "tg-voice-fail"
+
+    def fake_mkdtemp(*a, **k):
+        workdir.mkdir()
+        return str(workdir)
+
+    monkeypatch.setattr("claude_tg.bot.tempfile.mkdtemp", fake_mkdtemp)
+
+    async def boom(*, template, audio_path, work_dir, timeout):
+        raise TranscriptionError("boom")
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", boom)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    assert not workdir.exists()  # finally cleaned it even though transcribe raised
+
+
+# ---- end-to-end through a REAL transcriber subprocess (no shell injection) ---
+
+
+async def test_on_voice_real_transcriber_no_shell_injection(tmp_path):
+    # Use a REAL python "transcriber" via TRANSCRIBE_CMD that just prints a fixed transcript.
+    # The downloaded temp audio path is passed as {audio}; prove no shell runs it (the handler
+    # path uses exec, not a shell). A separate injection probe of the path tokenization lives
+    # in test_voice.py; here we prove the bot handler wires a real subprocess end to end.
+    sentinel = tmp_path / "PWNED"
+    template = f'{_sys.executable} -c "print(\'real voice transcript\')" {{audio}}'
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", transcribe_cmd=template),
+        FakeRunner(), streaming=streaming,
+    )
+    bot._welcomed.add(1)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    # The transcript was produced by the real subprocess and fired as a turn.
+    assert streaming.handle_message_calls[0][1] == "real voice transcript"
+    assert not sentinel.exists()
+
+
+# ---- registration: SB1 chat filter; NOT a command (no menu change) ----------
+
+
+def test_build_application_registers_voice_handler():
+    from telegram.ext import MessageHandler
+
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming()
+    )
+    app = bot.build_application()
+    voice_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, MessageHandler) and h.callback == bot.on_voice
+    ]
+    assert len(voice_handlers) == 1
+
+
+def test_voice_is_not_a_command_no_menu_change():
+    # The voice handler is a MessageHandler, NOT a command — COMMAND_MENU must not gain a
+    # "voice" entry (the lock-step menu test would otherwise fail).
+    from claude_tg.bot import COMMAND_MENU
+
+    assert "voice" not in {cmd for cmd, _desc in COMMAND_MENU}

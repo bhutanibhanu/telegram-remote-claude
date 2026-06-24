@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import logging
+import os
+import shutil
+import tempfile
 import time
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, InputFile, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -21,6 +25,7 @@ from telegram.ext import (
 
 from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
+from .engine import ImageInput, ImageMediaType
 from .paths import PathNotAllowed, resolve_within_roots
 from .render import (
     BODY_FREE_ERROR_LINE,
@@ -39,12 +44,17 @@ from .session_store import (
 )
 from .stream_session import StreamingBusy, StreamingSession
 from .util import _redact_sid_in_text, expand_macro, split_message
+from .voice import TranscriptionError, TranscriptionUnavailable, transcribe
 
 log = logging.getLogger(__name__)
 
 HELP_TEXT = (
     "🤖 *Claude Code remote*\n\n"
-    "Just send me a message and I'll run it through Claude Code on the Mac and reply.\n\n"
+    "Just send me a message and I'll run it through Claude Code on the Mac and reply.\n"
+    "Send a photo and Claude sees it; send a file and it's saved into the project for "
+    "Claude to read (streaming mode); pull a file back with /get. Send a voice note and, "
+    "with a transcriber configured, it's transcribed and run as a turn (otherwise you get "
+    "a quick setup tip).\n\n"
     "Commands:\n"
     "/help — this help\n"
     "/status — health: uptime, mode, gate, runs, per-project status + cost\n"
@@ -64,6 +74,8 @@ HELP_TEXT = (
     "/switch <name> — switch the active project; the next message resumes it (streaming mode)\n"
     "/rm <name> — drop a project from the registry, leaving its transcript on disk (streaming mode)\n"
     "/pwd — show the active project's working directory\n"
+    "/get <path> — send a file from the project back to you (path-confined to the "
+    "permitted roots; relative to the active project, or an absolute path)\n"
     "/cd <path> — change the working directory (one-shot mode only; in streaming mode "
     "the cwd is fixed per project — use /new to work elsewhere)\n"
     "/save <name> <text> — save a reusable prompt template (macro)\n"
@@ -99,6 +111,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("switch", "Switch the active project"),
     ("rm", "Drop a project from the registry"),
     ("pwd", "Show the active project's working directory"),
+    ("get", "Send a file from the project back to you: /get <path>"),
     ("cd", "Change the working directory (one-shot mode only)"),
     ("save", "Save a reusable prompt template: /save <name> <text>"),
     ("run", "Run a saved macro: /run <name> [args…]"),
@@ -125,6 +138,111 @@ def _format_uptime(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
+
+
+#: P10 T1 (multimodal): the default prompt when an operator sends a photo with NO caption.
+#: The caption is normally the turn's prompt; with none we give Claude a sensible
+#: look-at-this instruction so a bare screenshot still does something useful.
+DEFAULT_IMAGE_PROMPT = "Look at this image and tell me what you see / help me with it."
+
+#: P10 T3 (file receive): a safe fallback filename when a Telegram ``Document`` carries no
+#: usable ``file_name`` (or one that sanitizes to nothing). Saved into the active project's
+#: cwd so Claude can Read it; never executed.
+DEFAULT_INBOUND_FILENAME = "upload.bin"
+
+#: P10 T2 (voice): the graceful-off message when no ``TRANSCRIBE_CMD`` is configured. Voice
+#: transcription is operator-provided infra (no hard dependency); with none set up, a voice
+#: note gets this clean, actionable setup message instead of a crash (RB2).
+#:
+#: BUG A: this is sent as PLAIN TEXT (the ``on_voice`` send-sites pass no ``parse_mode``). The
+#: ``TRANSCRIBE_CMD`` token + the backtick spans below would, under ``parse_mode="Markdown"``,
+#: leave an unterminated italic / code span and make Telegram REJECT the entire send (the user
+#: then gets nothing — the common no-transcriber case). The backticks here render literally as
+#: plain text. The ``_strip_code_spans`` guard in ``tests/test_voice.py`` additionally pins the
+#: emphasis markers balanced so a future Markdown send can't silently re-break it.
+VOICE_SETUP_MESSAGE = (
+    "🎙️ Voice transcription isn't set up. Install a transcriber "
+    "(e.g. `brew install whisper-cpp` + a model) and set the `TRANSCRIBE_CMD` "
+    "environment variable — or just type your message."
+)
+
+
+def _safe_filename(name: str | None) -> str:
+    """Reduce a Telegram-supplied ``file_name`` to a SINGLE, inert basename (P10 T3 / SB2).
+
+    The destination is built by joining this name onto the active project's cwd and then
+    re-confined through :func:`~claude_tg.paths.resolve_within_roots` — but we ALSO strip the
+    name to a bare basename here so a hostile ``../../etc/passwd`` or an absolute
+    ``/etc/cron.d/x`` can never even *form* a traversal before confinement runs (defense in
+    depth; the SB2 resolve is the authoritative boundary, this is the belt). Steps, pure (no
+    I/O):
+
+    * take only the final path component (``os.path.basename`` after normalizing both
+      separators) — drops every directory part, so ``../`` and a leading ``/`` are gone;
+    * reject the special ``.`` / ``..`` components and any empty result;
+    * strip control chars / NULs that could confuse the filesystem.
+
+    Returns a clean basename, or :data:`DEFAULT_INBOUND_FILENAME` when nothing usable
+    remains. The caller STILL runs the confinement resolve on the joined path — this only
+    guarantees the join starts from a single inert component.
+    """
+    raw = (name or "").strip()
+    # Normalize Windows separators too, then take the final component only. This discards
+    # any directory portion (../, leading /, nested dirs) regardless of OS.
+    raw = raw.replace("\\", "/")
+    base = os.path.basename(raw)
+    # Strip NUL / control characters (defensive — a filename should be printable text).
+    base = "".join(ch for ch in base if ch.isprintable()).strip()
+    if not base or base in (".", ".."):
+        return DEFAULT_INBOUND_FILENAME
+    return base
+
+#: P10 T1: map a Telegram mime-type / file extension to an Anthropic image ``media_type``.
+#: Telegram compresses inbound *photos* to JPEG (no mime on a PhotoSize), so a photo with
+#: no usable hint defaults to ``image/jpeg``; an image *document* carries a mime_type /
+#: file_name we map explicitly. Only these four are supported by the model; anything else
+#: returns None and the handler refuses it (never guesses a wrong media_type).
+_MIME_TO_MEDIA_TYPE: dict[str, ImageMediaType] = {
+    "image/jpeg": "image/jpeg",
+    "image/jpg": "image/jpeg",
+    "image/png": "image/png",
+    "image/webp": "image/webp",
+    "image/gif": "image/gif",
+}
+_EXT_TO_MEDIA_TYPE: dict[str, ImageMediaType] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _media_type_for(
+    *, mime_type: str | None, file_name: str | None, is_photo: bool
+) -> ImageMediaType | None:
+    """Derive the Anthropic image ``media_type`` from a Telegram attachment's hints.
+
+    Precedence: an explicit ``mime_type`` (image documents carry one) wins; else the
+    ``file_name`` extension; else — for a compressed Telegram *photo*, which has neither —
+    default to ``image/jpeg`` (Telegram re-encodes photos to JPEG). Returns ``None`` for an
+    unsupported / unknown type so the caller refuses it rather than mislabeling the bytes
+    (which the model would reject). Pure (no I/O); case-insensitive on mime + extension.
+    """
+    if mime_type:
+        mapped = _MIME_TO_MEDIA_TYPE.get(mime_type.strip().casefold())
+        if mapped is not None:
+            return mapped
+        # An explicit non-image (or unsupported image) mime → refuse, never fall through to
+        # a JPEG default (an image document the model can't read must be rejected cleanly).
+        return None
+    if file_name and "." in file_name:
+        ext = "." + file_name.rsplit(".", 1)[1].strip().casefold()
+        mapped = _EXT_TO_MEDIA_TYPE.get(ext)
+        if mapped is not None:
+            return mapped
+    # A compressed photo has no mime/name — Telegram serves it as JPEG.
+    return "image/jpeg" if is_photo else None
 
 
 class TelegramClaudeBot:
@@ -1115,6 +1233,460 @@ class TelegramClaudeBot:
             reply_to_message_id=self._reply_to_id(update),
         )
 
+    async def on_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """P10 T1 — a photo / image-document → a native multimodal turn (SB1-gated).
+
+        **SB1 security boundary.** Registered with the ``allowed`` chat filter, AND this
+        explicit :meth:`_ok` recheck — a new inbound surface gets the same allowlist gate as
+        every other handler (defense in depth). A non-allowlisted chat never reaches the
+        download / engine.
+
+        Flow: take the LARGEST photo size (Telegram sends a size ladder) or the image
+        ``Document``, **size-cap** it (refuse > ``config.image_max_bytes`` with a clean
+        message — never download an oversized image into a turn), download the bytes,
+        base64-encode them, derive the ``media_type`` from the mime/extension (a compressed
+        photo with no hint → JPEG; an unsupported type is refused), and run the turn with the
+        caption as the prompt (a sensible default when there is no caption). The pixels thread
+        through ``_run_turn`` → ``handle_message`` → ``engine.send(images=…)``.
+
+        **SB3 — never log the image bytes / base64.** We log only a size summary ("received
+        an image (<N> KB)"); the base64 ``data`` is placed on the
+        :class:`~claude_tg.engine.ImageInput` (whose ``repr`` elides it) and never logged.
+        The pixels are operator-supplied (acceptable to forward to Claude). RB1: any
+        download/decode failure is caught and surfaced as a clean message, never a crash.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._maybe_welcome(update)
+        msg = update.message
+        # Resolve the attachment: prefer a photo (largest size = last in the ladder), else an
+        # image document. The registration filter guarantees one of these is present, but be
+        # defensive (RB1) — a message with neither is a clean no-op.
+        photo = msg.photo[-1] if msg.photo else None
+        document = msg.document if (msg.document is not None and not photo) else None
+        if photo is None and document is None:
+            return
+        is_photo = photo is not None
+        media_type = _media_type_for(
+            mime_type=getattr(document, "mime_type", None),
+            file_name=getattr(document, "file_name", None),
+            is_photo=is_photo,
+        )
+        if media_type is None:
+            # An image document of an unsupported type (or a non-image document that slipped
+            # past the filter) — refuse cleanly rather than mislabel the bytes (RB2/SB6).
+            await msg.reply_text(
+                "🖼️ I can only read JPEG, PNG, WebP, or GIF images. "
+                "Send the screenshot as a photo, or a supported image file."
+            )
+            return
+        # Size-cap BEFORE download (SB3/RB2): Telegram reports file_size on both PhotoSize and
+        # Document. A missing/odd size (defensive) falls through to download + a post-download
+        # cap so an over-cap image can never reach the engine either way.
+        cap = self.config.image_max_bytes
+        attachment = photo if is_photo else document
+        declared = getattr(attachment, "file_size", None)
+        if isinstance(declared, int) and declared > cap:
+            await msg.reply_text(
+                f"🖼️ That image is too large ({declared // 1024} KB) — "
+                f"the limit is {cap // 1024} KB. Send a smaller screenshot."
+            )
+            return
+        try:
+            tg_file = await attachment.get_file()
+            raw = await tg_file.download_as_bytearray()
+        except Exception:
+            # RB1: a transient download failure must never crash the handler — clean message.
+            log.debug("image download failed for chat %s", update.effective_chat.id, exc_info=True)
+            await msg.reply_text("⚠️ Couldn't download that image — please try sending it again.")
+            return
+        # Post-download cap (defense-in-depth: a missing declared size, or a server that
+        # under-reported it). Never thread an over-cap image into a turn (SB3/RB2).
+        if len(raw) > cap:
+            await msg.reply_text(
+                f"🖼️ That image is too large ({len(raw) // 1024} KB) — "
+                f"the limit is {cap // 1024} KB. Send a smaller screenshot."
+            )
+            return
+        # SB3: log a SIZE SUMMARY only — never the bytes / base64.
+        log.info("chat %s received an image (%d KB)", update.effective_chat.id, len(raw) // 1024)
+        data_b64 = base64.b64encode(bytes(raw)).decode("ascii")
+        image = ImageInput(data=data_b64, media_type=media_type)
+        # The caption is the prompt; a bare image gets a sensible default look-at-this prompt.
+        prompt = (msg.caption or "").strip() or DEFAULT_IMAGE_PROMPT
+        await self._run_turn(
+            update, ctx, update.effective_chat.id, prompt,
+            reply_to_message_id=self._reply_to_id(update),
+            images=[image],
+        )
+
+    async def on_document(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """P10 T3 — a NON-image ``Document`` → saved (path-confined) into the project (SB1/SB2).
+
+        **Registration boundary (no collision with T1's image-Document handler).** Registered
+        as ``MessageHandler(allowed & filters.Document.ALL & ~filters.Document.IMAGE, …)`` —
+        the EXACT complement of T1's ``filters.PHOTO | filters.Document.IMAGE``: an image
+        document (``image/*``) routes to :meth:`on_photo` (the multimodal path) and a
+        non-image document (a ``.py`` / ``.log`` / ``.pdf`` / ``.zip`` …) routes HERE. The two
+        document filters are disjoint, so neither steals the other's messages.
+
+        **SB1 security boundary.** The ``allowed`` chat filter on the registration AND this
+        explicit :meth:`_ok` recheck — same allowlist gate as every handler (defense in
+        depth). A non-allowlisted chat never reaches the download / disk write.
+
+        **Streaming-only.** Saving a file requires the active project's cwd (a per-project
+        streaming concept) + the "offer it to Claude" turn; one-shot mode has no per-project
+        cwd, so it replies a clean "needs streaming mode" message rather than dropping the
+        file silently.
+
+        Flow: **size-cap** (refuse > ``config.file_max_bytes`` BEFORE download — never pull an
+        oversized file onto disk), **sanitize** the Telegram ``file_name`` to a single inert
+        basename, **SB2-confine** the destination by resolving ``cwd / basename`` through
+        :func:`~claude_tg.paths.resolve_within_roots` (a ``../`` / absolute filename can never
+        escape the permitted roots — the SAME resolver ``/cd`` · ``/new`` use), download +
+        write the bytes atomically, then fire a normal turn ("I've added <file> …") so Claude
+        can Read it. **Never auto-executed.** RB1: any download/write failure → a clean message,
+        never a crash. SB3: only a size SUMMARY is logged — never the file bytes.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._maybe_welcome(update)
+        msg = update.message
+        document = msg.document
+        if document is None:  # RB1: the filter guarantees a document, but be defensive.
+            return
+        chat_id = update.effective_chat.id
+        # Streaming-only: the inbound save needs the active project's cwd. One-shot mode has
+        # no per-project cwd → a clean refusal (never silently drop the file).
+        if self.streaming is None:
+            await msg.reply_text(
+                "📎 Receiving a file needs streaming mode (ENGINE_MODE=streaming). "
+                "In one-shot mode I can't save attachments into a project yet."
+            )
+            return
+        # Size-cap BEFORE download (RB2): Telegram reports file_size on a Document. A
+        # missing/odd size (defensive) falls through to download + a post-download cap so an
+        # over-cap file can never land on disk either way.
+        cap = self.config.file_max_bytes
+        declared = getattr(document, "file_size", None)
+        if isinstance(declared, int) and declared > cap:
+            await msg.reply_text(
+                f"📎 That file is too large ({declared // 1024} KB) — "
+                f"the limit is {cap // 1024} KB."
+            )
+            return
+        # SB2: build the destination from the active project's cwd + a SANITIZED basename,
+        # then re-confine through resolve_within_roots. A ``../`` / absolute file_name is
+        # stripped to a basename above AND cannot escape the roots here (the authoritative
+        # boundary). allow_any_path=true is the explicit opt-out, identical to /cd · /new.
+        cwd = self.streaming.get_cwd(chat_id)
+        filename = _safe_filename(getattr(document, "file_name", None))
+        try:
+            dest = resolve_within_roots(
+                filename,
+                cwd=cwd,
+                allowed_roots=self.config.allowed_roots,
+                allow_any=self.config.allow_any_path,
+            )
+        except PathNotAllowed:
+            # An escaping name that survived sanitization (belt-and-braces) — refuse cleanly.
+            await msg.reply_text(
+                f"📎 Can't save that file — its name resolves outside the permitted "
+                f"roots: {code_path(filename)}",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            tg_file = await document.get_file()
+            raw = await tg_file.download_as_bytearray()
+        except Exception:
+            # RB1: a transient download failure must never crash the handler — clean message.
+            log.debug("file download failed for chat %s", chat_id, exc_info=True)
+            await msg.reply_text("⚠️ Couldn't download that file — please try sending it again.")
+            return
+        # Post-download cap (defense-in-depth: a missing/under-reported declared size). Never
+        # write an over-cap file to disk.
+        if len(raw) > cap:
+            await msg.reply_text(
+                f"📎 That file is too large ({len(raw) // 1024} KB) — "
+                f"the limit is {cap // 1024} KB."
+            )
+            return
+        try:
+            # Write atomically (random tmp + os.replace) so a partial download never leaves a
+            # truncated file in the project. The destination is the SB2-confined path.
+            #
+            # BUG B (Codex B1 — symlink-escape on save): we MUST NOT open a *predictable*-named
+            # temp like ``<dest.name>.part`` for write — an attacker could pre-place an in-root
+            # symlink of that exact name pointing OUT of the allowed roots, and open-for-write
+            # would FOLLOW it and clobber the out-of-root target (a confinement escape). Instead
+            # create a RANDOM temp name in the SAME (confined) parent dir via mkstemp — a random
+            # name cannot have been pre-placed as a symlink — write to its fd, then os.replace()
+            # it onto ``dest``. os.replace() swaps the directory entry: if ``dest`` itself is a
+            # symlink, replace overwrites the LINK (it does not write through it the way an
+            # open-for-write would). Both moves stay inside ``dest.parent`` (the confined dir).
+            fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=".tg-", suffix=".part")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(bytes(raw))
+                os.replace(tmp_name, dest)
+            except BaseException:
+                # Best-effort cleanup of the temp on any failure (it's a random in-root name,
+                # never a symlink) so a failed save can't leave a stray ``.tg-…part`` behind.
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            # RB1: a write failure (permissions / no space / the path is a directory) → a
+            # clean message, never a crash. SB3: no file content in the log.
+            log.debug("file save failed for chat %s", chat_id, exc_info=True)
+            await msg.reply_text(
+                f"⚠️ Couldn't save {code_path(filename)} into the project — check the bot logs.",
+                parse_mode="HTML",
+            )
+            return
+        # SB3: log a SIZE SUMMARY only (name + KB) — never the file bytes.
+        log.info("chat %s received a file %r (%d KB)", chat_id, dest.name, len(raw) // 1024)
+        # Offer it to Claude as a NORMAL turn (never auto-executed): the caption is the
+        # operator's instruction, with a sensible default. The path is wrapped in <code> so
+        # it renders inert (R6), but the turn text Claude receives is plain so it can Read it.
+        caption = (msg.caption or "").strip()
+        instruction = caption or "Read it and tell me what it is, or help me with it."
+        prompt = f"I've added the file {dest} to the project — {instruction}"
+        await self._run_turn(
+            update, ctx, chat_id, prompt,
+            reply_to_message_id=self._reply_to_id(update),
+        )
+
+    async def on_voice(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """P10 T2 — a voice note / audio → transcribe (pluggable) → run as a turn (SB1).
+
+        **SB1 security boundary.** Registered with the ``allowed`` chat filter AND this
+        explicit :meth:`_ok` recheck — a new inbound surface gets the same allowlist gate as
+        every other handler (defense in depth). A non-allowlisted chat never reaches the
+        download / transcriber.
+
+        **Pluggable + graceful-off.** Transcription is operator-provided infra, NOT a hard
+        dependency. When ``TRANSCRIBE_CMD`` is unset (the default), a voice note gets the clean
+        :data:`VOICE_SETUP_MESSAGE` ("…install a transcriber and set TRANSCRIBE_CMD…") — never
+        a crash (RB2). When it IS set, the bot:
+
+        1. downloads the Telegram voice ``.ogg``/opus (or audio) to a per-turn TEMP dir;
+        2. runs the configured transcriber over it (see :mod:`claude_tg.voice` for the
+           ``{audio}`` / ``{out}`` placeholder contract + injection-safety — the template is
+           split with ``shlex`` and run via ``create_subprocess_exec``, NEVER a shell);
+        3. **echoes the transcript back quoted** (``🎙️ "…"``) so the operator sees what was
+           heard;
+        4. fires the transcript as a NORMAL turn (the same ``_run_turn`` path a typed message
+           takes) against the active project.
+
+        **Streaming-only.** Running the transcript as a turn rides the streaming turn path; in
+        one-shot mode it replies a clean "needs streaming mode" notice (the message-as-turn
+        machinery + per-project session live there — mirrors :meth:`on_document`). The audio (+
+        any transcript ``.txt`` the transcriber writes) lives under a ``TemporaryDirectory`` and
+        is cleaned in a ``finally`` (RB1). **SB3:** only a size SUMMARY is logged — never the
+        audio bytes nor the raw transcript (the transcript echo to the chat is by design; the
+        logs stay body-free).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._maybe_welcome(update)
+        msg = update.message
+        chat_id = update.effective_chat.id
+        # The attachment is a Telegram Voice (opus .ogg) or an Audio (music/voice file). The
+        # registration filter guarantees one is present; be defensive (RB1) about neither.
+        attachment = msg.voice or msg.audio
+        if attachment is None:
+            return
+        # Graceful-off FIRST: with no transcriber configured we never download — just point the
+        # operator at the setup (RB2). Sent as PLAIN TEXT (no parse_mode): the copy names the
+        # literal env var TRANSCRIBE_CMD, whose underscore would open an unterminated Markdown
+        # italic span and make Telegram REJECT the whole send (BUG A — same class as the P9
+        # `/help $*` break, where the user then gets nothing). Plain text can't be misparsed.
+        if not (self.config.transcribe_cmd or "").strip():
+            await msg.reply_text(VOICE_SETUP_MESSAGE)
+            return
+        # Streaming-only: the transcript runs as a turn (a per-project streaming concept). In
+        # one-shot mode reply a clean notice rather than transcribing into nothing.
+        if self.streaming is None:
+            await msg.reply_text(
+                "🎙️ Voice notes need streaming mode (ENGINE_MODE=streaming) — the transcript "
+                "runs as a turn against a project. In one-shot mode, please type your message."
+            )
+            return
+        # Size-cap BEFORE download (Codex B3 / RB2): Telegram reports file_size on a Voice /
+        # Audio. A declared size over the cap is refused cleanly — never pull oversized audio
+        # into memory. A missing/odd size (defensive) falls through to the post-download cap
+        # below so an over-cap (or under-reported) file can never be transcribed either way.
+        cap = self.config.file_max_bytes
+        declared = getattr(attachment, "file_size", None)
+        if isinstance(declared, int) and declared > cap:
+            await msg.reply_text(
+                f"🎙️ That voice note is too large ({declared // 1024} KB) — "
+                f"the limit is {cap // 1024} KB."
+            )
+            return
+        # Download + transcribe under a per-turn temp dir, cleaned in finally (RB1). The audio
+        # path is a temp file the bot names (never operator-controlled), so the transcribe
+        # subprocess gets only a controlled path (SB3/injection-safety — see voice.py).
+        tmpdir = tempfile.mkdtemp(prefix="tg-voice-")
+        try:
+            audio_path = os.path.join(tmpdir, "audio.ogg")
+            try:
+                tg_file = await attachment.get_file()
+                raw = await tg_file.download_as_bytearray()
+            except Exception:
+                # RB1: a transient download failure must never crash the handler.
+                log.debug("voice download failed for chat %s", chat_id, exc_info=True)
+                await msg.reply_text(
+                    "⚠️ Couldn't download that voice note — please try sending it again."
+                )
+                return
+            # SB3: log a SIZE SUMMARY only — never the audio bytes.
+            log.info("chat %s received a voice note (%d KB)", chat_id, len(raw) // 1024)
+            # Post-download cap (Codex B3 / defense-in-depth): a missing/under-reported declared
+            # size means the pre-check above passed — re-check the ACTUAL bytes and never write /
+            # transcribe an over-cap file.
+            if len(raw) > cap:
+                await msg.reply_text(
+                    f"🎙️ That voice note is too large ({len(raw) // 1024} KB) — "
+                    f"the limit is {cap // 1024} KB."
+                )
+                return
+            try:
+                with open(audio_path, "wb") as fh:
+                    fh.write(bytes(raw))
+            except OSError:
+                log.debug("voice temp write failed for chat %s", chat_id, exc_info=True)
+                await msg.reply_text("⚠️ Couldn't process that voice note — check the bot logs.")
+                return
+            try:
+                transcript = await transcribe(
+                    template=self.config.transcribe_cmd,
+                    audio_path=audio_path,
+                    work_dir=tmpdir,
+                    timeout=self.config.transcribe_timeout_seconds,
+                )
+            except TranscriptionUnavailable:
+                # Defensive: the cmd was set at handler entry but normalizes to empty here —
+                # treat as graceful-off (RB2). (The entry guard above normally catches this.)
+                # Plain text, same as the entry-guard send — never Markdown (BUG A).
+                await msg.reply_text(VOICE_SETUP_MESSAGE)
+                return
+            except TranscriptionError as exc:
+                # A real transcriber failure — bot-authored, body-free message (SB3); the raw
+                # detail is already logged at DEBUG inside voice.transcribe. ``str(exc)`` is a
+                # fixed bot-authored summary (exit code / "timed out" / "empty"), never raw stderr.
+                log.debug("transcription failed for chat %s: %s", chat_id, exc)
+                await msg.reply_text(
+                    f"⚠️ Couldn't transcribe that voice note — {exc}. "
+                    "Check TRANSCRIBE_CMD and the bot logs, or type your message."
+                )
+                return
+        finally:
+            # RB1: always clean the temp dir (audio + any transcript .txt the transcriber wrote),
+            # even on an early return / exception. Best-effort — a cleanup failure never raises.
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        # Echo the transcript back QUOTED so the operator sees what was heard (R6: escape it so
+        # a stray </>& renders inert; the transcript is operator speech, not a command).
+        await msg.reply_text(
+            f'🎙️ "{html.escape(transcript, quote=False)}"', parse_mode="HTML"
+        )
+        # Fire the transcript as a NORMAL turn — the exact path a typed message takes.
+        await self._run_turn(
+            update, ctx, chat_id, transcript,
+            reply_to_message_id=self._reply_to_id(update),
+        )
+
+    async def cmd_get(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """P10 T3 — ``/get <path>`` uploads an in-root file back to the chat (SB1/SB2/RB2).
+
+        SB1: allowlist-gated (the ``_ok`` recheck). **Streaming-only:** ``<path>`` resolves
+        relative to the active project's cwd, a per-project streaming concept; one-shot mode
+        replies a clean notice. Order, fail-fast + secure:
+
+        1. ``_ok`` + streaming check + a usage message for a missing arg.
+        2. **SB2 confinement** — resolve ``<path>`` (relative to the active cwd, or absolute)
+           through :func:`~claude_tg.paths.resolve_within_roots`. An out-of-root target
+           (``../`` / absolute / a symlink that points outside) is REFUSED ("outside the
+           permitted roots") and nothing is read (the SAME resolver ``/cd`` · ``/new`` use).
+        3. Missing / not-a-regular-file → refuse cleanly (RB2).
+        4. **Size-cap** — a file over ``config.file_max_bytes`` is refused (never uploaded).
+        5. Else ``bot.send_document`` it to the chat. RB1: a send failure → a clean message.
+
+        The shown path is wrapped in ``<code>`` (P8/R6) so it renders inert. SB3: only a size
+        summary is logged — never the file bytes.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if self.streaming is None:
+            await update.message.reply_text(
+                "📎 /get applies to streaming mode only — it sends a file from the active "
+                "project, and one-shot mode has no per-project working directory."
+            )
+            return
+        chat_id = update.effective_chat.id
+        arg = " ".join(ctx.args).strip() if ctx.args else ""
+        if not arg:
+            await update.message.reply_text("Usage: /get <path>")
+            return
+        cwd = self.streaming.get_cwd(chat_id)
+        # SB2: canonicalize (resolves symlinks AND ..) and confine to ALLOWED_ROOTS. A path
+        # that escapes the permitted roots is refused here and never read/uploaded.
+        try:
+            target = resolve_within_roots(
+                arg,
+                cwd=cwd,
+                allowed_roots=self.config.allowed_roots,
+                allow_any=self.config.allow_any_path,
+            )
+        except PathNotAllowed:
+            await update.message.reply_text(
+                f"❌ Path not allowed (outside the permitted roots): {code_path(arg)}",
+                parse_mode="HTML",
+            )
+            return
+        # Must be an existing REGULAR file (not a directory / device / missing). RB2.
+        if not target.is_file():
+            await update.message.reply_text(
+                f"❌ No such file: {code_path(arg)}", parse_mode="HTML"
+            )
+            return
+        cap = self.config.file_max_bytes
+        try:
+            size = target.stat().st_size
+        except OSError:
+            await update.message.reply_text(
+                f"❌ Couldn't read {code_path(arg)}.", parse_mode="HTML"
+            )
+            return
+        if size > cap:
+            await update.message.reply_text(
+                f"❌ That file is too large to send ({size // 1024} KB) — "
+                f"the limit is {cap // 1024} KB."
+            )
+            return
+        # SB3: log a size SUMMARY only — never the file bytes.
+        log.info("chat %s requested /get %r (%d KB)", chat_id, target.name, size // 1024)
+        try:
+            # Codex NB: open the file inside a context manager so its descriptor is ALWAYS
+            # closed (no fd leak) — PTB reads InputFile's stream into the outgoing request
+            # before this await resolves, so closing on the way out is safe.
+            with open(target, "rb") as fh:
+                await ctx.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(fh, filename=target.name),
+                )
+        except Exception:
+            # RB1: a transient upload failure must never crash the handler — clean message.
+            log.debug("send_document failed for chat %s", chat_id, exc_info=True)
+            await update.message.reply_text(
+                f"⚠️ Couldn't send {code_path(target.name)} — please try again.",
+                parse_mode="HTML",
+            )
+
     async def on_skill_command(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward any *unregistered* slash-command verbatim to the active session (P3, D1).
 
@@ -1152,6 +1724,7 @@ class TelegramClaudeBot:
         *,
         reply_to_message_id: int | None = None,
         command_initiated: bool = False,
+        images: list[ImageInput] | None = None,
     ) -> None:
         """Run ``text`` as one turn for ``chat_id`` — the shared dispatch both the message
         handler and the skill-launch passthrough route through (one path, no duplication).
@@ -1164,12 +1737,33 @@ class TelegramClaudeBot:
         is likewise forwarded so the streaming session opens a FRESH turn instead of letting
         the expanded text satisfy a pending free-text hold; one-shot mode has no holds, so it
         ignores the flag and just runs the text.
+
+        **P10 T1 — ``images`` (multimodal).** When the operator sends a photo/image-document
+        the handler passes the decoded :class:`~claude_tg.engine.ImageInput` list here. It is
+        a STREAMING-only path (the SDK's ``--input-format stream-json`` is the proven
+        mechanism; oneshot multimodal is the deferred bigger lift), so in one-shot mode the
+        turn is refused with a clean "images need streaming mode" message rather than silently
+        dropping the pixels and running text-only. In streaming mode the images thread through
+        to ``handle_message`` → ``engine.send(images=…)``.
         """
         if self.streaming is not None:
             await self._on_message_streaming(
                 update, ctx, chat_id, text,
                 reply_to_message_id=reply_to_message_id,
                 command_initiated=command_initiated,
+                images=images,
+            )
+            return
+
+        # P10 T1 oneshot fallback (documented choice): the multimodal turn needs the SDK's
+        # streaming ``--input-format stream-json`` path, which one-shot mode does not run. The
+        # lower-risk behavior is a clean refusal (NOT silently running the caption text-only,
+        # which would hide that the image was ignored). The text/turn path is otherwise 100%
+        # unchanged for one-shot.
+        if images:
+            await update.message.reply_text(
+                "🖼️ Sending an image needs streaming mode (ENGINE_MODE=streaming). "
+                "In one-shot mode I can't see attached images yet."
             )
             return
 
@@ -1237,6 +1831,7 @@ class TelegramClaudeBot:
         *,
         reply_to_message_id: int | None = None,
         command_initiated: bool = False,
+        images: list[ImageInput] | None = None,
     ) -> None:
         """Drive the streaming engine for one message (delegates to StreamingSession).
 
@@ -1246,7 +1841,8 @@ class TelegramClaudeBot:
         reply the same "still working" notice as one-shot mode. SB4: the text is the
         engine's prompt, never interpolated into a shell command/argument.
         ``reply_to_message_id`` (D5) is forwarded so a reply to a free-text prompt routes
-        the answer to the project that owns that prompt.
+        the answer to the project that owns that prompt. **P10 T1:** ``images`` (the decoded
+        photo/screenshot) is forwarded so the turn is multimodal.
         """
         assert self.streaming is not None
         bot = ctx.bot
@@ -1278,10 +1874,16 @@ class TelegramClaudeBot:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
 
         try:
+            # P10 T1: pass ``images`` ONLY when present, so a pure TEXT turn calls
+            # handle_message with the EXACT pre-P10 signature — every existing FakeStreaming
+            # (whose handle_message has no ``images`` kwarg) keeps working verbatim. The image
+            # path supplies the kwarg to the real StreamingSession (which accepts it).
+            extra = {"images": images} if images else {}
             captured_free_text = await self.streaming.handle_message(
                 chat_id, text, send=send, edit=edit, delete=delete,
                 reply_to_message_id=reply_to_message_id,
                 command_initiated=command_initiated,
+                **extra,
             )
         except StreamingBusy:
             await update.message.reply_text(
@@ -1454,6 +2056,11 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("deep", self.cmd_deep, filters=allowed))
         app.add_handler(CommandHandler(["auto", "model"], self.cmd_auto, filters=allowed))
         app.add_handler(CommandHandler("pwd", self.cmd_pwd, filters=allowed))
+        # P10 T3: /get <path> uploads an in-root file back to the chat (streaming mode only;
+        # one-shot replies a notice). Same `allowed` chat filter (SB1) + registered BEFORE
+        # the on_skill_command COMMAND passthrough so first-match-wins consumes it here
+        # rather than forwarding /get to the session as a skill.
+        app.add_handler(CommandHandler("get", self.cmd_get, filters=allowed))
         app.add_handler(CommandHandler("cd", self.cmd_cd, filters=allowed))
         # P4 multi-project navigation (streaming mode only; the handlers reply a
         # streaming-only notice in one-shot). Registered as specific CommandHandlers with
@@ -1479,6 +2086,39 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("macros", self.cmd_macros, filters=allowed))
         app.add_handler(CommandHandler("unsave", self.cmd_unsave, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))
+        # P10 T1 (multimodal): a photo OR an image-document → on_photo (a native multimodal
+        # turn). SB1: the SAME `allowed` chat filter as every other handler (the `_ok` recheck
+        # inside on_photo is defense in depth). filters.Document.IMAGE matches image/* sent as
+        # an uncompressed file (so a PNG screenshot keeps full fidelity); filters.PHOTO matches
+        # Telegram's compressed photo. Registered BEFORE the COMMAND passthrough; neither
+        # overlaps a TEXT/COMMAND message, so handler ordering is unaffected.
+        app.add_handler(
+            MessageHandler(allowed & (filters.PHOTO | filters.Document.IMAGE), self.on_photo)
+        )
+        # P10 T3 (file receive): a NON-image Document → on_document (saved, path-confined, into
+        # the active project's cwd). SB1: the SAME `allowed` chat filter as every other handler
+        # (the `_ok` recheck inside on_document is defense in depth). The filter is the EXACT
+        # COMPLEMENT of on_photo's image-document filter — ``filters.Document.ALL &
+        # ~filters.Document.IMAGE`` — so an image document still routes to on_photo (T1's
+        # multimodal path) and only a non-image document (.py/.log/.pdf/.zip …) reaches here.
+        # The two are disjoint; neither steals the other's messages. Registered BEFORE the
+        # COMMAND passthrough; a Document message is neither TEXT nor COMMAND, so handler
+        # ordering is unaffected.
+        app.add_handler(
+            MessageHandler(
+                allowed & filters.Document.ALL & ~filters.Document.IMAGE, self.on_document
+            )
+        )
+        # P10 T2 (voice): a voice note OR an audio file → on_voice (transcribe → run as a turn).
+        # SB1: the SAME `allowed` chat filter as every other handler (the `_ok` recheck inside
+        # on_voice is defense in depth). filters.VOICE matches Telegram's opus voice note;
+        # filters.AUDIO matches an audio file. Neither overlaps PHOTO/Document/TEXT/COMMAND, so
+        # it never collides with the photo/document handlers above or the skill passthrough
+        # below. Voice is pluggable + graceful-off: with no TRANSCRIBE_CMD configured the
+        # handler replies a clean setup message (not a command — no COMMAND_MENU change).
+        app.add_handler(
+            MessageHandler(allowed & (filters.VOICE | filters.AUDIO), self.on_voice)
+        )
         # P3 skill-launch passthrough (D1): forward any *unregistered* slash-command verbatim
         # to the session. Registered AFTER the specific CommandHandlers above so PTB's
         # first-match-wins routing lets a real bot command (/reset, /cd, …) be consumed by

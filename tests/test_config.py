@@ -3,12 +3,14 @@ import os
 import pytest
 
 from claude_tg.config import (
+    DEFAULT_FILE_MAX_BYTES,
     DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS,
     Config,
     load_dotenv,
     parse_allowed_roots,
     parse_chat_ids,
     parse_chat_send_interval_seconds,
+    parse_file_max_bytes,
     parse_max_concurrent_runs,
     parse_stream_message_timeout_seconds,
 )
@@ -35,6 +37,10 @@ def clean_env(monkeypatch):
     # host/CI value can't leak into the model-default assertions below.
     monkeypatch.delenv("FAST_MODEL", raising=False)
     monkeypatch.delenv("DEEP_MODEL", raising=False)
+    # IMAGE_MAX_BYTES (P10/T1) / FILE_MAX_BYTES (P10/T3) have no TELEGRAM_/CLAUDE_ prefix —
+    # clear them so a host/CI value can't leak into the cap-default assertions below.
+    monkeypatch.delenv("IMAGE_MAX_BYTES", raising=False)
+    monkeypatch.delenv("FILE_MAX_BYTES", raising=False)
 
 
 def test_parse_chat_ids():
@@ -417,3 +423,47 @@ def test_fast_deep_model_empty_override_falls_back_to_default(monkeypatch):
     cfg = Config.from_env(dotenv_path=None)
     assert cfg.fast_model == DEFAULT_FAST_MODEL
     assert cfg.deep_model == DEFAULT_DEEP_MODEL
+
+
+# ---------------------------------------------------------------------------
+# P10 T3 — FILE_MAX_BYTES parsing/validation (file send/receive cap)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_file_max_bytes_default_and_values():
+    assert parse_file_max_bytes(None) == DEFAULT_FILE_MAX_BYTES
+    assert parse_file_max_bytes("") == DEFAULT_FILE_MAX_BYTES
+    assert parse_file_max_bytes("   ") == DEFAULT_FILE_MAX_BYTES
+    assert parse_file_max_bytes("1048576") == 1048576
+    assert parse_file_max_bytes(" 2048 ") == 2048  # whitespace tolerated
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "x", "1.5"])
+def test_parse_file_max_bytes_rejects_bad(bad):
+    # 0/negative would reject every file; non-integer is a typo — both fail loud (not
+    # silently disable file transfer).
+    with pytest.raises(ValueError):
+        parse_file_max_bytes(bad)
+
+
+def test_config_default_file_max_bytes(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.file_max_bytes == DEFAULT_FILE_MAX_BYTES
+
+
+def test_config_file_max_bytes_override(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("FILE_MAX_BYTES", "1048576")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.file_max_bytes == 1048576
+
+
+def test_config_bad_file_max_bytes_fails_loud(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("FILE_MAX_BYTES", "0")
+    with pytest.raises(ValueError):
+        Config.from_env(dotenv_path=None)

@@ -29,10 +29,11 @@ from typing import (
     Callable,
     Optional,
     Protocol,
+    Sequence,
     runtime_checkable,
 )
 
-from .types import Event, SubstrateDecision
+from .types import Event, ImageInput, SubstrateDecision
 
 #: The permission/decision seam. The engine supplies this; the adapter calls it
 #: when the substrate asks to use a tool (or raises an interactive AskUserQuestion /
@@ -78,13 +79,26 @@ class Substrate(Protocol):
         """
         ...
 
-    def send(self, prompt: str, *, timeout: float = 120.0) -> AsyncIterator[Event]:
+    def send(
+        self,
+        prompt: str,
+        *,
+        timeout: float = 120.0,
+        images: Optional[Sequence[ImageInput]] = None,
+    ) -> AsyncIterator[Event]:
         """Send one operator turn; async-yield **normalized events** out.
 
         Returns an async iterator (so the engine can ``async for`` it). Iteration
         ends after the turn's terminal result event. The turn is **bounded** by
         ``timeout`` — on timeout/failure the adapter yields a ``driver_error``
         :class:`~claude_tg.engine.types.ErrorEvent` and stops, never hanging (RB2).
+
+        **P10 T1 — optional ``images``.** Defaults to ``None`` → the pure text turn
+        (every pre-P10 caller is unchanged). When one or more
+        :class:`~claude_tg.engine.types.ImageInput` are supplied, the adapter sends the
+        prompt + pixels as a multimodal turn (the SDK adapter streams a ``user`` message
+        whose ``content`` is ``[text, image…]``). The seam shape only GROWS an optional
+        keyword, so a fake substrate that ignores it still satisfies the Protocol.
         """
         ...
 
@@ -142,7 +156,11 @@ class SubstrateBAdapter:
         raise NotImplementedError
 
     def send(  # pragma: no cover - slot
-        self, prompt: str, *, timeout: float = 120.0
+        self,
+        prompt: str,
+        *,
+        timeout: float = 120.0,
+        images: Optional[Sequence[ImageInput]] = None,
     ) -> AsyncIterator[Event]:
         raise NotImplementedError
 

@@ -32,6 +32,8 @@ from .types import (
     ErrorEvent,
     Event,
     FreeTextReply,
+    ImageInput,
+    ImageMediaType,
     PermissionDecision,
     PermissionEvent,
     PermissionVerdict,
@@ -76,4 +78,7 @@ __all__ = [
     "DENIED_MESSAGE",
     "SubstrateDecision",
     "decision_to_substrate",
+    # multimodal input (P10 T1)
+    "ImageInput",
+    "ImageMediaType",
 ]

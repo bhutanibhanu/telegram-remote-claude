@@ -51,7 +51,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional, Sequence
 
 from ..permissions import PermissionPolicy, path_needs_approval
 from ..util import _redact_sid
@@ -62,6 +62,7 @@ from .types import (
     AskEvent,
     Decision,
     Event,
+    ImageInput,
     PermissionDecision,
     PermissionEvent,
     PermissionVerdict,
@@ -378,8 +379,19 @@ class Engine:
         # SB3/H1: redacted tag only (the raw id is a credential — see _redact_sid).
         log.debug("engine resumed %s", _redact_sid(self.session_id))
 
-    async def send(self, prompt: str, *, timeout: Optional[float] = None) -> AsyncIterator[Event]:
+    async def send(
+        self,
+        prompt: str,
+        *,
+        timeout: Optional[float] = None,
+        images: Optional[Sequence[ImageInput]] = None,
+    ) -> AsyncIterator[Event]:
         """Send one operator turn; async-yield normalized events out.
+
+        **P10 T1 — optional ``images``.** Defaults to ``None`` (the unchanged text turn);
+        when supplied it is threaded straight through to the substrate's ``send`` so the
+        turn is multimodal (prompt + pixels). The merge/inject/decision machinery below is
+        identical for both — only the substrate's ``query`` argument differs.
 
         Merges TWO sources onto one stream so the operator sees everything in order and
         nothing deadlocks:
@@ -399,7 +411,7 @@ class Engine:
         queue: asyncio.Queue[Any] = asyncio.Queue()
         self._out_queue = queue
         producer = asyncio.create_task(
-            self._drain_substrate(prompt, timeout or self._send_timeout, queue),
+            self._drain_substrate(prompt, timeout or self._send_timeout, queue, images=images),
             name="substrate-drain",
         )
         try:
@@ -424,9 +436,18 @@ class Engine:
             self._out_queue = None
 
     async def _drain_substrate(
-        self, prompt: str, timeout: float, queue: "asyncio.Queue[Any]"
+        self,
+        prompt: str,
+        timeout: float,
+        queue: "asyncio.Queue[Any]",
+        *,
+        images: Optional[Sequence[ImageInput]] = None,
     ) -> None:
         """Producer: push every substrate event onto ``queue``, then the sentinel.
+
+        **P10 T1:** ``images`` (default ``None`` → text turn) is threaded straight to the
+        substrate's ``send`` so a multimodal turn streams the prompt + pixels; everything
+        else (the ask/plan dedup below, the sentinel) is unchanged.
 
         The substrate's ``send`` is already bounded + fail-clean (RB2): a timeout or
         driver error is yielded as a ``driver_error`` event, not raised, so this loop
@@ -455,8 +476,16 @@ class Engine:
         hand-added settings allow-rule for ``AskUserQuestion``/``ExitPlanMode`` is the only
         way to break this invariant.)
         """
+        # P10 T1: thread ``images`` to the substrate ONLY when present, so the pure TEXT
+        # turn calls ``send(prompt, timeout=…)`` with the EXACT pre-P10 signature — every
+        # existing substrate (incl. the test fakes whose ``send`` has no ``images`` kwarg)
+        # is unchanged. The optional kwarg is added to the Protocol for the image path; a
+        # text turn never exercises it, so an old-shape fake keeps working verbatim.
+        send_kwargs: dict[str, Any] = {"timeout": timeout}
+        if images:
+            send_kwargs["images"] = images
         try:
-            async for event in self._substrate.send(prompt, timeout=timeout):
+            async for event in self._substrate.send(prompt, **send_kwargs):
                 if isinstance(event, (AskEvent, PlanEvent)):
                     # Drop: the engine injects the authoritative, pending-synced copy.
                     log.debug(
