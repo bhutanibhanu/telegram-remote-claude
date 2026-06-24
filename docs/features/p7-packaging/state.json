@@ -1,0 +1,8 @@
+{
+  "slug": "p7-packaging",
+  "phase": "approved",
+  "branch": "feat/p7-packaging",
+  "worktree": "/Users/ray/dev/claude-telegram-bot-p7",
+  "updated": "2026-06-24T01:30:00Z",
+  "note": "All Codex QA findings closed (B1/NB confirmed re-QA#2; B2 matcher fixed + independently harness-verified — re-QA#3 stalled on API). Live-verified through the new entry. Merging."
+}

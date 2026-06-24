@@ -7,3 +7,7 @@ __pycache__/
 .DS_Store
 .pytest_cache/
 .claude_tg_sessions.json
+# Python packaging build artifacts (P7: `pip install .` drops these locally)
+build/
+dist/
+*.egg-info/

@@ -1,26 +1,39 @@
 import asyncio
 import logging
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import main
+from claude_tg import app as app_mod
+from claude_tg import cli as cli_mod
+
+# B1 (cwd-shadow fix): the bot startup logic moved out of the root `main` module and into
+# `claude_tg.app` (driven by `claude_tg.cli.main`). These tests now patch `claude_tg.app.*`
+# and drive `claude_tg.cli.main` directly. Coverage is preserved verbatim — the loud
+# allow-all WARNING, the event-loop/polling install, and the gated-default-stays-INFO
+# assertions — plus a new shadow-proof test (see test_entry_is_not_cwd_shadowed).
 
 
 def _run_main_with_config(monkeypatch, config):
-    """Drive ``main.main()`` with a stub config + fully-mocked PTB app/bot, returning
-    the mock app. Shared by the polling + SB5 startup-surface tests."""
+    """Drive ``claude_tg.cli.main()`` with a stub config + fully-mocked PTB app/bot,
+    returning the mock app. Shared by the polling + SB5 startup-surface tests."""
     app = Mock()
 
     def run_polling(**kwargs):
         assert asyncio.get_event_loop() is not None
 
     app.run_polling.side_effect = run_polling
-    monkeypatch.setattr(main.Config, "from_env", lambda: config)
-    monkeypatch.setattr(main, "ClaudeRunner", Mock())
+    monkeypatch.setattr(app_mod.Config, "from_env", lambda: config)
+    monkeypatch.setattr(app_mod, "ClaudeRunner", Mock())
     bot = Mock()
     bot.build_application.return_value = app
-    monkeypatch.setattr(main, "TelegramClaudeBot", Mock(return_value=bot))
-    main.main()
+    monkeypatch.setattr(app_mod, "TelegramClaudeBot", Mock(return_value=bot))
+    # Drive the REAL console entry (no args => start the bot, not the --version short
+    # circuit). Exercises cli.main -> app.run end to end.
+    cli_mod.main([])
     return app
 
 
@@ -93,3 +106,56 @@ def test_main_gated_default_stays_info_no_warning(monkeypatch, caplog):
         r.getMessage() for r in caplog.records if r.levelno == logging.INFO
     ).lower()
     assert "starting" in info_blob
+
+
+def test_root_main_shim_delegates_to_package(monkeypatch):
+    """B1: root ``main.py`` is a thin shim — ``main.main`` IS ``claude_tg.cli.main`` (the
+    dependency points package-ward now, not the other way). Guards against the shim
+    re-growing its own startup logic (which would reintroduce the cwd-shadow footgun)."""
+    import main as root_main
+
+    assert root_main.main is cli_mod.main
+
+
+def test_entry_is_not_cwd_shadowed(tmp_path, monkeypatch):
+    """B1 RED→GREEN: ``python -m claude_tg --version`` must print the SHIPPED version even
+    when the CWD contains an unrelated ``main.py``.
+
+    The package import path (``claude_tg.cli`` -> ``claude_tg.app``) is fully self-contained,
+    so a decoy ``main.py`` in ``sys.path[0]`` (the CWD) can't shadow the entry. This is RED
+    on the pre-B1 code (``cli.py`` did ``from main import main``, which resolves the decoy
+    because the CWD precedes site-packages on ``sys.path``) and GREEN after.
+
+    Run in a child interpreter from inside the decoy dir so ``sys.path[0]`` is that dir,
+    faithfully reproducing the installed-tool scenario (package on the path, decoy in CWD).
+    """
+    decoy = tmp_path / "main.py"
+    decoy.write_text(
+        textwrap.dedent(
+            """\
+            # Unrelated decoy main.py. If the entry is cwd-shadowed this is imported
+            # instead of the shipped startup; its sentinel version would then print.
+            __version__ = "DECOY-SHADOWED-9.9.9"
+
+            def main(argv=None):
+                print(f"claude-telegram-bot {__version__}")
+            """
+        )
+    )
+    repo_root = Path(__file__).resolve().parent.parent
+    env = {
+        **__import__("os").environ,
+        # Put the package on the path WITHOUT relying on the CWD (mirrors site-packages).
+        "PYTHONPATH": str(repo_root),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "claude_tg", "--version"],
+        cwd=str(decoy.parent),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"stderr: {proc.stderr}"
+    out = proc.stdout.strip()
+    assert out == "claude-telegram-bot 0.1.0", f"shadowed? got {out!r} (stderr: {proc.stderr})"
+    assert "DECOY" not in out

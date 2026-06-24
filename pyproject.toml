@@ -1,11 +1,80 @@
-# Project tooling config (lint + type-check). This file configures dev tooling
-# ONLY — it is NOT a packaging manifest and does not change runtime behavior or
-# runtime dependencies (those stay in requirements.txt). Introduced in P1/T3
-# alongside CI so pushes/PRs are gated on tests + lint + type-check + secret-scan.
+# Project manifest + tooling config. Two concerns live here:
+#   1. PACKAGING ([build-system] / [project] / [tool.setuptools]) — added in P7/T1 so
+#      the repo is cleanly `pip install .` / `pip install -e .`-able and ships a
+#      `claude-telegram-bot` console command. Runtime deps are declared in
+#      [project.dependencies] as the SINGLE SOURCE OF TRUTH; requirements.txt /
+#      requirements-dev.txt now install this project (`-e .` / `-e ".[dev]"`) so the
+#      existing venv + CI gate flow keeps working with no version drift.
+#   2. TOOLING ([tool.ruff] / [tool.mypy]) — lint + type-check config (P1/T3) so
+#      pushes/PRs are gated on tests + lint + type-check + secret-scan.
 #
-# BASELINE INTENT: deliberately LENIENT so it is GREEN on the current codebase
-# without retrofitting. Each "tighten later" note marks where we'd raise the bar
-# once the team opts in. Do not treat the current leniency as the target state.
+# BASELINE INTENT (tooling): deliberately LENIENT so it is GREEN on the current
+# codebase without retrofitting. Each "tighten later" note marks where we'd raise the
+# bar once the team opts in. Do not treat the current leniency as the target state.
+
+[build-system]
+# PEP 517/518 build backend. setuptools + wheel is the minimal, ubiquitous choice and
+# keeps the existing flat repo layout (no src/ move). Pinned to floors that support the
+# [project] table + the packages.find / py-modules directives used below.
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-telegram-bot"
+# Mirrors claude_tg.__init__.__version__ (kept in sync by hand; single human-facing
+# version). Bump both together.
+version = "0.1.0"
+description = "Control Claude Code on your Mac from your phone via Telegram."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Ray" }]
+keywords = ["claude", "telegram", "bot", "claude-code", "anthropic"]
+# SINGLE SOURCE OF TRUTH for runtime deps — mirrors what requirements.txt pinned
+# (python-telegram-bot 21.x, claude-agent-sdk 0.2.105). requirements.txt now just
+# installs this project (`-e .`) so the two cannot drift. See requirements.txt for the
+# rationale behind the exact claude-agent-sdk pin (ADR-001: pin + monitor).
+dependencies = [
+    "python-telegram-bot>=21,<22",
+    "claude-agent-sdk==0.2.105",
+]
+
+[project.optional-dependencies]
+# Dev/CI toolchain (the gate set): test runner + lint + type-check. Mirrors what
+# requirements-dev.txt layered on top of the runtime deps. `pip install -e ".[dev]"`
+# is equivalent to `pip install -r requirements-dev.txt`.
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.15,<1.0",
+    "mypy>=1.11,<2.0",
+]
+
+[project.scripts]
+# Console entry point: `claude-telegram-bot` starts the bot. The entry lives in
+# claude_tg/cli.py:main (startup logic in claude_tg/app.py), so the installed command,
+# `python -m claude_tg`, and `python main.py` are identical — and self-contained (no
+# top-level `main` module to be cwd-shadowed; see B1 in docs/features/p7-packaging/qa.md).
+claude-telegram-bot = "claude_tg.cli:main"
+
+[tool.setuptools]
+# B1 (cwd-shadow fix): explicitly ship NO top-level modules. The package is fully
+# self-contained — the entry is claude_tg.cli:main (startup in claude_tg/app.py). Root
+# main.py is just a thin shim (`from claude_tg.cli import main`) for the `python main.py`
+# flow; it is intentionally NOT installed. An empty `py-modules` also SUPPRESSES
+# setuptools flat-layout auto-discovery, which would otherwise sweep main.py into the
+# wheel as a top-level `main` module — and a shipped top-level `main` is exactly what an
+# unrelated ./main.py in the user's CWD can shadow (CWD precedes site-packages on
+# sys.path). Was previously `py-modules = ["main"]`; removed in B1.
+py-modules = []
+
+[tool.setuptools.packages.find]
+# Deterministic discovery: ONLY the runtime package (+ its sub-packages, e.g.
+# claude_tg.engine). Without this, setuptools flat-layout auto-discovery aborts with
+# "Multiple top-level packages discovered" because tests/, docs/, scripts/ and spikes/
+# also sit at the repo root. Excludes are belt-and-suspenders given the include filter.
+include = ["claude_tg*"]
+exclude = ["tests*", "docs*", "scripts*", "spikes*"]
 
 [tool.ruff]
 # Match the CI baseline interpreter.
