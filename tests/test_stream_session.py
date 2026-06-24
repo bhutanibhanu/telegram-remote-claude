@@ -4094,6 +4094,114 @@ async def test_foreground_permission_hold_renders_inline_no_ping(tmp_path):
     await turn
 
 
+# ---------------------------------------------------------------------------
+# T2 (P8) — path-like values in the tool-status line + permission body render as
+# <code> on the LIVE send path (parse_mode="HTML"); hostile input never breaks the
+# send. The pure-render proofs live in test_render.py; these assert the transport.
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_use_status_line_is_sent_html_with_code_path(tmp_path):
+    # T2/R6: the "▶️ Tool(file_path=…)" status line is sent with parse_mode="HTML" and the
+    # path inside <code>…</code> so Telegram renders it as inert monospace, NOT tappable
+    # "/segment" fake-links. (Frozen clock → the leading-edge status fires immediately.)
+    engine = FakeEngine(
+        [
+            ToolUseEvent(
+                tool_name="Write",
+                tool_input_summary="Write(file_path=/tmp/p5verify/a, content=<7 chars>)",
+            ),
+            ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok"),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    status = next(s for s in rec.sends if "▶️" in s["text"])
+    assert status["parse_mode"] == "HTML"  # sent as HTML (or the <code> tags would show)
+    assert "<code>" in status["text"] and "</code>" in status["text"]
+    assert "/tmp/p5verify/a" in status["text"]
+    # The path appears ONLY inside the code span (the bare form is what linkifies).
+    inner = status["text"][
+        status["text"].index("<code>") + len("<code>") : status["text"].index("</code>")
+    ]
+    outside = status["text"].replace(f"<code>{inner}</code>", "")
+    assert "/tmp/p5verify/a" not in outside
+    # The "<7 chars>" body marker is escaped → the HTML message is valid (it would otherwise
+    # be a broken tag and Telegram would reject the whole status send).
+    assert "&lt;7 chars&gt;" in status["text"]
+
+
+async def test_foreground_permission_body_is_sent_html_code_path_buttons_intact(tmp_path):
+    # T2/R6: the "🔐 Permission needed …" prompt (the operator's approve/deny surface) is
+    # sent with parse_mode="HTML", its summary inside <code> (monospace path), and the three
+    # verdict buttons still attached and routable.
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="alpha")
+    perm = PermissionEvent(
+        tool_name="Bash",
+        tool_input_summary="Bash(command=ls /tmp/p5verify/a)",
+        tool_use_id="a-perm", session_id="alpha-sid",
+    )
+    eng_alpha._script = [perm, HOLD, ResultEvent(session_id="alpha-sid", is_error=False, subtype="success")]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rec = Recorder()
+    turn = asyncio.create_task(_drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if any("🔐 Permission needed" in s["text"] for s in rec.sends):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("permission prompt was never rendered inline")
+    prompt = next(s for s in rec.sends if "🔐 Permission needed" in s["text"])
+    assert prompt["parse_mode"] == "HTML"
+    assert "<code>" in prompt["text"] and "</code>" in prompt["text"]
+    assert "/tmp/p5verify/a" in prompt["text"]
+    # The keyboard rode the prompt and the tap still routes to alpha's held request.
+    assert prompt["reply_markup"] is not None
+    session.resolve_callback(1, encode_callback("m", "a-perm", payload="o"))
+    await turn
+    assert eng_alpha.resolve_calls == [("a-perm", PermissionDecision(verdict="allow_once"))]
+
+
+async def test_permission_body_hostile_input_sends_and_falls_back_plain(tmp_path):
+    # SECURITY (load-bearing): a misaligned/prompt-injected Claude could put HTML
+    # metacharacters in the tool input. The prompt MUST still reach the operator. Two
+    # guarantees on the live send path:
+    #  1. the HTML body is VALID (escaped) so a normal Recorder sends it fine;
+    #  2. EVEN IF Telegram rejected the HTML (fail_html Recorder), the parallel PLAIN body is
+    #     resent (parse_mode=None) — the prompt is never dropped (a dropped approve/deny
+    #     prompt is a worse bug than plain text).
+    hostile = "Bash(command=</code><b>pwn</b> && rm -rf /tmp/p5verify, file_path=/a&b)"
+    session, _store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="alpha")
+    perm = PermissionEvent(
+        tool_name="Bash", tool_input_summary=hostile, tool_use_id="a-perm", session_id="alpha-sid",
+    )
+    eng_alpha._script = [perm, HOLD, ResultEvent(session_id="alpha-sid", is_error=False, subtype="success")]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    # fail_html → the HTML send raises (as Telegram would on a bad entity), exercising the fallback.
+    rec = Recorder(fail_html=True)
+    turn = asyncio.create_task(_drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit))
+    for _ in range(500):
+        if any("🔐 Permission needed" in s["text"] and s["parse_mode"] is None for s in rec.sends):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("permission prompt (plain fallback) never sent")
+    # The HTML attempt was made first (escaped — no live injected tag), then a PLAIN resend.
+    html_try = next(s for s in rec.sends if "🔐 Permission needed" in s["text"] and s["parse_mode"] == "HTML")
+    assert "<b>pwn</b>" not in html_try["text"]  # injected tag is inert (escaped)
+    assert "&lt;b&gt;pwn&lt;/b&gt;" in html_try["text"]
+    plain = next(s for s in rec.sends if "🔐 Permission needed" in s["text"] and s["parse_mode"] is None)
+    # The plain fallback is the RAW summary (no <code> wrapper) — what the bot showed pre-R6.
+    assert "<code>" not in plain["text"]
+    assert hostile in plain["text"]
+    assert plain["reply_markup"] is not None  # the keyboard still rides the fallback
+    session.resolve_callback(1, encode_callback("m", "a-perm", payload="o"))
+    await turn
+
+
 async def test_background_ask_pings_then_sends_question_keyboards(tmp_path):
     # A BACKGROUND ask → a "🔔 alpha — asks a question" ping + each question's option
     # keyboard (so a multi-question ask stays answerable while backgrounded), and NO inline

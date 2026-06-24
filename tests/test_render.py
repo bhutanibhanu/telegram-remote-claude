@@ -58,6 +58,7 @@ from claude_tg.render import (
     plan_keyboard,
     project_status_label,
     render_event,
+    tool_use_line,
     yolo_banner,
     yolo_indicator,
 )
@@ -171,14 +172,16 @@ def test_permission_buttons_round_trip_to_once_session_deny():
 def test_permission_render_is_body_free_sb3():
     # SB3: the summary is already lengths-not-bodies; render.py must NOT expand it.
     # A Write whose 600-char content collapsed to "content=<600 chars>" must show that
-    # marker and NOT the raw 600-char body.
+    # marker and NOT the raw 600-char body. T2 now <code>-wraps + HTML-escapes the summary,
+    # so the marker renders as the ESCAPED "content=&lt;600 chars&gt;" — still the count, never
+    # the body (wrapping is a rendering change, not a disclosure change).
     raw_body = "S3CR3T-" + "x" * 593  # 600 chars of "content" the operator must not see
     assert len(raw_body) == 600
     summary = "Write(file_path=/tmp/secret.txt, content=<600 chars>)"
     action = render_event(
         make_permission(tool_name="Write", tool_input_summary=summary)
     )
-    assert "content=<600 chars>" in action.text  # the safe marker is present
+    assert "content=&lt;600 chars&gt;" in action.text  # the safe marker (escaped) is present
     assert raw_body not in action.text  # the raw body is absent (SB3)
     assert "S3CR3T" not in action.text
 
@@ -733,6 +736,160 @@ def test_code_path_is_pure_and_accepts_non_str():
 
 
 # ============================================================================
+# T2 — path-like values in the tool-use status line + permission-prompt body
+# render as <code> (stop Telegram /segment auto-linkify); injection-proof escaping
+# ============================================================================
+#
+# Telegram auto-linkifies each "/segment" of a bare path in a bot message as a fake
+# command-link. P6/R6 fixed the command replies (code_path, bot.py); T2 fixes the two
+# remaining surfaces: the "▶️ Tool(file_path=/a/b)" status line and the
+# "🔐 Permission needed …" prompt body. Both now carry the SB3-safe summary inside
+# <code>…</code> and are sent with parse_mode="HTML". The tool input is
+# attacker-influenceable, so EVERYTHING interpolated MUST be html.escaped — a hostile
+# field renders as inert text, never markup, and never breaks the HTML message.
+
+# Telegram's allowed HTML tags (subset we ever emit here). Used to assert validity:
+# after dropping these tags, NO bare "<" / ">" may remain (else Telegram rejects the
+# send) — i.e. every metacharacter from the (attacker-influenceable) tool input is
+# escaped and only OUR wrapper tags are live markup.
+_TG_TAGS = ("<code>", "</code>", "<b>", "</b>", "<i>", "</i>", "<pre>", "</pre>")
+
+
+def _strip_known_tags(s: str) -> str:
+    for t in _TG_TAGS:
+        s = s.replace(t, "")
+    return s
+
+
+def _assert_valid_telegram_html(s: str) -> None:
+    """No bare angle brackets survive once our wrapper tags are removed (valid HTML)."""
+    bare = _strip_known_tags(s)
+    assert "<" not in bare and ">" not in bare, f"un-escaped angle bracket in: {s!r}"
+    # <code> wrappers are balanced (every open has a close).
+    assert s.count("<code>") == s.count("</code>")
+
+
+def test_tool_use_line_wraps_path_in_code_not_bare_segments():
+    # A Read/Write/Bash status line shows the path inside <code>…</code> so Telegram
+    # renders it as inert monospace, NOT a row of tappable "/segment" fake commands.
+    ev = ToolUseEvent(
+        tool_name="Write", tool_input_summary="Write(file_path=/tmp/p5verify/a, content=<500 chars>)"
+    )
+    line = tool_use_line(ev)
+    # The path is inside a <code> wrapper (monospace), not bare.
+    assert "<code>" in line and "</code>" in line
+    assert "/tmp/p5verify/a" in line
+    # The path is NOT present OUTSIDE the <code> span (a bare path is what linkifies). Drop
+    # the whole code span and confirm the path no longer appears.
+    inner = line[line.index("<code>") + len("<code>") : line.index("</code>")]
+    assert "/tmp/p5verify/a" in inner
+    outside = line.replace(f"<code>{inner}</code>", "")
+    assert "/tmp/p5verify/a" not in outside
+    # The "<500 chars>" body marker is escaped (it would break the HTML message otherwise).
+    assert "&lt;500 chars&gt;" in line
+    assert "<500 chars>" not in line
+    _assert_valid_telegram_html(line)
+
+
+def test_tool_use_line_render_event_is_html_status():
+    # render_event tags the tool-use status action parse_mode="HTML" so T7 sends the
+    # <code> wrapper as real markup (without it the literal tags would show).
+    ev = ToolUseEvent(tool_name="Read", tool_input_summary="Read(file_path=/a/b/c.py)")
+    action = render_event(ev)
+    assert action.op == "edit_status"
+    assert action.verbatim is False
+    assert action.parse_mode == "HTML"
+    assert "<code>" in action.text
+
+
+def test_tool_use_line_hostile_input_is_fully_escaped_valid_html():
+    # SECURITY: a misaligned / prompt-injected Claude could put HTML metacharacters in a
+    # file_path/command. They MUST render escaped (inert text), never as markup, and the
+    # message must stay valid HTML (Telegram rejects invalid HTML → a dropped status).
+    hostile = "Bash(command=</code><b>x</b><script>alert(1)</script>, file_path=/a&b/<x>)"
+    ev = ToolUseEvent(tool_name="Bash", tool_input_summary=hostile)
+    line = tool_use_line(ev)
+    # No live <b>/<script> tag leaked: the only live tags are our <code> wrapper.
+    assert "<b>" not in line and "<script>" not in line
+    assert "&lt;b&gt;" in line and "&lt;script&gt;" in line
+    assert "&lt;/code&gt;" in line  # the injected closing tag is inert
+    assert "&amp;" in line  # the "&" in /a&b is escaped exactly once
+    assert "&amp;amp;" not in line  # not double-escaped
+    _assert_valid_telegram_html(line)
+
+
+def test_status_line_has_no_paths_stays_plain_no_code():
+    # The lifecycle/health status line (rate_limit / "thinking…") carries no path, so it
+    # stays plain — no <code>, no parse_mode forced. (Only the tool-use line is HTML.)
+    action = render_event(StatusEvent(phase="rate_limit", detail="retry in 5s"))
+    assert action.op == "edit_status"
+    assert "<code>" not in action.text
+    assert action.parse_mode is None
+
+
+def test_permission_body_wraps_summary_in_code_html():
+    # The "🔐 Permission needed …" body shows the (body-free) summary inside <code> and is
+    # an HTML message (parse_mode="HTML"), with the plain body as the raw fallback.
+    action = render_event(
+        make_permission(
+            tool_name="Write",
+            tool_input_summary="Write(file_path=/tmp/p5verify/a, content=<200 chars>)",
+        )
+    )
+    assert action.op == "new"
+    assert action.verbatim is True
+    assert action.parse_mode == "HTML"
+    assert "<code>" in action.text and "</code>" in action.text
+    # The path lives inside the code span; the body marker is escaped (valid HTML).
+    assert "/tmp/p5verify/a" in action.text
+    assert "&lt;200 chars&gt;" in action.text
+    assert "<200 chars>" not in action.text
+    # The verdict prose + tool name are still present (escaped) and readable.
+    assert "Permission needed" in action.text
+    assert "Write" in action.text
+    assert "Allow once" in action.text
+    _assert_valid_telegram_html(action.text)
+    # A parallel raw plain fallback is carried for the HTML-rejection path (T7 resends it).
+    assert action.plain_chunks
+    assert "/tmp/p5verify/a" in "".join(action.plain_chunks)
+    assert "<code>" not in "".join(action.plain_chunks)  # the fallback is plain text
+
+
+def test_permission_body_hostile_input_is_fully_escaped_valid_html():
+    # SECURITY (this is the operator's approve/deny surface): a hostile tool_input must
+    # render escaped + the message stay valid HTML so the prompt actually SENDS (an invalid
+    # HTML body would be rejected by Telegram = the operator never sees the prompt = worse).
+    hostile = "Write(file_path=</code><b>pwn</b>/&/etc, content=<999 chars>)"
+    action = render_event(
+        make_permission(tool_name="Ev<il>", tool_input_summary=hostile)
+    )
+    assert action.parse_mode == "HTML"
+    body = action.text
+    # No live injected tag; the tool NAME (also attacker-shaped) is escaped too.
+    assert "<b>" not in body and "</code><b>" not in body
+    assert "&lt;b&gt;pwn&lt;/b&gt;" in body
+    assert "Ev&lt;il&gt;" in body  # the hostile tool name rendered inert
+    assert "<il>" not in body
+    assert "&amp;" in body and "&amp;amp;" not in body
+    _assert_valid_telegram_html(body)
+
+
+def test_permission_body_still_body_free_after_code_wrap_sb3():
+    # SB3 regression: wrapping in <code> is a RENDERING change only — it must NOT expand the
+    # already-collapsed body. A Write's 600-char content stays "content=<600 chars>" (escaped),
+    # never the raw 600 chars.
+    raw_body = "S3CR3T-" + "x" * 593
+    assert len(raw_body) == 600
+    summary = "Write(file_path=/tmp/secret.txt, content=<600 chars>)"
+    action = render_event(make_permission(tool_name="Write", tool_input_summary=summary))
+    assert "content=&lt;600 chars&gt;" in action.text
+    assert raw_body not in action.text
+    assert "S3CR3T" not in action.text
+    # And the plain fallback is likewise body-free.
+    assert raw_body not in "".join(action.plain_chunks)
+
+
+# ============================================================================
 # Per-project status labels for /projects (P5 / ADR-005 D7) — pure label map
 # ============================================================================
 
@@ -885,8 +1042,32 @@ def test_tool_use_and_status_coalesce_into_one_status_line():
     edits = [a for a in actions if a.op == "edit_status"]
     # Leading-edge only -> one edit; the rest fold into the buffered line.
     assert len(edits) == 1
-    # The buffered newest line is the last tool_use.
-    assert coalescer.flush().actions[0].text == "▶️ Bash(command=ls)"
+    # The buffered newest line is the last tool_use — now <code>-wrapped HTML (T2/R6), and the
+    # Coalescer carries its parse_mode forward (without that the <code> tags would render
+    # literally because _emit_status rebuilds the action).
+    flushed = coalescer.flush().actions[0]
+    assert flushed.text == "▶️ <code>Bash(command=ls)</code>"
+    assert flushed.parse_mode == "HTML"
+
+
+def test_coalescer_parse_mode_tracks_newest_status_line():
+    # T2: text + parse_mode are replaced together (newest-wins). An HTML tool-use line
+    # buffered then REPLACED by a plain lifecycle status must flush with parse_mode=None —
+    # the slot never pairs a stale HTML parse_mode with the new plain text (which would make
+    # Telegram try to parse a non-existent entity / mis-render).
+    clock = FakeClock()
+    coalescer = Coalescer(now=clock, min_interval=10.0)
+    # Leading-edge HTML tool line fires immediately…
+    first = coalescer.offer(
+        ToolUseEvent(tool_name="Read", tool_input_summary="Read(file_path=/a/b)")
+    ).actions
+    assert first and first[0].parse_mode == "HTML" and "<code>" in first[0].text
+    # …a plain status replaces it in the buffer; the flush carries plain parse_mode.
+    coalescer.offer(StatusEvent(phase="rate_limit", detail="retry in 5s"))
+    flushed = coalescer.flush().actions[0]
+    assert flushed.parse_mode is None
+    assert "<code>" not in flushed.text
+    assert "rate_limit" in flushed.text
 
 
 def test_coalesce_stream_helper_flushes_trailing_status():
