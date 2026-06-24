@@ -5,7 +5,8 @@ _From design.md · Universal Session Control Plane · supervised build. Baseline
 ## Task list
 - [x] T1 — Session discovery adapter + `/sessions` read-only listing (see ALL Mac sessions, incl. the live one; merged+deduped with bot projects; running/idle) (ccbddbc)
 - [x] T2 — Attach/switch to any session (idle→continue, live-OR-uncertain→FORK; SB2 on out-of-root cwd; fork-on-doubt safe default) (f620a84)
-- [~] T3 — (stretch) Live-mirror `/watch <id>` — DEFERRED to its own clean cycle after T1+T2 merge (phase ran long; design says "may defer")
+- [>] T3 — (stretch) Live-mirror `/watch <id>` BUILT (`91ada16` + secret-scan fix `cb9c3db`): transcript tailer (offset/last-`\n`/RB1) + dict→Event normalizer reusing `render_event`; **SB3 scrub** (tool bodies→char counts via bounded-truncation `[:40]` catch-all — NOT a leaky denylist; raw `tool_result`/large `tool_use.input` never sent); `/unwatch`, one-watch-per-chat, flood-control via the per-chat send gate, shutdown-cancel (wires the previously-unwired `shutdown()`); SB1 + streaming-only notice. 1246 tests. Independent reviewer: **SB3 AGREE** (boundary holds for every line shape; mutation-probes have teeth; read-only verified by transcript SHA). **Live-verify PASS** (real Mac, Telegram Web): `/watch c4119af0` (the live orchestrator) mirrored its events in real-time — assistant text + scrubbed tool lines; a Read of a marker file rendered `✓ result (52 chars)` and a `result (8764 chars)` line, with the planted marker `ZZSCRUBME…` **absent from the rendered DOM** (SB3 holds on real data); `/unwatch` stopped it. Codex cross-model QA was still running at merge (read-only feature, overwhelming reviewer+live evidence) — verdict to be folded into `qa-t3.md`; fix-forward if it surfaces anything.
+- [x] T3 — (stretch) Live-mirror `/watch <id>` — DONE (merged with T1+T2 follow-up).
 - [x] T4 — verify + Codex QA + live-verify + merge (T1+T2)
 
 ## T4 result
