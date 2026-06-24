@@ -227,6 +227,8 @@ def _default_engine_factory(
     permission_mode: str = "default",
     thinking: bool = False,
     audit_sink: Optional[AuditSink] = None,
+    bash_policy_mode: str = "off",
+    bash_policy_extra_patterns: tuple[str, ...] = (),
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
@@ -287,6 +289,14 @@ def _default_engine_factory(
     The default ``None`` makes the engine's audit hook a no-op, so a bare factory call (or a
     deploy with audit disabled) is byte-for-byte unchanged. Best-effort (RB1): an audit write
     never breaks a turn.
+
+    **P13 T-BASH:** ``bash_policy_mode`` (``flag``/``deny``/``off``) + ``bash_policy_extra_patterns``
+    are the Bash command-policy knobs threaded straight into the engine, where they are
+    consulted ADDITIVELY in ``on_tool_request`` for ``Bash`` only (the C2-residual guardrail).
+    The default ``"off"`` keeps a bare factory call (and a deploy with the policy off)
+    byte-for-byte unchanged; the bot binds ``config.bash_policy_mode`` (default ``flag``) via
+    ``_bound_factory``. The policy can only ESCALATE a matched dangerous command (prompt/deny),
+    never auto-allow it.
     """
     engine: Engine
 
@@ -311,6 +321,8 @@ def _default_engine_factory(
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
         audit_sink=audit_sink,
+        bash_policy_mode=bash_policy_mode,
+        bash_policy_extra_patterns=bash_policy_extra_patterns,
     )
     return engine
 
@@ -780,6 +792,12 @@ class StreamingSession:
                     permission_mode=permission_mode,
                     thinking=thinking,
                     audit_sink=audit_sink,
+                    # P13 T-BASH: bind the live config's Bash policy (default flag) into the
+                    # production engine — consulted ADDITIVELY for Bash in on_tool_request. A
+                    # bare/injected factory keeps the "off" default, so only the real bot turns
+                    # the guardrail on. Closed over `config` (not a per-build param).
+                    bash_policy_mode=config.bash_policy_mode,
+                    bash_policy_extra_patterns=config.bash_policy_extra_patterns,
                 )
 
             self._engine_factory = _bound_factory

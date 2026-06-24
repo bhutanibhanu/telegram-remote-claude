@@ -55,10 +55,12 @@ from typing import Any, AsyncIterator, Optional, Sequence
 
 from ..audit import (
     KIND_PLAN_DECISION,
+    KIND_POLICY_EVENT,
     KIND_TOOL_DECISION,
     AuditEvent,
     AuditSink,
 )
+from ..bash_policy import BashPolicyMatch, classify_bash
 from ..permissions import PermissionPolicy, path_needs_approval
 from ..util import _now_iso, _redact_sid
 from .pending import DEFAULT_BACKSTOP_SECONDS, PendingRegistry
@@ -109,10 +111,22 @@ class Engine:
         allowed_roots: tuple[str | Path, ...] = (),
         allow_any_path: bool = False,
         audit_sink: AuditSink | None = None,
+        bash_policy_mode: str = "off",
+        bash_policy_extra_patterns: tuple[str, ...] = (),
     ) -> None:
         self._substrate = substrate
         self._send_timeout = send_timeout
         self._backstop_seconds = backstop_seconds
+        # P13 T-BASH: the Bash command-policy mode + owner extra denylist patterns, layered
+        # ADDITIVELY on the gate (the C2-residual guardrail). **Default ``"off"`` → NO policy**:
+        # an Engine built without it (every pre-P13 construction + all existing tests) behaves
+        # byte-for-byte as before — ``off`` is the current gate exactly. The bot's production
+        # factory wires ``flag`` (the design default) from config. A non-Bash tool, or any tool
+        # when the mode is ``off``, never touches the policy. The policy may only ESCALATE (an
+        # auto-allow → a prompt, a prompt → a deny); it NEVER converts a would-prompt/would-deny
+        # into an auto-allow (the load-bearing additive invariant — see on_tool_request).
+        self._bash_policy_mode = bash_policy_mode
+        self._bash_policy_extra_patterns = bash_policy_extra_patterns
         # P13 T-AUDIT: the optional, BODY-FREE audit sink the gate records every decision
         # to. **Default None → a NO-OP**: when unset, ``_record_*`` returns immediately, so
         # an Engine built without it (every pre-P13 construction + all 1288 tests) behaves
@@ -210,6 +224,73 @@ class Engine:
         except Exception:  # pragma: no cover - the sink is already best-effort
             log.debug("audit record (plan) failed (ignored)", exc_info=True)
 
+    def _record_policy(self, action: str, tool_name: str, tool_input: dict[str, Any]) -> None:
+        """Record a body-free ``policy_event`` for a Bash-policy outcome (P13 T-BASH).
+
+        ``action`` is ``bash_policy_flag`` (flag mode escalated the prompt) or
+        ``bash_policy_block`` (deny mode auto-denied). The ``summary`` is the SAME body-free
+        :func:`safe_input_summary` string the prompt/tool_decision shows (the matched command,
+        truncated to 160 chars — NOT the raw command beyond that, and NOT the matched-pattern
+        label, which is UX-only) and ``tool`` is the tool name, so a reviewer sees *which*
+        command tripped the policy without any body. No-op when no sink is wired; best-effort
+        otherwise (RB1) — a policy-audit write never breaks a turn. Reuses the T-AUDIT sink /
+        ``policy_event`` schema (the bot already records ``/yolo`` the same way).
+        """
+        sink = self._audit_sink
+        if sink is None:
+            return
+        try:
+            sink.record(
+                AuditEvent(
+                    ts=_now_iso(),
+                    kind=KIND_POLICY_EVENT,
+                    tool=tool_name,
+                    summary=action,
+                    decision=safe_input_summary(tool_name, tool_input),
+                    session_tag=_redact_sid(self.session_id),
+                )
+            )
+        except Exception:  # pragma: no cover - the sink is already best-effort
+            log.debug("audit record (policy) failed (ignored)", exc_info=True)
+
+    def _bash_policy_match(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> BashPolicyMatch | None:
+        """Classify a Bash command against the policy — FAIL-CLOSED (P13 T-BASH).
+
+        Returns a :class:`~claude_tg.bash_policy.BashPolicyMatch` when the RAW command matches
+        the denylist (scanning ``tool_input["command"]`` verbatim — NOT the 160-char summary,
+        so a long dangerous command can't slip past the truncation), else ``None``. **Only**
+        consulted for ``Bash`` when the mode is not ``off`` (the caller guards both, so a
+        non-Bash tool / ``off`` mode never reaches here — zero behavior change).
+
+        **FAIL-CLOSED:** if :func:`classify_bash` raises (a policy bug, an unexpected input),
+        this returns a synthetic ``error``/``classifier-error`` match — i.e. the command is
+        treated as FLAGGED — never ``None``. A policy error therefore escalates (flag mode) or
+        denies (deny mode) at the call site; it can **never** silent-allow (the SB6 invariant).
+        Mutation-probe: make this swallow the exception and ``return None`` and the
+        fail-closed test flips to an auto-allow and FAILS.
+        """
+        command = tool_input.get("command", "")
+        try:
+            return classify_bash(
+                command if isinstance(command, str) else str(command),
+                extra_patterns=self._bash_policy_extra_patterns,
+            )
+        except Exception:
+            # FAIL-CLOSED: a classifier error is treated as a hit (escalate/deny), NEVER a
+            # silent allow. Log body-free (no command) and synthesize a generic match.
+            log.warning(
+                "bash policy classifier raised for %s — failing closed (treat as flagged)",
+                tool_name,
+                exc_info=True,
+            )
+            return BashPolicyMatch(
+                pattern="error",
+                label="policy check failed (treated as dangerous)",
+                severity="high",
+            )
+
     # -- session id ----------------------------------------------------------
 
     @property
@@ -251,6 +332,69 @@ class Engine:
         """
         if tool_name in (ASK_TOOL, PLAN_TOOL) and tool_use_id is not None:
             return await self._answer_hold(tool_name, tool_input, tool_use_id)
+
+        # --- P13 T-BASH: the Bash command policy (ADDITIVE, checked FIRST so it can override
+        # grant/yolo for a MATCHED dangerous command — the C2-residual closure). It runs ONLY
+        # for Bash and ONLY when the mode is not ``off`` (so a non-Bash tool, or any tool with
+        # the policy off, is byte-for-byte the pre-P13 gate below — zero behavior change). The
+        # match is FAIL-CLOSED (a classifier raise → treated as flagged; never silent-allow).
+        #
+        # The load-bearing INVARIANT: the policy may only ESCALATE. ``deny`` mode turns a
+        # would-allow/would-prompt into a DENY; ``flag`` mode turns a would-AUTO-ALLOW (a prior
+        # grant / /yolo) into a one-time PROMPT (and a would-prompt stays a prompt, just louder
+        # + session-button-dropped). It NEVER converts a would-prompt/would-deny into an
+        # auto-allow. A NON-matching Bash command falls straight through to today's gate (grant/
+        # yolo still auto-allow it) — only a MATCHED command is escalated.
+        if self._bash_policy_mode != "off" and tool_name == "Bash":
+            bash_match = self._bash_policy_match(tool_name, tool_input)
+            if bash_match is not None:
+                if self._bash_policy_mode == "deny":
+                    # Hard wall: auto-deny the matched command, OVERRIDING any grant / /yolo
+                    # (the one place policy beats yolo — the owner opted into a hard wall).
+                    # Audited as a policy block + a tool_decision deny (so /audit shows both
+                    # the policy trip and the denied tool). Body-free.
+                    log.info(
+                        "bash policy DENY for %s (%s) — auto-denying (overrides grant/yolo)",
+                        tool_name,
+                        bash_match.pattern,
+                    )
+                    self._record_policy("bash_policy_block", tool_name, tool_input)
+                    self._record_tool(tool_name, tool_input, "deny")
+                    return decision_to_substrate(
+                        PermissionVerdict(behavior="deny", message=DENIED_MESSAGE),
+                        tool_input=tool_input,
+                    )
+                # flag mode: ESCALATE to a deliberate one-time prompt, OVERRIDING any grant /
+                # /yolo for THIS command. A flag-mode hold still needs a tool_use_id to route
+                # the verdict; if a flagged Bash command somehow arrives without one we CANNOT
+                # open a resolvable hold, so we fail CLOSED and DENY (never auto-allow a flagged
+                # command — the additive invariant holds even on this edge). Audited.
+                if tool_use_id is None:
+                    log.warning(
+                        "flagged Bash command (%s) arrived with no tool_use_id; cannot route "
+                        "approval — failing closed (deny)",
+                        bash_match.pattern,
+                    )
+                    self._record_policy("bash_policy_flag", tool_name, tool_input)
+                    self._record_tool(tool_name, tool_input, "deny")
+                    return decision_to_substrate(
+                        PermissionVerdict(behavior="deny", message=DENIED_MESSAGE),
+                        tool_input=tool_input,
+                    )
+                log.info(
+                    "bash policy FLAG for %s (%s) — escalating to a one-time prompt "
+                    "(overrides grant/yolo)",
+                    tool_name,
+                    bash_match.pattern,
+                )
+                self._record_policy("bash_policy_flag", tool_name, tool_input)
+                return await self._permission_hold(
+                    tool_name,
+                    tool_input,
+                    tool_use_id,
+                    bash_flag=True,
+                    bash_flag_label=bash_match.label,
+                )
 
         # --- ordinary tool: the permission gate (P2 name-only + P6/C2 path layer) ----
         # Ordering (owner-approved posture, PROMPT-ON-OUT-OF-ROOT):
@@ -355,8 +499,18 @@ class Engine:
         tool_name: str,
         tool_input: dict[str, Any],
         tool_use_id: str,
+        *,
+        bash_flag: bool = False,
+        bash_flag_label: str | None = None,
     ) -> SubstrateDecision:
         """Hold a risky tool for operator approval and map the verdict (ADR-003 §2/§4).
+
+        **P13 T-BASH:** ``bash_flag`` / ``bash_flag_label`` (default ``False`` / ``None`` —
+        unchanged for every non-policy hold) ride onto the injected :class:`PermissionEvent`
+        so the render shows ``⚠️`` + the matched-pattern label and DROPS ``[Allow for
+        session]``. A flagged hold can therefore only resolve to ``allow_once`` / ``deny`` —
+        and because ``allow_session`` is impossible (no button), ``_verdict_for`` never records
+        a session grant for a flagged command, so the NEXT dangerous command re-prompts too.
 
         Mirrors :meth:`_answer_hold` — same inject + hold + map shape, reusing the SAME
         ``PendingRegistry`` — but for a permission prompt rather than an ask/plan:
@@ -387,13 +541,17 @@ class Engine:
         **ADR-001 caveat:** ``allow_session`` grants ONLY ``tool_name`` (per-name, T2);
         a different risky tool is unaffected — nothing here broadens the grant.
         """
-        # 1) Surface the prompt with its tool_use_id; the summary is body-free (SB3).
+        # 1) Surface the prompt with its tool_use_id; the summary is body-free (SB3). A
+        #    P13-flagged Bash command carries bash_flag (+ the body-free label) so the render
+        #    shows ⚠️ + the pattern and drops the [Allow for session] button.
         self._inject(
             PermissionEvent(
                 tool_name=tool_name,
                 tool_input_summary=safe_input_summary(tool_name, tool_input),
                 tool_use_id=tool_use_id,
                 session_id=self.session_id,
+                bash_flag=bash_flag,
+                bash_flag_label=bash_flag_label,
             )
         )
 

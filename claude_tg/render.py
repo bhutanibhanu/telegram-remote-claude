@@ -685,22 +685,33 @@ def permission_keyboard(event: PermissionEvent) -> InlineKeyboardMarkup:
     The three buttons stack one-per-row so the (potentially wide) labels stay readable
     on a phone. ``tool_use_id`` is required (the engine sets it when emitting the
     :class:`PermissionEvent`); without it there is nothing to route a verdict to.
+
+    **P13 T-BASH:** when ``event.bash_flag`` is set (the Bash policy flagged a dangerous
+    command in flag mode), the **``[Allow for session]`` button is OMITTED** — a flagged
+    command must never be session-granted, so the only allow is a deliberate one-time
+    ``[Allow once]``. The keyboard is then just ``[Allow once] / [Deny]``. (The engine
+    ALSO re-prompts a flagged command even under a prior grant / ``/yolo``, so this is the
+    UI half of the same closure: the operator can grant the *tool* for the session, but
+    never a *flagged dangerous command*.)
     """
     tool_use_id = event.tool_use_id
     if not tool_use_id:
         raise ValueError(
             "PermissionEvent.tool_use_id is required to build a permission keyboard"
         )
-    return InlineKeyboardMarkup(
+    rows = [
         [
-            [
-                InlineKeyboardButton(
-                    text="✅ Allow once",
-                    callback_data=encode_callback(
-                        KIND_PERMISSION, tool_use_id, payload=PERMISSION_ONCE
-                    ),
-                )
-            ],
+            InlineKeyboardButton(
+                text="✅ Allow once",
+                callback_data=encode_callback(
+                    KIND_PERMISSION, tool_use_id, payload=PERMISSION_ONCE
+                ),
+            )
+        ],
+    ]
+    # P13 T-BASH: drop [Allow for session] for a policy-flagged command (one-time only).
+    if not event.bash_flag:
+        rows.append(
             [
                 InlineKeyboardButton(
                     text="☑️ Allow for session",
@@ -708,17 +719,19 @@ def permission_keyboard(event: PermissionEvent) -> InlineKeyboardMarkup:
                         KIND_PERMISSION, tool_use_id, payload=PERMISSION_SESSION
                     ),
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⛔ Deny",
-                    callback_data=encode_callback(
-                        KIND_PERMISSION, tool_use_id, payload=PERMISSION_DENY
-                    ),
-                )
-            ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⛔ Deny",
+                callback_data=encode_callback(
+                    KIND_PERMISSION, tool_use_id, payload=PERMISSION_DENY
+                ),
+            )
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
 def open_project_keyboard(name: str) -> InlineKeyboardMarkup:
@@ -1894,7 +1907,20 @@ def _render_permission_body(event: PermissionEvent) -> str:
     summary here would risk surfacing a raw body (a Write's ``content``, a Bash secret),
     so the SB3-safe string is rendered exactly as given. The keyboard (built separately)
     is the verdict surface.
+
+    **P13 T-BASH:** a policy-flagged Bash command (``event.bash_flag``) prepends a ``⚠️``
+    warning + the body-free matched-pattern label, and the closing line drops the "for this
+    session" option (the keyboard omits that button) so the operator confirms a deliberate
+    one-time allow. The label is a fixed pattern description, never the command body (SB3).
     """
+    if event.bash_flag:
+        label = event.bash_flag_label or "a dangerous pattern"
+        return (
+            f"⚠️ Flagged by the Bash policy: {label}\n"
+            f"🔐 Permission needed — Claude wants to run {event.tool_name}:\n"
+            f"{event.tool_input_summary}\n\n"
+            "This command was flagged as dangerous — allow once, or deny?"
+        )
     return (
         f"🔐 Permission needed — Claude wants to run {event.tool_name}:\n"
         f"{event.tool_input_summary}\n\n"
@@ -1920,7 +1946,21 @@ def _render_permission_body_html(event: PermissionEvent) -> str:
     never markup, and the prompt always sends (Telegram rejecting invalid HTML would mean the
     operator never sees the approve/deny prompt — a worse failure). The plain
     :func:`_render_permission_body` is the parallel raw fallback T7 resends on an HTML rejection.
+
+    **P13 T-BASH:** a policy-flagged Bash command (``event.bash_flag``) prepends a ``⚠️``
+    warning + the matched-pattern label (HTML-ESCAPED — the label is a fixed body-free
+    description, escaped exactly once like the prose so it can never break the markup), and
+    the closing line drops the "for this session" option to match the keyboard (which omits
+    that button for a flagged command). The label never carries the command body (SB3).
     """
+    if event.bash_flag:
+        label = event.bash_flag_label or "a dangerous pattern"
+        return (
+            f"⚠️ Flagged by the Bash policy: {_escape_html(label)}\n"
+            f"🔐 Permission needed — Claude wants to run {_escape_html(event.tool_name)}:\n"
+            f"{code_path(event.tool_input_summary)}\n\n"
+            "This command was flagged as dangerous — allow once, or deny?"
+        )
     return (
         f"🔐 Permission needed — Claude wants to run {_escape_html(event.tool_name)}:\n"
         f"{code_path(event.tool_input_summary)}\n\n"
