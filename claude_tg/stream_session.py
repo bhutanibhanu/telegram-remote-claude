@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
@@ -112,7 +113,12 @@ from .render import (
     strip_telegram_html,
     yolo_indicator,
 )
-from .session_store import DEFAULT_PROJECT
+from .session_store import (
+    DEFAULT_PROJECT,
+    DuplicateProject,
+    InvalidProjectName,
+)
+from .sessions_discovery import DiscoveredSession, SessionDiscovery, discover_sessions
 from .util import _redact_sid, _redact_sid_in_text
 
 log = logging.getLogger(__name__)
@@ -142,6 +148,43 @@ _PERMISSION_NOTES: dict[PermissionVerdictName, str] = {
     "allow_session": "Allowed for session",
     "deny": "Denied",
 }
+
+#: P11 T2 (attach naming): every char NOT in the SB4 project-name charset
+#: (``[A-Za-z0-9_-]`` — ``session_store._NAME_RE``) collapses to ``-`` so a derived name (from
+#: a session title / cwd basename, which may carry spaces, slashes, dots, unicode) is rendered
+#: SB4-valid. Runs of separators collapse to ONE ``-`` and leading/trailing ``-`` are trimmed.
+_ATTACH_NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _sanitize_attach_name(text: object) -> str:
+    """Reduce arbitrary text to the SB4 project-name charset (P11 T2 attach naming).
+
+    Maps every non-``[A-Za-z0-9_-]`` run to a single ``-``, strips leading/trailing ``-``/``_``,
+    and clamps to 32 chars (the SB4 budget). Returns ``""`` when nothing usable survives (the
+    caller falls back to ``attached-<shortid>``). Pure; defensive against a non-``str`` input.
+    """
+    if text is None:
+        return ""
+    raw = str(text).strip()
+    if not raw:
+        return ""
+    cleaned = _ATTACH_NAME_SANITIZE_RE.sub("-", raw).strip("-_")
+    return cleaned[:32]
+
+
+def _basename_of(path: object) -> str:
+    """The final path component of ``path`` (the dir name), or ``""`` (P11 T2 attach naming).
+
+    Used to derive a friendly project name from a session's cwd when it has no title. Pure;
+    uses :class:`pathlib.PurePosixPath`-style ``Path.name`` (a discovered cwd is a Mac path).
+    Defensive: a None/empty/odd value → ``""`` so the caller falls back.
+    """
+    if not path:
+        return ""
+    try:
+        return Path(str(path)).name
+    except Exception:
+        return ""
 
 
 class EngineFactory(Protocol):
@@ -312,6 +355,18 @@ class _ProjectRuntime:
     # session erroring is never mistaken for a resume failure. Reset on the in-memory
     # runtime only (never persisted).
     resumed_unverified: bool = False
+    # P11 T2 (attach-fork): True iff this project was ADOPTED from an external session that
+    # was LIVE in another process at attach time, so its NEXT resume MUST fork (resume into a
+    # fresh id, transcript copied) rather than continue the live id — two writers on one
+    # ``(id, cwd)`` silently corrupt the transcript (THE hard safety rule). ``_ensure_engine``
+    # reads this and passes ``fork=True`` to ``engine.resume`` for exactly that first resume;
+    # it is CLEARED the moment the fork succeeds (the substrate then owns a brand-new id that
+    # is ours alone, so every subsequent resume of THIS project is an ordinary continue of the
+    # forked id — never re-forking). An IDLE attach leaves this False (continue the same id —
+    # nobody else is writing it). Transient in-memory (RB3): a process restart loses it, but
+    # the engine is rebuilt from the persisted (forked or continued) id, which is by then ours
+    # alone, so a continue is correct after restart. Set by :meth:`attach_session`.
+    attach_fork: bool = False
     # P5 / ADR-005 D7: THIS project's status line for in-place coalesced edits (created on
     # the first edit of its turn). Each project's turn has its OWN line so two concurrent
     # turns' status updates never clash (moved off _ChatState).
@@ -565,9 +620,26 @@ class StreamingSession:
         min_edit_interval: Optional[float] = None,
         chat_send_interval: Optional[float] = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        discover: Callable[[], list[DiscoveredSession]] = discover_sessions,
+        probe_one: Optional[Callable[[str, Optional[str]], tuple[bool, bool]]] = None,
     ) -> None:
         self.config = config
         self.store = session_store
+        # P11 T2 (attach): the machine-wide session discovery seam (id -> cwd + liveness).
+        # Injected so attach tests feed a fixed discovered list + a fixed running/idle verdict
+        # with NO real SDK / ps / ~/.claude; defaults to the real :func:`discover_sessions`
+        # (already RB1-total). ``attach_session`` looks the target id up here to learn its cwd
+        # (for the SB2 check) and its composite liveness (which gates fork-vs-continue).
+        self._discover = discover
+        # P11 T2 (B2+B3): the SINGLE-SESSION liveness re-probe seam, called at the FIRST WRITE
+        # of an adopted (fork_pending) session to re-derive fork-vs-continue from a FRESH probe
+        # → ``(running, degraded)``. Injected so the restart + race tests feed a deterministic
+        # verdict; defaults to a fresh real :meth:`SessionDiscovery.probe_one` (its own ps /
+        # registry / mtime snapshot). _ensure_engine forks on ``running or degraded`` (never
+        # co-driving) and continues only on a confident idle.
+        self._probe_one: Callable[[str, Optional[str]], tuple[bool, bool]] = (
+            probe_one if probe_one is not None else SessionDiscovery().probe_one
+        )
         # P6/C2 (SB2): bind the live config's path-confinement context into the DEFAULT
         # factory so the production engine confines the SDK's file/search tools to
         # allowed_roots (an out-of-root tool call is held for approval — see
@@ -1321,10 +1393,40 @@ class StreamingSession:
         engine = self._build_engine(rt.cwd, rt.policy, model)
         rt.engine = engine
         resume_id = self._resume_id(chat_id, name)
+        # ⭐ P11 T2 (B2+B3) — the BINDING fork-vs-continue decision, made HERE at the first
+        # write from a FRESH liveness re-probe (not frozen at attach time). When this project
+        # is an ADOPTED-not-yet-resumed session (the PERSISTED ``fork_pending`` marker — which
+        # survives a restart, unlike the in-memory runtime), RE-PROBE the base id's CURRENT
+        # liveness and FORK on live-OR-uncertain; CONTINUE only on a confident idle. This
+        # closes:
+        #   * B2 (restart before first turn): the in-memory intent is gone but the persisted
+        #     marker triggers a re-probe, so a restart re-decides instead of co-driving.
+        #   * B3 (attach→first-write race): an idle-at-attach session that has since gone live
+        #     is caught by the re-probe NOW, at the moment of the write — never co-driven.
+        # The fork forks the FIRST resume only; ``fork_pending`` is cleared (persisted) after
+        # the first successful turn (in _drive_turn) and on the resume-failure rebuild below.
+        fork = False
+        fork_pending = bool(resume_id) and self._fork_pending(chat_id, name)
+        if fork_pending:
+            assert resume_id is not None  # guarded by ``bool(resume_id) and`` above
+            running, degraded = self._reprobe_liveness(resume_id, rt.cwd)
+            fork = running or degraded  # fork on doubt — never co-drive a possibly-live session
+            log.info(
+                "attach first-write re-probe for chat %s project %s: running=%s degraded=%s "
+                "→ fork=%s",
+                chat_id, name, running, degraded, fork,
+            )
         resume_failed = False
         if resume_id:
             try:
-                await engine.resume(resume_id)
+                # Pass ``fork`` ONLY when forking so the IDLE-continue path (and every
+                # pre-P11 resume) calls ``engine.resume(id)`` byte-for-byte as before — an
+                # injected engine fake that omits the kwarg is unaffected; only the new
+                # attach-fork path exercises the grown signature.
+                if fork:
+                    await engine.resume(resume_id, fork=True)
+                else:
+                    await engine.resume(resume_id)
             except Exception:
                 # QF4 (B3′/RB3): resume() RAISED — e.g. the SDK adapter assigns its
                 # client BEFORE connect(), so a connect failure (dead/aged session)
@@ -1371,12 +1473,27 @@ class StreamingSession:
                 #     it is NOT resumed_unverified — a fresh-session error is an ordinary
                 #     turn error, never mistaken for a resume failure.
                 resume_failed = True
+                # P11 T2: the (possibly forked) resume failed and we recovered onto a FRESH
+                # session whose dead id was cleared — there is no longer a base id to fork
+                # from, so clear BOTH the in-memory hint AND the PERSISTED fork_pending marker
+                # (the next resume of THIS project is a plain continue of the fresh id). This
+                # matches the existing attach_fork-clearing on the resume-failure rebuild path.
+                rt.attach_fork = False
+                self._clear_fork_pending(chat_id, name)
             else:
                 # Resume CONNECTED. It is not yet CONFIRMED good — a stale/aged/torn
                 # session can connect and then error on the first turn (B3). Mark the
                 # runtime so _drive_turn applies the resume-failure heuristic to this
                 # first turn only (cleared once a turn completes clean — QF3/RB3).
                 rt.resumed_unverified = True
+                # P11 T2: the fork-or-continue resume CONNECTED — clear the in-memory hint so a
+                # subsequent resume WITHIN THIS PROCESS continues. But DO NOT clear the PERSISTED
+                # ``fork_pending`` yet: the turn has not completed, and a restart between connect
+                # and a successful turn must STILL re-probe (a forked id is captured + persisted
+                # only when the first turn's result lands — until then the persisted id is still
+                # the base id). _drive_turn clears the persisted marker after the first
+                # SUCCESSFUL turn (by which point the forked/continued id is persisted + ours).
+                rt.attach_fork = False
         else:
             await engine.start()
         rt.started = True
@@ -1413,6 +1530,333 @@ class StreamingSession:
         record = self.store.get_project(chat_id, name)
         session_id = (record or {}).get("session_id")
         return session_id if isinstance(session_id, str) and session_id else None
+
+    def _fork_pending(self, chat_id: int, name: str) -> bool:
+        """Whether ``name`` is an adopted-not-yet-resumed session (persisted marker, B2+B3).
+
+        Read-only (RB1): no store, or a missing/false marker → ``False`` (an ordinary
+        continue). ``_ensure_engine`` reads this to decide whether to RE-PROBE the base id's
+        liveness at the first write (forking on doubt). Survives a restart (it is persisted),
+        so a restart before the first turn re-probes instead of co-driving a stale continue.
+        """
+        if self.store is None:
+            return False
+        try:
+            return bool(self.store.get_fork_pending(chat_id, name))
+        except Exception:  # a misbehaving store must not crash the turn (RB1)
+            log.debug("get_fork_pending failed for chat %s project %s", chat_id, name, exc_info=True)
+            return False
+
+    def _clear_fork_pending(self, chat_id: int, name: str) -> None:
+        """Clear the PERSISTED ``fork_pending`` marker (B2+B3); swallow any store error (RB1).
+
+        Called after the first SUCCESSFUL turn of an adopted session (the forked/continued id is
+        then persisted + ours alone, so subsequent resumes are ordinary continues) and on the
+        resume-failure rebuild path (a fresh session, no base to fork). Never crashes the turn
+        over a write — an :class:`~claude_tg.session_store.UnknownProject` (``/rm``'d mid-turn)
+        or any other store error is logged and ignored.
+        """
+        if self.store is None:
+            return
+        try:
+            self.store.set_fork_pending(chat_id, name, False)
+        except Exception:
+            log.debug("clear fork_pending failed for chat %s project %s", chat_id, name, exc_info=True)
+
+    def _reprobe_liveness(self, session_id: str, cwd: Optional[str]) -> tuple[bool, bool]:
+        """Re-probe a base id's CURRENT liveness at the first write → ``(running, degraded)``.
+
+        Delegates to the injected single-session probe seam (``self._probe_one`` →
+        :meth:`SessionDiscovery.probe_one` by default), which runs a FRESH composite liveness
+        check (its own ps / registry / mtime snapshot). **Never raises (RB1):** any unexpected
+        error degrades to ``(False, True)`` — uncertain — so :meth:`_ensure_engine` forks on
+        doubt rather than risk co-driving. The probe itself is already RB1-total; this is the
+        belt-and-braces wrapper at the call boundary.
+        """
+        try:
+            running, degraded = self._probe_one(session_id, cwd)
+            return bool(running), bool(degraded)
+        except Exception:  # RB1: a probe hiccup → uncertain (fork on doubt), never crash the turn
+            log.debug("first-write liveness re-probe failed; treating as uncertain", exc_info=True)
+            return False, True
+
+    # -- attach: adopt ANY discovered Claude session as a project (P11 T2) ----
+
+    def attach_session(self, chat_id: int, session_id: str) -> AttachOutcome:
+        """Adopt the discovered session ``session_id`` as a controllable bot project (P11 T2).
+
+        The "drive any session from your phone" core: look the discovered session up (id →
+        cwd + composite liveness), then create/adopt it as a bot project pinned to that
+        ``(session_id, cwd)`` and make it active, so the operator's NEXT message resumes +
+        drives it through the **normal turn + permission gate** path (no bypass). Returns an
+        :class:`AttachOutcome` the bot replies (the session owns all the policy; the bot is a
+        pure renderer, like ``/sessions``).
+
+        **⭐ The hard safety rules (this is the risky write part):**
+
+        1. **Fork-if-live (never co-drive a live session).** The target's composite liveness
+           (the T1 epoch-validated ``running`` hint) gates the adopt: if it is RUNNING in
+           another process the project is marked to **FORK** on its first resume
+           (``attach_fork=True`` → ``_ensure_engine`` passes ``fork=True`` → the SDK resumes
+           into a NEW id with the transcript copied, never writing the live id) and the
+           operator is TOLD why; if IDLE it continues the same id (``attach_fork=False``).
+           Two writers on one ``(id, cwd)`` silently corrupt the transcript — this is THE
+           rule that prevents it.
+        2. **SB2 on the discovered cwd.** A discovered session's cwd can be ANYWHERE on the
+           Mac. The cwd is canonicalized + confined via :func:`resolve_within_roots`; an
+           out-of-``ALLOWED_ROOTS`` cwd (with ``ALLOW_ANY_PATH`` off) is **refused** with a
+           clear message — we never silently adopt + drive a session in an arbitrary dir.
+        3. **SB1** is enforced by the bot (``/attach`` rides the ``allowed`` filter + the
+           ``_authorized`` recheck; the attach callback rechecks ``_authorized`` in
+           ``on_callback``) BEFORE this is reached — an unauthorized chat never adopts.
+        4. The adopted project drives through the normal path and is **persisted** in the
+           registry under a generated SB4-valid name (RB1/RB2: unknown id / out-of-root / a
+           resume that fails → a clean message, no crash; the resume-fail recovery is the
+           existing ``_ensure_engine`` RB3 path).
+
+        Steps (fail-fast + secure):
+
+        * **No store →** projects need persistence — reply a clean notice (RB1: never deref a
+          None store).
+        * **Look up** ``session_id`` in the (injected) discovery. An id absent from discovery
+          → a clean "unknown session" refusal (RB2 — the operator typed/tapped a stale id).
+        * **SB2** the discovered cwd; out-of-root → refuse (rule 2).
+        * **Already adopted?** If a project already points at this ``session_id`` for the
+          chat, just switch to it (idempotent — re-attaching the same id never forks a
+          duplicate project, and never spuriously re-forks a session we already own).
+        * **Adopt:** derive an SB4-valid, deduped project name, ``store.create`` it at the
+          discovered cwd + ``set_session_id`` to the discovered id, make it active, and seed
+          the in-memory runtime's ``attach_fork`` from the liveness (rule 1).
+        """
+        if self.store is None:
+            return AttachOutcome(
+                ok=False,
+                message="Attaching a session needs persistence — set CLAUDE_STATE_FILE.",
+            )
+        sid = (session_id or "").strip()
+        if not sid:
+            return AttachOutcome(ok=False, message="Usage: /attach <session-id>")
+
+        discovered = self._find_discovered(sid)
+        if discovered is None:
+            # RB2: the id is not among the machine's discovered sessions (stale / mistyped /
+            # never existed). A clean refusal — no crash, no adopt. SB3: echo only a SHORT id
+            # prefix (the full id is a resumable credential; the operator typed it, but we
+            # keep the reply body-free of the full id, mirroring the render discipline).
+            return AttachOutcome(
+                ok=False,
+                message=(
+                    f"❌ No Claude session found with id <code>{html.escape(sid[:12], quote=False)}</code>. "
+                    "Use /sessions to see what's on this machine."
+                ),
+                parse_mode="HTML",
+            )
+
+        cwd = discovered.cwd
+        if not cwd:
+            # A discovered session with no recorded cwd can't be resumed (the resume is
+            # cwd-scoped — ADR-001/C6) — refuse cleanly rather than adopt an un-runnable one.
+            return AttachOutcome(
+                ok=False,
+                message="❌ That session has no recorded working directory — can't attach it.",
+            )
+
+        # SB2 (rule 2): the discovered cwd can be ANYWHERE — confine it to the permitted roots
+        # BEFORE adopting. resolve_within_roots canonicalizes (~, .., symlinks); an out-of-root
+        # cwd raises PathNotAllowed and we refuse — we never silently adopt + drive a session
+        # in an arbitrary dir. ALLOW_ANY_PATH=true no-ops the check (the resolver returns the
+        # canonical path), the same opt-out /new + /cd honor.
+        try:
+            resolved = resolve_within_roots(
+                cwd,
+                cwd=cwd,
+                allowed_roots=self.config.allowed_roots,
+                allow_any=self.config.allow_any_path,
+            )
+        except PathNotAllowed:
+            # R6: wrap the (discovered) path in <code> so Telegram renders it inert monospace,
+            # not tappable fake command-links; code_path HTML-escapes it.
+            return AttachOutcome(
+                ok=False,
+                message=(
+                    f"❌ That session's directory {code_path(cwd)} is outside the permitted "
+                    "roots — not attaching. Widen ALLOWED_ROOTS (or set ALLOW_ANY_PATH) to "
+                    "drive a session there."
+                ),
+                parse_mode="HTML",
+            )
+        # Use the CANONICAL path as the project's cwd (never the raw discovered string) so the
+        # stored cwd is the resolved, contained path — consistent with /new + /cd.
+        canonical_cwd = str(resolved)
+
+        # Idempotent re-attach: if a project already points at this id, just switch to it
+        # (case-insensitive on the value match is unnecessary — session ids are exact). This
+        # avoids forking a duplicate project AND never re-forks a session we already own.
+        existing = self._project_for_session(chat_id, sid)
+        if existing is not None:
+            self.store.switch(chat_id, existing)
+            name_html = html.escape(existing, quote=False)
+            return AttachOutcome(
+                ok=True,
+                message=(
+                    f"✅ Already attached as <b>{name_html}</b> — switched to it; your next "
+                    "message resumes it."
+                ),
+                parse_mode="HTML",
+                project_name=existing,
+                forked=False,
+            )
+
+        # Derive an SB4-valid, deduped project name from the session's title / cwd basename.
+        name = self._attach_project_name(chat_id, discovered, sid)
+
+        try:
+            self.store.create(chat_id, name, canonical_cwd, make_active=True)
+        except (InvalidProjectName, DuplicateProject):
+            # Defensive (RB1): _attach_project_name already validated + deduped, so neither
+            # should fire — but never crash the attach over a registry write. Re-derive once
+            # with a guaranteed-unique fallback and retry; if THAT fails, refuse cleanly.
+            name = self._fallback_attach_name(chat_id, sid)
+            try:
+                self.store.create(chat_id, name, canonical_cwd, make_active=True)
+            except (InvalidProjectName, DuplicateProject):
+                return AttachOutcome(
+                    ok=False,
+                    message="❌ Couldn't adopt that session as a project — please try again.",
+                )
+        # Pin the discovered id onto the new (active) project so the next turn resumes it.
+        self.store.set_session_id(chat_id, name, sid)
+        # ⭐ B2+B3: PERSIST the fork-pending marker so the BINDING fork-vs-continue decision is
+        # made at the FIRST WRITE, from a FRESH liveness re-probe — NOT frozen here at attach
+        # time. This survives a restart (the in-memory runtime is lost on restart, but the
+        # persisted base id + this marker are not), so a restart before the first turn re-probes
+        # and re-decides (closing B2's co-drive-after-restart). And because the re-probe runs at
+        # first write, an idle-at-attach session that has since gone live is caught then (B3).
+        # _ensure_engine reads this, re-probes, forks on live-or-uncertain, and clears it
+        # (persisted) after the first successful turn (never re-forking thereafter).
+        self.store.set_fork_pending(chat_id, name, True)
+
+        # Build the runtime (fresh — brand-new name) and ALSO mirror the marker in memory so a
+        # turn within THIS process doesn't need a store round-trip; _ensure_engine consults the
+        # persisted marker as the source of truth (the in-memory one is just a fast-path /
+        # restart-survivable mirror). attach_fork stays for the in-process hint; the persisted
+        # fork_pending is authoritative.
+        rt = self._runtime(chat_id, name, canonical_cwd)
+        rt.attach_fork = True  # adopted-pending; the actual fork-vs-continue is decided at write
+
+        # The attach-time liveness is only a PREVIEW hint for the message — NOT a promise (the
+        # binding decision is the first-write re-probe). Phrase honestly so we never over-promise
+        # an outcome that the re-probe could change between now and the first message.
+        name_html = html.escape(name, quote=False)
+        message = (
+            f"✅ Attached <b>{name_html}</b>. On your next message I'll resume it — forking "
+            "automatically if it's active elsewhere, so I never corrupt a live session.\n"
+            f"{code_path(canonical_cwd)}"
+        )
+        return AttachOutcome(
+            ok=True,
+            message=message,
+            parse_mode="HTML",
+            project_name=name,
+            # ``forked`` is not yet known (decided at first write); report False here and surface
+            # the ACTUAL outcome when the first turn starts. The bot relays only ``message``.
+            forked=False,
+        )
+
+    def _find_discovered(self, session_id: str) -> Optional[DiscoveredSession]:
+        """The discovered session whose id matches ``session_id``, or ``None`` (RB1-total).
+
+        Runs the (injected) machine-wide discovery and returns the matching
+        :class:`~claude_tg.sessions_discovery.DiscoveredSession` (id is exact — session ids
+        are UUIDs). Discovery is already best-effort/total (an empty/odd ``~/.claude`` →
+        ``[]``); a misbehaving injected discover is swallowed to ``None`` so an attach can
+        never crash the handler. The match carries the cwd (for SB2) + the ``running`` hint
+        (for fork-vs-continue).
+        """
+        try:
+            sessions = self._discover() or []
+        except Exception:  # a custom discover that misbehaves must not crash attach (RB1)
+            log.warning("session discovery failed during attach", exc_info=True)
+            return None
+        for s in sessions:
+            if getattr(s, "session_id", None) == session_id:
+                return s
+        return None
+
+    def _project_for_session(self, chat_id: int, session_id: str) -> Optional[str]:
+        """The chat's project (stored name) already pinned to ``session_id``, or ``None``.
+
+        Makes attach idempotent: a re-attach of an id the chat already adopted just switches
+        to the existing project instead of forking a duplicate (and never re-forks a session
+        we already own). Read-only; never raises (RB1).
+        """
+        if self.store is None:
+            return None
+        try:
+            projects = self.store.list_projects(chat_id)
+        except Exception:
+            return None
+        for pname, record in projects.items():
+            if isinstance(record, dict) and record.get("session_id") == session_id:
+                return str(pname)
+        return None
+
+    def _attach_project_name(
+        self, chat_id: int, discovered: DiscoveredSession, session_id: str
+    ) -> str:
+        """Derive an SB4-valid, deduped project name for an adopted session (P11 T2 naming).
+
+        A project name must satisfy SB4 (``^[A-Za-z0-9_-]{1,32}$``) so ``/projects`` /
+        ``/switch`` work on it. We build a friendly base from the session's title (the first
+        prompt / custom title) or its cwd basename, sanitize every non-``[A-Za-z0-9_-]`` char
+        to ``-``, collapse/trim, and clamp to the length budget; an empty result falls back to
+        ``attached-<shortid>``. Then we DEDUPE against the chat's existing projects
+        (case-insensitive, mirroring the store) by appending ``-2``, ``-3``, … so two attaches
+        of similarly-named sessions never collide. Pure of I/O beyond the read-only store list.
+        """
+        base = _sanitize_attach_name(discovered.title) or _sanitize_attach_name(
+            _basename_of(discovered.cwd)
+        )
+        if not base:
+            base = self._fallback_attach_name(chat_id, session_id)
+        return self._dedupe_attach_name(chat_id, base)
+
+    def _fallback_attach_name(self, chat_id: int, session_id: str) -> str:
+        """An always-valid ``attached-<shortid>`` name (deduped), the last-resort base.
+
+        Used when the title + cwd basename both sanitize to nothing, or as the retry base if a
+        derived name somehow collided. ``<shortid>`` is the session id's first 8 chars
+        (sanitized to the SB4 charset), so it is recognizable + unique-ish; the dedupe suffix
+        guarantees uniqueness within the chat.
+        """
+        short = _sanitize_attach_name(session_id[:8]) or "x"
+        return self._dedupe_attach_name(chat_id, f"attached-{short}")
+
+    def _dedupe_attach_name(self, chat_id: int, base: str) -> str:
+        """``base`` (or ``base-2``/``base-3``/…) — the first not already used by the chat.
+
+        Matches the store's case-insensitive name comparison so the returned name is
+        guaranteed to pass ``store.create`` without a :class:`DuplicateProject`. Clamps each
+        candidate to the SB4 32-char budget (trimming the BASE, never the numeric suffix, so
+        the suffix always survives). Read-only on the store (RB1).
+        """
+        existing = set()
+        if self.store is not None:
+            try:
+                existing = {n.casefold() for n in self.store.list_projects(chat_id)}
+            except Exception:
+                existing = set()
+        candidate = base[:32] or "attached"
+        if candidate.casefold() not in existing:
+            return candidate
+        i = 2
+        while True:
+            suffix = f"-{i}"
+            trimmed = base[: 32 - len(suffix)] or "attached"[: 32 - len(suffix)]
+            candidate = f"{trimmed}{suffix}"
+            if candidate.casefold() not in existing:
+                return candidate
+            i += 1
 
     def request_remove(self, chat_id: int, name: str) -> bool:
         """INFLIGHT-AWARE ``/rm`` admission (ADR-005 D9 / round-3 BLOCKERS 1+2).
@@ -2423,6 +2867,16 @@ class StreamingSession:
             elif turn_rt is not None:
                 # The first resumed turn completed without a resume failure → confirmed good.
                 turn_rt.resumed_unverified = False
+                # ⭐ P11 T2 (B2+B3): the first turn of an ADOPTED session completed cleanly, so
+                # the forked/continued id is now persisted (the result event's session_id landed
+                # via _persist) and is OURS alone — clear the PERSISTED fork_pending so every
+                # SUBSEQUENT resume of this project is an ordinary continue (never re-forking).
+                # Cleared HERE (after a clean turn), NOT at resume-connect, so a restart between
+                # connect and a successful turn STILL re-probes (the persisted id is still the
+                # base id until the turn's result lands). Best-effort (RB1) — never crash the
+                # turn's teardown over the write.
+                turn_rt.attach_fork = False
+                self._clear_fork_pending(chat_id, turn_name)
 
         # P6/H2/RB2: a transport/liveness driver_error on a VERIFIED session (a fresh start,
         # or a resume already confirmed good) leaves a dead/wedged SDK client behind — every
@@ -2465,6 +2919,15 @@ class StreamingSession:
         #    clear it on the CAPTURED project (``name`` — the project whose turn just failed
         #    to resume), not the active one, since /switch may have moved active mid-turn.
         self._persist(chat_id, session_id=None, name=name)
+        # P11 T2: ALSO clear the persisted ``fork_pending`` here — the recovery drops the dead
+        # base id, so the NEXT turn starts FRESH and persists a brand-new id that is OURS alone.
+        # A leftover ``fork_pending`` would, after a restart, trigger a needless re-probe/fork of
+        # the bot's OWN fresh session (self-healing, never a co-drive — there is no live base id
+        # to corrupt — but untidy). Clear it wherever the dead id is cleared (mirrors the
+        # resume-raises rebuild path, which already clears both). Must come BEFORE the
+        # best-effort notice send below so a send failure can't leave the marker stale.
+        if name is not None:
+            self._clear_fork_pending(chat_id, name)
         # 2) Drop the in-memory engine so the next turn rebuilds + starts fresh. Best-effort
         #    stop() the connected-but-dead engine BEFORE dropping the reference so its SDK
         #    client is closed rather than orphaned (QF3-review non-blocker, same pattern as
@@ -2738,6 +3201,13 @@ class StreamingSession:
         # write); we just decode + return the target name. A switch never resolves a decision.
         if decoded.kind == "switch":
             return self._resolve_switch(chat_id, decoded)
+        # P11 T2: an [Attach] tap routes by SESSION ID (not a tool_use_id) and touches no
+        # pending hold — handle it BEFORE the pending-index lookup, like switch. The bot has
+        # already enforced SB1 (the _authorized recheck) before reaching here. We decode +
+        # return the session id; the bot calls attach_session (which does the SB2 cwd check +
+        # fork-vs-continue). An attach never resolves a held decision.
+        if decoded.kind == "attach":
+            return self._resolve_attach(chat_id, decoded)
         # Route by id: the pending index owns id -> (project, kind, held event). An "Other"
         # tap arms free-text capture (no engine call), but it must still target a KNOWN
         # pending ask, so it too looks the id up first.
@@ -2786,6 +3256,27 @@ class StreamingSession:
         # Hand the (decoded) name to the bot to switch + path-revalidate; the toast is set by
         # the bot after the switch. ``handled`` is True (we recognized + routed the tap).
         return CallbackOutcome(handled=True, note=f"Opening {name}…", switch_to=name)
+
+    def _resolve_attach(self, chat_id: int, decoded: Callback) -> "CallbackOutcome":
+        """Route an ``[Attach]`` tap (P11 T2) — decode-only; the bot calls ``attach_session``.
+
+        The attach tap carries the TARGET SESSION ID (``decoded.attach_session_id``), already
+        lexically validated by :func:`~claude_tg.render.decode_callback` (the session-id shape).
+        This returns a :class:`CallbackOutcome` with ``attach_session_id`` set so the bot's
+        ``on_callback`` performs the adopt through :meth:`attach_session` — which does the SB2
+        cwd confinement + the fork-vs-continue decision (the same code path ``/attach`` uses).
+        The session does the actual work in ``attach_session``; this is just the decode + route
+        (mirroring ``_resolve_switch``). With no store there is nothing to attach into (single
+        implicit project) → a benign no-op note. The bot's SB1 ``_authorized`` recheck already
+        gated this call. An attach resolves no held decision.
+        """
+        sid = decoded.attach_session_id
+        if not sid:
+            return CallbackOutcome(handled=False, note="ignored")
+        if self.store is None:
+            # No registry to attach into (single implicit project) — benign no-op (RB1).
+            return CallbackOutcome(handled=False, note="no projects")
+        return CallbackOutcome(handled=True, note="Attaching…", attach_session_id=sid)
 
     def _engine_for_pending(
         self, chat_id: int, ref: _PendingRef
@@ -3573,6 +4064,32 @@ def _footer_only_result(event: ResultEvent) -> ResultEvent:
 
 
 @dataclass(frozen=True)
+class AttachOutcome:
+    """Result of an ``/attach <id>`` / ``[Attach]`` adopt (so the bot can reply, P11 T2).
+
+    The session decides everything (lookup, SB2, fork-vs-continue, the registry write) and
+    returns this for the bot to render — the bot adds no policy, exactly as ``/sessions`` is a
+    pure render of the session's discovery. Fields:
+
+    * ``ok``       — True iff a project was adopted + made active (the next message resumes it).
+    * ``message``  — the operator-facing reply (already styled; HTML when ``parse_mode``='HTML').
+    * ``parse_mode`` — the reply's Telegram parse mode (``"HTML"`` for the styled replies,
+                       ``None`` for a plain one).
+    * ``project_name`` — the adopted project's STORED (SB4-validated) name, or ``None`` on a
+                       refusal/no-op (unknown id, out-of-root cwd, no store).
+    * ``forked``   — True iff the target was LIVE elsewhere and we adopted a FORK (a fresh id,
+                       transcript copied — never the live id); False for an idle continue. Only
+                       meaningful when ``ok``. Surfaced so the reply can tell the operator why.
+    """
+
+    ok: bool
+    message: str
+    parse_mode: Optional[str] = None
+    project_name: Optional[str] = None
+    forked: bool = False
+
+
+@dataclass(frozen=True)
 class CallbackOutcome:
     """Result of routing one inline-keyboard tap (so the bot can answer the query).
 
@@ -3592,10 +4109,14 @@ class CallbackOutcome:
                          SB2 path re-validation, the same as ``/switch``); it decodes + routes
                          and returns the name so the bot performs the switch via its shared
                          ``/switch`` helper. ``None`` for every non-switch outcome.
+    * ``attach_session_id`` — (P11 T2) the TARGET session id of an ``[Attach]`` tap. The
+                         session decodes + routes it and returns it; the bot calls
+                         :meth:`attach_session` (which does the SB2 cwd check + fork-vs-continue).
+                         ``None`` for every non-attach outcome.
 
     ``project_name`` / ``tool_use_id`` are populated only for an ``expects_text`` outcome
-    (the "Other"/"Reject" arm); ``switch_to`` only for a switch tap; all are ``None``
-    otherwise.
+    (the "Other"/"Reject" arm); ``switch_to`` only for a switch tap; ``attach_session_id``
+    only for an attach tap; all are ``None`` otherwise.
     """
 
     handled: bool
@@ -3604,11 +4125,13 @@ class CallbackOutcome:
     project_name: Optional[str] = None
     tool_use_id: Optional[str] = None
     switch_to: Optional[str] = None
+    attach_session_id: Optional[str] = None
 
 
 __all__ = [
     "StreamingSession",
     "StreamingBusy",
+    "AttachOutcome",
     "CallbackOutcome",
     "EngineFactory",
     "SendFn",

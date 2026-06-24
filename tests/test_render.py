@@ -38,6 +38,7 @@ from claude_tg.engine.types import (
 from claude_tg.render import (
     BODY_FREE_ERROR_LINE,
     CALLBACK_LIMIT,
+    KIND_ATTACH,
     KIND_PERMISSION,
     KIND_SWITCH,
     ChatSendGate,
@@ -51,6 +52,7 @@ from claude_tg.render import (
     code_path,
     decode_callback,
     done_footer_suffix,
+    encode_attach_callback,
     encode_callback,
     encode_switch_callback,
     free_text_prompt,
@@ -1567,6 +1569,87 @@ def test_open_project_keyboard_carries_switch_callback():
     assert decode_callback(buttons[0].callback_data).switch_to == "beta"
 
 
+# ---- P11 T2: the attach callback codec + the /sessions attach keyboard -----
+
+
+def test_attach_callback_round_trips():
+    # P11 T2: encode_attach_callback -> decode_callback recovers kind="attach" + the session id.
+    sid = "f47ac10b-58cc-4372-a567-0e02b2c3d479"  # a real UUID-shaped id
+    data = encode_attach_callback(sid)
+    assert data == f"{KIND_ATTACH}|{sid}|x"
+    cb = decode_callback(data)
+    assert cb is not None
+    assert cb.kind == "attach"
+    assert cb.attach_session_id == sid
+
+
+def test_attach_callback_within_byte_budget_for_uuid():
+    # A 36-char UUID id stays well under Telegram's 64-byte callback limit.
+    sid = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    data = encode_attach_callback(sid)
+    assert len(data.encode("utf-8")) <= CALLBACK_LIMIT
+    assert decode_callback(data).attach_session_id == sid
+
+
+def test_attach_callback_does_not_collide_with_other_kinds():
+    # P11 T2: the attach kind char 't' is distinct from ask/other/plan/permission/switch, so
+    # an attach callback never decodes to any of them (and vice versa) — collision-free.
+    assert decode_callback(encode_attach_callback("sess-1")).kind == "attach"
+    assert decode_callback(encode_switch_callback("alpha")).kind == "switch"
+    assert decode_callback(encode_callback("a", REAL_TOOL_USE_ID, question_index=0, option_index=0)).kind == "ask"
+    assert decode_callback(encode_callback("p", REAL_TOOL_USE_ID, plan_action="a")).kind == "plan"
+    assert decode_callback(encode_callback(KIND_PERMISSION, REAL_TOOL_USE_ID, payload="o")).kind == "permission"
+
+
+def test_decode_rejects_forged_attach_id_and_payload():
+    # SB1 trust boundary: an attach callback with a non-session-shaped id (illegal chars / too
+    # long) or a wrong payload char is forged/stale -> decode returns None (adopts nothing).
+    assert decode_callback("t|bad id|x") is None        # space is not in the id charset
+    assert decode_callback("t|" + "a" * 49 + "|x") is None  # over the 48-char bound
+    assert decode_callback("t|sess-1|s") is None         # wrong payload char ('s' is switch)
+    assert decode_callback("t||x") is None               # empty id
+
+
+def test_encode_attach_callback_rejects_pipe_in_id():
+    # Defensive: a '|' in the id would break the 3-field scheme -> ValueError at build.
+    with pytest.raises(ValueError):
+        encode_attach_callback("a|b")
+    with pytest.raises(ValueError):
+        encode_attach_callback("")
+
+
+def test_sessions_keyboard_one_attach_button_per_session():
+    from claude_tg.render import sessions_keyboard
+
+    class _S:
+        def __init__(self, sid):
+            self.session_id = sid
+
+    kb = sessions_keyboard([_S("aaaa1111-2222-3333-4444-555566667777"), _S("bbbb")])
+    assert isinstance(kb, InlineKeyboardMarkup)
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    assert len(buttons) == 2
+    # Each button text shows the SHORT id; the callback_data carries the FULL id.
+    assert buttons[0].text.startswith("📎 Attach aaaa1111")
+    assert decode_callback(buttons[0].callback_data).attach_session_id == "aaaa1111-2222-3333-4444-555566667777"
+    assert decode_callback(buttons[1].callback_data).attach_session_id == "bbbb"
+
+
+def test_sessions_keyboard_empty_is_none_and_caps():
+    from claude_tg.render import sessions_keyboard
+
+    class _S:
+        def __init__(self, sid):
+            self.session_id = sid
+
+    assert sessions_keyboard([]) is None  # no sessions → no keyboard (listing sent alone)
+    # The button count is capped; an id-less session is skipped (no button, no crash).
+    many = [_S(f"sess-{i}") for i in range(20)] + [_S(None)]
+    kb = sessions_keyboard(many, cap=5)
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    assert len(buttons) == 5  # honored the cap
+
+
 def test_queued_suffix():
     # T6: " (N more waiting)" only when N>=1; 0/negative -> "".
     assert queued_suffix(0) == ""
@@ -1610,3 +1693,238 @@ def test_quick_reply_keyboard_is_one_time_and_has_common_chips():
 def test_quick_reply_dismiss_is_a_keyboard_remove():
     # T6: the dismiss object is a ReplyKeyboardRemove (clears the one-time chips after capture).
     assert isinstance(quick_reply_dismiss(), ReplyKeyboardRemove)
+
+
+# ---------------------------------------------------------------------------
+# /sessions listing (P11 T1) — discovered sessions merged with bot projects (PURE)
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass  # noqa: E402
+from typing import Optional  # noqa: E402
+
+from claude_tg.render import (  # noqa: E402
+    SESSIONS_EMPTY_NOTICE,
+    ProjectMark,
+    relative_age,
+    sessions_listing,
+    short_session_id,
+)
+
+
+@dataclass
+class _Sess:
+    """A minimal stand-in for sessions_discovery.DiscoveredSession (attribute access only)."""
+
+    session_id: str
+    cwd: Optional[str] = "/work/a"
+    title: Optional[str] = "do a thing"
+    last_active: Optional[int] = 1000
+    running: bool = False
+
+
+def test_sessions_listing_empty_returns_notice():
+    assert sessions_listing([], {}, now=0.0) == SESSIONS_EMPTY_NOTICE
+
+
+def test_sessions_listing_shows_short_id_running_glyph_and_code_cwd():
+    sessions = [
+        _Sess(session_id="abcdef0123456789", cwd="/work/proj", running=True, last_active=0),
+        _Sess(session_id="0011223344556677", cwd="/work/other", running=False, last_active=0),
+    ]
+    out = sessions_listing(sessions, {}, now=10.0)
+    # Short id (8 chars) only — the full id never appears.
+    assert "abcdef01" in out and "abcdef0123456789" not in out
+    # Running 🟢 vs idle ⚪.
+    assert "🟢" in out and "⚪" in out
+    # cwd wrapped in <code> (R6 — inert monospace, not tappable /segments), HTML parse mode.
+    assert "<code>/work/proj</code>" in out
+    # No bare cwd outside <code> (a bare copy would auto-linkify).
+    assert ">/work/proj<" not in out.replace("<code>/work/proj</code>", "")
+
+
+def test_sessions_listing_merges_and_marks_bot_known_and_active():
+    sessions = [
+        _Sess(session_id="sess-active", cwd="/w/a"),
+        _Sess(session_id="sess-known", cwd="/w/b"),
+        _Sess(session_id="sess-unknown", cwd="/w/c"),
+    ]
+    marks = {
+        "sess-active": ProjectMark(name="alpha", active=True),
+        "sess-known": ProjectMark(name="beta", active=False),
+    }
+    out = sessions_listing(sessions, marks, now=2000.0)
+    lines = out.splitlines()
+    active_line = next(line for line in lines if "alpha" in line)
+    known_line = next(line for line in lines if "beta" in line)
+    unknown_line = next(line for line in lines if "sess-unk" in line)
+    # The active bot project is marked → and ✓ <name>; the known one ✓ but ·; the unknown
+    # neither.
+    assert "→" in active_line and "✓ <b>alpha</b>" in active_line
+    assert "·" in known_line and "✓ <b>beta</b>" in known_line
+    assert "✓" not in unknown_line and "→" not in unknown_line
+    # Dedup-by-id: each discovered session appears exactly ONCE (it is not duplicated by being
+    # both discovered AND a bot project).
+    assert sum(1 for line in lines if "sess-act" in line) == 1
+
+
+def test_sessions_listing_truncates_and_escapes_title_body_free():
+    # SB3: a long, HTML-bearing first-prompt is clipped AND escaped (no raw markup, no flood).
+    nasty = "<script>alert(1)</script> " + "x" * 200
+    sessions = [_Sess(session_id="s1", title=nasty, cwd="/w")]
+    out = sessions_listing(sessions, {}, now=0.0)
+    assert "<script>" not in out  # escaped
+    assert "&lt;script&gt;" in out
+    assert "…" in out  # truncated
+    # The clipped+escaped title row is far shorter than the raw 200-char prompt.
+    assert len(out) < 400
+
+
+def test_sessions_listing_title_collapses_newlines():
+    sessions = [_Sess(session_id="s1", title="line one\nline two\nline three", cwd="/w")]
+    out = sessions_listing(sessions, {}, now=0.0)
+    assert "line one line two line three" in out
+
+
+def test_sessions_listing_handles_missing_cwd_and_title():
+    sessions = [_Sess(session_id="s1", cwd=None, title=None, last_active=None)]
+    out = sessions_listing(sessions, {}, now=0.0)
+    assert "(no path)" in out and "(untitled)" in out and "unknown" in out
+
+
+def test_short_session_id_escapes_and_clips():
+    assert short_session_id("abcdef0123456789") == "abcdef01"
+    assert short_session_id(None) == ""
+    # An odd id with HTML metacharacters is clipped to 8 chars FIRST, then escaped (defensive
+    # — a session id is UUID-shaped, but a hand-crafted/forged value can never inject markup).
+    out = short_session_id("<b>xxxxx-rest")
+    assert "&lt;b&gt;" in out and "<b>" not in out
+
+
+def test_relative_age_units_and_rb1():
+    assert relative_age(1000, now=1000) == "just now"
+    assert relative_age(1000, now=1000 + 30) == "just now"
+    assert relative_age(1000, now=1000 + 120) == "2m ago"
+    assert relative_age(1000, now=1000 + 3 * 3600) == "3h ago"
+    assert relative_age(1000, now=1000 + 2 * 86400) == "2d ago"
+    # RB1: a non-numeric value → "unknown"; a future timestamp (skew) → "just now", not negative.
+    assert relative_age(None, now=1000) == "unknown"
+    assert relative_age("nope", now=1000) == "unknown"
+    assert relative_age(2000, now=1000) == "just now"
+
+
+# ---------------------------------------------------------------------------
+# /sessions sort + cap + truncation footer (P11 T1 live-fix — the >4096 crash)
+# ---------------------------------------------------------------------------
+
+from claude_tg.render import (  # noqa: E402
+    cap_sessions,
+    prioritize_sessions,
+)
+from claude_tg.util import TELEGRAM_MAX, _utf16_len  # noqa: E402
+
+
+def test_prioritize_sessions_active_first_then_known_then_recent():
+    # bucket order: active → bot-known → others-by-recency-desc.
+    s_active = _Sess(session_id="active", last_active=1)        # oldest, but active
+    s_known = _Sess(session_id="known", last_active=2)          # old, but bot-known
+    s_new = _Sess(session_id="plain-new", last_active=1000)     # newest plain
+    s_old = _Sess(session_id="plain-old", last_active=500)      # older plain
+    marks = {"active": ProjectMark(name="A", active=True), "known": ProjectMark(name="K")}
+    ordered = prioritize_sessions([s_old, s_new, s_known, s_active], marks)
+    ids = [s.session_id for s in ordered]
+    # active first (despite being oldest), then bot-known, then plain by recency DESC.
+    assert ids == ["active", "known", "plain-new", "plain-old"]
+
+
+def test_prioritize_sessions_missing_recency_sorts_last_in_bucket():
+    a = _Sess(session_id="has-recency", last_active=100)
+    b = _Sess(session_id="no-recency", last_active=None)
+    ordered = prioritize_sessions([b, a], {})
+    assert [s.session_id for s in ordered] == ["has-recency", "no-recency"]
+
+
+def test_cap_sessions_keeps_all_known_plus_top_recent():
+    # 3 bot-known (incl. active) + 10 plain; limit 5 → all 3 known + top 2 recent = 5.
+    known = [_Sess(session_id=f"k{i}", last_active=i) for i in range(3)]  # old
+    plain = [_Sess(session_id=f"p{i}", last_active=1000 + i) for i in range(10)]
+    marks = {"k0": ProjectMark(name="a", active=True), "k1": ProjectMark(name="b"),
+             "k2": ProjectMark(name="c")}
+    ordered = prioritize_sessions(known + plain, marks)
+    capped = cap_sessions(ordered, marks, limit=5)
+    ids = {s.session_id for s in capped}
+    assert {"k0", "k1", "k2"} <= ids  # ALL bot-known kept even though old
+    assert len(capped) == 5  # exactly the limit
+    # The 2 plain kept are the most-recent (p9, p8), not arbitrary.
+    plain_kept = [s.session_id for s in capped if s.session_id.startswith("p")]
+    assert set(plain_kept) == {"p9", "p8"}
+
+
+def test_cap_sessions_never_hides_known_even_if_known_exceed_limit():
+    # 8 bot-known but limit 3 → all 8 kept (operator's own are never hidden).
+    known = [_Sess(session_id=f"k{i}", last_active=i) for i in range(8)]
+    marks = {f"k{i}": ProjectMark(name=f"n{i}", active=(i == 0)) for i in range(8)}
+    capped = cap_sessions(prioritize_sessions(known, marks), marks, limit=3)
+    assert {s.session_id for s in capped} == {f"k{i}" for i in range(8)}
+
+
+def test_sessions_listing_caps_rows_and_shows_honest_footer():
+    sessions = [_Sess(session_id=f"s{i:04d}aa", cwd=f"/w/{i}", last_active=1000 - i)
+                for i in range(100)]
+    out = sessions_listing(sessions, {}, now=2000.0, limit=15)
+    # Header reports the TRUE total; only `limit` rows are rendered.
+    assert "(100 found)" in out
+    row_lines = [line for line in out.splitlines() if line.startswith(("→", "·"))]
+    assert len(row_lines) == 15
+    # Honest footer names shown-of-total and points at /attach (escaped angle brackets).
+    assert "Showing 15 of 100 sessions" in out
+    assert "<code>/attach &lt;id&gt;</code>" in out
+    # The most-recent 15 are shown (s0000..s0014 by last_active desc), not an arbitrary slice.
+    assert "s0000aa" in out and "s0014aa" in out and "s0015aa" not in out
+
+
+def test_sessions_listing_no_footer_when_all_shown():
+    sessions = [_Sess(session_id=f"s{i}", cwd="/w", last_active=i) for i in range(5)]
+    out = sessions_listing(sessions, {}, now=100.0, limit=15)
+    assert "Showing" not in out  # total (5) ≤ shown → no truncation footer
+
+
+def test_sessions_listing_capped_stays_well_under_4096():
+    # Even with long cwds + titles, the CAPPED listing is comfortably under Telegram's limit.
+    sessions = [
+        _Sess(session_id=f"sess{i:04d}", cwd="/Users/ray/dev/" + "deep/" * 30 + f"proj{i}",
+              title="x" * 500, last_active=2000 - i)
+        for i in range(300)
+    ]
+    out = sessions_listing(sessions, {}, now=3000.0)  # default limit
+    assert _utf16_len(out) <= TELEGRAM_MAX, f"capped listing is {_utf16_len(out)} > 4096"
+
+
+def test_sessions_listing_UNCAPPED_would_overflow_4096_mutation_probe():
+    # ⭐ Mutation-probe for the cap: with the cap effectively REMOVED (a huge limit) the SAME
+    # 300-session input renders a single message FAR over Telegram's 4096 limit — the exact
+    # live crash. This pins that the cap (not luck) is what keeps the message legal: if a
+    # future change rendered everything, this length assertion would fire.
+    sessions = [
+        _Sess(session_id=f"sess{i:04d}", cwd="/Users/ray/dev/" + "deep/" * 30 + f"proj{i}",
+              title="x" * 500, last_active=2000 - i)
+        for i in range(300)
+    ]
+    uncapped = sessions_listing(sessions, {}, now=3000.0, limit=10_000)
+    assert _utf16_len(uncapped) > TELEGRAM_MAX  # proves an uncapped render WOULD overflow
+
+
+def test_sessions_keyboard_buttons_are_most_relevant_active_first():
+    # The attach buttons follow the SAME relevance order as the listing (active → known →
+    # recent), not SDK order — so the capped buttons cover the operator's own + freshest.
+    from claude_tg.render import sessions_keyboard
+
+    s_active = _Sess(session_id="active-1", last_active=1)   # oldest but active
+    s_known = _Sess(session_id="known-1", last_active=2)     # old but known
+    plain = [_Sess(session_id=f"p{i}", last_active=1000 + i) for i in range(10)]  # newest
+    marks = {"active-1": ProjectMark(name="A", active=True), "known-1": ProjectMark(name="K")}
+    kb = sessions_keyboard(plain + [s_known, s_active], marks=marks, cap=3)
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    ids = [decode_callback(b.callback_data).attach_session_id for b in buttons]
+    # active + known lead the (capped) buttons despite being the oldest sessions.
+    assert ids[0] == "active-1" and ids[1] == "known-1"
+    assert len(buttons) == 3

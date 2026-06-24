@@ -2965,24 +2965,36 @@ async def test_resume_id_non_str_session_id_starts_fresh(tmp_path):
 # ===========================================================================
 
 
-def make_sequential_session(engines_by_cwd: dict, *, store, config=None) -> StreamingSession:
+def make_sequential_session(
+    engines_by_cwd: dict, *, store, config=None, discover=None, probe_one=None
+) -> StreamingSession:
     """A session whose factory hands out the NEXT engine for a cwd on each BUILD.
 
     ``engines_by_cwd`` maps a cwd → a LIST of engines; successive builds for that cwd
     pop the next one. Used by the QF3 recovery tests where the first engine resumes
     (and fails) and the engine is then DROPPED, so the next turn must BUILD a SECOND,
     fresh engine — letting us assert the dead id is never re-resumed.
+
+    ``discover`` / ``probe_one`` are optional injected P11-attach seams (the discovery
+    lookup + the first-write liveness re-probe) so the adopt-recovery tests below can drive a
+    deterministic verdict; omitted → the StreamingSession defaults (the real ones).
     """
     queues = {cwd: list(engines) for cwd, engines in engines_by_cwd.items()}
 
     def factory(*, cwd, backstop_seconds, permission_policy):
         return queues[cwd].pop(0)
 
+    kwargs = {}
+    if discover is not None:
+        kwargs["discover"] = discover
+    if probe_one is not None:
+        kwargs["probe_one"] = probe_one
     return StreamingSession(
         config or make_config(),
         session_store=store,
         engine_factory=factory,
         clock=lambda: 0.0,
+        **kwargs,
     )
 
 
@@ -3065,6 +3077,196 @@ async def test_resume_failure_on_first_turn_clears_id_recovers_and_notifies(tmp_
     assert eng2.started is True
     assert eng2.resumed is None  # fresh start — the dead id was never re-resumed
     assert any("ok" in s["text"] for s in rec.sends)
+
+
+# ===========================================================================
+# P11 T2 hardening (post-SHIP) — (1) recovery clears the persisted fork_pending; (2) the
+# fork_pending clear-at-CLEAN-TURN boundary (NOT at resume-connect) is data-corruption-critical
+# and durably pinned. Both use a REAL JsonSessionStore (so fork_pending is observable on disk).
+# ===========================================================================
+
+
+class ForkResumeOkButFirstTurnFailsEngine:
+    """A fork-aware engine: resume(fork=…) CONNECTS, the first send yields a resume-failure
+    event → _recover_failed_resume fires. Records (id, fork) per resume."""
+
+    def __init__(self, script, *, session_id):
+        self._script = script
+        self.session_id = session_id
+        self.started = False
+        self.stopped = False
+        self.resume_calls: list[tuple[str, bool]] = []
+
+    async def start(self):
+        self.started = True
+
+    async def resume(self, session_id, *, fork=False):
+        self.resume_calls.append((session_id, fork))
+        self.started = True
+        self.session_id = session_id
+
+    async def stop(self):
+        self.stopped = True
+
+    async def send(self, prompt, *, timeout=None):
+        for ev in self._script:
+            yield ev
+
+    def resolve(self, tool_use_id, decision):
+        return True
+
+    def cancel(self, tool_use_id=None):
+        return 1
+
+
+class ForkResumeThenRaiseEngine:
+    """A fork-aware engine: resume(fork=…) CONNECTS, then the first send RAISES mid-stream so
+    the turn never reaches the clean-turn finalize (fork_pending stays set). Records resumes."""
+
+    def __init__(self, *, session_id=None):
+        self.session_id = session_id
+        self.started = False
+        self.stopped = False
+        self.resume_calls: list[tuple[str, bool]] = []
+
+    async def start(self):
+        self.started = True
+
+    async def resume(self, session_id, *, fork=False):
+        self.resume_calls.append((session_id, fork))
+        self.started = True
+        # A fork lands on a fresh id, but no CLEAN turn persists it (send raises below), so the
+        # store keeps the BASE id — the exact "connected but no clean turn" state under test.
+        self.session_id = "forked-but-uncommitted" if fork else session_id
+
+    async def stop(self):
+        self.stopped = True
+
+    async def send(self, prompt, *, timeout=None):
+        raise RuntimeError("transport blip mid-turn — no clean turn completes")
+        yield  # unreachable; makes this an async generator
+
+    def resolve(self, tool_use_id, decision):
+        return True
+
+    def cancel(self, tool_use_id=None):
+        return 1
+
+
+async def test_recovery_clears_persisted_fork_pending(tmp_path):
+    """⭐ Hardening item 1: when a resumed turn fails and _recover_failed_resume fires, it
+    clears NOT ONLY the dead session_id but ALSO the persisted ``fork_pending`` marker. A
+    leftover marker would, after a restart, needlessly re-probe/fork the bot's OWN fresh
+    session (self-healing, not a co-drive — but untidy). We adopt a session (fork_pending=True),
+    re-probe IDLE (so it continues), the resume connects but the first turn fails → recovery
+    clears both."""
+    from claude_tg.session_store import JsonSessionStore
+    from claude_tg.sessions_discovery import DiscoveredSession as _D
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+
+    # Engine 1: resume connects (continue — re-probe is idle), first turn yields a resume
+    # failure. Engine 2: the fresh engine the recovered next turn builds.
+    eng1 = ForkResumeOkButFirstTurnFailsEngine(
+        [
+            ErrorEvent(kind_of_error="turn_error", message="No conversation found with session id base-1"),
+            ResultEvent(session_id="base-1", is_error=True, subtype="error_during_execution"),
+        ],
+        session_id="base-1",
+    )
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="fresh-1", is_error=False, subtype="success", result_text="ok")],
+        session_id="fresh-1",
+    )
+    session = make_sequential_session(
+        {str(proj): [eng1, eng2]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+        discover=lambda: [_D(session_id="base-1", cwd=str(proj), title="t", last_active=0, running=False)],
+        probe_one=_probe_returning(False, False),  # re-probe IDLE → continue the base id
+    )
+    # Adopt: pins base-1 + fork_pending=True.
+    name = session.attach_session(1, "base-1").project_name
+    assert store.get_fork_pending(1, name) is True
+
+    rec = Recorder()
+    await asyncio.wait_for(session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0)
+    # The re-probe said idle → the resume CONTINUED the base id (no fork).
+    assert eng1.resume_calls == [("base-1", False)]
+    # Recovery fired: the dead id is cleared AND — the item-1 fix — fork_pending is cleared too.
+    assert store.get_project(1, name)["session_id"] is None
+    assert store.get_fork_pending(1, name) is False, \
+        "recovery must clear the persisted fork_pending (item 1)"
+    assert any("Couldn't resume" in s["text"] for s in rec.sends)
+
+
+async def test_fork_pending_cleared_only_after_clean_turn_not_at_connect(tmp_path):
+    """⭐ Hardening item 2 — the DATA-CORRUPTION-CRITICAL timing boundary. ``fork_pending`` is
+    cleared ONLY after a CLEAN turn, NOT at resume-connect. We attach a LIVE-elsewhere session
+    → the first resume re-probes → FORKS and CONNECTS, but the turn RAISES before a clean turn
+    completes (a restart-equivalent gap). Because no clean turn ran:
+      * ``fork_pending`` is STILL True (the binding decision is not yet committed), and
+      * the store STILL holds the BASE id (no forked id was persisted).
+    So a RESTART here (a fresh StreamingSession over the same store) must RE-PROBE and FORK
+    AGAIN — never ``resume(fork=False)`` on the still-live base id (which would co-drive).
+
+    This pins the boundary against a "simplify: clear fork_pending at connect" regression —
+    which broke ZERO existing tests yet is a real co-drive bug. The mutation-probe below moves
+    the clear to connect and asserts THIS test then fails."""
+    from claude_tg.session_store import JsonSessionStore
+    from claude_tg.sessions_discovery import DiscoveredSession as _D
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "live"
+    proj.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+
+    disc = [_D(session_id="live-base", cwd=str(proj), title="t", last_active=0, running=True)]
+
+    # --- Process A: attach + a first turn that forks+connects but RAISES before a clean turn.
+    eng_a = ForkResumeThenRaiseEngine(session_id=None)
+    session_a = make_sequential_session(
+        {str(proj): [eng_a]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+        discover=lambda: list(disc),
+        probe_one=_probe_returning(True, False),  # base id is LIVE → fork at first write
+    )
+    name = session_a.attach_session(1, "live-base").project_name
+    assert store.get_fork_pending(1, name) is True
+
+    # The first turn: resume FORKS + connects, then send() raises → the clean-turn finalize is
+    # NEVER reached, so fork_pending is NOT cleared. The raise propagates out of handle_message.
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(session_a.handle_message(1, "go", send=Recorder().send, edit=Recorder().edit), timeout=2.0)
+    # The resume FORKED off the live base id (never co-drove it).
+    assert eng_a.resume_calls == [("live-base", True)]
+    # ⭐ The boundary: fork_pending is STILL True (connected, but no clean turn committed it),
+    # and the persisted id is STILL the base id (no forked id landed — no clean result).
+    assert store.get_fork_pending(1, name) is True, \
+        "fork_pending must persist until a CLEAN turn completes (NOT at connect)"
+    assert store.get_project(1, name)["session_id"] == "live-base"
+
+    # --- Process B (RESTART): a fresh StreamingSession over the SAME store. The base id is
+    # still live; the persisted fork_pending re-triggers a fresh re-probe → it must FORK AGAIN.
+    eng_b = ForkResumeThenRaiseEngine(session_id=None)
+    session_b = make_sequential_session(
+        {str(proj): [eng_b]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+        discover=lambda: list(disc),
+        probe_one=_probe_returning(True, False),  # still LIVE at the restart re-probe
+    )
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(session_b.handle_message(1, "go2", send=Recorder().send, edit=Recorder().edit), timeout=2.0)
+    # ⭐ The post-restart resume RE-PROBED and FORKED — never resume(fork=False) on the live base.
+    assert eng_b.resume_calls == [("live-base", True)], \
+        "after a restart-before-clean-turn, the re-probe must FORK again (never co-drive)"
 
 
 async def test_resume_failure_signalled_via_is_error_result_event(tmp_path):
@@ -6202,3 +6404,416 @@ async def test_free_text_capture_returns_true_for_chip_dismissal(tmp_path):
     assert captured is True, "a free-text capture must return True so the bot dismisses chips"
     # The free text was routed to the engine as the answer (not a new turn).
     assert eng.resolve_calls and eng.resolve_calls[-1][0] == "a-other"
+
+
+# ===========================================================================
+# P11 / T2 — attach: adopt ANY discovered session as a controllable project.
+#
+# ⭐ The BINDING fork-vs-continue decision is made at the FIRST WRITE (in _ensure_engine),
+# re-derived from a FRESH single-session liveness re-probe — NOT frozen at attach time.
+# Persisted via ``fork_pending`` so it survives a restart. Discovery (attach lookup) AND the
+# re-probe are both INJECTED (no real SDK / ps / ~/.claude); the engine captures each resume's
+# (id, fork) so a test proves what actually happened at the write. The HARD safety rule under
+# test: a base id that is LIVE or UNCERTAIN at first write is FORKED (never co-driven); a
+# confidently-idle one continues; an out-of-ALLOWED_ROOTS cwd is refused.
+# ===========================================================================
+
+from claude_tg.session_store import JsonSessionStore as _AttachStore  # noqa: E402
+from claude_tg.sessions_discovery import DiscoveredSession as _Disc  # noqa: E402
+from claude_tg.stream_session import AttachOutcome as _AttachOutcome  # noqa: E402
+
+
+class ForkCapturingEngine:
+    """A fake Engine that records every resume's (id, fork) so a test can prove the decision.
+
+    Mirrors FakeEngine but its ``resume`` accepts the P11 ``fork`` kwarg (the fork path calls
+    ``engine.resume(id, fork=True)``). On a FORK it adopts a fresh ``forked_session_id``
+    (simulating the SDK resuming into a NEW id, copied transcript) so the persisted result id is
+    the FORK's, never the live base id; on a CONTINUE it keeps the resumed id.
+    """
+
+    def __init__(self, *, forked_session_id="forked-new-id"):
+        self.session_id = None
+        self.started = False
+        self.stopped = False
+        self.resume_calls: list[tuple[str, bool]] = []
+        self._forked_session_id = forked_session_id
+        self._gate = asyncio.Event()
+
+    async def start(self):
+        self.started = True
+
+    async def resume(self, session_id, *, fork=False):
+        self.resume_calls.append((session_id, fork))
+        self.started = True
+        # A FORK lands on a brand-new id (never the live base); a CONTINUE keeps the base.
+        self.session_id = self._forked_session_id if fork else session_id
+
+    async def stop(self):
+        self.stopped = True
+
+    async def send(self, prompt, *, timeout=None):
+        # One clean turn whose result carries whatever id the engine currently holds (the
+        # forked id after a fork, the continued id otherwise) — so _drive_turn persists THAT.
+        yield ResultEvent(
+            session_id=self.session_id, is_error=False, subtype="success", result_text="ok"
+        )
+
+    def resolve(self, tool_use_id, decision):
+        self._gate.set()
+        return True
+
+    def cancel(self, tool_use_id=None):
+        self._gate.set()
+        return 1
+
+
+def _probe_returning(running, degraded=False):
+    """A probe_one seam returning a FIXED ``(running, degraded)`` verdict (B2+B3 re-probe)."""
+    def _probe(session_id, cwd):
+        return (running, degraded)
+    return _probe
+
+
+def make_attach_session(
+    store, discovered, *, engine=None, workdir="/work",
+    allowed_roots=(), allow_any_path=True, probe_one=None,
+):
+    """A real StreamingSession over ``store`` with INJECTED discovery + re-probe + a fork engine.
+
+    ``discovered`` is the list ``self._discover`` returns (the attach lookup). ``probe_one`` is
+    the FIRST-WRITE single-session re-probe seam → ``(running, degraded)``; it defaults to a
+    CONFIDENTLY-IDLE verdict ``(False, False)`` so a plain idle attach continues unless a test
+    scripts otherwise. The engine factory returns ONE ``ForkCapturingEngine`` so a test reads
+    its ``resume_calls``. Defaults to ``allow_any_path=True`` (SB2 no-ops for the in-root tests).
+    """
+    eng = engine if engine is not None else ForkCapturingEngine()
+    session = StreamingSession(
+        make_config(
+            engine_mode="streaming", workdir=workdir,
+            allowed_roots=allowed_roots, allow_any_path=allow_any_path,
+        ),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng,
+        clock=lambda: 0.0,
+        discover=lambda: list(discovered),
+        probe_one=probe_one if probe_one is not None else _probe_returning(False, False),
+    )
+    return session, eng
+
+
+# ---- attach mechanics (lookup / SB2 / naming / idempotency) ---------------
+
+
+def test_attach_adopts_persists_base_id_and_fork_pending(tmp_path):
+    """Attach adopts the session as an active project pinned to the base id, persists the
+    PERSISTED ``fork_pending`` marker (the binding decision is deferred to first write), and
+    the attach-time message does NOT over-promise an outcome."""
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="sess-1", cwd=str(tmp_path), title="My Task", last_active=0, running=False)]
+    session, _eng = make_attach_session(store, disc, workdir=str(tmp_path))
+
+    outcome = session.attach_session(1, "sess-1")
+    assert isinstance(outcome, _AttachOutcome) and outcome.ok
+    name = outcome.project_name
+    assert name is not None
+    rec = store.get_project(1, name)
+    assert rec["session_id"] == "sess-1"          # pinned to the base id
+    assert store.get_active(1) == name            # made active
+    assert store.get_fork_pending(1, name) is True  # adopted-not-yet-resumed (B2+B3)
+    # The message does NOT promise forked/continue (decided at first write); it explains the
+    # auto-fork-if-live guarantee honestly.
+    assert "forking automatically if it's active elsewhere" in outcome.message
+    assert outcome.forked is False  # not yet known at attach time
+
+
+def test_attach_out_of_root_cwd_is_refused_not_adopted(tmp_path):
+    """⭐ SB2: a discovered session whose cwd is OUTSIDE ALLOWED_ROOTS is REFUSED with a clear
+    message — never silently adopted + driven in an arbitrary dir. No project is created."""
+    root = tmp_path / "allowed"
+    root.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="ext-sess", cwd=str(outside), title="t", last_active=0, running=False)]
+    session, _eng = make_attach_session(
+        store, disc, workdir=str(root),
+        allowed_roots=(str(root),), allow_any_path=False,  # confinement ON
+    )
+
+    outcome = session.attach_session(1, "ext-sess")
+    assert outcome.ok is False
+    assert "permitted roots" in outcome.message
+    assert store.list_projects(1) == {}  # NOTHING adopted
+
+
+def test_attach_unknown_session_id_clean_error_no_crash(tmp_path):
+    """RB2: an id absent from discovery → a clean refusal, no project, no crash."""
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="known-1", cwd=str(tmp_path), title="t", last_active=0, running=False)]
+    session, _eng = make_attach_session(store, disc, workdir=str(tmp_path))
+
+    outcome = session.attach_session(1, "does-not-exist")
+    assert outcome.ok is False
+    assert "No Claude session" in outcome.message
+    assert store.list_projects(1) == {}
+
+
+def test_attach_no_store_replies_needs_persistence():
+    """RB1: with no store there is no registry to attach into — a clean notice, no deref."""
+    session = StreamingSession(
+        make_config(engine_mode="streaming"),
+        session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: ForkCapturingEngine(),
+        clock=lambda: 0.0,
+        discover=lambda: [_Disc(session_id="x", cwd="/w", title="t", last_active=0)],
+    )
+    outcome = session.attach_session(1, "x")
+    assert outcome.ok is False and "persistence" in outcome.message.lower()
+
+
+def test_attach_appears_in_projects_listing(tmp_path):
+    """The adopted session is a first-class project: it shows up in list_projects + get_active
+    so /projects + /switch work on it (SB4-valid name)."""
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="sess-q", cwd=str(tmp_path), title="Fix the bug", last_active=0, running=False)]
+    session, _eng = make_attach_session(store, disc, workdir=str(tmp_path))
+
+    outcome = session.attach_session(1, "sess-q")
+    name = outcome.project_name
+    import re as _re
+    assert _re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name), f"name {name!r} must be SB4-valid"
+    assert name in store.list_projects(1)
+    assert store.get_active(1) == name
+
+
+def test_attach_derives_sb4_name_from_messy_title(tmp_path):
+    """Naming: a messy title (spaces/slashes/unicode) is sanitized to the SB4 charset; an empty
+    one falls back to attached-<shortid>. Two attaches of similar names DEDUPE (no collision)."""
+    store = _AttachStore(tmp_path / "s.json")
+    d1 = _Disc(session_id="s1", cwd=str(tmp_path), title="Fix: the /login bug!! 🎉", last_active=0)
+    d2 = _Disc(session_id="s2", cwd=str(tmp_path), title="Fix: the /login bug!! 🎉", last_active=0)
+    d3 = _Disc(session_id="s3deadbeef", cwd="/", title="   ", last_active=0)  # empty → fallback
+    session, _eng = make_attach_session(store, [d1, d2, d3], workdir=str(tmp_path), allow_any_path=True)
+
+    n1 = session.attach_session(1, "s1").project_name
+    n2 = session.attach_session(1, "s2").project_name
+    n3 = session.attach_session(1, "s3deadbeef").project_name
+    import re as _re
+    for n in (n1, n2, n3):
+        assert _re.fullmatch(r"[A-Za-z0-9_-]{1,32}", n)
+    assert n1 != n2  # deduped — two similar titles don't collide
+    assert n3.startswith("attached-")  # empty title + no basename → the shortid fallback
+    assert len({n1, n2, n3}) == 3
+    assert set(store.list_projects(1)) == {n1, n2, n3}
+
+
+def test_attach_same_id_twice_is_idempotent_switch_no_duplicate(tmp_path):
+    """Re-attaching an id the chat already adopted just SWITCHES to it — no duplicate project."""
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="dup-sess", cwd=str(tmp_path), title="t", last_active=0, running=True)]
+    session, _eng = make_attach_session(store, disc, workdir=str(tmp_path))
+
+    first = session.attach_session(1, "dup-sess")
+    assert first.ok
+    n_before = set(store.list_projects(1))
+    second = session.attach_session(1, "dup-sess")
+    assert second.ok
+    assert second.project_name == first.project_name  # same project
+    assert set(store.list_projects(1)) == n_before    # NO new project
+
+
+# ---- the BINDING decision at FIRST WRITE (re-probe), incl. B2 restart + B3 race ----------
+
+
+async def test_attach_idle_first_write_reprobe_idle_continues(tmp_path):
+    """A confidently-idle base id (idle at attach AND idle at the first-write re-probe) drives a
+    NORMAL turn that CONTINUES the same id (fork=False) and persists it; fork_pending CLEARED."""
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="idle-1", cwd=str(tmp_path), title="t", last_active=0, running=False)]
+    session, eng = make_attach_session(
+        store, disc, workdir=str(tmp_path), probe_one=_probe_returning(False, False),
+    )
+    name = session.attach_session(1, "idle-1").project_name
+
+    rec = Recorder()
+    await asyncio.wait_for(session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0)
+    assert eng.resume_calls == [("idle-1", False)]  # CONTINUED the same id (re-probe idle)
+    assert store.get_project(1, name)["session_id"] == "idle-1"
+    # First successful turn → fork_pending cleared (subsequent resumes are ordinary continues).
+    assert store.get_fork_pending(1, name) is False
+
+
+async def test_attach_live_first_write_forks_and_persists_forked_id(tmp_path):
+    """⭐ THE HARD RULE end-to-end: a base id LIVE at the first-write re-probe is FORKED
+    (resume fork=True) and the FORKED id is persisted — the live base id is never co-driven."""
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="live-9", cwd=str(tmp_path), title="t", last_active=0, running=True)]
+    eng = ForkCapturingEngine(forked_session_id="fork-abc")
+    session, _ = make_attach_session(
+        store, disc, engine=eng, workdir=str(tmp_path), probe_one=_probe_returning(True, False),
+    )
+    name = session.attach_session(1, "live-9").project_name
+
+    rec = Recorder()
+    await asyncio.wait_for(session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0)
+    assert eng.resume_calls == [("live-9", True)]   # FORKED off the live base id
+    assert store.get_project(1, name)["session_id"] == "fork-abc"  # forked id persisted
+    assert store.get_fork_pending(1, name) is False  # cleared after the first clean turn
+
+
+async def test_attach_restart_before_first_turn_still_forks(tmp_path):
+    """⭐ B2 — restart before the first turn. Attach a session, then RECREATE StreamingSession
+    from the SAME store (the in-memory attach_fork is gone) and send a message. The PERSISTED
+    fork_pending triggers a fresh re-probe; with the base id now live the resume FORKS — never
+    a co-driving resume(fork=False) on the persisted base id."""
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="live-r", cwd=str(tmp_path), title="t", last_active=0, running=True)]
+    # 1) Attach in session A.
+    session_a, _ = make_attach_session(store, disc, workdir=str(tmp_path), probe_one=_probe_returning(True, False))
+    name = session_a.attach_session(1, "live-r").project_name
+    assert store.get_fork_pending(1, name) is True  # the durable marker survives the restart
+
+    # 2) Simulate a RESTART: a brand-new StreamingSession over the SAME store (no in-memory
+    #    runtime / attach_fork). The first-write re-probe reports the base id is LIVE.
+    eng_b = ForkCapturingEngine(forked_session_id="fork-after-restart")
+    session_b = StreamingSession(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allow_any_path=True),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng_b,
+        clock=lambda: 0.0,
+        discover=lambda: list(disc),
+        probe_one=_probe_returning(True, False),  # base id is live NOW
+    )
+    rec = Recorder()
+    await asyncio.wait_for(session_b.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0)
+    # The restarted process FORKED (never co-drove the persisted base id).
+    assert eng_b.resume_calls == [("live-r", True)]
+    assert store.get_project(1, name)["session_id"] == "fork-after-restart"
+
+
+async def test_attach_idle_then_goes_live_before_first_write_forks(tmp_path):
+    """⭐ B3 — the attach→first-write race. Attach while IDLE (idle at attach), but the
+    first-write re-probe reports the base id has since gone LIVE → the resume FORKS (caught at
+    the write), never co-driving. The decision is the FRESH probe, not the stale attach-time
+    liveness."""
+    store = _AttachStore(tmp_path / "s.json")
+    # IDLE at attach time…
+    disc = [_Disc(session_id="race-1", cwd=str(tmp_path), title="t", last_active=0, running=False)]
+    eng = ForkCapturingEngine(forked_session_id="fork-race")
+    # …but the first-write re-probe says LIVE.
+    session, _ = make_attach_session(
+        store, disc, engine=eng, workdir=str(tmp_path), probe_one=_probe_returning(True, False),
+    )
+    name = session.attach_session(1, "race-1").project_name
+
+    rec = Recorder()
+    await asyncio.wait_for(session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0)
+    assert eng.resume_calls == [("race-1", True)]  # FORKED — the race was caught at the write
+    assert store.get_project(1, name)["session_id"] == "fork-race"
+
+
+async def test_attach_first_write_reprobe_uncertain_forks(tmp_path):
+    """Safe-default-on-doubt at the FIRST WRITE: if the re-probe can't confirm idle
+    (degraded=True), the resume FORKS rather than risk co-driving a possibly-live session."""
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="unc-1", cwd=str(tmp_path), title="t", last_active=0, running=False)]
+    eng = ForkCapturingEngine(forked_session_id="fork-unc")
+    session, _ = make_attach_session(
+        store, disc, engine=eng, workdir=str(tmp_path),
+        probe_one=_probe_returning(False, True),  # could NOT tell → uncertain
+    )
+    name = session.attach_session(1, "unc-1").project_name
+
+    rec = Recorder()
+    await asyncio.wait_for(session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0)
+    assert eng.resume_calls == [("unc-1", True)]  # forked on doubt
+    assert store.get_project(1, name)["session_id"] == "fork-unc"
+
+
+async def test_attach_idle_second_turn_is_ordinary_continue_no_refork(tmp_path):
+    """After the first successful turn clears fork_pending, a SECOND turn is an ordinary
+    continue — NO second re-probe, NO re-fork (the forked/continued id is ours alone now)."""
+    store = _AttachStore(tmp_path / "s.json")
+    disc = [_Disc(session_id="idle-2", cwd=str(tmp_path), title="t", last_active=0, running=False)]
+    probe_calls = []
+
+    def probe(session_id, cwd):
+        probe_calls.append(session_id)
+        return (False, False)  # confidently idle
+
+    eng = ForkCapturingEngine()
+    session, _ = make_attach_session(store, disc, engine=eng, workdir=str(tmp_path), probe_one=probe)
+    name = session.attach_session(1, "idle-2").project_name
+
+    rec = Recorder()
+    await asyncio.wait_for(session.handle_message(1, "t1", send=rec.send, edit=rec.edit), timeout=2.0)
+    assert store.get_fork_pending(1, name) is False  # cleared after the first clean turn
+    assert probe_calls == ["idle-2"]  # re-probed exactly once (the first write)
+
+    # A SECOND turn: the engine is warm-started, so no resume at all; even on a fresh engine it
+    # would be a plain continue. Crucially fork_pending is cleared so NO further re-probe fires.
+    await asyncio.wait_for(session.handle_message(1, "t2", send=rec.send, edit=rec.edit), timeout=2.0)
+    assert probe_calls == ["idle-2"]  # STILL only the one first-write probe (no re-probe)
+
+
+# ---- mutation probe 1: the fork-if-live rule is at first write (re-probe) -----------------
+
+async def test_mutation_probe_fork_if_live_at_first_write(tmp_path):
+    """MUTATION PROBE — the fork-if-live decision is genuinely gated on the FIRST-WRITE
+    re-probe. INTACT: a base id the re-probe reports LIVE forks; one it reports IDLE continues.
+    If someone froze the decision at attach (skipped the re-probe and continued the persisted
+    base id), the LIVE assertion would FAIL — catching the co-drive-on-restart/race regression.
+    The IDLE assertion proves it's not just always-forking."""
+    # LIVE at re-probe → fork.
+    store_l = _AttachStore(tmp_path / "l.json")
+    eng_l = ForkCapturingEngine(forked_session_id="fk")
+    s_l, _ = make_attach_session(
+        store_l, [_Disc(session_id="L", cwd=str(tmp_path), title="t", last_active=0, running=False)],
+        engine=eng_l, workdir=str(tmp_path), probe_one=_probe_returning(True, False),
+    )
+    s_l.attach_session(1, "L")
+    rec = Recorder()
+    await asyncio.wait_for(s_l.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0)
+    assert eng_l.resume_calls == [("L", True)], "a LIVE-at-write base id MUST fork (never co-drive)"
+
+    # IDLE at re-probe → continue.
+    store_i = _AttachStore(tmp_path / "i.json")
+    eng_i = ForkCapturingEngine()
+    s_i, _ = make_attach_session(
+        store_i, [_Disc(session_id="I", cwd=str(tmp_path), title="t", last_active=0, running=False)],
+        engine=eng_i, workdir=str(tmp_path), probe_one=_probe_returning(False, False),
+    )
+    s_i.attach_session(1, "I")
+    rec2 = Recorder()
+    await asyncio.wait_for(s_i.handle_message(1, "go", send=rec2.send, edit=rec2.edit), timeout=2.0)
+    assert eng_i.resume_calls == [("I", False)], "a confidently-idle base id continues the same id"
+
+
+# ---- mutation probe 2: the SB2 out-of-root refusal ------------------------
+
+def test_mutation_probe_sb2_out_of_root_refusal(tmp_path):
+    """MUTATION PROBE — SB2 genuinely gates the attach on the discovered cwd. In-root → adopted;
+    the SAME id moved OUT-of-root → refused. Dropping resolve_within_roots would FAIL the
+    out-of-root assertion. The in-root case proves it's not just always-refusing."""
+    root = tmp_path / "ok"
+    root.mkdir()
+    outside = tmp_path / "no"
+    outside.mkdir()
+
+    store_ok = _AttachStore(tmp_path / "ok.json")
+    s_ok, _ = make_attach_session(
+        store_ok, [_Disc(session_id="X", cwd=str(root), title="t", last_active=0)],
+        workdir=str(root), allowed_roots=(str(root),), allow_any_path=False,
+    )
+    assert s_ok.attach_session(1, "X").ok is True
+    assert store_ok.list_projects(1) != {}
+
+    store_no = _AttachStore(tmp_path / "no.json")
+    s_no, _ = make_attach_session(
+        store_no, [_Disc(session_id="X", cwd=str(outside), title="t", last_active=0)],
+        workdir=str(root), allowed_roots=(str(root),), allow_any_path=False,
+    )
+    refused = s_no.attach_session(1, "X")
+    assert refused.ok is False, "an out-of-ALLOWED_ROOTS cwd MUST be refused (SB2)"
+    assert store_no.list_projects(1) == {}

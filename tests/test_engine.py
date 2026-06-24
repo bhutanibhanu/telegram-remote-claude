@@ -64,9 +64,14 @@ class FakeSubstrate:
     async def start(self):
         self.calls.append(("start",))
 
-    async def resume(self, session_id):
-        self.calls.append(("resume", session_id))
-        self.session_id = session_id
+    async def resume(self, session_id, *, fork=False):
+        # P11 T2: record the fork flag so the engine-level fork test can assert the engine
+        # threads it through. A CONTINUE (fork=False, every pre-P11 resume) keeps the same id;
+        # a FORK (fork=True) simulates the SDK resuming into a NEW id — so we do NOT seed the
+        # base id, mirroring the real SdkSubstrate (the forked id arrives on the first send).
+        self.calls.append(("resume", session_id, fork))
+        if not fork:
+            self.session_id = session_id
 
     async def send(self, prompt, *, timeout=120.0):
         self.calls.append(("send", prompt, timeout))
@@ -122,8 +127,49 @@ async def test_resume_reattaches_and_carries_session_id():
     out = await drain(eng.send("more"))
     await eng.stop()
 
-    assert ("resume", "S-prev") in sub.calls
+    # P11 T2: the resume call now records the fork flag; a plain continue is fork=False.
+    assert ("resume", "S-prev", False) in sub.calls
     assert out[0].text == "resumed"
+
+
+async def test_resume_fork_threads_through_and_does_not_seed_base_id():
+    """P11 T2: ``Engine.resume(id, fork=True)`` threads ``fork`` to the substrate AND does not
+    adopt the base id (a fork resumes into a NEW id, copied transcript — never the base, which
+    may be live elsewhere). The forked id is reported on the first turn, exactly as a fresh
+    start captures its id. This is the engine half of the never-co-drive-a-live-session rule."""
+    sub = FakeSubstrate(script={"go": [TextEvent(text="forked", session_id="S-forked")]})
+    eng = Engine(sub)
+
+    await eng.resume("S-base", fork=True)
+    # The base id was NOT seeded (we never write it) — the substrate stays id-less until the
+    # forked id arrives on the first event.
+    assert eng.session_id is None
+    assert ("resume", "S-base", True) in sub.calls
+    out = await drain(eng.send("go"))
+    # The forked id (a fresh one) is what the engine now carries — never the base id.
+    assert out[0].text == "forked"
+    assert eng.session_id == "S-forked"
+    assert eng.session_id != "S-base"
+
+
+def test_sdk_build_options_fork_sets_fork_session_only_with_resume():
+    """P11 T2: ``_build_options(resume=id, fork=True)`` sets ``fork_session=True`` so the SDK
+    resumes into a fresh id (copied transcript). ``fork`` without a ``resume`` is meaningless
+    (a fork with no base is a fresh start) and must NOT set it; the default (continue / no
+    resume) never sets it — behavior is unchanged for every pre-P11 path."""
+    sub = SdkSubstrate()
+    # Fork + resume → fork_session=True on the options.
+    forked = sub._build_options(resume="sess-1", fork=True)
+    assert getattr(forked, "fork_session", None) is True
+    # Resume WITHOUT fork (the idle-continue path) → fork_session unset/falsey.
+    cont = sub._build_options(resume="sess-1")
+    assert not getattr(cont, "fork_session", False)
+    # Fork WITHOUT resume is a no-op (a fork needs a base; no base = fresh start).
+    nores = sub._build_options(fork=True)
+    assert not getattr(nores, "fork_session", False)
+    # Plain fresh start (no resume, no fork) → unset, exactly as pre-P11.
+    fresh = sub._build_options()
+    assert not getattr(fresh, "fork_session", False)
 
 
 # A UUID-shaped session id (Claude's real format) so the redaction is unambiguous.

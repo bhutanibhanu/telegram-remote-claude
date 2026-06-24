@@ -333,7 +333,7 @@ class SdkSubstrate:
 
     # -- options -------------------------------------------------------------
 
-    def _build_options(self, resume: Optional[str] = None) -> Any:
+    def _build_options(self, resume: Optional[str] = None, *, fork: bool = False) -> Any:
         from claude_agent_sdk import ClaudeAgentOptions  # lazy
 
         kwargs: dict[str, Any] = {
@@ -356,6 +356,18 @@ class SdkSubstrate:
             kwargs["disallowed_tools"] = self._disallowed_tools
         if resume:
             kwargs["resume"] = resume
+            if fork:
+                # P11 T2: fork the resumed session — the SDK resumes into a NEW session id
+                # with the transcript copied, NEVER writing to the resumed (``resume``) id.
+                # This is the load-bearing safety primitive: when the target session is LIVE
+                # in another process, attaching with ``fork_session=True`` means two writers
+                # never share one ``(id, cwd)`` transcript (which silently fork-corrupts the
+                # conversation tree). Set ONLY alongside ``resume`` (a fork with no base is a
+                # fresh ``start``); ``fork=False`` (the default + idle attach + every pre-P11
+                # resume) omits it entirely so behavior is unchanged. The spike proved the SDK
+                # honors ``fork_session`` on resume (the new id arrives in the init frame and
+                # is captured by ``_capture_session_id`` exactly as a normal resume's id).
+                kwargs["fork_session"] = True
         return ClaudeAgentOptions(**kwargs)
 
     def _make_can_use_tool(self) -> Any:
@@ -402,16 +414,25 @@ class SdkSubstrate:
         self._client = ClaudeSDKClient(options=self._build_options())
         await self._client.connect()
 
-    async def resume(self, session_id: str) -> None:
+    async def resume(self, session_id: str, *, fork: bool = False) -> None:
         from claude_agent_sdk import ClaudeSDKClient  # lazy
 
         if not session_id:
             raise ValueError("resume() requires a non-empty session_id")
         if self._client is not None:
             raise RuntimeError("session already started; call stop() first")
-        self._client = ClaudeSDKClient(options=self._build_options(resume=session_id))
+        self._client = ClaudeSDKClient(
+            options=self._build_options(resume=session_id, fork=fork)
+        )
         await self._client.connect()
-        self.session_id = session_id
+        # P11 T2: a CONTINUE resume keeps the same id, so we can seed it immediately. A FORK
+        # resumes into a BRAND-NEW id (the SDK copies the transcript under a fresh id, leaving
+        # the base id — which may be live elsewhere — untouched), so we must NOT seed the base
+        # id here: the real forked id arrives in the init/result frame and is captured by
+        # ``_capture_session_id`` on the first send, exactly like a fresh ``start``. Seeding the
+        # base id on a fork would persist + route against an id we never actually write to.
+        if not fork:
+            self.session_id = session_id
 
     async def send(
         self,

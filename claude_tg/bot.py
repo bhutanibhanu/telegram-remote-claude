@@ -29,11 +29,14 @@ from .engine import ImageInput, ImageMediaType
 from .paths import PathNotAllowed, resolve_within_roots
 from .render import (
     BODY_FREE_ERROR_LINE,
+    ProjectMark,
     code_path,
     free_text_prompt,
     project_status_label,
     quick_reply_dismiss,
     quick_reply_keyboard,
+    sessions_keyboard,
+    sessions_listing,
     yolo_banner,
 )
 from .session_store import (
@@ -42,6 +45,7 @@ from .session_store import (
     UnknownProject,
     validate_project_name,
 )
+from .sessions_discovery import discover_sessions
 from .stream_session import StreamingBusy, StreamingSession
 from .util import _redact_sid_in_text, expand_macro, split_message
 from .voice import TranscriptionError, TranscriptionUnavailable, transcribe
@@ -69,6 +73,11 @@ HELP_TEXT = (
     "/deep — use the deep model (Opus) for this project's next turn (streaming mode)\n"
     "/auto (or /model default) — clear the model override, back to the default (streaming mode)\n"
     "/projects — list your projects and which one is active (streaming mode)\n"
+    "/sessions — list every Claude Code session on the Mac (running/idle), including the "
+    "one running right now, merged with your projects (read-only)\n"
+    "/attach <session-id> — adopt any Mac session (from /sessions) as a project and drive "
+    "it; a session that's live elsewhere is attached as a FORK so it isn't corrupted "
+    "(streaming mode)\n"
     "/new <name> <path> — create a project at <path> and switch to it; <path> must be an "
     "existing directory inside the permitted roots (streaming mode)\n"
     "/switch <name> — switch the active project; the next message resumes it (streaming mode)\n"
@@ -107,6 +116,8 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("auto", "Clear the model override (back to the default)"),
     ("model", "Clear the model override (alias of /auto)"),
     ("projects", "List your projects and which one is active"),
+    ("sessions", "List all Claude sessions on the Mac (running/idle)"),
+    ("attach", "Adopt + drive any Mac session: /attach <session-id>"),
     ("new", "Create a project at a path and switch to it"),
     ("switch", "Switch the active project"),
     ("rm", "Drop a project from the registry"),
@@ -726,6 +737,118 @@ class TelegramClaudeBot:
                 f"{cwd_html} ({status}) (last active {html.escape(str(last), quote=False)})"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    def _bot_project_marks(self, chat_id: int) -> dict[str, ProjectMark]:
+        """Map ``session_id -> ProjectMark`` for the chat's OWN projects (``/sessions`` merge).
+
+        Built from ``streaming.store.list_projects`` so ``/sessions`` can mark a discovered
+        machine session that is ALSO a known bot project (its name + ``✓``) and flag the
+        chat's active project (``→``). Keyed by each project's stored ``session_id`` (a
+        project with no session yet — never run — has none, so it can't be matched to a
+        discovered session and is skipped). Read-only + defensive (RB1): no store (one-shot
+        mode, or an unconfigured streaming store) → ``{}`` (the listing then just shows the
+        discovered sessions unannotated). Never raises.
+        """
+        if self.streaming is None or self.streaming.store is None:
+            return {}
+        try:
+            chat_id_active = self.streaming.store.get_active(chat_id)
+            projects = self.streaming.store.list_projects(chat_id)
+        except Exception:  # a misbehaving store must never break /sessions (RB1)
+            log.debug("could not read bot projects for /sessions merge", exc_info=True)
+            return {}
+        marks: dict[str, ProjectMark] = {}
+        for name, record in projects.items():
+            if not isinstance(record, dict):
+                continue
+            sid = record.get("session_id")
+            if not sid:
+                continue  # a project that never ran has no session id to merge on
+            marks[str(sid)] = ProjectMark(name=str(name), active=(name == chat_id_active))
+        return marks
+
+    async def cmd_sessions(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """List ALL Claude Code sessions on the Mac, merged with the bot's own projects (P11 T1).
+
+        Read-only discovery (no attach in T1): :func:`~claude_tg.sessions_discovery.discover_sessions`
+        enumerates every session under ``~/.claude`` (started in a terminal, an IDE, or by the
+        bot — *including the orchestrator running right now*) with a composite running/idle
+        hint. Each row shows a short session id, the cwd (``<code>``-wrapped, R6), a truncated
+        title/first-prompt, a relative last-active, and a 🟢/⚪ marker;
+        :func:`~claude_tg.render.sessions_listing` then **merges + dedups** the discovered list
+        (by ``session_id``) with the chat's OWN projects so a bot-known session is marked with
+        its project name + ``✓`` and the active one with ``→``.
+
+        Works in BOTH engine modes — discovery is machine-wide, independent of the streaming
+        registry; the bot-project annotation is simply empty in one-shot (no store). SB1: the
+        ``_ok`` allowlist recheck gates it (a non-allowlisted chat gets nothing). SB3: the
+        listing is body-free (metadata only — title/first-prompt is truncated + escaped, never
+        a transcript body). RB1: a discovery failure / empty ``~/.claude`` replies a clean
+        "no sessions found" notice (``sessions_listing`` returns it for an empty list), never a
+        crash. Read-only — no on-disk write, no attach.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        chat_id = update.effective_chat.id
+        try:
+            sessions = discover_sessions()
+        except Exception:  # discover_sessions is already RB1-total; belt-and-braces here too.
+            log.warning("session discovery failed for /sessions", exc_info=True)
+            sessions = []
+        marks = self._bot_project_marks(chat_id)
+        text = sessions_listing(sessions, marks, now=time.time())
+        # P11 T2: in STREAMING mode attach a [📎 Attach <shortid>] button per discovered
+        # session so the operator can adopt + drive any of them in one tap (the typed
+        # /attach <id> works too, incl. for sessions past the button cap — the id is on the
+        # row). The keyboard's buttons are the most-RELEVANT sessions (active → bot-known →
+        # most-recent — the SAME order as the listing rows, via `marks`), not an arbitrary
+        # first-N. One-shot mode has no project registry to attach into, so it gets the listing
+        # alone (no keyboard) — discovery there is read-only, exactly as T1. A keyboard is only
+        # attached when there ARE sessions (sessions_keyboard returns None for an empty list).
+        # SB1 already gated this above.
+        keyboard = (
+            sessions_keyboard(sessions, marks=marks) if self.streaming is not None else None
+        )
+        # P11 T1 live-fix: a real Mac can have hundreds of sessions; even after the relevance
+        # cap a listing with long cwds/titles could approach Telegram's 4096-char limit and
+        # throw BadRequest "message too long" (the live bug). Route the reply through the
+        # chunked HTML sender so it can NEVER overflow; the keyboard rides only the last chunk.
+        await self._reply_html_chunked(update, text, keyboard)
+
+    async def cmd_attach(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Adopt ANY discovered Claude session as a controllable project (``/attach <id>``, P11 T2).
+
+        The "drive any session from your phone" command: ``/attach <session-id>`` (the id is
+        shown on each ``/sessions`` row) looks the session up machine-wide, then adopts its
+        ``(session_id, cwd)`` as a bot project + switches to it, so the NEXT message resumes +
+        drives it through the **normal turn + permission gate** path. Streaming mode only (the
+        project registry is a streaming concept — one-shot replies the streaming-only notice).
+        Order (fail-fast):
+
+        1. ``_ok`` allowlist recheck (SB1) + ``_require_streaming`` one-shot notice.
+        2. Parse the session id (all args joined — an id has no spaces, but be forgiving);
+           missing → usage (RB1).
+        3. Delegate to :meth:`~claude_tg.stream_session.StreamingSession.attach_session`,
+           which does ALL the policy — the SB2 cwd confinement (refuse an out-of-roots cwd),
+           the **fork-if-live** decision (a session live elsewhere is adopted as a FORK, never
+           co-driven), the SB4-named registry write, and the operator-facing reply. The bot is
+           a pure renderer of its :class:`~claude_tg.stream_session.AttachOutcome` (no policy
+           here — same posture as ``/sessions``).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_streaming(update):
+            return
+        assert self.streaming is not None
+        chat_id = update.effective_chat.id
+        # An id carries no spaces; join defensively so a stray paste with a trailing space
+        # still works. Empty → usage.
+        session_id = " ".join(ctx.args).strip() if ctx.args else ""
+        if not session_id:
+            await update.message.reply_text("Usage: /attach <session-id>")
+            return
+        outcome = self.streaming.attach_session(chat_id, session_id)
+        await update.message.reply_text(outcome.message, parse_mode=outcome.parse_mode)
 
     async def cmd_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Switch the chat's active project (streaming mode only).
@@ -1821,6 +1944,30 @@ class TelegramClaudeBot:
                 continue
             await update.message.reply_text(chunk)
 
+    async def _reply_html_chunked(
+        self, update: Update, text: str, keyboard=None
+    ) -> None:
+        """Send ``text`` as ``parse_mode="HTML"``, split to Telegram-safe chunks (P11 T1 live-fix).
+
+        The hard backstop against BadRequest "message too long": a ``/sessions`` listing on a
+        machine with hundreds of sessions (or any long HTML reply) is routed through
+        :func:`~claude_tg.util.split_message` so no single send exceeds Telegram's 4096-UTF-16
+        limit. ``split_message`` **prefers to break on a newline**, and every session row is a
+        complete, self-contained line (no ``<code>``/``<b>`` span crosses a ``\\n``), so a chunk
+        boundary never splits an HTML tag and each chunk stays valid HTML. The optional inline
+        ``keyboard`` is attached to the **last** chunk only — never duplicated per chunk. Blank
+        chunks are skipped; an all-blank/empty text still sends one (possibly empty) message so
+        the operator always gets a reply. ``update.message`` is non-None at the call sites.
+        """
+        chunks = [c for c in split_message(text) if c.strip()] or [text]
+        last = len(chunks) - 1
+        for i, chunk in enumerate(chunks):
+            await update.message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                reply_markup=keyboard if i == last else None,
+            )
+
     # ---- streaming mode (ENGINE_MODE=streaming) -----------------------------
     async def _on_message_streaming(
         self,
@@ -1956,6 +2103,21 @@ class TelegramClaudeBot:
             except Exception:
                 log.debug("switch-button reply send failed", exc_info=True)
             return
+        # P11 T2: an [Attach] tap routes by session id. The session decoded + validated the id
+        # (the session-id shape) and returned it on ``attach_session_id``; the bot performs the
+        # actual adopt through ``streaming.attach_session`` — which does ALL the policy (the
+        # SB2 cwd confinement + the fork-if-live decision + the registry write). SB1 is already
+        # enforced above (the _authorized recheck), so a non-allowlisted tap never reaches here.
+        # We answer the query (stop the spinner), do the attach, and reply its outcome; nothing
+        # else (no free-text arm) applies to an attach.
+        if outcome.attach_session_id and self.streaming is not None:
+            await self._answer_callback(query, outcome.note if outcome.handled else None)
+            result = self.streaming.attach_session(chat.id, outcome.attach_session_id)
+            try:
+                await query.message.reply_text(result.message, parse_mode=result.parse_mode)
+            except Exception:
+                log.debug("attach-button reply send failed", exc_info=True)
+            return
         await self._answer_callback(query, outcome.note if outcome.handled else None)
         if outcome.expects_text:
             # D5: name-echo the free-text prompt so the operator knows which project the
@@ -2071,6 +2233,15 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("new", self.cmd_new, filters=allowed))
         app.add_handler(CommandHandler("switch", self.cmd_switch, filters=allowed))
         app.add_handler(CommandHandler("rm", self.cmd_rm, filters=allowed))
+        # P11 T1: /sessions — read-only discovery of ALL Claude sessions on the Mac (incl.
+        # the live orchestrator), merged with the bot's own projects. Same `allowed` chat
+        # filter (SB1) + registered BEFORE the skill passthrough so it isn't forwarded.
+        app.add_handler(CommandHandler("sessions", self.cmd_sessions, filters=allowed))
+        # P11 T2: /attach <session-id> — adopt ANY discovered Claude session as a controllable
+        # project (+ switch to it), forking it if it is live elsewhere. Same `allowed` chat
+        # filter (SB1) + registered BEFORE the skill passthrough so it isn't forwarded as a
+        # skill. Streaming mode only (cmd_attach replies the one-shot notice otherwise).
+        app.add_handler(CommandHandler("attach", self.cmd_attach, filters=allowed))
         # P5 /to <name> <text> (D5 free-text escape hatch): routes a free-text answer to a
         # named project's pending "Other"/reject. Same `allowed` chat filter (SB1) +
         # registered BEFORE the skill passthrough (first-match-wins) — no new callback
