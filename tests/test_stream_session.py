@@ -2965,24 +2965,36 @@ async def test_resume_id_non_str_session_id_starts_fresh(tmp_path):
 # ===========================================================================
 
 
-def make_sequential_session(engines_by_cwd: dict, *, store, config=None) -> StreamingSession:
+def make_sequential_session(
+    engines_by_cwd: dict, *, store, config=None, discover=None, probe_one=None
+) -> StreamingSession:
     """A session whose factory hands out the NEXT engine for a cwd on each BUILD.
 
     ``engines_by_cwd`` maps a cwd → a LIST of engines; successive builds for that cwd
     pop the next one. Used by the QF3 recovery tests where the first engine resumes
     (and fails) and the engine is then DROPPED, so the next turn must BUILD a SECOND,
     fresh engine — letting us assert the dead id is never re-resumed.
+
+    ``discover`` / ``probe_one`` are optional injected P11-attach seams (the discovery
+    lookup + the first-write liveness re-probe) so the adopt-recovery tests below can drive a
+    deterministic verdict; omitted → the StreamingSession defaults (the real ones).
     """
     queues = {cwd: list(engines) for cwd, engines in engines_by_cwd.items()}
 
     def factory(*, cwd, backstop_seconds, permission_policy):
         return queues[cwd].pop(0)
 
+    kwargs = {}
+    if discover is not None:
+        kwargs["discover"] = discover
+    if probe_one is not None:
+        kwargs["probe_one"] = probe_one
     return StreamingSession(
         config or make_config(),
         session_store=store,
         engine_factory=factory,
         clock=lambda: 0.0,
+        **kwargs,
     )
 
 
@@ -3065,6 +3077,196 @@ async def test_resume_failure_on_first_turn_clears_id_recovers_and_notifies(tmp_
     assert eng2.started is True
     assert eng2.resumed is None  # fresh start — the dead id was never re-resumed
     assert any("ok" in s["text"] for s in rec.sends)
+
+
+# ===========================================================================
+# P11 T2 hardening (post-SHIP) — (1) recovery clears the persisted fork_pending; (2) the
+# fork_pending clear-at-CLEAN-TURN boundary (NOT at resume-connect) is data-corruption-critical
+# and durably pinned. Both use a REAL JsonSessionStore (so fork_pending is observable on disk).
+# ===========================================================================
+
+
+class ForkResumeOkButFirstTurnFailsEngine:
+    """A fork-aware engine: resume(fork=…) CONNECTS, the first send yields a resume-failure
+    event → _recover_failed_resume fires. Records (id, fork) per resume."""
+
+    def __init__(self, script, *, session_id):
+        self._script = script
+        self.session_id = session_id
+        self.started = False
+        self.stopped = False
+        self.resume_calls: list[tuple[str, bool]] = []
+
+    async def start(self):
+        self.started = True
+
+    async def resume(self, session_id, *, fork=False):
+        self.resume_calls.append((session_id, fork))
+        self.started = True
+        self.session_id = session_id
+
+    async def stop(self):
+        self.stopped = True
+
+    async def send(self, prompt, *, timeout=None):
+        for ev in self._script:
+            yield ev
+
+    def resolve(self, tool_use_id, decision):
+        return True
+
+    def cancel(self, tool_use_id=None):
+        return 1
+
+
+class ForkResumeThenRaiseEngine:
+    """A fork-aware engine: resume(fork=…) CONNECTS, then the first send RAISES mid-stream so
+    the turn never reaches the clean-turn finalize (fork_pending stays set). Records resumes."""
+
+    def __init__(self, *, session_id=None):
+        self.session_id = session_id
+        self.started = False
+        self.stopped = False
+        self.resume_calls: list[tuple[str, bool]] = []
+
+    async def start(self):
+        self.started = True
+
+    async def resume(self, session_id, *, fork=False):
+        self.resume_calls.append((session_id, fork))
+        self.started = True
+        # A fork lands on a fresh id, but no CLEAN turn persists it (send raises below), so the
+        # store keeps the BASE id — the exact "connected but no clean turn" state under test.
+        self.session_id = "forked-but-uncommitted" if fork else session_id
+
+    async def stop(self):
+        self.stopped = True
+
+    async def send(self, prompt, *, timeout=None):
+        raise RuntimeError("transport blip mid-turn — no clean turn completes")
+        yield  # unreachable; makes this an async generator
+
+    def resolve(self, tool_use_id, decision):
+        return True
+
+    def cancel(self, tool_use_id=None):
+        return 1
+
+
+async def test_recovery_clears_persisted_fork_pending(tmp_path):
+    """⭐ Hardening item 1: when a resumed turn fails and _recover_failed_resume fires, it
+    clears NOT ONLY the dead session_id but ALSO the persisted ``fork_pending`` marker. A
+    leftover marker would, after a restart, needlessly re-probe/fork the bot's OWN fresh
+    session (self-healing, not a co-drive — but untidy). We adopt a session (fork_pending=True),
+    re-probe IDLE (so it continues), the resume connects but the first turn fails → recovery
+    clears both."""
+    from claude_tg.session_store import JsonSessionStore
+    from claude_tg.sessions_discovery import DiscoveredSession as _D
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "api"
+    proj.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+
+    # Engine 1: resume connects (continue — re-probe is idle), first turn yields a resume
+    # failure. Engine 2: the fresh engine the recovered next turn builds.
+    eng1 = ForkResumeOkButFirstTurnFailsEngine(
+        [
+            ErrorEvent(kind_of_error="turn_error", message="No conversation found with session id base-1"),
+            ResultEvent(session_id="base-1", is_error=True, subtype="error_during_execution"),
+        ],
+        session_id="base-1",
+    )
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="fresh-1", is_error=False, subtype="success", result_text="ok")],
+        session_id="fresh-1",
+    )
+    session = make_sequential_session(
+        {str(proj): [eng1, eng2]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+        discover=lambda: [_D(session_id="base-1", cwd=str(proj), title="t", last_active=0, running=False)],
+        probe_one=_probe_returning(False, False),  # re-probe IDLE → continue the base id
+    )
+    # Adopt: pins base-1 + fork_pending=True.
+    name = session.attach_session(1, "base-1").project_name
+    assert store.get_fork_pending(1, name) is True
+
+    rec = Recorder()
+    await asyncio.wait_for(session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0)
+    # The re-probe said idle → the resume CONTINUED the base id (no fork).
+    assert eng1.resume_calls == [("base-1", False)]
+    # Recovery fired: the dead id is cleared AND — the item-1 fix — fork_pending is cleared too.
+    assert store.get_project(1, name)["session_id"] is None
+    assert store.get_fork_pending(1, name) is False, \
+        "recovery must clear the persisted fork_pending (item 1)"
+    assert any("Couldn't resume" in s["text"] for s in rec.sends)
+
+
+async def test_fork_pending_cleared_only_after_clean_turn_not_at_connect(tmp_path):
+    """⭐ Hardening item 2 — the DATA-CORRUPTION-CRITICAL timing boundary. ``fork_pending`` is
+    cleared ONLY after a CLEAN turn, NOT at resume-connect. We attach a LIVE-elsewhere session
+    → the first resume re-probes → FORKS and CONNECTS, but the turn RAISES before a clean turn
+    completes (a restart-equivalent gap). Because no clean turn ran:
+      * ``fork_pending`` is STILL True (the binding decision is not yet committed), and
+      * the store STILL holds the BASE id (no forked id was persisted).
+    So a RESTART here (a fresh StreamingSession over the same store) must RE-PROBE and FORK
+    AGAIN — never ``resume(fork=False)`` on the still-live base id (which would co-drive).
+
+    This pins the boundary against a "simplify: clear fork_pending at connect" regression —
+    which broke ZERO existing tests yet is a real co-drive bug. The mutation-probe below moves
+    the clear to connect and asserts THIS test then fails."""
+    from claude_tg.session_store import JsonSessionStore
+    from claude_tg.sessions_discovery import DiscoveredSession as _D
+
+    root = tmp_path / "root"
+    root.mkdir()
+    proj = root / "live"
+    proj.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+
+    disc = [_D(session_id="live-base", cwd=str(proj), title="t", last_active=0, running=True)]
+
+    # --- Process A: attach + a first turn that forks+connects but RAISES before a clean turn.
+    eng_a = ForkResumeThenRaiseEngine(session_id=None)
+    session_a = make_sequential_session(
+        {str(proj): [eng_a]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+        discover=lambda: list(disc),
+        probe_one=_probe_returning(True, False),  # base id is LIVE → fork at first write
+    )
+    name = session_a.attach_session(1, "live-base").project_name
+    assert store.get_fork_pending(1, name) is True
+
+    # The first turn: resume FORKS + connects, then send() raises → the clean-turn finalize is
+    # NEVER reached, so fork_pending is NOT cleared. The raise propagates out of handle_message.
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(session_a.handle_message(1, "go", send=Recorder().send, edit=Recorder().edit), timeout=2.0)
+    # The resume FORKED off the live base id (never co-drove it).
+    assert eng_a.resume_calls == [("live-base", True)]
+    # ⭐ The boundary: fork_pending is STILL True (connected, but no clean turn committed it),
+    # and the persisted id is STILL the base id (no forked id landed — no clean result).
+    assert store.get_fork_pending(1, name) is True, \
+        "fork_pending must persist until a CLEAN turn completes (NOT at connect)"
+    assert store.get_project(1, name)["session_id"] == "live-base"
+
+    # --- Process B (RESTART): a fresh StreamingSession over the SAME store. The base id is
+    # still live; the persisted fork_pending re-triggers a fresh re-probe → it must FORK AGAIN.
+    eng_b = ForkResumeThenRaiseEngine(session_id=None)
+    session_b = make_sequential_session(
+        {str(proj): [eng_b]},
+        store=store,
+        config=make_roots_config(tmp_path, root=root),
+        discover=lambda: list(disc),
+        probe_one=_probe_returning(True, False),  # still LIVE at the restart re-probe
+    )
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(session_b.handle_message(1, "go2", send=Recorder().send, edit=Recorder().edit), timeout=2.0)
+    # ⭐ The post-restart resume RE-PROBED and FORKED — never resume(fork=False) on the live base.
+    assert eng_b.resume_calls == [("live-base", True)], \
+        "after a restart-before-clean-turn, the re-probe must FORK again (never co-drive)"
 
 
 async def test_resume_failure_signalled_via_is_error_result_event(tmp_path):

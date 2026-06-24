@@ -2919,6 +2919,15 @@ class StreamingSession:
         #    clear it on the CAPTURED project (``name`` — the project whose turn just failed
         #    to resume), not the active one, since /switch may have moved active mid-turn.
         self._persist(chat_id, session_id=None, name=name)
+        # P11 T2: ALSO clear the persisted ``fork_pending`` here — the recovery drops the dead
+        # base id, so the NEXT turn starts FRESH and persists a brand-new id that is OURS alone.
+        # A leftover ``fork_pending`` would, after a restart, trigger a needless re-probe/fork of
+        # the bot's OWN fresh session (self-healing, never a co-drive — there is no live base id
+        # to corrupt — but untidy). Clear it wherever the dead id is cleared (mirrors the
+        # resume-raises rebuild path, which already clears both). Must come BEFORE the
+        # best-effort notice send below so a send failure can't leave the marker stale.
+        if name is not None:
+            self._clear_fork_pending(chat_id, name)
         # 2) Drop the in-memory engine so the next turn rebuilds + starts fresh. Best-effort
         #    stop() the connected-but-dead engine BEFORE dropping the reference so its SDK
         #    client is closed rather than orphaned (QF3-review non-blocker, same pattern as
