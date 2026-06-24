@@ -71,6 +71,14 @@ from typing import Any, Literal, Optional, Protocol
 
 from telegram import InlineKeyboardMarkup, LinkPreviewOptions
 
+from .audit import (
+    KIND_POLICY_EVENT,
+    KIND_SESSION_EVENT,
+    AuditEvent,
+    AuditLog,
+    AuditSink,
+    ChatBoundSink,
+)
 from .claude_runner import ClaudeResult, ClaudeRunner
 from .config import Config
 from .engine import (
@@ -218,6 +226,9 @@ def _default_engine_factory(
     model: Optional[str] = None,
     permission_mode: str = "default",
     thinking: bool = False,
+    audit_sink: Optional[AuditSink] = None,
+    bash_policy_mode: str = "off",
+    bash_policy_extra_patterns: tuple[str, ...] = (),
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
@@ -271,6 +282,21 @@ def _default_engine_factory(
     no ``thinking`` option, ``include_partial_messages`` stays off → no extra wire traffic.
     Off by default (cost + flood posture); toggled per project by ``/thinking`` (transient,
     RB3). SB3: the reasoning TEXT is shown; the opaque signature is dropped in ``normalize``.
+
+    **P13 T-AUDIT:** ``audit_sink`` is the optional, BODY-FREE audit sink the engine records
+    every gate decision to (a :class:`~claude_tg.audit.ChatBoundSink` over the process
+    :class:`~claude_tg.audit.AuditLog`, bound per chat by ``StreamingSession._build_engine``).
+    The default ``None`` makes the engine's audit hook a no-op, so a bare factory call (or a
+    deploy with audit disabled) is byte-for-byte unchanged. Best-effort (RB1): an audit write
+    never breaks a turn.
+
+    **P13 T-BASH:** ``bash_policy_mode`` (``flag``/``deny``/``off``) + ``bash_policy_extra_patterns``
+    are the Bash command-policy knobs threaded straight into the engine, where they are
+    consulted ADDITIVELY in ``on_tool_request`` for ``Bash`` only (the C2-residual guardrail).
+    The default ``"off"`` keeps a bare factory call (and a deploy with the policy off)
+    byte-for-byte unchanged; the bot binds ``config.bash_policy_mode`` (default ``flag``) via
+    ``_bound_factory``. The policy can only ESCALATE a matched dangerous command (prompt/deny),
+    never auto-allow it.
     """
     engine: Engine
 
@@ -294,6 +320,9 @@ def _default_engine_factory(
         cwd=cwd,
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
+        audit_sink=audit_sink,
+        bash_policy_mode=bash_policy_mode,
+        bash_policy_extra_patterns=bash_policy_extra_patterns,
     )
     return engine
 
@@ -691,6 +720,19 @@ class StreamingSession:
     ) -> None:
         self.config = config
         self.store = session_store
+        # P13 T-AUDIT: the ONE process-wide durable, body-free audit log (append-only JSONL,
+        # atomic + 0600, size-bounded). Built from config ONLY when an audit path is resolved
+        # (``CLAUDE_STATE_FILE``-derived default, or an explicit ``AUDIT_LOG_FILE``); ``None``
+        # disables audit entirely → every engine is built with ``audit_sink=None`` (a no-op),
+        # so behavior is IDENTICAL to pre-P13. ``_build_engine`` wraps this in a per-chat
+        # ``ChatBoundSink`` (which stamps the chat id the substrate-neutral engine cannot see)
+        # and the bot-side records (session/policy events) append to it directly.
+        _audit_path = getattr(config, "audit_log_file", None)
+        self.audit_log: Optional[AuditLog] = (
+            AuditLog(_audit_path, max_bytes=config.audit_log_max_bytes)
+            if _audit_path is not None
+            else None
+        )
         # P11 T2 (attach): the machine-wide session discovery seam (id -> cwd + liveness).
         # Injected so attach tests feed a fixed discovered list + a fixed running/idle verdict
         # with NO real SDK / ps / ~/.claude; defaults to the real :func:`discover_sessions`
@@ -737,6 +779,7 @@ class StreamingSession:
                 model: Optional[str] = None,
                 permission_mode: str = "default",
                 thinking: bool = False,
+                audit_sink: Optional[AuditSink] = None,
             ) -> Engine:
                 return _default_engine_factory(
                     cwd=cwd,
@@ -748,6 +791,13 @@ class StreamingSession:
                     model=model,
                     permission_mode=permission_mode,
                     thinking=thinking,
+                    audit_sink=audit_sink,
+                    # P13 T-BASH: bind the live config's Bash policy (default flag) into the
+                    # production engine — consulted ADDITIVELY for Bash in on_tool_request. A
+                    # bare/injected factory keeps the "off" default, so only the real bot turns
+                    # the guardrail on. Closed over `config` (not a per-build param).
+                    bash_policy_mode=config.bash_policy_mode,
+                    bash_policy_extra_patterns=config.bash_policy_extra_patterns,
                 )
 
             self._engine_factory = _bound_factory
@@ -1288,6 +1338,16 @@ class StreamingSession:
         _name, rt = self._active_runtime(chat_id, create_default=True)
         if rt is not None:
             rt.policy.set_yolo(on)
+            # P13 T-AUDIT: record the bypass toggle (body-free policy_event) — /yolo widens
+            # the gate to allow-all, so it is a security-relevant decision worth a durable
+            # record. ``decision`` carries the new posture; no body. Best-effort (RB1).
+            self.record_audit(
+                KIND_POLICY_EVENT,
+                chat_id=chat_id,
+                summary="yolo_on" if on else "yolo_off",
+                decision="on" if on else "off",
+                name=_name,
+            )
 
     def get_yolo(self, chat_id: int) -> bool:
         """Whether the chat's ACTIVE project is in ``/yolo`` allow-all mode (T2 /status).
@@ -1592,7 +1652,7 @@ class StreamingSession:
         # mode on the runtime so the warm fast-path reuses this engine only for a same-mode turn
         # and rebuilds back to ``"default"`` after the one-shot plan turn (the mismatch path).
         engine = self._build_engine(
-            rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
+            chat_id, rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
         )
         rt.engine = engine
         rt.engine_permission_mode = permission_mode
@@ -1674,7 +1734,7 @@ class StreamingSession:
                 #     P12 T-THINK: and the SAME thinking flag — a thinking-ON project whose
                 #     resume failed still starts fresh with live reasoning on (sticky flag).
                 engine = self._build_engine(
-                    rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
+                    chat_id, rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
                 )
                 rt.engine = engine
                 rt.engine_permission_mode = permission_mode  # P12 T-PLAN: track the fresh mode
@@ -1712,8 +1772,76 @@ class StreamingSession:
         rt.started = True
         return engine, resume_failed
 
+    def _audit_sink_for(self, chat_id: int) -> Optional[AuditSink]:
+        """Build a per-chat :class:`~claude_tg.audit.ChatBoundSink`, or ``None`` (P13 T-AUDIT).
+
+        Returns ``None`` when no process audit log is configured (audit disabled) — the
+        engine is then built with ``audit_sink=None`` (a no-op), so behavior is unchanged.
+        Otherwise wraps the ONE process :class:`~claude_tg.audit.AuditLog` in a sink that
+        STAMPS ``chat_id`` on every record the substrate-neutral engine emits (the engine
+        does not know the chat id). Best-effort downstream (the sink/log never raise).
+        """
+        if self.audit_log is None:
+            return None
+        return ChatBoundSink(self.audit_log, chat_id)
+
+    def _session_tag(self, chat_id: int, name: Optional[str]) -> Optional[str]:
+        """The named project's REDACTED session tag for an audit record, or ``None`` (P13).
+
+        Read-only (never raises, RB1): looks up the project's persisted ``session_id`` and
+        runs it through :func:`~claude_tg.util._redact_sid` so the audit record carries a
+        correlatable tag (``sid:ab12cd``) — NEVER the raw resumable id (SB3/H1). A missing
+        store / project / id yields the fixed ``sid:none`` sentinel.
+        """
+        from .util import _redact_sid
+
+        sid: Optional[str] = None
+        if self.store is not None and name is not None:
+            try:
+                record = self.store.get_project(chat_id, name)
+                sid = (record or {}).get("session_id")
+            except Exception:  # pragma: no cover - store reads are RB1 already
+                sid = None
+        return _redact_sid(sid)
+
+    def record_audit(
+        self,
+        kind: str,
+        *,
+        chat_id: int,
+        summary: Optional[str] = None,
+        decision: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
+        """Append a BODY-FREE session/policy audit event to the process log (P13 T-AUDIT).
+
+        The bot-side counterpart of the engine's tool/plan records — used for events the
+        substrate-neutral engine never sees (``/attach`` · ``/watch`` · ``/unwatch`` ·
+        ``/reset`` · ``/switch`` → ``session_event``; ``/yolo`` · ``/unyolo`` →
+        ``policy_event``). ``summary`` is a short fixed ACTION token (e.g. ``"attach"`` /
+        ``"yolo_on"``) — NEVER a body — and ``name`` (a project name, used only to resolve
+        the redacted session tag) is the sole free value, which is SB4-validated. No-op when
+        no audit log is configured; best-effort otherwise — :meth:`AuditLog.append` never
+        raises (RB1), so a bot-side record can never break a command.
+        """
+        if self.audit_log is None:
+            return
+        from .util import _now_iso
+
+        self.audit_log.append(
+            AuditEvent(
+                ts=_now_iso(),
+                kind=kind,
+                summary=summary,
+                decision=decision,
+                chat_id=chat_id,
+                session_tag=self._session_tag(chat_id, name),
+            )
+        )
+
     def _build_engine(
         self,
+        chat_id: int,
         cwd: str,
         policy: PermissionPolicy,
         model: Optional[str],
@@ -1740,6 +1868,12 @@ class StreamingSession:
         a thinking-ON project, ``False`` (the default, always passed pre-P12) keeps a normal
         turn byte-for-byte unchanged. An injected test factory never receives it (3-kwarg
         contract), so every existing test factory is unaffected.
+
+        **P13 T-AUDIT:** the per-chat ``audit_sink`` rides the SAME default-factory-only gate —
+        the engine records every gate decision through it (body-free). ``None`` (no audit log
+        configured) makes the engine's hook a no-op. An injected test factory keeps its 3-kwarg
+        contract and never receives it, so every existing test factory is unaffected (and the
+        no-op default keeps the 1288 floor).
         """
         if self._factory_accepts_model:
             return self._engine_factory(
@@ -1749,6 +1883,7 @@ class StreamingSession:
                 model=model,  # type: ignore[call-arg]  # default factory accepts model (T4)
                 permission_mode=permission_mode,  # default factory accepts it too (P12 T-PLAN-1)
                 thinking=thinking,  # default factory accepts it too (P12 T-THINK)
+                audit_sink=self._audit_sink_for(chat_id),  # default factory accepts it too (P13)
             )
         return self._engine_factory(
             cwd=cwd,
@@ -1928,6 +2063,10 @@ class StreamingSession:
         existing = self._project_for_session(chat_id, sid)
         if existing is not None:
             self.store.switch(chat_id, existing)
+            # P13 T-AUDIT: an idempotent re-attach is still a (re-)attach — record it.
+            self.record_audit(
+                KIND_SESSION_EVENT, chat_id=chat_id, summary="attach", name=existing
+            )
             name_html = html.escape(existing, quote=False)
             return AttachOutcome(
                 ok=True,
@@ -1968,6 +2107,9 @@ class StreamingSession:
         # _ensure_engine reads this, re-probes, forks on live-or-uncertain, and clears it
         # (persisted) after the first successful turn (never re-forking thereafter).
         self.store.set_fork_pending(chat_id, name, True)
+        # P13 T-AUDIT: record the adopt (body-free session_event). The session tag resolves
+        # from the just-pinned id (redacted — never the raw resumable id). Best-effort (RB1).
+        self.record_audit(KIND_SESSION_EVENT, chat_id=chat_id, summary="attach", name=name)
 
         # Build the runtime (fresh — brand-new name) and ALSO mirror the marker in memory so a
         # turn within THIS process doesn't need a store round-trip; _ensure_engine consults the
@@ -2145,6 +2287,10 @@ class StreamingSession:
 
         task.add_done_callback(_done)
 
+        # P13 T-AUDIT: record the live-mirror start (body-free session_event). The watched id
+        # is NOT a project session — pass name=None so the tag is sid:none (the record marks
+        # that a /watch happened; the watched id is not logged). Best-effort (RB1).
+        self.record_audit(KIND_SESSION_EVENT, chat_id=chat_id, summary="watch")
         short = html.escape(sid[:8], quote=False)
         prefix = "🔁 Replaced the previous mirror. " if replaced else ""
         return WatchOutcome(
@@ -2165,6 +2311,9 @@ class StreamingSession:
         active watch → a clean "nothing to stop" notice. Never raises (RB1).
         """
         if self._cancel_watch(chat_id):
+            # P13 T-AUDIT: record the mirror stop only when one was actually active (an
+            # idempotent no-op /unwatch records nothing). Body-free session_event (RB1).
+            self.record_audit(KIND_SESSION_EVENT, chat_id=chat_id, summary="unwatch")
             return "🛑 Stopped mirroring."
         return "There's no active mirror to stop (use /watch <session-id> to start one)."
 
@@ -2453,6 +2602,13 @@ class StreamingSession:
             # Clear the persisted session_id for the active project (keep cwd — D4 — and
             # the project record itself). update() writes the active project's fields.
             self._persist(chat_id, session_id=None)
+            # P13 T-AUDIT: record the reset (body-free session_event). Recorded only when a
+            # project was actually reset (name is not None — a no-project /reset is a no-op,
+            # nothing to audit). The session id is now cleared, so the tag reads sid:none —
+            # an honest "fresh session" marker. Best-effort (RB1).
+            self.record_audit(
+                KIND_SESSION_EVENT, chat_id=chat_id, summary="reset", name=name
+            )
 
     def _persist(
         self, chat_id: int, *, session_id: Optional[str], name: Optional[str] = None

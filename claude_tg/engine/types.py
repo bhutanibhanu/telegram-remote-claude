@@ -140,6 +140,18 @@ class PermissionEvent:
     ``tool_input_summary`` is **body-free** (lengths / short values, NOT raw contents,
     SB3) — built by :func:`safe_input_summary`. The raw tool input never rides this
     event, so a Write's file contents or a Bash secret are never surfaced or logged.
+
+    **P13 T-BASH — ``bash_flag`` / ``bash_flag_label`` (the Bash-policy escalation).** When
+    the Bash command policy matches a dangerous command in ``flag`` mode, the engine sets
+    ``bash_flag=True`` (and ``bash_flag_label`` to the matched pattern's short, body-free
+    label, e.g. ``"git force-push (can overwrite remote history)"``). The renderer then shows
+    a ``⚠️`` warning + the label and **omits the ``[Allow for session]`` button** — so the
+    only way through is a deliberate one-time ``[Allow once]`` (a flagged command can never be
+    session-granted, and is re-prompted even under a prior grant / ``/yolo``). Both default to
+    the unflagged values (``False`` / ``None``) so every existing :class:`PermissionEvent` and
+    its render are byte-for-byte unchanged. The label is body-free (a fixed pattern label, NOT
+    the command body — the command text the operator sees is the existing 160-char
+    ``tool_input_summary``), so SB3 still holds.
     """
 
     tool_name: str
@@ -147,6 +159,12 @@ class PermissionEvent:
     tool_use_id: str
     session_id: str | None = None
     kind: Literal["permission"] = "permission"
+    # P13 T-BASH: set True when the Bash policy flagged this command (flag mode) — the render
+    # shows ⚠️ + the matched pattern and DROPS [Allow for session] (deliberate one-time only).
+    bash_flag: bool = False
+    # P13 T-BASH: the matched pattern's short, body-free label (None when not flagged). NEVER
+    # the raw command — that stays in the existing body-free tool_input_summary (SB3).
+    bash_flag_label: str | None = None
 
 
 # Error origin: a tool failed, the turn failed, or the substrate/driver failed.

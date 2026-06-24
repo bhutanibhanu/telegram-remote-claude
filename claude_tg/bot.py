@@ -23,6 +23,13 @@ from telegram.ext import (
     filters,
 )
 
+from .audit import (
+    KIND_PLAN_DECISION,
+    KIND_POLICY_EVENT,
+    KIND_SESSION_EVENT,
+    KIND_TOOL_DECISION,
+    AuditEvent,
+)
 from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
 from .engine import ImageInput, ImageMediaType
@@ -62,6 +69,8 @@ HELP_TEXT = (
     "Commands:\n"
     "/help — this help\n"
     "/status — health: uptime, mode, gate, runs, per-project status + cost\n"
+    "/audit [n] — show the recent decision trail for this chat (tool allow/deny, plan "
+    "approve/reject, /attach·/switch·/watch, /yolo); body-free, read-only (streaming mode)\n"
     "/reset — start a fresh Claude session (forget context)\n"
     "/cancel [name|all] — abort the in-flight run: the active project, a named project, "
     "or every running/queued project (streaming mode)\n"
@@ -113,6 +122,7 @@ HELP_TEXT = (
 COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("help", "Show the help text"),
     ("status", "Health: uptime, mode, runs, per-project status + cost"),
+    ("audit", "Show the recent body-free decision trail for this chat"),
     ("reset", "Start a fresh Claude session (forget context)"),
     ("cancel", "Abort the in-flight run (active / a name / all)"),
     ("to", "Send a free-text answer to a named project's prompt"),
@@ -160,6 +170,26 @@ def _format_uptime(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
+
+
+def _audit_clock(ts: str) -> str:
+    """Extract a compact ``HH:MM:SS`` from an ISO-8601 audit timestamp (P13 T-AUDIT).
+
+    Pure + defensive (RB1): an ISO string like ``2026-06-24T12:03:41.789+00:00`` →
+    ``12:03:41``. A malformed / empty value falls back to the raw string (truncated) so a
+    bad timestamp can never crash the ``/audit`` render. Time-only is shown (not the date)
+    to keep each line short — the tail is "recent", so the date is rarely load-bearing.
+    """
+    if not ts:
+        return "??:??:??"
+    # ISO 8601: date and time are separated by 'T'. Take the time, drop sub-seconds + tz.
+    time_part = ts.split("T", 1)[1] if "T" in ts else ts
+    # Strip a timezone suffix (+00:00 / Z) and fractional seconds, keep HH:MM:SS.
+    for sep in ("+", "-", "Z", "."):
+        idx = time_part.find(sep)
+        if idx > 0:
+            time_part = time_part[:idx]
+    return time_part[:8] if time_part else ts[:8]
 
 
 #: P10 T1 (multimodal): the default prompt when an operator sends a photo with NO caption.
@@ -1105,6 +1135,12 @@ class TelegramClaudeBot:
                 "HTML",
             )
         self.streaming.store.switch(chat_id, name)
+        # P13 T-AUDIT: record the active-project switch (body-free session_event). Shared by
+        # the /switch command AND the [Open <project>] ping button (both reach here), so a
+        # switch is audited regardless of path. Best-effort (RB1) — never breaks the switch.
+        self.streaming.record_audit(
+            KIND_SESSION_EVENT, chat_id=chat_id, summary="switch", name=name
+        )
         return (
             f"✅ Switched to <b>{name_html}</b> — your next message resumes that project.",
             "HTML",
@@ -1428,6 +1464,138 @@ class TelegramClaudeBot:
                 f"• <b>{html.escape(str(name), quote=False)}</b> — "
                 f"<code>{html.escape(preview, quote=False)}</code>"
             )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    #: P13 T-AUDIT: the default + max number of audit records ``/audit`` shows. The default
+    #: keeps the reply compact; ``/audit <n>`` is capped at the max so a huge request can't
+    #: build a giant message (RB1). Both bound the body-free tail render.
+    _AUDIT_TAIL_DEFAULT = 20
+    _AUDIT_TAIL_MAX = 100
+
+    #: P13 T-AUDIT: verdict → a compact glyph for the ``/audit`` render (body-free). An
+    #: unknown verdict falls back to a neutral dot — the verdict TEXT is always shown too, so
+    #: the glyph is decoration, never the only signal.
+    _AUDIT_DECISION_GLYPHS = {
+        "auto_allow": "✅",
+        "allow_once": "✅",
+        "allow_session": "✅",
+        "deny": "⛔",
+        "backstop_deny": "⛔",
+        "cancel": "🚫",
+        "approve": "✅",
+        "reject": "⛔",
+        "on": "⚠️",
+        "off": "🔒",
+    }
+
+    #: P13 T-AUDIT: event-kind → a compact glyph prefix for the ``/audit`` render.
+    _AUDIT_KIND_GLYPHS = {
+        KIND_TOOL_DECISION: "🔧",
+        KIND_PLAN_DECISION: "📋",
+        KIND_SESSION_EVENT: "🔗",
+        KIND_POLICY_EVENT: "⚙️",
+    }
+
+    def _audit_log(self):
+        """The process audit log for ``/audit``, or ``None`` (P13 T-AUDIT).
+
+        Audit is a streaming-session surface (the durable log is owned by
+        :class:`~claude_tg.stream_session.StreamingSession`, built from config). In one-shot
+        mode, or when audit is disabled (no ``AUDIT_LOG_FILE`` / ``CLAUDE_STATE_FILE``), this
+        is ``None`` and ``/audit`` replies a clean notice (RB1 — never deref a None).
+        """
+        if self.streaming is not None:
+            # getattr (not attribute access) so a lightweight test stand-in without an
+            # audit_log attribute degrades to None (a clean "audit disabled" reply), mirroring
+            # _macro_store's getattr(self.runner, "store", None) tolerance (RB1).
+            return getattr(self.streaming, "audit_log", None)
+        return None
+
+    @staticmethod
+    def _render_audit_line(event: "AuditEvent") -> str:
+        """Render ONE audit record as a compact, BODY-FREE, HTML-escaped line (P13 T-AUDIT).
+
+        The record carries only already-safe fields (a :func:`safe_input_summary` string, a
+        verdict/action token, a redacted session tag, a timestamp), so this is body-free by
+        construction — there is nothing here that *could* be a body. Every interpolated value
+        is HTML-escaped anyway (defense-in-depth — a tool name / summary could contain ``<>&``
+        and must render inert). Shape, e.g.::
+
+            12:03:41 🔧 ✅ allow_once <code>Bash(command=npm test)</code>
+            12:04:02 📋 ✅ plan approve
+            12:04:10 ⚙️ ⚠️ yolo_on
+        """
+        ts = _audit_clock(event.ts)
+        kind_glyph = TelegramClaudeBot._AUDIT_KIND_GLYPHS.get(event.kind, "•")
+        decision = event.decision or ""
+        dec_glyph = TelegramClaudeBot._AUDIT_DECISION_GLYPHS.get(decision, "")
+        parts = [html.escape(ts, quote=False), kind_glyph]
+        if dec_glyph:
+            parts.append(dec_glyph)
+        if decision:
+            parts.append(html.escape(decision, quote=False))
+        if event.kind == KIND_TOOL_DECISION:
+            # tool name is folded into the summary (safe_input_summary -> "Bash(command=…)"),
+            # so render the summary in a code span; fall back to the bare tool name.
+            summary = event.summary or event.tool or ""
+            if summary:
+                parts.append(f"<code>{html.escape(summary, quote=False)}</code>")
+        else:
+            # plan/session/policy: the summary is a short action token (e.g. "attach"). Show
+            # it plainly (it carries no body); for a plan_decision "plan" reads naturally.
+            label = event.summary or ""
+            if event.kind == KIND_PLAN_DECISION:
+                label = ("plan " + label).strip() if label else "plan"
+            if label:
+                parts.append(html.escape(label, quote=False))
+        return " ".join(parts)
+
+    async def cmd_audit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/audit [n]`` — show the recent BODY-FREE audit tail for THIS chat (P13 T-AUDIT). SB1.
+
+        Mirrors :meth:`cmd_macros` (the read-only template): the ``_ok`` allowlist recheck
+        (SB1) → ``chat_id`` → read the process :class:`~claude_tg.audit.AuditLog`'s tail →
+        FILTER to this chat's records (each record carries ``chat_id``) → render each as a
+        compact, body-free, HTML-escaped line. ``/audit <n>`` requests the last ``n`` (capped
+        at :data:`_AUDIT_TAIL_MAX`; default :data:`_AUDIT_TAIL_DEFAULT`). The render is
+        body-free BY CONSTRUCTION — the record only has already-safe fields (a
+        ``safe_input_summary`` string, a verdict, a redacted session tag, a timestamp); no raw
+        tool input / plan text / file content / secret can be present (SB3). Empty / disabled
+        / one-shot → a clean notice, never an error (RB1).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        audit_log = self._audit_log()
+        if audit_log is None:
+            await update.message.reply_text(
+                "Audit log isn't enabled — set CLAUDE_STATE_FILE (or AUDIT_LOG_FILE) in "
+                "streaming mode to record a durable, body-free decision trail."
+            )
+            return
+        chat_id = update.effective_chat.id
+        # Parse an optional count (default 20, capped at 100). A non-numeric / non-positive
+        # arg falls back to the default (RB1 — never crash on a bad arg).
+        n = self._AUDIT_TAIL_DEFAULT
+        if ctx.args:
+            try:
+                requested = int(ctx.args[0])
+                if requested > 0:
+                    n = min(requested, self._AUDIT_TAIL_MAX)
+            except ValueError:
+                pass
+        # Read a generous tail (records for OTHER chats are interleaved in the one process
+        # log), then filter to THIS chat and keep the last n. Reading a bounded multiple keeps
+        # the work small for a size-bounded log while still surfacing this chat's recent events.
+        raw = audit_log.tail(self._AUDIT_TAIL_MAX * 5)
+        mine = [e for e in raw if e.chat_id == chat_id][-n:]
+        if not mine:
+            await update.message.reply_text(
+                "🛡️ No audit events yet for this chat. Decisions (tool allow/deny, plan "
+                "approve/reject, /attach·/switch·/watch, /yolo) are recorded here as they happen."
+            )
+            return
+        lines = ["🛡️ <b>Audit</b> (most recent last):"]
+        lines.extend(self._render_audit_line(e) for e in mine)
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def cmd_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2440,6 +2608,11 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("run", self.cmd_run, filters=allowed))
         app.add_handler(CommandHandler("macros", self.cmd_macros, filters=allowed))
         app.add_handler(CommandHandler("unsave", self.cmd_unsave, filters=allowed))
+        # P13 T-AUDIT: /audit — body-free tail of the durable decision trail. Read-only,
+        # SB1-gated (the `allowed` filter + the _ok recheck), registered BEFORE the
+        # on_skill_command passthrough so first-match-wins makes it a real command (not
+        # forwarded to the session as a skill).
+        app.add_handler(CommandHandler("audit", self.cmd_audit, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))
         # P10 T1 (multimodal): a photo OR an image-document → on_photo (a native multimodal
         # turn). SB1: the SAME `allowed` chat filter as every other handler (the `_ok` recheck

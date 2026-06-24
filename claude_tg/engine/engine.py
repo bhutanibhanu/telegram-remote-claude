@@ -53,13 +53,23 @@ import logging
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional, Sequence
 
+from ..audit import (
+    KIND_PLAN_DECISION,
+    KIND_POLICY_EVENT,
+    KIND_TOOL_DECISION,
+    AuditEvent,
+    AuditSink,
+    audit_safe_summary,
+)
+from ..bash_policy import BashPolicyMatch, classify_bash
 from ..permissions import PermissionPolicy, path_needs_approval
-from ..util import _redact_sid
+from ..util import _now_iso, _redact_sid
 from .pending import DEFAULT_BACKSTOP_SECONDS, PendingRegistry
 from .substrate import Substrate
 from .types import (
     DENIED_MESSAGE,
     AskEvent,
+    Cancel,
     Decision,
     Event,
     ImageInput,
@@ -67,6 +77,7 @@ from .types import (
     PermissionEvent,
     PermissionVerdict,
     PlanEvent,
+    PlanVerdict,
     StatusEvent,
     SubstrateDecision,
     decision_to_substrate,
@@ -100,10 +111,30 @@ class Engine:
         cwd: str | None = None,
         allowed_roots: tuple[str | Path, ...] = (),
         allow_any_path: bool = False,
+        audit_sink: AuditSink | None = None,
+        bash_policy_mode: str = "off",
+        bash_policy_extra_patterns: tuple[str, ...] = (),
     ) -> None:
         self._substrate = substrate
         self._send_timeout = send_timeout
         self._backstop_seconds = backstop_seconds
+        # P13 T-BASH: the Bash command-policy mode + owner extra denylist patterns, layered
+        # ADDITIVELY on the gate (the C2-residual guardrail). **Default ``"off"`` → NO policy**:
+        # an Engine built without it (every pre-P13 construction + all existing tests) behaves
+        # byte-for-byte as before — ``off`` is the current gate exactly. The bot's production
+        # factory wires ``flag`` (the design default) from config. A non-Bash tool, or any tool
+        # when the mode is ``off``, never touches the policy. The policy may only ESCALATE (an
+        # auto-allow → a prompt, a prompt → a deny); it NEVER converts a would-prompt/would-deny
+        # into an auto-allow (the load-bearing additive invariant — see on_tool_request).
+        self._bash_policy_mode = bash_policy_mode
+        self._bash_policy_extra_patterns = bash_policy_extra_patterns
+        # P13 T-AUDIT: the optional, BODY-FREE audit sink the gate records every decision
+        # to. **Default None → a NO-OP**: when unset, ``_record_*`` returns immediately, so
+        # an Engine built without it (every pre-P13 construction + all 1288 tests) behaves
+        # byte-for-byte as before — same pattern as the optional cwd/allowed_roots C2 params.
+        # The production sink is a ChatBoundSink (stamps the chat id the substrate-neutral
+        # engine does not know); it is best-effort (an audit write never breaks a turn, RB1).
+        self._audit_sink = audit_sink
         # The per-session permission policy the gate consults (ADR-003). Defaulting to a
         # FRESH PermissionPolicy() makes the engine fail-closed: a fresh policy has no
         # grants and yolo off, so every risky tool gates. The bot (T5) injects the
@@ -133,6 +164,139 @@ class Engine:
         # decision callback and the backstop notify push injected events onto it; the
         # substrate stream is drained onto it by send()'s producer task.
         self._out_queue: Optional[asyncio.Queue[Any]] = None
+
+    # -- audit hook (P13 T-AUDIT — body-free, best-effort, no-op when unset) --
+
+    def _record_tool(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        decision: str,
+    ) -> None:
+        """Record a body-free ``tool_decision`` audit event for ``tool_name`` (SB3).
+
+        Called at EVERY gate outcome in :meth:`on_tool_request` / :meth:`_permission_hold`
+        — auto-allow (safe / live grant / ``/yolo``), the out-of-root and risky holds'
+        resolved verdicts, and the fail-closed no-id deny — so a tool that auto-runs under
+        ``/yolo`` (and never reaches the bot) is still audited. The summary is
+        :func:`audit_safe_summary` — the STRONGLY body-free audit renderer that collapses
+        BOTH body fields AND idents (``command`` / ``path`` / ``url`` / ``pattern``) to a
+        length/shape, so a secret early in a Bash command is **never persisted to the durable
+        log** (stricter than the ephemeral prompt's ``safe_input_summary``; BLOCKER 1). The
+        session tag is :func:`_redact_sid` (never the raw resumable id). When no sink is wired
+        this is a no-op (the floor holds). Best-effort: the sink swallows its own failures
+        (RB1) — an audit write never breaks a turn.
+        """
+        sink = self._audit_sink
+        if sink is None:
+            return  # no-op default — behavior identical to pre-P13
+        try:
+            sink.record(
+                AuditEvent(
+                    ts=_now_iso(),
+                    kind=KIND_TOOL_DECISION,
+                    tool=tool_name,
+                    summary=audit_safe_summary(tool_name, tool_input),
+                    decision=decision,
+                    session_tag=_redact_sid(self.session_id),
+                )
+            )
+        except Exception:  # pragma: no cover - the sink is already best-effort
+            log.debug("audit record (tool) failed (ignored)", exc_info=True)
+
+    def _record_plan(self, decision: str) -> None:
+        """Record a body-free ``plan_decision`` audit event (``approve`` / ``reject``).
+
+        Emitted from :meth:`_answer_hold` for an ``ExitPlanMode`` verdict — NO plan text
+        and NO reject feedback ride the record (SB3 structural: :class:`AuditEvent` has no
+        body field), only the verdict + the redacted session tag. No-op when no sink is
+        wired; best-effort otherwise (RB1).
+        """
+        sink = self._audit_sink
+        if sink is None:
+            return
+        try:
+            sink.record(
+                AuditEvent(
+                    ts=_now_iso(),
+                    kind=KIND_PLAN_DECISION,
+                    decision=decision,
+                    session_tag=_redact_sid(self.session_id),
+                )
+            )
+        except Exception:  # pragma: no cover - the sink is already best-effort
+            log.debug("audit record (plan) failed (ignored)", exc_info=True)
+
+    def _record_policy(self, action: str, tool_name: str, *, label: str | None = None) -> None:
+        """Record a body-free ``policy_event`` for a Bash-policy outcome (P13 T-BASH).
+
+        ``action`` is ``bash_policy_flag`` (flag mode escalated the prompt) or
+        ``bash_policy_block`` (deny mode auto-denied). **Clean semantics (Codex QA non-block):**
+        ``summary`` carries the action token PLUS the body-free matched-pattern ``label`` (e.g.
+        ``"bash_policy_block (chmod-777-recursive)"``) — so ``/audit`` reads "a chmod-777 Bash
+        command was denied" WITHOUT the command text — and ``decision`` carries the verdict
+        token (``deny`` for both modes: flag denies on the no-id edge / on operator deny, deny
+        mode auto-denies). The matched command's body-free summary is recorded SEPARATELY by
+        the paired ``_record_tool`` call (the ``tool_decision``), via the STRICT
+        :func:`audit_safe_summary` — so NO command text (raw or 160-char) is persisted on EITHER
+        record (BLOCKER 1). No-op when no sink is wired; best-effort otherwise (RB1) — a
+        policy-audit write never breaks a turn.
+        """
+        sink = self._audit_sink
+        if sink is None:
+            return
+        summary = f"{action} ({label})" if label else action
+        try:
+            sink.record(
+                AuditEvent(
+                    ts=_now_iso(),
+                    kind=KIND_POLICY_EVENT,
+                    tool=tool_name,
+                    summary=summary,
+                    decision="deny",
+                    session_tag=_redact_sid(self.session_id),
+                )
+            )
+        except Exception:  # pragma: no cover - the sink is already best-effort
+            log.debug("audit record (policy) failed (ignored)", exc_info=True)
+
+    def _bash_policy_match(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> BashPolicyMatch | None:
+        """Classify a Bash command against the policy — FAIL-CLOSED (P13 T-BASH).
+
+        Returns a :class:`~claude_tg.bash_policy.BashPolicyMatch` when the RAW command matches
+        the denylist (scanning ``tool_input["command"]`` verbatim — NOT the 160-char summary,
+        so a long dangerous command can't slip past the truncation), else ``None``. **Only**
+        consulted for ``Bash`` when the mode is not ``off`` (the caller guards both, so a
+        non-Bash tool / ``off`` mode never reaches here — zero behavior change).
+
+        **FAIL-CLOSED:** if :func:`classify_bash` raises (a policy bug, an unexpected input),
+        this returns a synthetic ``error``/``classifier-error`` match — i.e. the command is
+        treated as FLAGGED — never ``None``. A policy error therefore escalates (flag mode) or
+        denies (deny mode) at the call site; it can **never** silent-allow (the SB6 invariant).
+        Mutation-probe: make this swallow the exception and ``return None`` and the
+        fail-closed test flips to an auto-allow and FAILS.
+        """
+        command = tool_input.get("command", "")
+        try:
+            return classify_bash(
+                command if isinstance(command, str) else str(command),
+                extra_patterns=self._bash_policy_extra_patterns,
+            )
+        except Exception:
+            # FAIL-CLOSED: a classifier error is treated as a hit (escalate/deny), NEVER a
+            # silent allow. Log body-free (no command) and synthesize a generic match.
+            log.warning(
+                "bash policy classifier raised for %s — failing closed (treat as flagged)",
+                tool_name,
+                exc_info=True,
+            )
+            return BashPolicyMatch(
+                pattern="error",
+                label="policy check failed (treated as dangerous)",
+                severity="high",
+            )
 
     # -- session id ----------------------------------------------------------
 
@@ -176,6 +340,69 @@ class Engine:
         if tool_name in (ASK_TOOL, PLAN_TOOL) and tool_use_id is not None:
             return await self._answer_hold(tool_name, tool_input, tool_use_id)
 
+        # --- P13 T-BASH: the Bash command policy (ADDITIVE, checked FIRST so it can override
+        # grant/yolo for a MATCHED dangerous command — the C2-residual closure). It runs ONLY
+        # for Bash and ONLY when the mode is not ``off`` (so a non-Bash tool, or any tool with
+        # the policy off, is byte-for-byte the pre-P13 gate below — zero behavior change). The
+        # match is FAIL-CLOSED (a classifier raise → treated as flagged; never silent-allow).
+        #
+        # The load-bearing INVARIANT: the policy may only ESCALATE. ``deny`` mode turns a
+        # would-allow/would-prompt into a DENY; ``flag`` mode turns a would-AUTO-ALLOW (a prior
+        # grant / /yolo) into a one-time PROMPT (and a would-prompt stays a prompt, just louder
+        # + session-button-dropped). It NEVER converts a would-prompt/would-deny into an
+        # auto-allow. A NON-matching Bash command falls straight through to today's gate (grant/
+        # yolo still auto-allow it) — only a MATCHED command is escalated.
+        if self._bash_policy_mode != "off" and tool_name == "Bash":
+            bash_match = self._bash_policy_match(tool_name, tool_input)
+            if bash_match is not None:
+                if self._bash_policy_mode == "deny":
+                    # Hard wall: auto-deny the matched command, OVERRIDING any grant / /yolo
+                    # (the one place policy beats yolo — the owner opted into a hard wall).
+                    # Audited as a policy block + a tool_decision deny (so /audit shows both
+                    # the policy trip and the denied tool). Body-free.
+                    log.info(
+                        "bash policy DENY for %s (%s) — auto-denying (overrides grant/yolo)",
+                        tool_name,
+                        bash_match.pattern,
+                    )
+                    self._record_policy("bash_policy_block", tool_name, label=bash_match.label)
+                    self._record_tool(tool_name, tool_input, "deny")
+                    return decision_to_substrate(
+                        PermissionVerdict(behavior="deny", message=DENIED_MESSAGE),
+                        tool_input=tool_input,
+                    )
+                # flag mode: ESCALATE to a deliberate one-time prompt, OVERRIDING any grant /
+                # /yolo for THIS command. A flag-mode hold still needs a tool_use_id to route
+                # the verdict; if a flagged Bash command somehow arrives without one we CANNOT
+                # open a resolvable hold, so we fail CLOSED and DENY (never auto-allow a flagged
+                # command — the additive invariant holds even on this edge). Audited.
+                if tool_use_id is None:
+                    log.warning(
+                        "flagged Bash command (%s) arrived with no tool_use_id; cannot route "
+                        "approval — failing closed (deny)",
+                        bash_match.pattern,
+                    )
+                    self._record_policy("bash_policy_flag", tool_name, label=bash_match.label)
+                    self._record_tool(tool_name, tool_input, "deny")
+                    return decision_to_substrate(
+                        PermissionVerdict(behavior="deny", message=DENIED_MESSAGE),
+                        tool_input=tool_input,
+                    )
+                log.info(
+                    "bash policy FLAG for %s (%s) — escalating to a one-time prompt "
+                    "(overrides grant/yolo)",
+                    tool_name,
+                    bash_match.pattern,
+                )
+                self._record_policy("bash_policy_flag", tool_name, label=bash_match.label)
+                return await self._permission_hold(
+                    tool_name,
+                    tool_input,
+                    tool_use_id,
+                    bash_flag=True,
+                    bash_flag_label=bash_match.label,
+                )
+
         # --- ordinary tool: the permission gate (P2 name-only + P6/C2 path layer) ----
         # Ordering (owner-approved posture, PROMPT-ON-OUT-OF-ROOT):
         #   1. /yolo (D6) bypasses EVERYTHING — the operator took the wheel; an out-of-root
@@ -198,6 +425,10 @@ class Engine:
             )
         elif not self._policy.needs_approval(tool_name, tool_input):
             log.debug("policy allows tool %s without prompt", tool_name)
+            # P13 T-AUDIT: record the AUTO-ALLOW (safe tool / live grant / /yolo) at the
+            # chokepoint — this branch never reaches the bot, so the engine is the only
+            # place a yolo/grant auto-allow can be audited.
+            self._record_tool(tool_name, tool_input, "auto_allow")
             return decision_to_substrate(
                 PermissionVerdict(behavior="allow"), tool_input=tool_input
             )
@@ -213,6 +444,8 @@ class Engine:
                 "failing closed (deny)",
                 tool_name,
             )
+            # P13 T-AUDIT: record the fail-closed deny (a risky tool we could not gate).
+            self._record_tool(tool_name, tool_input, "deny")
             return decision_to_substrate(
                 PermissionVerdict(behavior="deny", message=DENIED_MESSAGE),
                 tool_input=tool_input,
@@ -257,6 +490,14 @@ class Engine:
         #    resolve()/cancel()/backstop are the only things that complete this.
         decision = await self._pending.await_decision(tool_use_id, tool_name)
 
+        # P13 T-AUDIT: record a body-free plan_decision for an ExitPlanMode verdict —
+        # approve / reject (a backstop/cancel rejects → recorded as "reject"). NO plan text
+        # and NO reject feedback are recorded (SB3 structural). Ask answers are NOT audited
+        # (an answer is not a security decision and its content is the operator's). Recorded
+        # here at the engine chokepoint so it is captured regardless of the bot's path.
+        if tool_name == PLAN_TOOL:
+            self._record_plan(_audit_plan_verdict(decision))
+
         # 3) Map the decision through the single load-bearing mapper (every [FLAG]).
         return decision_to_substrate(decision, tool_input=tool_input)
 
@@ -265,8 +506,18 @@ class Engine:
         tool_name: str,
         tool_input: dict[str, Any],
         tool_use_id: str,
+        *,
+        bash_flag: bool = False,
+        bash_flag_label: str | None = None,
     ) -> SubstrateDecision:
         """Hold a risky tool for operator approval and map the verdict (ADR-003 §2/§4).
+
+        **P13 T-BASH:** ``bash_flag`` / ``bash_flag_label`` (default ``False`` / ``None`` —
+        unchanged for every non-policy hold) ride onto the injected :class:`PermissionEvent`
+        so the render shows ``⚠️`` + the matched-pattern label and DROPS ``[Allow for
+        session]``. A flagged hold can therefore only resolve to ``allow_once`` / ``deny`` —
+        and because ``allow_session`` is impossible (no button), ``_verdict_for`` never records
+        a session grant for a flagged command, so the NEXT dangerous command re-prompts too.
 
         Mirrors :meth:`_answer_hold` — same inject + hold + map shape, reusing the SAME
         ``PendingRegistry`` — but for a permission prompt rather than an ask/plan:
@@ -297,18 +548,30 @@ class Engine:
         **ADR-001 caveat:** ``allow_session`` grants ONLY ``tool_name`` (per-name, T2);
         a different risky tool is unaffected — nothing here broadens the grant.
         """
-        # 1) Surface the prompt with its tool_use_id; the summary is body-free (SB3).
+        # 1) Surface the prompt with its tool_use_id; the summary is body-free (SB3). A
+        #    P13-flagged Bash command carries bash_flag (+ the body-free label) so the render
+        #    shows ⚠️ + the pattern and drops the [Allow for session] button.
         self._inject(
             PermissionEvent(
                 tool_name=tool_name,
                 tool_input_summary=safe_input_summary(tool_name, tool_input),
                 tool_use_id=tool_use_id,
                 session_id=self.session_id,
+                bash_flag=bash_flag,
+                bash_flag_label=bash_flag_label,
             )
         )
 
         # 2) Hold on the SHARED registry until resolved (operator / backstop / cancel).
         decision = await self._pending.await_decision(tool_use_id, tool_name)
+
+        # P13 T-AUDIT: record the RESOLVED verdict (body-free) for this held tool, covering
+        # every resolution: an operator allow_once/allow_session/deny, the 60-min backstop
+        # (a PermissionVerdict deny → "backstop_deny"), or a /cancel / turn cancel (a Cancel
+        # → "cancel"). Recorded BEFORE the mapping so the audited verdict is the operator's
+        # intent (allow_session is distinguished from allow_once, which decision_to_substrate
+        # collapses). The grant side effect is still in _verdict_for below.
+        self._record_tool(tool_name, tool_input, _audit_verdict(decision))
 
         # 3) Map the resolved decision. An operator PermissionDecision is translated to a
         #    PermissionVerdict (recording an allow-session grant as a side effect first);
@@ -559,8 +822,40 @@ class Engine:
 
 
 # ---------------------------------------------------------------------------
-# Small helper (module-level + pure so it is trivially testable)
+# Small helpers (module-level + pure so they are trivially testable)
 # ---------------------------------------------------------------------------
+
+
+def _audit_verdict(decision: Decision) -> str:
+    """Map a resolved permission decision to its body-free audit verdict string (P13).
+
+    Mirrors how :meth:`Engine._permission_hold` resolves: an operator
+    :class:`PermissionDecision` carries its own verdict (``allow_once`` / ``allow_session``
+    / ``deny``); the 60-min backstop arrives as a :class:`PermissionVerdict` ``deny`` →
+    ``backstop_deny``; a ``/cancel`` / turn cancel arrives as a :class:`Cancel` → ``cancel``.
+    Any other shape (defensive — should not occur on this path) is recorded as ``deny`` (the
+    fail-closed reading). Pure — carries no body, just a fixed verdict token.
+    """
+    if isinstance(decision, PermissionDecision):
+        return decision.verdict  # allow_once | allow_session | deny
+    if isinstance(decision, Cancel):
+        return "cancel"
+    if isinstance(decision, PermissionVerdict):
+        # The registry's backstop resolves a held permission as a PermissionVerdict deny.
+        return "backstop_deny" if decision.behavior == "deny" else "allow_once"
+    return "deny"  # unexpected shape → fail-closed audit reading
+
+
+def _audit_plan_verdict(decision: Decision) -> str:
+    """Map a resolved plan decision to ``approve`` / ``reject`` (body-free; P13).
+
+    A :class:`PlanVerdict` carries ``approve`` (→ ``approve`` / ``reject``); a backstop
+    (:class:`PermissionVerdict` ``deny``) or a :class:`Cancel` is a non-approval → ``reject``
+    (fail-closed). NO feedback text is read — only the verdict. Pure.
+    """
+    if isinstance(decision, PlanVerdict):
+        return "approve" if decision.approve else "reject"
+    return "reject"
 
 
 def _interactive_event(

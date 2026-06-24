@@ -6159,7 +6159,7 @@ def test_default_factory_threads_per_project_model_into_substrate(tmp_path):
     # The session resolves alpha's override...
     assert session._resolve_project_model(1, "alpha") == "claude-haiku-4-5"
     # ...and the engine it builds carries it into the substrate's ClaudeAgentOptions.
-    engine = session._build_engine(str(tmp_path), PermissionPolicy(), "claude-haiku-4-5")
+    engine = session._build_engine(1, str(tmp_path), PermissionPolicy(), "claude-haiku-4-5")
     assert engine._substrate._model == "claude-haiku-4-5"
 
 
@@ -6182,7 +6182,7 @@ def test_resolve_project_model_falls_back_to_config_then_none(tmp_path):
         _make_config_with_model(tmp_path, model=None), session_store=store, clock=lambda: 0.0
     )
     assert session2._resolve_project_model(1, "alpha") is None
-    assert session2._build_engine(str(tmp_path), PermissionPolicy(), None)._substrate._model is None
+    assert session2._build_engine(1, str(tmp_path), PermissionPolicy(), None)._substrate._model is None
 
 
 def test_set_model_persists_on_active_project_and_get_model_reads_it(tmp_path):
@@ -6240,7 +6240,7 @@ def test_injected_factory_never_receives_model_kwarg(tmp_path):
     # Resolves the override, but builds via the 3-kwarg injected factory without it.
     model = session._resolve_project_model(1, "alpha")
     assert model == "claude-haiku-4-5"
-    assert session._build_engine(str(tmp_path), PermissionPolicy(), model) is sentinel
+    assert session._build_engine(1, str(tmp_path), PermissionPolicy(), model) is sentinel
 
 
 # ===========================================================================
