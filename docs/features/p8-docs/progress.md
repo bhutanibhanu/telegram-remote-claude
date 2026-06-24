@@ -3,10 +3,10 @@
 _From design.md · docs refresh + deferred UX polish · supervised. Baseline 863 tests._
 
 ## Task list
-- [ ] T1 — README/docs full refresh (modes, full command set, multi-project + concurrency, config table, install + launchd, security model, docs/ index) — cross-checked vs the code (DOCS-ONLY)
-- [ ] T2 — UX path-linkify: tool-use status line (`safe_input_summary`) + permission-prompt body render path-like values as `<code>` (HTML-aware, R5-dedup-safe, SB3-safe) — CODE + reviewer + live-verify
-- [ ] T3 — minor polish: project-name styling consistency (`{name!r}`→styled); `notify_last` prune-on-resolve (if low-risk); document the `_is_resume_failure` heuristic limitation
-- [ ] T4 — Verify (docs accuracy cross-check vs code; live-verify the T2 linkify on Telegram) → Codex QA → merge
+- [x] T1 — README/docs full refresh — cross-checked vs the code (14 commands ↔ handlers 1:1, 16 configs, security≈findings.md, install/launchd, docs index) (ac5f304)
+- [x] T2 — UX path-linkify: tool-status + permission-prompt paths render as `<code>` (HTML-escaped, injection-proof, plain-text fallback; coalescer carries parse_mode) — reviewer AGREE + live-verified (4551cc4)
+- [x] T3 — project-name styling consistency (`<b>`, escaped incl. pre-validation invalid-name) + ADR-006 (notify_last / _is_resume_failure documented as known-acceptable, not fixed) (f856efd)
+- [x] T4 — Verify: Verifier SHIP (README accurate) + Codex SHIP + live-verify PASS (DOM: permission/tool paths render as real `<code>` entities, zero fake-links, buttons work, no literal-tag leak in a 181-poll mixed burst, no dup). + accuracy fix STATE_FILE→CLAUDE_STATE_FILE (57458ef). 875 tests green.
 
 Legend: `[ ]` todo · `[x]` done (sha) · `[!]` blocked
 
