@@ -1610,3 +1610,120 @@ def test_quick_reply_keyboard_is_one_time_and_has_common_chips():
 def test_quick_reply_dismiss_is_a_keyboard_remove():
     # T6: the dismiss object is a ReplyKeyboardRemove (clears the one-time chips after capture).
     assert isinstance(quick_reply_dismiss(), ReplyKeyboardRemove)
+
+
+# ---------------------------------------------------------------------------
+# /sessions listing (P11 T1) — discovered sessions merged with bot projects (PURE)
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass  # noqa: E402
+from typing import Optional  # noqa: E402
+
+from claude_tg.render import (  # noqa: E402
+    SESSIONS_EMPTY_NOTICE,
+    ProjectMark,
+    relative_age,
+    sessions_listing,
+    short_session_id,
+)
+
+
+@dataclass
+class _Sess:
+    """A minimal stand-in for sessions_discovery.DiscoveredSession (attribute access only)."""
+
+    session_id: str
+    cwd: Optional[str] = "/work/a"
+    title: Optional[str] = "do a thing"
+    last_active: Optional[int] = 1000
+    running: bool = False
+
+
+def test_sessions_listing_empty_returns_notice():
+    assert sessions_listing([], {}, now=0.0) == SESSIONS_EMPTY_NOTICE
+
+
+def test_sessions_listing_shows_short_id_running_glyph_and_code_cwd():
+    sessions = [
+        _Sess(session_id="abcdef0123456789", cwd="/work/proj", running=True, last_active=0),
+        _Sess(session_id="0011223344556677", cwd="/work/other", running=False, last_active=0),
+    ]
+    out = sessions_listing(sessions, {}, now=10.0)
+    # Short id (8 chars) only — the full id never appears.
+    assert "abcdef01" in out and "abcdef0123456789" not in out
+    # Running 🟢 vs idle ⚪.
+    assert "🟢" in out and "⚪" in out
+    # cwd wrapped in <code> (R6 — inert monospace, not tappable /segments), HTML parse mode.
+    assert "<code>/work/proj</code>" in out
+    # No bare cwd outside <code> (a bare copy would auto-linkify).
+    assert ">/work/proj<" not in out.replace("<code>/work/proj</code>", "")
+
+
+def test_sessions_listing_merges_and_marks_bot_known_and_active():
+    sessions = [
+        _Sess(session_id="sess-active", cwd="/w/a"),
+        _Sess(session_id="sess-known", cwd="/w/b"),
+        _Sess(session_id="sess-unknown", cwd="/w/c"),
+    ]
+    marks = {
+        "sess-active": ProjectMark(name="alpha", active=True),
+        "sess-known": ProjectMark(name="beta", active=False),
+    }
+    out = sessions_listing(sessions, marks, now=2000.0)
+    lines = out.splitlines()
+    active_line = next(line for line in lines if "alpha" in line)
+    known_line = next(line for line in lines if "beta" in line)
+    unknown_line = next(line for line in lines if "sess-unk" in line)
+    # The active bot project is marked → and ✓ <name>; the known one ✓ but ·; the unknown
+    # neither.
+    assert "→" in active_line and "✓ <b>alpha</b>" in active_line
+    assert "·" in known_line and "✓ <b>beta</b>" in known_line
+    assert "✓" not in unknown_line and "→" not in unknown_line
+    # Dedup-by-id: each discovered session appears exactly ONCE (it is not duplicated by being
+    # both discovered AND a bot project).
+    assert sum(1 for line in lines if "sess-act" in line) == 1
+
+
+def test_sessions_listing_truncates_and_escapes_title_body_free():
+    # SB3: a long, HTML-bearing first-prompt is clipped AND escaped (no raw markup, no flood).
+    nasty = "<script>alert(1)</script> " + "x" * 200
+    sessions = [_Sess(session_id="s1", title=nasty, cwd="/w")]
+    out = sessions_listing(sessions, {}, now=0.0)
+    assert "<script>" not in out  # escaped
+    assert "&lt;script&gt;" in out
+    assert "…" in out  # truncated
+    # The clipped+escaped title row is far shorter than the raw 200-char prompt.
+    assert len(out) < 400
+
+
+def test_sessions_listing_title_collapses_newlines():
+    sessions = [_Sess(session_id="s1", title="line one\nline two\nline three", cwd="/w")]
+    out = sessions_listing(sessions, {}, now=0.0)
+    assert "line one line two line three" in out
+
+
+def test_sessions_listing_handles_missing_cwd_and_title():
+    sessions = [_Sess(session_id="s1", cwd=None, title=None, last_active=None)]
+    out = sessions_listing(sessions, {}, now=0.0)
+    assert "(no path)" in out and "(untitled)" in out and "unknown" in out
+
+
+def test_short_session_id_escapes_and_clips():
+    assert short_session_id("abcdef0123456789") == "abcdef01"
+    assert short_session_id(None) == ""
+    # An odd id with HTML metacharacters is clipped to 8 chars FIRST, then escaped (defensive
+    # — a session id is UUID-shaped, but a hand-crafted/forged value can never inject markup).
+    out = short_session_id("<b>xxxxx-rest")
+    assert "&lt;b&gt;" in out and "<b>" not in out
+
+
+def test_relative_age_units_and_rb1():
+    assert relative_age(1000, now=1000) == "just now"
+    assert relative_age(1000, now=1000 + 30) == "just now"
+    assert relative_age(1000, now=1000 + 120) == "2m ago"
+    assert relative_age(1000, now=1000 + 3 * 3600) == "3h ago"
+    assert relative_age(1000, now=1000 + 2 * 86400) == "2d ago"
+    # RB1: a non-numeric value → "unknown"; a future timestamp (skew) → "just now", not negative.
+    assert relative_age(None, now=1000) == "unknown"
+    assert relative_age("nope", now=1000) == "unknown"
+    assert relative_age(2000, now=1000) == "just now"

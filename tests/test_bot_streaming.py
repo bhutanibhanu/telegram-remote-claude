@@ -4105,3 +4105,133 @@ def test_voice_is_not_a_command_no_menu_change():
     from claude_tg.bot import COMMAND_MENU
 
     assert "voice" not in {cmd for cmd, _desc in COMMAND_MENU}
+
+
+# ===========================================================================
+# P11 / T1 — /sessions: read-only discovery of ALL Mac sessions, merged with bot projects.
+# discover_sessions is patched (no real SDK / ps / ~/.claude); we assert SB1, body-free,
+# <code>-paths, the bot-project merge/dedup, and the RB1 empty-reply path.
+# ===========================================================================
+
+from claude_tg.sessions_discovery import DiscoveredSession as _DiscoveredSession  # noqa: E402
+
+
+def _disc(session_id, cwd="/work/x", title="hello", last_active=0, running=False):
+    return _DiscoveredSession(
+        session_id=session_id, cwd=cwd, title=title, last_active=last_active, running=running
+    )
+
+
+async def test_cmd_sessions_lists_discovered_with_code_paths(monkeypatch):
+    import claude_tg.bot as botmod
+
+    monkeypatch.setattr(
+        botmod, "discover_sessions",
+        lambda: [_disc("aaaaaaaa1111", cwd="/work/proj", running=True),
+                 _disc("bbbbbbbb2222", cwd="/work/two", running=False)],
+    )
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    upd = make_update(1, "/sessions")
+    await bot.cmd_sessions(upd, make_cmd_ctx())
+    text, kwargs = upd.message.reply_text.await_args.args[0], upd.message.reply_text.await_args.kwargs
+    assert "aaaaaaaa" in text and "bbbbbbbb" in text  # short ids
+    assert "<code>/work/proj</code>" in text  # cwd is <code>-wrapped (R6)
+    assert kwargs.get("parse_mode") == "HTML"
+    assert "🟢" in text and "⚪" in text  # running + idle markers
+
+
+async def test_cmd_sessions_unauthorized_replies_nothing(monkeypatch):
+    import claude_tg.bot as botmod
+
+    called = []
+    monkeypatch.setattr(botmod, "discover_sessions", lambda: called.append(1) or [_disc("x")])
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    upd = make_update(999, "/sessions")  # NOT allowlisted
+    await bot.cmd_sessions(upd, make_cmd_ctx())
+    upd.message.reply_text.assert_not_awaited()  # SB1: nothing sent
+    assert called == []  # and discovery is never even run for an unauthorized chat
+
+
+async def test_cmd_sessions_empty_replies_clean_notice(monkeypatch):
+    import claude_tg.bot as botmod
+    from claude_tg.render import SESSIONS_EMPTY_NOTICE
+
+    monkeypatch.setattr(botmod, "discover_sessions", lambda: [])  # empty ~/.claude / no sessions
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    upd = make_update(1, "/sessions")
+    await bot.cmd_sessions(upd, make_cmd_ctx())
+    assert upd.message.reply_text.await_args.args[0] == SESSIONS_EMPTY_NOTICE
+
+
+async def test_cmd_sessions_total_when_discovery_raises(monkeypatch):
+    import claude_tg.bot as botmod
+    from claude_tg.render import SESSIONS_EMPTY_NOTICE
+
+    def boom():
+        raise RuntimeError("discovery exploded")
+
+    monkeypatch.setattr(botmod, "discover_sessions", boom)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    upd = make_update(1, "/sessions")
+    await bot.cmd_sessions(upd, make_cmd_ctx())  # must NOT raise (RB1)
+    assert upd.message.reply_text.await_args.args[0] == SESSIONS_EMPTY_NOTICE
+
+
+async def test_cmd_sessions_merges_with_bot_projects_marks_active(monkeypatch, tmp_path):
+    import claude_tg.bot as botmod
+
+    # A REAL store with two projects, each carrying a session_id; "alpha" is active.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    store.set_session_id(1, "alpha", "sess-alpha")
+    store.set_session_id(1, "beta", "sess-beta")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+
+    # Discovery returns the two bot sessions PLUS an unrelated terminal session.
+    monkeypatch.setattr(
+        botmod, "discover_sessions",
+        lambda: [_disc("sess-alpha", cwd="/work/alpha", running=True),
+                 _disc("sess-beta", cwd="/work/beta"),
+                 _disc("sess-terminal", cwd="/elsewhere")],
+    )
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path)), FakeRunner(), streaming=session
+    )
+    upd = make_update(1, "/sessions")
+    await bot.cmd_sessions(upd, make_cmd_ctx())
+    text = upd.message.reply_text.await_args.args[0]
+    lines = text.splitlines()
+    alpha_line = next(line for line in lines if "sess-alp" in line)
+    beta_line = next(line for line in lines if "sess-bet" in line)
+    term_line = next(line for line in lines if "sess-ter" in line)
+    # alpha: active bot project → marked → and ✓ <b>alpha</b>.
+    assert "→" in alpha_line and "✓ <b>alpha</b>" in alpha_line
+    # beta: known bot project but not active → ✓ <b>beta</b>, no →.
+    assert "✓ <b>beta</b>" in beta_line and "→" not in beta_line
+    # terminal: unknown to the bot → no project annotation.
+    assert "✓" not in term_line
+    # Dedup: each discovered session is ONE row (not duplicated by the merge).
+    assert sum(1 for line in lines if "sess-alp" in line) == 1
+
+
+async def test_cmd_sessions_works_in_oneshot_without_store(monkeypatch):
+    # /sessions is machine-wide discovery — it must work in one-shot mode too (no streaming
+    # store), just without the bot-project annotation.
+    import claude_tg.bot as botmod
+
+    monkeypatch.setattr(botmod, "discover_sessions", lambda: [_disc("sololo01", cwd="/w")])
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())  # streaming=None
+    upd = make_update(1, "/sessions")
+    await bot.cmd_sessions(upd, make_cmd_ctx())
+    text = upd.message.reply_text.await_args.args[0]
+    assert "sololo01" in text and "✓" not in text  # listed, no bot-project mark
+
+
+def test_sessions_in_command_menu_and_help_lockstep():
+    # T1: /sessions must be in the native menu AND documented in HELP_TEXT (the lock-step
+    # guards already assert menu==registered; this pins the new command specifically).
+    from claude_tg.bot import COMMAND_MENU, HELP_TEXT
+
+    assert "sessions" in {cmd for cmd, _desc in COMMAND_MENU}
+    assert "/sessions" in HELP_TEXT

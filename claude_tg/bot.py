@@ -29,11 +29,13 @@ from .engine import ImageInput, ImageMediaType
 from .paths import PathNotAllowed, resolve_within_roots
 from .render import (
     BODY_FREE_ERROR_LINE,
+    ProjectMark,
     code_path,
     free_text_prompt,
     project_status_label,
     quick_reply_dismiss,
     quick_reply_keyboard,
+    sessions_listing,
     yolo_banner,
 )
 from .session_store import (
@@ -42,6 +44,7 @@ from .session_store import (
     UnknownProject,
     validate_project_name,
 )
+from .sessions_discovery import discover_sessions
 from .stream_session import StreamingBusy, StreamingSession
 from .util import _redact_sid_in_text, expand_macro, split_message
 from .voice import TranscriptionError, TranscriptionUnavailable, transcribe
@@ -69,6 +72,8 @@ HELP_TEXT = (
     "/deep — use the deep model (Opus) for this project's next turn (streaming mode)\n"
     "/auto (or /model default) — clear the model override, back to the default (streaming mode)\n"
     "/projects — list your projects and which one is active (streaming mode)\n"
+    "/sessions — list every Claude Code session on the Mac (running/idle), including the "
+    "one running right now, merged with your projects (read-only)\n"
     "/new <name> <path> — create a project at <path> and switch to it; <path> must be an "
     "existing directory inside the permitted roots (streaming mode)\n"
     "/switch <name> — switch the active project; the next message resumes it (streaming mode)\n"
@@ -107,6 +112,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("auto", "Clear the model override (back to the default)"),
     ("model", "Clear the model override (alias of /auto)"),
     ("projects", "List your projects and which one is active"),
+    ("sessions", "List all Claude sessions on the Mac (running/idle)"),
     ("new", "Create a project at a path and switch to it"),
     ("switch", "Switch the active project"),
     ("rm", "Drop a project from the registry"),
@@ -726,6 +732,67 @@ class TelegramClaudeBot:
                 f"{cwd_html} ({status}) (last active {html.escape(str(last), quote=False)})"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    def _bot_project_marks(self, chat_id: int) -> dict[str, ProjectMark]:
+        """Map ``session_id -> ProjectMark`` for the chat's OWN projects (``/sessions`` merge).
+
+        Built from ``streaming.store.list_projects`` so ``/sessions`` can mark a discovered
+        machine session that is ALSO a known bot project (its name + ``✓``) and flag the
+        chat's active project (``→``). Keyed by each project's stored ``session_id`` (a
+        project with no session yet — never run — has none, so it can't be matched to a
+        discovered session and is skipped). Read-only + defensive (RB1): no store (one-shot
+        mode, or an unconfigured streaming store) → ``{}`` (the listing then just shows the
+        discovered sessions unannotated). Never raises.
+        """
+        if self.streaming is None or self.streaming.store is None:
+            return {}
+        try:
+            chat_id_active = self.streaming.store.get_active(chat_id)
+            projects = self.streaming.store.list_projects(chat_id)
+        except Exception:  # a misbehaving store must never break /sessions (RB1)
+            log.debug("could not read bot projects for /sessions merge", exc_info=True)
+            return {}
+        marks: dict[str, ProjectMark] = {}
+        for name, record in projects.items():
+            if not isinstance(record, dict):
+                continue
+            sid = record.get("session_id")
+            if not sid:
+                continue  # a project that never ran has no session id to merge on
+            marks[str(sid)] = ProjectMark(name=str(name), active=(name == chat_id_active))
+        return marks
+
+    async def cmd_sessions(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """List ALL Claude Code sessions on the Mac, merged with the bot's own projects (P11 T1).
+
+        Read-only discovery (no attach in T1): :func:`~claude_tg.sessions_discovery.discover_sessions`
+        enumerates every session under ``~/.claude`` (started in a terminal, an IDE, or by the
+        bot — *including the orchestrator running right now*) with a composite running/idle
+        hint. Each row shows a short session id, the cwd (``<code>``-wrapped, R6), a truncated
+        title/first-prompt, a relative last-active, and a 🟢/⚪ marker;
+        :func:`~claude_tg.render.sessions_listing` then **merges + dedups** the discovered list
+        (by ``session_id``) with the chat's OWN projects so a bot-known session is marked with
+        its project name + ``✓`` and the active one with ``→``.
+
+        Works in BOTH engine modes — discovery is machine-wide, independent of the streaming
+        registry; the bot-project annotation is simply empty in one-shot (no store). SB1: the
+        ``_ok`` allowlist recheck gates it (a non-allowlisted chat gets nothing). SB3: the
+        listing is body-free (metadata only — title/first-prompt is truncated + escaped, never
+        a transcript body). RB1: a discovery failure / empty ``~/.claude`` replies a clean
+        "no sessions found" notice (``sessions_listing`` returns it for an empty list), never a
+        crash. Read-only — no on-disk write, no attach.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        chat_id = update.effective_chat.id
+        try:
+            sessions = discover_sessions()
+        except Exception:  # discover_sessions is already RB1-total; belt-and-braces here too.
+            log.warning("session discovery failed for /sessions", exc_info=True)
+            sessions = []
+        marks = self._bot_project_marks(chat_id)
+        text = sessions_listing(sessions, marks, now=time.time())
+        await update.message.reply_text(text, parse_mode="HTML")
 
     async def cmd_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Switch the chat's active project (streaming mode only).
@@ -2071,6 +2138,10 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("new", self.cmd_new, filters=allowed))
         app.add_handler(CommandHandler("switch", self.cmd_switch, filters=allowed))
         app.add_handler(CommandHandler("rm", self.cmd_rm, filters=allowed))
+        # P11 T1: /sessions — read-only discovery of ALL Claude sessions on the Mac (incl.
+        # the live orchestrator), merged with the bot's own projects. Same `allowed` chat
+        # filter (SB1) + registered BEFORE the skill passthrough so it isn't forwarded.
+        app.add_handler(CommandHandler("sessions", self.cmd_sessions, filters=allowed))
         # P5 /to <name> <text> (D5 free-text escape hatch): routes a free-text answer to a
         # named project's pending "Other"/reject. Same `allowed` chat filter (SB1) +
         # registered BEFORE the skill passthrough (first-match-wins) — no new callback

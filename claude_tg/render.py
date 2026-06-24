@@ -975,6 +975,158 @@ def project_status_label(status: object) -> str:
 
 
 # ---------------------------------------------------------------------------
+# /sessions listing (P11 T1) — discovered machine sessions, merged with bot projects
+# ---------------------------------------------------------------------------
+#
+# `/sessions` shows ALL Claude Code sessions on the Mac (from sessions_discovery), merged +
+# deduped (by session_id) with the bot's OWN projects: a discovered session that is a known
+# bot project is marked with that project's name (and a ✓), and the chat's active project is
+# marked too. This is pure render logic (no I/O); the bot supplies the discovered list + a
+# {session_id: ProjectMark} map (built from store.list_projects) and sends the string.
+#
+# SB3 (body-free): a discovered session carries a title / first-prompt line — operator-
+# authored PROMPT text the owner is entitled to see, NOT transcript bodies (no file contents,
+# no tool output; sessions_discovery never reads those). Here it is truncated AND HTML-escaped
+# so a long prompt can't flood the message and a stray `<`/`&` can't break the HTML or inject
+# markup. Paths are <code>-wrapped (R6) so a cwd doesn't render as tappable /segment links.
+
+#: 🟢 running / ⚪ idle markers for a discovered session's composite liveness (a HINT).
+_SESSION_RUNNING_GLYPH: Final = "🟢"
+_SESSION_IDLE_GLYPH: Final = "⚪"
+
+#: How many chars of the full session id the listing shows (the rest is noise on a phone).
+#: 8 hex chars is plenty to disambiguate by eye and to type for a future /attach (T2).
+_SESSION_ID_PREFIX = 8
+
+#: Max chars of a session's title / first-prompt shown on its row (SB3 truncation — a long
+#: first prompt would otherwise dominate the listing). Trailing "…" marks a clip.
+_SESSION_TITLE_MAX = 60
+
+
+@dataclass(frozen=True)
+class ProjectMark:
+    """How a discovered session relates to the bot's OWN project registry (``/sessions``).
+
+    Built by the bot from ``store.list_projects`` keyed by ``session_id``: ``name`` is the
+    bot project that owns this session id, and ``active`` is whether it is the chat's active
+    project. Used by :func:`sessions_listing` to mark a discovered session as bot-known
+    (``✓ <name>``) and flag the active one (``→``). Pure data; SB4-validated names.
+    """
+
+    name: str
+    active: bool = False
+
+
+def short_session_id(session_id: object) -> str:
+    """The first :data:`_SESSION_ID_PREFIX` chars of a session id (display only).
+
+    A full Claude session id is a 36-char UUID — too long for a phone listing. We show a
+    short prefix (enough to recognize / type). HTML-escaped defensively (a session id is
+    UUID-shaped, but escape anyway so an odd id can never break the HTML). Pure; no I/O.
+    """
+    text = str(session_id) if session_id is not None else ""
+    return _escape_html(text[:_SESSION_ID_PREFIX])
+
+
+def _session_title(title: object) -> str:
+    """Truncate + HTML-escape a session's title/first-prompt for its row (SB3).
+
+    The title is operator-authored prompt text (custom title / first prompt / summary) — the
+    owner may see it (SB1), but it is clipped to :data:`_SESSION_TITLE_MAX` chars so a long
+    first prompt can't flood the listing, and HTML-escaped so a stray ``<``/``&`` can't break
+    the message. A missing/empty title reads ``"(untitled)"``. Never a raw transcript body
+    (sessions_discovery only ever carries metadata, SB3).
+    """
+    text = str(title).strip() if title is not None else ""
+    if not text:
+        return "(untitled)"
+    # Collapse newlines so a multi-line first prompt stays one row.
+    text = " ".join(text.split())
+    if len(text) > _SESSION_TITLE_MAX:
+        text = text[: _SESSION_TITLE_MAX - 1].rstrip() + "…"
+    return _escape_html(text)
+
+
+def relative_age(last_active: object, *, now: float) -> str:
+    """A compact relative age like ``"just now"`` / ``"5m ago"`` / ``"3d ago"`` (``/sessions``).
+
+    ``last_active`` is epoch seconds (the SDK's ``last_modified``); ``now`` is injected (wall
+    seconds) so the render is deterministic in tests. Shows the single most-significant unit
+    (seconds→minutes→hours→days). A missing/odd value, or a timestamp in the future (clock
+    skew), degrades to ``"unknown"`` / ``"just now"`` rather than a negative age (RB1). Pure.
+    """
+    if not isinstance(last_active, (int, float)):
+        return "unknown"
+    delta = now - float(last_active)
+    if delta < 0:
+        return "just now"  # future timestamp (skew) — don't show a negative age
+    if delta < 60:
+        return "just now"
+    minutes = int(delta // 60)
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    return f"{days}d ago"
+
+
+def sessions_listing(
+    sessions: Iterable[object],
+    marks: dict[str, ProjectMark],
+    *,
+    now: float,
+) -> str:
+    """Render the ``/sessions`` listing — discovered machine sessions, merged with bot projects.
+
+    ``sessions`` is the discovered list (each item exposes ``session_id`` / ``cwd`` / ``title``
+    / ``last_active`` / ``running``; from :mod:`claude_tg.sessions_discovery`). ``marks`` maps a
+    ``session_id`` to a :class:`ProjectMark` for the bot's OWN projects — so a discovered
+    session that is also a known bot project shows its project name + ``✓`` and the active one
+    a ``→``. ``now`` (injected wall seconds) drives the relative-age column (deterministic in
+    tests).
+
+    **Merge + dedup (by session_id):** the discovered list is already deduped by the SDK; this
+    is the OTHER merge — overlaying the bot's project identity onto a discovered row, so a
+    bot-known session appears ONCE (as a discovered row, annotated), never twice. Each row::
+
+        {→|·} {🟢|⚪} <ab12cd34> <code>/cwd</code> — <title> · <age> [✓ <project>]
+
+    SB3: the title is truncated + escaped; the cwd is ``<code>``-wrapped (R6, inert monospace)
+    and escaped. The reply MUST be sent ``parse_mode="HTML"``. Pure string; no I/O. An empty
+    ``sessions`` yields the no-sessions notice (the RB1 fallback the bot also uses on a
+    discovery failure).
+    """
+    rows = list(sessions)
+    if not rows:
+        return SESSIONS_EMPTY_NOTICE
+
+    out: list[str] = [f"🖥️ <b>Sessions</b> ({len(rows)} found):"]
+    for s in rows:
+        sid = getattr(s, "session_id", "")
+        mark = marks.get(str(sid))
+        active_glyph = "→" if (mark is not None and mark.active) else "·"
+        live_glyph = _SESSION_RUNNING_GLYPH if getattr(s, "running", False) else _SESSION_IDLE_GLYPH
+        cwd = getattr(s, "cwd", None)
+        cwd_html = code_path(cwd) if cwd else "(no path)"
+        title = _session_title(getattr(s, "title", None))
+        age = relative_age(getattr(s, "last_active", None), now=now)
+        suffix = f" ✓ <b>{_escape_html(mark.name)}</b>" if mark is not None else ""
+        out.append(
+            f"{active_glyph} {live_glyph} <code>{short_session_id(sid)}</code> "
+            f"{cwd_html} — {title} · {age}{suffix}"
+        )
+    return "\n".join(out)
+
+
+#: Shown when no sessions are discovered — an empty ``~/.claude``, an SDK failure, or a
+#: machine with no Claude sessions (RB1: ``/sessions`` always replies this clean line rather
+#: than crashing or sending an empty message).
+SESSIONS_EMPTY_NOTICE: Final = "🖥️ No Claude sessions found on this machine."
+
+
+# ---------------------------------------------------------------------------
 # Event -> RenderAction (the verbatim-vs-one-liner split)
 # ---------------------------------------------------------------------------
 
@@ -1878,6 +2030,12 @@ __all__ = [
     # per-project status labels for /projects (D7)
     "ProjectStatus",
     "project_status_label",
+    # /sessions listing (P11 T1)
+    "sessions_listing",
+    "ProjectMark",
+    "short_session_id",
+    "relative_age",
+    "SESSIONS_EMPTY_NOTICE",
     # coalesce / throttle
     "Coalescer",
     "FlushResult",
