@@ -20,4 +20,10 @@
 - **AuditEvent confirmed structural** (fields: `ts/kind/tool/summary/decision/chat_id/session_tag` — no body field) — BUT `summary` carried the prompt's command text (the leak Codex found). Fixing #1 = a stricter audit summary.
 
 ## Round 2 — fix
-Audit gets a STRICTER body-free summary (collapse IDENT fields — command/path/url — to lengths, not raw text; keep the flagged pattern label) on both record paths; `BASH_POLICY_EXTRA_PATTERNS` validated at config load + fail-loud; `_record_policy` decision-token cleanup; docs refreshed. Re-QA + live-verify recorded after the fix lands.
+Audit gets a STRICTER body-free summary (collapse IDENT fields — command/path/url — to lengths, not raw text; keep the flagged pattern label) on both record paths; `BASH_POLICY_EXTRA_PATTERNS` validated at config load + fail-loud; `_record_policy` decision-token cleanup; docs refreshed.
+
+## Final: SHIP
+- **Codex re-check: SHIP** — B1 (audit secret leak) CLOSED (durable log uses `audit_safe_summary` collapsing command/path/url; argv0-only-when-safe), B2 (fail-open custom patterns) CLOSED (config fails loud at load). No new issues.
+- **Orchestrator corroboration:** the ADDITIVE ordering (policy before the yolo/grant/safe auto-allow), FAIL-CLOSED matcher, and structural body-free `AuditEvent` confirmed in code. (Same-model independent reviewer was content-filter-blocked — relied on Codex + corroboration + the Implementer's mutation-probes, per [[security-review-content-filter-workaround]].)
+- **Live phone-verify PASS:** `chmod -R 777` 🚩 flagged (⚠️ + pattern label, no `[Allow for session]`), denied → clean turn; the on-disk audit log (0600) collapsed the command to `<chmod …32 chars>` with the planted leak-marker `auditleaktest_zzz` **absent** (SB3 end-to-end); `/audit` rendered body-free.
+- ADR-007 + README + `.env.example` accurate. 1438 tests; ruff/mypy/secret_scan clean.

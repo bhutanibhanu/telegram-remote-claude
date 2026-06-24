@@ -68,6 +68,22 @@ layers (defaults are the safe state — you opt *out* explicitly):
     Grant `Bash` only when you mean it. (See
     [`docs/features/p6-security-audit/findings.md`](docs/features/p6-security-audit/findings.md),
     finding C2.)
+  - **Bash command policy — ON by default (P13).** Layered on top of the gate, a conservative
+    built-in denylist flags a small set of genuinely-dangerous shapes (`rm -rf` of `/`·`~`·`$HOME`,
+    `curl … | sh`, `git push --force`, `mkfs`, `dd of=/dev/…`, fork bombs, recursive `chmod 777`,
+    reads of `~/.ssh/id_*` / `.aws/credentials` / `.env`). In the default `flag` mode a matched command
+    **re-prompts with a `⚠️` warning and no *Allow for session* button — even if `Bash` is already
+    session-granted or `/yolo` is on** (so a dangerous command always re-confirms; this closes the C2
+    residual above). `BASH_POLICY_MODE=deny` makes it a hard wall (auto-deny, overriding `/yolo`); `off`
+    is the pre-P13 behavior. **Honest limit:** this is a *heuristic* pattern guardrail on the raw command
+    — it raises the floor against obvious/accidental destruction, **not** a sandbox or a defense against
+    a determined adversary (the C2 boundary stands). See [ADR-007](docs/adr/ADR-007-trust-layer.md).
+  - **Every gate decision is recorded — body-free (P13).** Tool allow/deny, plan approve/reject, `/yolo`,
+    and attach/switch/watch are written to a durable, append-only, `0600` JSONL **audit log** (on by
+    default when `CLAUDE_STATE_FILE` is set). It records only tool names, body-free input summaries
+    (lengths, not contents), verdicts, redacted session tags, and timestamps — **never** file contents,
+    command output, prompts, or secrets — so a secret in an approved command never reaches disk. Review
+    the recent trail from your phone with [`/audit`](#commands).
 - **Secret hygiene.** `TELEGRAM_BOT_TOKEN` lives only in `.env` (git-ignored — never commit
   it). The token is kept out of logs (the httpx request-URL log is suppressed) and is never
   written into the launchd plist. Error text that could carry file contents or secrets is
@@ -205,6 +221,7 @@ Claude to read; `/get` pulls one back), or **a voice note** — with a transcrib
 | `/new <name> <path>` | **Streaming.** Create a project at `<path>` and switch to it; `<path>` must be an existing directory inside `ALLOWED_ROOTS`. Needs `CLAUDE_STATE_FILE` set |
 | `/switch <name>` | **Streaming.** Switch the active project; your next message resumes it |
 | `/rm <name>` | **Streaming.** Drop a project from the registry (its Claude transcript is left on disk). Can't remove the active or an in-flight project |
+| `/audit [n]` | **Streaming.** Show the recent **body-free** decision trail for this chat (tool allow/deny, plan approve/reject, `/yolo`, attach/switch/watch) streamed back as a compact list — last 20 by default, `/audit <n>` for the last *n* (capped at 100). Read-only (SB1); records contain no command/file bodies. Needs `CLAUDE_STATE_FILE` (or `AUDIT_LOG_FILE`) so the durable log exists |
 
 The **Streaming**-tagged commands reply with a short "streaming mode only" notice when
 `ENGINE_MODE=oneshot`. Long replies are auto-split into Telegram-sized chunks; a typing
@@ -303,6 +320,10 @@ its default; only the first two are required.
 | `FILE_MAX_BYTES` | | `20971520` (20 MB) | *(streaming)* Max size of an inbound saved file / outbound `/get` file. Larger → refused. Positive integer; else fails loud. |
 | `TRANSCRIBE_CMD` | | empty (voice off) | *(streaming)* Command **template** to transcribe a voice note. Placeholders `{audio}` (input path) and `{out}` (output basename → read `<out>.txt`; omit → read stdout). Unset → voice gracefully off. See [Voice notes](#voice-notes-streaming-mode). |
 | `TRANSCRIBE_TIMEOUT_SECONDS` | | `120.0` | *(streaming)* Max seconds the `TRANSCRIBE_CMD` subprocess may run before it's killed. Positive number; else fails loud. |
+| `AUDIT_LOG_FILE` | | `<CLAUDE_STATE_FILE>.audit.jsonl` (on when a state file is set; else off) | *(streaming)* Path to the durable, body-free audit log (P13; see [`/audit`](#commands)). **On by default when `CLAUDE_STATE_FILE` is set** (defaults next to the store, inheriting its dir + `0600`); with no state file it's off unless you set a path. Set `off`/`none`/empty to disable. |
+| `AUDIT_LOG_MAX_BYTES` | | `5242880` (5 MB) | *(streaming)* Size the audit log may reach before a 1-keep rotation to `<file>.1` (disk bounded to ~2×). Positive integer; else fails loud. |
+| `BASH_POLICY_MODE` | | `flag` | *(streaming)* Bash command-policy mode (P13): `flag` \| `deny` \| `off`. `flag` (default) escalates the approval prompt for a matched dangerous command (⚠️, no *Allow for session*, re-prompts even under a grant/`/yolo`); `deny` auto-denies it; `off` is byte-for-byte the pre-P13 gate. Invalid value → fails loud at startup. |
+| `BASH_POLICY_EXTRA_PATTERNS` | | empty | *(streaming)* Extra Bash-policy denylist regexes, **additive** to the built-ins (built-ins can't be removed via config). Newline- or semicolon-separated (commas are not separators). A regex that won't compile → fails loud at startup. |
 
 The `*(streaming)*` variables are only consulted when `ENGINE_MODE=streaming`.
 
@@ -341,7 +362,8 @@ The `*(streaming)*` variables are only consulted when `ENGINE_MODE=streaming`.
   [003 permission gating](docs/adr/ADR-003-permission-gating.md) ·
   [004 multi-project](docs/adr/ADR-004-multi-project-sessions.md) ·
   [005 concurrency](docs/adr/ADR-005-concurrency-correlation.md) ·
-  [006 known limitations](docs/adr/ADR-006-known-limitations.md).
+  [006 known limitations](docs/adr/ADR-006-known-limitations.md) ·
+  [007 trust layer](docs/adr/ADR-007-trust-layer.md).
 - Security: [P6 audit findings + remediation](docs/features/p6-security-audit/findings.md).
 - Keep-alive: [`deploy/README.md`](deploy/README.md).
 - Per-feature specs live under [`docs/features/`](docs/features/).
