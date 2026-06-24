@@ -8,14 +8,14 @@ This module is the **pure-ish core** of the proactive scheduler (the design's
 SDK, no real time, no I/O** — so the whole thing is unit-testable with an injected
 clock.
 
-**Scope (this task = T1+T2+T3+T7 of the design, NO firing).** A :class:`Schedule`
-is dormant data: it carries a ``next_run`` epoch and the math to decide when it is
-due, but **nothing here fires it**. The asyncio driver that actually drives a turn
-through the engine is T-FIRE — a later task. Until then a created schedule simply
-sits persisted (see :mod:`claude_tg.session_store`) with a ``next_run``.
+**Scope (this module = T1+T2+T3+T7 of the design — the data + math, NOT the firing).**
+A :class:`Schedule` is a pure data record: it carries a ``next_run`` epoch and the math
+to decide when it is due, but **nothing here fires it** — it is persisted (see
+:mod:`claude_tg.session_store`) and the asyncio driver that drives a turn through the
+engine (T-FIRE) consumes it, firing a due schedule on its interval.
 
-The security model (design §5) lives with T-FIRE; this module only owns the data
-shape + the interval/due arithmetic. The two facts it DOES encode that matter for
+The security model (design §5) lives with the firing driver (T-FIRE); this module only
+owns the data shape + the interval/due arithmetic. The two facts it DOES encode that matter for
 safety/robustness:
 
 * **SB4 name rule** — a schedule name is the same ``^[A-Za-z0-9_-]{1,32}$`` shape a
@@ -157,10 +157,10 @@ def format_interval(seconds: int) -> str:
 class Schedule:
     """One proactive scheduled task — a frozen, pure data record (P14 T1).
 
-    A :class:`Schedule` is **dormant data**: it carries everything needed to know WHEN
-    it should fire (:attr:`next_run`, an epoch) and the math to decide that
-    (:meth:`due` / :meth:`compute_next_run`), but it does **not** fire anything — the
-    runtime driver is T-FIRE. Fields (design §3.1):
+    A :class:`Schedule` is a **pure data record**: it carries everything needed to know
+    WHEN it should fire (:attr:`next_run`, an epoch) and the math to decide that
+    (:meth:`due` / :meth:`compute_next_run`), but it does **not** fire anything itself —
+    the runtime driver (T-FIRE) consumes it and fires it. Fields (design §3.1):
 
     * ``name``            — SB4 label (``^[A-Za-z0-9_-]{1,32}$``); the operator's own
       handle for the task (used in ``/unschedule``/``/pause``/``/resume`` and the

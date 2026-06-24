@@ -1682,9 +1682,9 @@ class TelegramClaudeBot:
     # The CRUD surface for the proactive scheduler: /every (create), /schedules (list),
     # /unschedule, /pause, /resume. Each is SB1-gated (the _ok recheck) and STREAMING-ONLY
     # (proactive needs the per-chat send gate + the permission-hold path — one-shot has
-    # neither, so it replies a clean notice, exactly like /projects / /yolo). This task ships
-    # the CRUD + persistence ONLY — a created schedule sits persisted with a next_run; the
-    # asyncio driver that fires it is T-FIRE (so nothing runs unattended yet).
+    # neither, so it replies a clean notice, exactly like /projects / /yolo). A created schedule
+    # is persisted with a next_run; the asyncio firing driver (T-FIRE) then fires it on its
+    # interval (and /runnow fires it immediately).
 
     async def _require_scheduling(self, update: Update) -> bool:
         """Reply the scheduling-needs-streaming notice and return False in one-shot mode.
@@ -1733,9 +1733,10 @@ class TelegramClaudeBot:
            over the cap → :class:`~claude_tg.session_store.MaxSchedulesExceeded` → a clean
            "you've hit the limit" reply (fail-closed); a same-name schedule is overwritten.
 
-        **This does NOT fire anything** — the schedule is persisted with a ``next_run`` and
-        sits dormant until the firing driver (T-FIRE) lands. The prompt is operator-authored
-        and stored verbatim (SB4: fired later as a normal turn, never a shell command).
+        **This creates the schedule; it does not fire it inline** — the schedule is persisted
+        with a ``next_run`` and the firing driver (T-FIRE) fires it on its interval (``/runnow``
+        fires it immediately). The prompt is operator-authored and stored verbatim (SB4: fired
+        as a normal turn, never a shell command).
         """
         if not await self._ok(update) or update.message is None:
             return
@@ -1804,9 +1805,9 @@ class TelegramClaudeBot:
                 "Remove one with /unschedule <name> first."
             )
             return
-        # Confirm body-free: the name (SB4, escaped uniformly), the interval, and a clear note
-        # that NOTHING fires yet in this build (dormant until the firing runtime lands). The
-        # prompt is NOT echoed (it is the operator's own text; the listing previews it).
+        # Confirm body-free: the name (SB4, escaped uniformly), the interval, and how to see or
+        # fire it (it fires on its interval; /runnow fires it now — both through the approval
+        # gate). The prompt is NOT echoed (it is the operator's own text; the listing previews it).
         await update.message.reply_text(
             f"⏰ Saved schedule <b>{html.escape(name, quote=False)}</b> — "
             f"every {html.escape(format_interval(interval_seconds), quote=False)}. "
@@ -3016,8 +3017,8 @@ class TelegramClaudeBot:
         # P14 T-SCHED: the proactive-scheduler CRUD — /every (create), /schedules (list),
         # /unschedule, /pause, /resume. Each SB1-gated (the `allowed` filter + the _ok
         # recheck) + streaming-only (a clean notice in one-shot), registered BEFORE the
-        # on_skill_command passthrough so first-match-wins makes them real commands. (NO
-        # firing in this task — a created schedule is dormant data until the runtime lands.)
+        # on_skill_command passthrough so first-match-wins makes them real commands. (These are
+        # the CRUD surface; the firing driver + /runnow [T-FIRE] are registered just below.)
         app.add_handler(CommandHandler("every", self.cmd_every, filters=allowed))
         app.add_handler(CommandHandler("schedules", self.cmd_schedules, filters=allowed))
         app.add_handler(CommandHandler("unschedule", self.cmd_unschedule, filters=allowed))

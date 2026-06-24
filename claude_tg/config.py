@@ -453,9 +453,9 @@ def parse_bash_policy_extra_patterns(raw: str | None) -> tuple[str, ...]:
 #: the loop runs but does NOTHING until the owner creates a task (no schedules exist on a
 #: fresh install), so default-on is zero-risk and non-breaking — requiring a flag to use the
 #: headline feature would be needless friction. The per-task pause + the empty default keep it
-#: dormant; ``SCHEDULER_ENABLED=false`` opts out entirely. NOTE: this task (T-SCHED) ships the
-#: scheduler as DORMANT DATA only — nothing fires yet (the asyncio driver is T-FIRE); so even
-#: default-on changes no observable behavior until both a task exists AND T-FIRE lands.
+#: quiet; ``SCHEDULER_ENABLED=false`` opts out entirely. The asyncio firing driver is live, so
+#: a created schedule fires on its interval (and ``/runnow`` fires it immediately) — default-on
+#: still changes no observable behavior on a fresh install (no schedules exist there to fire).
 DEFAULT_SCHEDULER_ENABLED = True
 
 #: P14 T-SCHED — the per-CHAT cap on the number of proactive schedules (a DoS-by-schedule
@@ -670,10 +670,11 @@ class Config:
     # Empty by default. A pattern that fails to compile is dropped at match time (fail-safe).
     bash_policy_extra_patterns: tuple[str, ...] = ()
     # P14 T-SCHED: the proactive scheduler. ``scheduler_enabled`` is default ON (design O1) —
-    # the loop runs but does nothing until a task is created (no schedules on a fresh install),
-    # so default-on is non-breaking; SCHEDULER_ENABLED=false opts out. NOTE: this task ships the
-    # scheduler as DORMANT DATA — nothing fires yet (the asyncio driver is T-FIRE), so the
-    # default-on flag changes no observable behavior until firing lands. ``schedule_max_tasks_
+    # the loop runs but has nothing to fire until a task is created (no schedules on a fresh
+    # install), so default-on is non-breaking; SCHEDULER_ENABLED=false opts out. The asyncio
+    # firing driver is live: a created schedule fires on its interval (and /runnow fires it
+    # immediately), so default-on still changes no observable behavior on a fresh install (no
+    # schedules to fire). ``schedule_max_tasks_
     # per_chat`` is the per-chat DoS-by-schedule cap the store enforces fail-closed (default 20).
     # ``schedule_min_interval_seconds`` is the floor /every accepts (default 60 s) so a typo
     # ``/every 1s`` can't schedule a host-hammering cadence. Unset → defaults; a bad max/floor
@@ -764,9 +765,9 @@ class Config:
             os.environ.get("BASH_POLICY_EXTRA_PATTERNS")
         )
 
-        # P14 T-SCHED: the proactive scheduler knobs. Default ON (design O1) but
-        # dormant-until-a-task-exists (and nothing fires until T-FIRE), so non-breaking; the
-        # per-chat cap + interval floor fail loud on a bad value (a typo must not silently
+        # P14 T-SCHED: the proactive scheduler knobs. Default ON (design O1) but with nothing
+        # to fire until a task exists (firing IS live via the asyncio driver), so non-breaking;
+        # the per-chat cap + interval floor fail loud on a bad value (a typo must not silently
         # disable the DoS/host-hammer guardrails).
         scheduler_enabled = _env_bool("SCHEDULER_ENABLED", DEFAULT_SCHEDULER_ENABLED)
         schedule_max_tasks_per_chat = parse_schedule_max_tasks_per_chat(

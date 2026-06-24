@@ -3,9 +3,12 @@
 _From design.md · roadmap-v2 P14 "proactive / integrated" (LAST feature phase before P15 release) · supervised build. Baseline 1438 tests. Scope = an operator-managed PROACTIVE SCHEDULER (interval prompts fired as gated turns). MCP + dedicated-git + webhooks DEFERRED (triggers in design §). Owner-decisions accepted: O1 default-on-but-empty, O2 interval-only, O3 gate-only + force-gate-on (no unattended pre-auth)._
 
 ## Task list
-- [ ] T-SCHED — Scheduler core + persistence + config + CRUD commands: a `Schedule` model (interval, prompt, project, next_run, paused) in a pure module + `session_store` persistence (atomic 0600, RB3 re-arm from now, NO missed-fire replay) + config (`SCHEDULER_ENABLED` default-on, knobs) + `/every <interval> <name> <prompt>`, `/schedules`, `/unschedule`, `/pause`, `/resume` (SB1; menu+HELP lock-step). NO firing yet — CRUD + persistence only.
-- [ ] T-FIRE — The firing runtime (security core): an asyncio scheduler-driver task (started in `post_init`, cancelled in `post_shutdown`, injected clock) that fires a due task via `streaming.handle_message(..., proactive=True)` reusing the P5/P6/P13 stack; **the proactive turn FORCES the permission gate ON regardless of a stale `/yolo`/grant** (an unattended turn can't inherit allow-all — risky tools HOLD → backstop auto-DENY = fail-safe); body-free `proactive_fire`/`proactive_skip` audit records (P13); per-chat send-gate respected; `/runnow`.
-- [ ] T-VERIFY — Codex QA (iterate to SHIP) + live phone-verify (a `/every` task fires a turn, notifies, is audited; a risky unattended tool auto-denies at backstop; `/yolo` does NOT leak into a proactive fire) + ADR-008 + README + 4 gates + merge.
+- [x] T-SCHED — Scheduler core + persistence + config + CRUD commands (`0166381`) — dormant-data-only, no firing.
+- [x] T-FIRE — Firing runtime + the force-gate security core (`8064e85` + blocker-fix `d156589`).
+- [x] T-VERIFY — Codex QA SHIP + live phone-verify PASS + ADR-008 + README + merge. **DONE:**
+  - **Codex QA:** round-1 NO_SHIP (2 blockers — `/schedules` prompt-text display; SB1 not re-checked at fire time) → fixed → **Codex re-check SHIP** (both CLOSED). Independent reviewer: **FORCE-GATE + unattended-fail-safe + RB1 all AGREE**, mutation-probed (invert the force-gate → 3 proactive-gating tests fail; normal yolo turn still auto-allows = regression guard).
+  - **Live phone-verify PASS:** `/every 5m schedtest …` created (persisted) → `/schedules` body-free (no prompt text) → **`/runnow` fired a proactive turn → Claude replied `SCHEDULEFIRED`** + a body-free `proactive_fire (schedtest)` audit record (schedule name only). **⭐ Force-gate confirmed:** with `/yolo` ON, `/runnow risktest` (a risky Bash command) **STILL hit the permission gate** ("🔐 Permission needed … Allow/Deny") — an unattended fire does NOT inherit allow-all — denied → no file written.
+  - ADR-008 + README (+ docs index) written; stale "dormant/nothing-fires-yet" code comments corrected. 1577 tests; ruff/mypy/secret_scan clean.
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (sha) · `[!]` blocked
 
