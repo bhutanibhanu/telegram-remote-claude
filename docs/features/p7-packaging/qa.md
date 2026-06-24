@@ -11,5 +11,10 @@ _Cross-model Codex QA on the P7 diff (`git diff d5596e4..HEAD`). **Verdict: NO_S
 ## Non-blocking (fix with B1/B2)
 - **`deploy/install-launchd.sh` plist substitution is unescaped** (~lines 113/131): argv/path values are injected into the plist XML without XML-escaping, so a path containing `&`/`<`/`>` renders an invalid plist. **Fix:** XML-escape the substituted values.
 
-## State
-- All 5 P7 tasks built; **861 tests green**, ruff/mypy/secret_scan clean; functional T5 live-verify PASSED. The above are the only items between here and merge. Phase reset to `built` (NOT approved — has blockers). `main` is unaffected (P7 never merged).
+## Resolution — all findings CLOSED, P7 approved + merged
+- **B1 (cwd-shadow) — CLOSED.** Package made self-contained: startup logic → `claude_tg/app.py`; `claude_tg/cli.py:main` is the real entry (lazy `app.run`, `--version` short-circuit); root `main.py` is a thin `from claude_tg.cli import main` shim; `pyproject` `py-modules=[]` so setuptools doesn't ship `main.py`. Codex re-QA #2 confirmed: clean `pip install .` ships no top-level `main.py`; `claude-telegram-bot`/`python -m claude_tg --version` work from a decoy-`main.py` CWD.
+- **NB (plist XML-escaping) — CLOSED** (Codex re-QA #2 confirmed; sed-`&` re-corruption also fixed via bash `${//}`).
+- **B2 (installer double-poll) — CLOSED.** Matcher now `tolower()`-case-insensitive on the interpreter + boundary-anchored `main.py` + anchored `claude-telegram-bot`. Verified by the implementer's 15-case harness AND an **independent orchestrator harness**: the exact macOS `…/Python /abs/main.py` form Codex flagged now MATCHES; `pytest …/test_main.py`, `vim /x/main.py`, `foo_main.py`, and a process in a `claude-telegram-bot*` dir all correctly do NOT match.
+- **Live verify (post-fix):** bot booted via the NEW entry through launchd, real Telegram round-trip (`81` once — dup-fix holds), B2 ps-guard aborted a duplicate manual launch, KeepAlive respawned on kill, clean teardown.
+- **QA note:** Codex re-QA #3 (final confirmation of the B2 matcher) STALLED on the API (10.5 min @ 0% CPU, transient — see `codex-exec-stdin-hang`). Since the remaining item was a deterministic shell-regex fix targeting Codex's exact named gap, an independent harness substituted for the hung confirmation pass rather than blocking the merge. B1/NB were already Codex-CLOSED in re-QA #2.
+- **Final:** 863 tests green, ruff/mypy/secret_scan clean. Phase → `approved` → merged to `main`.
