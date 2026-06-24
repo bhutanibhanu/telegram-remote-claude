@@ -1,7 +1,7 @@
 {
   "slug": "statusline",
-  "phase": "built",
+  "phase": "qa",
   "branch": "feat/statusline",
   "worktree": "/Users/ray/dev/claude-telegram-bot-statusline",
-  "updated": "2026-06-24T14:55:00Z"
+  "updated": "2026-06-24T15:05:00Z"
 }
