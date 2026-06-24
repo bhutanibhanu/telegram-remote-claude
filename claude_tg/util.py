@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import re
+from datetime import datetime, timezone
 from typing import Optional
 
 TELEGRAM_MAX = 4096
+
+
+def _now_iso() -> str:
+    """An ISO-8601 timestamp in UTC (e.g. ``2026-06-24T12:34:56.789+00:00``).
+
+    The shared timestamp source for the audit trail (P13 T-AUDIT) — mirrors
+    ``session_store._now`` but lives here so the engine + audit modules share one helper
+    without importing the store. Pure (a wall-clock read); the value is a fixed-shape
+    digit/symbol string with no body, safe to write to the body-free audit log (SB3).
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 #: Length of the short hex tag appended after ``sid:`` (6 hex chars ≈ 24 bits — wide
 #: enough that two live sessions almost never collide in a log, short enough to stay a

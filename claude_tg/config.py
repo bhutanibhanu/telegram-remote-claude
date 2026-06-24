@@ -343,6 +343,76 @@ def parse_file_max_bytes(raw: str | None) -> int:
     return value
 
 
+#: Default audit-log rotation bound (P13 T-AUDIT): 5 MB before a 1-keep rotation, so the
+#: durable audit JSONL is bounded to ~2x this on disk (the live file + a single ``.1``
+#: keep). The audit log is body-free (SB3) — only tool names, ``safe_input_summary``
+#: outputs, decisions, redacted ids + timestamps — written atomically with ``0600`` perms
+#: next to ``CLAUDE_STATE_FILE``. Configurable via ``AUDIT_LOG_MAX_BYTES``.
+DEFAULT_AUDIT_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+#: The suffix appended to ``CLAUDE_STATE_FILE`` to derive the default audit-log path when
+#: ``AUDIT_LOG_FILE`` is unset (e.g. ``<state>.audit.jsonl``). It lives next to the session
+#: store so it inherits the same dir + ``0600`` posture (P13 T-AUDIT design §1.2).
+AUDIT_LOG_SUFFIX = ".audit.jsonl"
+
+#: Values that EXPLICITLY disable the audit log when set as ``AUDIT_LOG_FILE`` (case-
+#: insensitive). An empty string also disables it. Otherwise the value is a path.
+_AUDIT_DISABLE_VALUES = frozenset({"", "off", "none", "disabled", "0", "false"})
+
+
+def parse_audit_log_max_bytes(raw: str | None) -> int:
+    """Parse + validate AUDIT_LOG_MAX_BYTES (default 5 MB; P13 T-AUDIT).
+
+    The size (in BYTES) the durable audit JSONL may reach before a 1-keep rotation
+    (``<file>.1``). Parsing mirrors :func:`parse_file_max_bytes`: empty/unset → the
+    default; must be a **positive** integer (a ``0``/negative bound would rotate on every
+    write or never — so it is a configuration error and fails loud at startup rather than
+    silently producing a degenerate log). So ``""``/unset → 5 MB; ``"1048576"`` → 1 MB;
+    ``"0"``/``"-1"``/``"x"`` → raise.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_AUDIT_LOG_MAX_BYTES
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"AUDIT_LOG_MAX_BYTES must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError("AUDIT_LOG_MAX_BYTES must be positive")
+    return value
+
+
+def resolve_audit_log_file(raw: str | None, *, state_file: Path | None) -> Path | None:
+    """Resolve the audit-log path (P13 T-AUDIT design §1.2) — default-on but non-breaking.
+
+    Precedence:
+
+    * ``AUDIT_LOG_FILE`` set to a real path → that path (``expanduser()``), the explicit
+      override.
+    * ``AUDIT_LOG_FILE`` set to an explicit disable token (``""``/``off``/``none``/
+      ``disabled``/``0``/``false``, case-insensitive) → ``None`` (audit OFF), the
+      documented full-disable.
+    * ``AUDIT_LOG_FILE`` UNSET + a ``state_file`` configured → ``<state_file><suffix>``
+      (next to the session store, inheriting its dir + ``0600`` posture). This is the
+      **default-on** behavior: a stateful deploy gets an audit log out-of-the-box.
+    * ``AUDIT_LOG_FILE`` UNSET + NO ``state_file`` (a stateless oneshot deploy) → ``None``
+      (audit OFF unless ``AUDIT_LOG_FILE`` is set explicitly). Non-breaking: a deploy with
+      no durable state stays exactly as before (no surprise file).
+
+    Returns the resolved :class:`~pathlib.Path`, or ``None`` when audit is disabled. Pure
+    (no I/O — the caller/``AuditLog`` creates the file lazily on first append).
+    """
+    if raw is not None and raw.strip().casefold() in _AUDIT_DISABLE_VALUES:
+        # An explicit disable token (incl. an explicit empty string) → audit OFF.
+        return None
+    value = (raw or "").strip()
+    if value:
+        return Path(value).expanduser()
+    # Unset/blank → default next to the state file (default-on), or off if no state file.
+    if state_file is not None:
+        return state_file.with_name(state_file.name + AUDIT_LOG_SUFFIX)
+    return None
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -435,6 +505,18 @@ class Config:
     # default; 0/negative/non-numeric → fail loud (parse_transcribe_timeout_seconds). Only
     # consulted in streaming mode (and only when TRANSCRIBE_CMD is set).
     transcribe_timeout_seconds: float = DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS
+    # P13 T-AUDIT: the durable BODY-FREE audit-log path (append-only JSONL, atomic + 0600,
+    # size-bounded 1-keep rotation). Default-on but NON-BREAKING: when CLAUDE_STATE_FILE is
+    # set it defaults to ``<state_file>.audit.jsonl`` (next to the store, same dir/perms);
+    # with no state file (a stateless oneshot deploy) it is None (off) unless AUDIT_LOG_FILE
+    # is set explicitly. AUDIT_LOG_FILE overrides the path; ""/off/none/disabled/0/false
+    # disable it (resolve_audit_log_file). ``None`` here → no audit log is constructed, so
+    # every Engine is built with audit_sink=None (a no-op) and behavior is IDENTICAL.
+    audit_log_file: Path | None = None
+    # P13 T-AUDIT: the audit log's rotate-once size bound in BYTES (the live file + one
+    # ``.1`` keep ≈ 2x this on disk). Default 5 MB; unset → default; 0/negative/non-integer
+    # → fail loud (parse_audit_log_max_bytes). Only consulted when audit_log_file is set.
+    audit_log_max_bytes: int = DEFAULT_AUDIT_LOG_MAX_BYTES
 
     @classmethod
     def from_env(cls, dotenv_path: str | os.PathLike[str] | None = ".env") -> "Config":
@@ -499,6 +581,17 @@ class Config:
             os.environ.get("TRANSCRIBE_TIMEOUT_SECONDS")
         )
 
+        # P13 T-AUDIT: resolve the durable body-free audit-log path (default next to
+        # CLAUDE_STATE_FILE; off when no state file unless AUDIT_LOG_FILE is set; an
+        # explicit disable token turns it off) + its rotate-once size bound. Default-on
+        # but non-breaking — a deploy with no state file is unchanged.
+        audit_log_file = resolve_audit_log_file(
+            os.environ.get("AUDIT_LOG_FILE"), state_file=state_file
+        )
+        audit_log_max_bytes = parse_audit_log_max_bytes(
+            os.environ.get("AUDIT_LOG_MAX_BYTES")
+        )
+
         # SB2 /cd confinement. Default the allow-list to the workdir so an unset
         # ALLOWED_ROOTS still confines /cd (ON by default); ALLOW_ANY_PATH=true is the
         # explicit owner opt-out. workdir is already expanduser()'d above; resolve it so
@@ -530,4 +623,6 @@ class Config:
             file_max_bytes=file_max_bytes,
             transcribe_cmd=transcribe_cmd,
             transcribe_timeout_seconds=transcribe_timeout_seconds,
+            audit_log_file=audit_log_file,
+            audit_log_max_bytes=audit_log_max_bytes,
         )

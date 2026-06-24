@@ -15,6 +15,13 @@ import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+from claude_tg.audit import (
+    KIND_POLICY_EVENT,
+    KIND_SESSION_EVENT,
+    KIND_TOOL_DECISION,
+    AuditEvent,
+    AuditLog,
+)
 from claude_tg.bot import TelegramClaudeBot
 from claude_tg.claude_runner import ClaudeResult, ClaudeRunner
 from claude_tg.config import Config
@@ -4733,7 +4740,7 @@ def _make_plan_recording_session(store):
 
     def factory(
         *, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default",
-        thinking=False,
+        thinking=False, audit_sink=None,
     ):
         modes.append(permission_mode)
         return HoldEngine(
@@ -4832,7 +4839,7 @@ async def test_plan_turn_rebuild_resumes_persisted_session_for_continuity(tmp_pa
 
     def factory(
         *, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default",
-        thinking=False,
+        thinking=False, audit_sink=None,
     ):
         eng = HoldEngine(
             [ResultEvent(session_id="sid-keep", is_error=False, subtype="success", result_text="ok")]
@@ -4927,7 +4934,7 @@ async def test_plan_marker_consumed_even_when_sb2_refuses_turn(tmp_path):
 
     def factory(
         *, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default",
-        thinking=False,
+        thinking=False, audit_sink=None,
     ):
         modes.append(permission_mode)
         return HoldEngine(
@@ -4988,3 +4995,173 @@ async def test_plan_then_command_does_not_consume_marker(tmp_path):
     await _drive_plan_turn(session, 1, "build me X")
     assert modes == ["plan"]  # the prompt (not the command) ran in plan mode
     assert rt.plan_next is False  # consumed by the prompt turn
+
+
+# ===========================================================================
+# P13 T-AUDIT — /audit command (SB1, body-free, per-chat filtered, bounded).
+# ===========================================================================
+
+
+def _streaming_with_audit(tmp_path, store=None):
+    """A real StreamingSession whose process audit log is a fresh on-disk JSONL (P13)."""
+    session, _engine = make_streaming(store if store is not None else JsonSessionStore(tmp_path / "state.json"))
+    session.audit_log = AuditLog(tmp_path / "audit.jsonl")
+    return session
+
+
+async def test_cmd_audit_sb1_rejects_non_allowlisted_chat(tmp_path):
+    """SB1: ``/audit`` from a non-allowlisted chat is ignored (no reply, no read)."""
+    session = _streaming_with_audit(tmp_path)
+    session.audit_log.append(AuditEvent(ts="t", kind=KIND_TOOL_DECISION, tool="Bash", summary="s", decision="deny", chat_id=1))
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(chat_id=999, text="/audit")  # NOT allowlisted
+    await bot.cmd_audit(upd, make_cmd_ctx())
+    upd.message.reply_text.assert_not_awaited()
+
+
+async def test_cmd_audit_renders_recent_tail_body_free(tmp_path):
+    """``/audit`` renders this chat's recent records, HTML-escaped + body-free.
+
+    Plants a record whose summary contains an HTML-special tool name + a (fake) secret-shaped
+    string to prove the render escapes the markup and that nothing beyond the already-body-free
+    summary is shown.
+    """
+    session = _streaming_with_audit(tmp_path)
+    log = session.audit_log
+    # A body-free summary (as safe_input_summary would produce) carrying angle-brackets.
+    log.append(AuditEvent(ts="2026-06-24T12:03:41+00:00", kind=KIND_TOOL_DECISION, tool="Bash", summary="Bash(command=echo <b>hi</b>)", decision="allow_once", chat_id=1))
+    log.append(AuditEvent(ts="2026-06-24T12:04:02+00:00", kind=KIND_POLICY_EVENT, summary="yolo_on", decision="on", chat_id=1))
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(chat_id=1, text="/audit")
+    await bot.cmd_audit(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert kwargs.get("parse_mode") == "HTML"
+    assert "Audit" in reply
+    assert "12:03:41" in reply and "allow_once" in reply  # time + verdict
+    assert "yolo_on" in reply
+    # HTML-escaped: the literal <b> from the summary must be escaped, not a live tag.
+    assert "&lt;b&gt;hi&lt;/b&gt;" in reply
+    assert "<b>hi</b>" not in reply
+
+
+async def test_cmd_audit_filters_to_requesting_chat(tmp_path):
+    """``/audit`` shows ONLY the requesting chat's records (per-chat isolation)."""
+    session = _streaming_with_audit(tmp_path)
+    log = session.audit_log
+    log.append(AuditEvent(ts="t1", kind=KIND_TOOL_DECISION, tool="Bash", summary="MINE", decision="deny", chat_id=1))
+    log.append(AuditEvent(ts="t2", kind=KIND_TOOL_DECISION, tool="Bash", summary="OTHER", decision="deny", chat_id=2))
+    bot = TelegramClaudeBot(make_config(allowed=(1, 2), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(chat_id=1, text="/audit")
+    await bot.cmd_audit(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "MINE" in reply and "OTHER" not in reply  # chat 2's record is not shown to chat 1
+
+
+async def test_cmd_audit_bounds_n(tmp_path):
+    """``/audit <n>`` caps at the max; the render shows at most that many records."""
+    session = _streaming_with_audit(tmp_path)
+    for i in range(60):
+        session.audit_log.append(AuditEvent(ts=f"t{i}", kind=KIND_TOOL_DECISION, tool="Bash", summary=f"s{i}", decision="deny", chat_id=1))
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    # /audit 5 → only the last 5 records (+ the header line).
+    upd = make_update(chat_id=1, text="/audit 5")
+    await bot.cmd_audit(upd, make_cmd_ctx(args=["5"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    # Each tool_decision renders its summary (sNN) in a <code> span; count those record lines.
+    record_lines = [ln for ln in reply.splitlines() if "<code>s" in ln]
+    assert len(record_lines) == 5
+    assert "s59" in reply and "s54" not in reply  # the LAST 5 (s55..s59)
+
+
+async def test_cmd_audit_empty_is_clean_notice(tmp_path):
+    """An empty (for this chat) log → a clean 'no events yet' reply, never an error."""
+    session = _streaming_with_audit(tmp_path)  # nothing appended
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(chat_id=1, text="/audit")
+    await bot.cmd_audit(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "No audit events" in reply
+
+
+async def test_cmd_audit_disabled_when_no_log(tmp_path):
+    """With audit disabled (no log), ``/audit`` replies a clean 'not enabled' notice (RB1)."""
+    session, _ = make_streaming(JsonSessionStore(tmp_path / "state.json"))
+    assert session.audit_log is None  # make_streaming's config has no audit path
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(chat_id=1, text="/audit")
+    await bot.cmd_audit(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "isn't enabled" in reply
+
+
+async def test_cmd_audit_oneshot_mode_clean_notice():
+    """In one-shot mode (no streaming session) ``/audit`` replies the clean disabled notice."""
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="oneshot"), FakeRunner())
+    assert bot.streaming is None
+    upd = make_update(chat_id=1, text="/audit")
+    await bot.cmd_audit(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "isn't enabled" in reply
+
+
+async def test_cmd_audit_records_no_body_even_with_secret_summary(tmp_path):
+    """SB3 at the /audit surface: a record built from a secret-laden summary renders body-free.
+
+    The summary stored is what safe_input_summary produces for a Write-with-secret (the body
+    collapsed to <N chars>); /audit shows exactly that — never the secret.
+    """
+    from claude_tg.engine.types import safe_input_summary
+
+    fake_secret = "fake-sample-not-real-zzzz0000111122223333"  # placeholder (secret_scan-safe)
+    summary = safe_input_summary("Write", {"file_path": "/x", "content": fake_secret})
+    session = _streaming_with_audit(tmp_path)
+    session.audit_log.append(AuditEvent(ts="t", kind=KIND_TOOL_DECISION, tool="Write", summary=summary, decision="deny", chat_id=1))
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(chat_id=1, text="/audit")
+    await bot.cmd_audit(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert fake_secret not in reply  # the secret is never surfaced
+    assert "content=&lt;" in reply  # collapsed to a length (HTML-escaped < )
+
+
+# ===========================================================================
+# P13 T-AUDIT — bot-side records: /yolo, /switch, /attach, /watch, /reset.
+# ===========================================================================
+
+
+async def test_yolo_records_policy_event(tmp_path):
+    """``/yolo`` (set_yolo True) writes a body-free ``yolo_on`` policy_event; /unyolo → yolo_off."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session = _streaming_with_audit(tmp_path, store=store)
+    session.set_yolo(1, True)
+    session.set_yolo(1, False)
+    events = session.audit_log.tail(10)
+    kinds = [(e.kind, e.summary, e.decision) for e in events]
+    assert (KIND_POLICY_EVENT, "yolo_on", "on") in kinds
+    assert (KIND_POLICY_EVENT, "yolo_off", "off") in kinds
+    assert all(e.chat_id == 1 for e in events)
+
+
+async def test_switch_records_session_event(tmp_path):
+    """A successful ``/switch`` (via the bot's _switch_active) writes a ``switch`` session_event."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session = _streaming_with_audit(tmp_path, store=store)
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session)
+    await bot.cmd_switch(make_update(chat_id=1, text="/switch beta"), make_cmd_ctx(args=["beta"]))
+    events = session.audit_log.tail(10)
+    assert any(e.kind == KIND_SESSION_EVENT and e.summary == "switch" and e.chat_id == 1 for e in events)
+
+
+async def test_reset_records_session_event(tmp_path):
+    """``reset`` on an active project writes a ``reset`` session_event (body-free)."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.update(1, session_id="some-sess", cwd=None)
+    session = _streaming_with_audit(tmp_path, store=store)
+    session.reset(1)
+    events = session.audit_log.tail(10)
+    assert any(e.kind == KIND_SESSION_EVENT and e.summary == "reset" and e.chat_id == 1 for e in events)

@@ -53,13 +53,20 @@ import logging
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional, Sequence
 
+from ..audit import (
+    KIND_PLAN_DECISION,
+    KIND_TOOL_DECISION,
+    AuditEvent,
+    AuditSink,
+)
 from ..permissions import PermissionPolicy, path_needs_approval
-from ..util import _redact_sid
+from ..util import _now_iso, _redact_sid
 from .pending import DEFAULT_BACKSTOP_SECONDS, PendingRegistry
 from .substrate import Substrate
 from .types import (
     DENIED_MESSAGE,
     AskEvent,
+    Cancel,
     Decision,
     Event,
     ImageInput,
@@ -67,6 +74,7 @@ from .types import (
     PermissionEvent,
     PermissionVerdict,
     PlanEvent,
+    PlanVerdict,
     StatusEvent,
     SubstrateDecision,
     decision_to_substrate,
@@ -100,10 +108,18 @@ class Engine:
         cwd: str | None = None,
         allowed_roots: tuple[str | Path, ...] = (),
         allow_any_path: bool = False,
+        audit_sink: AuditSink | None = None,
     ) -> None:
         self._substrate = substrate
         self._send_timeout = send_timeout
         self._backstop_seconds = backstop_seconds
+        # P13 T-AUDIT: the optional, BODY-FREE audit sink the gate records every decision
+        # to. **Default None → a NO-OP**: when unset, ``_record_*`` returns immediately, so
+        # an Engine built without it (every pre-P13 construction + all 1288 tests) behaves
+        # byte-for-byte as before — same pattern as the optional cwd/allowed_roots C2 params.
+        # The production sink is a ChatBoundSink (stamps the chat id the substrate-neutral
+        # engine does not know); it is best-effort (an audit write never breaks a turn, RB1).
+        self._audit_sink = audit_sink
         # The per-session permission policy the gate consults (ADR-003). Defaulting to a
         # FRESH PermissionPolicy() makes the engine fail-closed: a fresh policy has no
         # grants and yolo off, so every risky tool gates. The bot (T5) injects the
@@ -133,6 +149,66 @@ class Engine:
         # decision callback and the backstop notify push injected events onto it; the
         # substrate stream is drained onto it by send()'s producer task.
         self._out_queue: Optional[asyncio.Queue[Any]] = None
+
+    # -- audit hook (P13 T-AUDIT — body-free, best-effort, no-op when unset) --
+
+    def _record_tool(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        decision: str,
+    ) -> None:
+        """Record a body-free ``tool_decision`` audit event for ``tool_name`` (SB3).
+
+        Called at EVERY gate outcome in :meth:`on_tool_request` / :meth:`_permission_hold`
+        — auto-allow (safe / live grant / ``/yolo``), the out-of-root and risky holds'
+        resolved verdicts, and the fail-closed no-id deny — so a tool that auto-runs under
+        ``/yolo`` (and never reaches the bot) is still audited. The summary is
+        :func:`safe_input_summary` (the SAME body-free string the prompt shows — lengths /
+        truncated idents, never a body); the session tag is :func:`_redact_sid` (never the
+        raw resumable id). When no sink is wired this is a no-op (the 1288 floor holds).
+        Best-effort: the sink swallows its own failures (RB1) — an audit write never breaks
+        a turn.
+        """
+        sink = self._audit_sink
+        if sink is None:
+            return  # no-op default — behavior identical to pre-P13
+        try:
+            sink.record(
+                AuditEvent(
+                    ts=_now_iso(),
+                    kind=KIND_TOOL_DECISION,
+                    tool=tool_name,
+                    summary=safe_input_summary(tool_name, tool_input),
+                    decision=decision,
+                    session_tag=_redact_sid(self.session_id),
+                )
+            )
+        except Exception:  # pragma: no cover - the sink is already best-effort
+            log.debug("audit record (tool) failed (ignored)", exc_info=True)
+
+    def _record_plan(self, decision: str) -> None:
+        """Record a body-free ``plan_decision`` audit event (``approve`` / ``reject``).
+
+        Emitted from :meth:`_answer_hold` for an ``ExitPlanMode`` verdict — NO plan text
+        and NO reject feedback ride the record (SB3 structural: :class:`AuditEvent` has no
+        body field), only the verdict + the redacted session tag. No-op when no sink is
+        wired; best-effort otherwise (RB1).
+        """
+        sink = self._audit_sink
+        if sink is None:
+            return
+        try:
+            sink.record(
+                AuditEvent(
+                    ts=_now_iso(),
+                    kind=KIND_PLAN_DECISION,
+                    decision=decision,
+                    session_tag=_redact_sid(self.session_id),
+                )
+            )
+        except Exception:  # pragma: no cover - the sink is already best-effort
+            log.debug("audit record (plan) failed (ignored)", exc_info=True)
 
     # -- session id ----------------------------------------------------------
 
@@ -198,6 +274,10 @@ class Engine:
             )
         elif not self._policy.needs_approval(tool_name, tool_input):
             log.debug("policy allows tool %s without prompt", tool_name)
+            # P13 T-AUDIT: record the AUTO-ALLOW (safe tool / live grant / /yolo) at the
+            # chokepoint — this branch never reaches the bot, so the engine is the only
+            # place a yolo/grant auto-allow can be audited.
+            self._record_tool(tool_name, tool_input, "auto_allow")
             return decision_to_substrate(
                 PermissionVerdict(behavior="allow"), tool_input=tool_input
             )
@@ -213,6 +293,8 @@ class Engine:
                 "failing closed (deny)",
                 tool_name,
             )
+            # P13 T-AUDIT: record the fail-closed deny (a risky tool we could not gate).
+            self._record_tool(tool_name, tool_input, "deny")
             return decision_to_substrate(
                 PermissionVerdict(behavior="deny", message=DENIED_MESSAGE),
                 tool_input=tool_input,
@@ -256,6 +338,14 @@ class Engine:
         # 2) Register the PendingDecision + backstop and AWAIT the operator's answer.
         #    resolve()/cancel()/backstop are the only things that complete this.
         decision = await self._pending.await_decision(tool_use_id, tool_name)
+
+        # P13 T-AUDIT: record a body-free plan_decision for an ExitPlanMode verdict —
+        # approve / reject (a backstop/cancel rejects → recorded as "reject"). NO plan text
+        # and NO reject feedback are recorded (SB3 structural). Ask answers are NOT audited
+        # (an answer is not a security decision and its content is the operator's). Recorded
+        # here at the engine chokepoint so it is captured regardless of the bot's path.
+        if tool_name == PLAN_TOOL:
+            self._record_plan(_audit_plan_verdict(decision))
 
         # 3) Map the decision through the single load-bearing mapper (every [FLAG]).
         return decision_to_substrate(decision, tool_input=tool_input)
@@ -309,6 +399,14 @@ class Engine:
 
         # 2) Hold on the SHARED registry until resolved (operator / backstop / cancel).
         decision = await self._pending.await_decision(tool_use_id, tool_name)
+
+        # P13 T-AUDIT: record the RESOLVED verdict (body-free) for this held tool, covering
+        # every resolution: an operator allow_once/allow_session/deny, the 60-min backstop
+        # (a PermissionVerdict deny → "backstop_deny"), or a /cancel / turn cancel (a Cancel
+        # → "cancel"). Recorded BEFORE the mapping so the audited verdict is the operator's
+        # intent (allow_session is distinguished from allow_once, which decision_to_substrate
+        # collapses). The grant side effect is still in _verdict_for below.
+        self._record_tool(tool_name, tool_input, _audit_verdict(decision))
 
         # 3) Map the resolved decision. An operator PermissionDecision is translated to a
         #    PermissionVerdict (recording an allow-session grant as a side effect first);
@@ -559,8 +657,40 @@ class Engine:
 
 
 # ---------------------------------------------------------------------------
-# Small helper (module-level + pure so it is trivially testable)
+# Small helpers (module-level + pure so they are trivially testable)
 # ---------------------------------------------------------------------------
+
+
+def _audit_verdict(decision: Decision) -> str:
+    """Map a resolved permission decision to its body-free audit verdict string (P13).
+
+    Mirrors how :meth:`Engine._permission_hold` resolves: an operator
+    :class:`PermissionDecision` carries its own verdict (``allow_once`` / ``allow_session``
+    / ``deny``); the 60-min backstop arrives as a :class:`PermissionVerdict` ``deny`` →
+    ``backstop_deny``; a ``/cancel`` / turn cancel arrives as a :class:`Cancel` → ``cancel``.
+    Any other shape (defensive — should not occur on this path) is recorded as ``deny`` (the
+    fail-closed reading). Pure — carries no body, just a fixed verdict token.
+    """
+    if isinstance(decision, PermissionDecision):
+        return decision.verdict  # allow_once | allow_session | deny
+    if isinstance(decision, Cancel):
+        return "cancel"
+    if isinstance(decision, PermissionVerdict):
+        # The registry's backstop resolves a held permission as a PermissionVerdict deny.
+        return "backstop_deny" if decision.behavior == "deny" else "allow_once"
+    return "deny"  # unexpected shape → fail-closed audit reading
+
+
+def _audit_plan_verdict(decision: Decision) -> str:
+    """Map a resolved plan decision to ``approve`` / ``reject`` (body-free; P13).
+
+    A :class:`PlanVerdict` carries ``approve`` (→ ``approve`` / ``reject``); a backstop
+    (:class:`PermissionVerdict` ``deny``) or a :class:`Cancel` is a non-approval → ``reject``
+    (fail-closed). NO feedback text is read — only the verdict. Pure.
+    """
+    if isinstance(decision, PlanVerdict):
+        return "approve" if decision.approve else "reject"
+    return "reject"
 
 
 def _interactive_event(
