@@ -448,6 +448,15 @@ class _ProjectRuntime:
     # :meth:`_ensure_engine`. ADR-001 C4: arming plan mode greenlights NOTHING about tools —
     # an approved plan's later risky tools still hit the permission gate independently.
     plan_next: bool = False
+    # STATUSLINE T-SL-WIRE (B3 fix): True WHILE a plan-mode turn is actually running on this
+    # project, so the statusline shows ``🔒 plan`` for the live plan turn's duration. The
+    # one-shot ``plan_next`` above is CONSUMED (read + cleared) in ``handle_message`` BEFORE
+    # ``_drive_turn`` runs, so by the time the plan turn is streaming ``plan_next`` is already
+    # False — reading it in :meth:`_statusline_text` would wrongly show ``gate`` DURING the plan
+    # turn. So ``_drive_turn`` sets this from the consumed ``plan_turn`` local at turn start and
+    # CLEARS it in its finally (turn end) — the line reads THIS for the live mode. Transient
+    # in-memory (RB3); a restart drops it (no turn is running across a restart anyway).
+    in_plan_turn: bool = False
     # P12 T-PLAN: the SDK ``permission_mode`` the CURRENT live engine (``engine``) was built
     # with — ``"default"`` for an ordinary session, ``"plan"`` for the fresh session built for
     # an armed ``/plan`` turn. ``_ensure_engine`` records it at build time and consults it in
@@ -714,6 +723,13 @@ class _ChatState:
     # ``send_gate``/``status_message_id``, the live pin id is never persisted.
     statusline_message_id: Optional[int] = None
     statusline_text: Optional[str] = None
+    # STATUSLINE T-SL-WIRE (pin-retry fix): whether the held ``statusline_message_id`` is
+    # actually PINNED. The send and the pin are separate Telegram calls — a send can succeed
+    # (id stored) while the pin RAISES (rate-limit, perms, hiccup), leaving the line sent but
+    # UNPINNED. Without this flag the identical-text skip would short-circuit every later update
+    # and the line would stay unpinned forever. So on a failed pin we leave this False and RETRY
+    # the pin on the next update even when the text is unchanged. Transient in-memory (RB3).
+    statusline_pinned: bool = False
 
 
 class StreamingBusy(Exception):
@@ -3334,7 +3350,7 @@ class StreamingSession:
                         state, chat_id, engine, text,
                         send=send, edit=edit, delete=delete,
                         pin=pin, unpin=unpin, target=target,
-                        images=images, proactive=proactive,
+                        images=images, proactive=proactive, plan_turn=plan_turn,
                     )
             finally:
                 # SLOT-LEAK SAFETY: release the slot this turn held — exactly once, on every
@@ -3529,6 +3545,7 @@ class StreamingSession:
         target: Optional[tuple[str, _ProjectRuntime]] = None,
         images: Optional[Sequence[ImageInput]] = None,
         proactive: bool = False,
+        plan_turn: bool = False,
     ) -> None:
         """Iterate ``engine.send`` → render → Telegram send/edit (coalesced).
 
@@ -3601,6 +3618,13 @@ class StreamingSession:
         turn_rt.status_message_id = None
         turn_rt.status_text = None
         turn_rt.status = "running"
+        # STATUSLINE T-SL-WIRE (B3 fix): mark the LIVE plan-mode flag for the statusline's
+        # duration so the line shows 🔒 plan WHILE the plan turn runs. ``plan_turn`` is the value
+        # ``handle_message`` consumed from the one-shot ``plan_next`` (already cleared there), so
+        # this transient flag is the only honest "this turn is a plan turn" signal at render
+        # time. Cleared in the finally (turn end → back to gate/yolo). Set BEFORE the turn-start
+        # statusline trigger so that first render already reads ``plan``.
+        turn_rt.in_plan_turn = plan_turn
         # STATUSLINE T-SL-WIRE (design §3.1): turn START → flip the working ⚙️ marker ON (and
         # refresh model/effort/mode/worktree). FOREGROUND-ONLY — gated on ``turn_name`` so a
         # BACKGROUND concurrent turn never stomps the foreground line (the make-or-break
@@ -3810,6 +3834,11 @@ class StreamingSession:
             # ADR-005 D7: the turn is over → this project is idle again (no runtime → idle is
             # the /projects default; a running/awaiting project that just ended → idle).
             turn_rt.status = "idle"
+            # STATUSLINE T-SL-WIRE (B3 fix): the plan turn is over → clear the live plan flag so
+            # the turn-end render (below) and every idle refresh show 🔒 gate/yolo again, not a
+            # lingering 🔒 plan. Cleared BEFORE the turn-end statusline trigger. (A freshly-armed
+            # /plan for the NEXT turn re-shows 🔒 plan via the command refresh's ``plan_next``.)
+            turn_rt.in_plan_turn = False
             # STATUSLINE T-SL-WIRE (design §3.1): turn END → flip the working ⚙️ marker OFF and
             # refresh ctx % (the context just grew, and the engine is still alive here — its
             # teardown for a driver_error/resume-failure happens AFTER this finally — so
@@ -4172,8 +4201,8 @@ class StreamingSession:
             # _update_statusline already swallows its own I/O; this guards the gate itself).
             log.debug("statusline trigger failed for chat (ignored)", exc_info=True)
 
-    def _statusline_text(self, chat_id: int) -> Optional[str]:
-        """Build the CURRENT statusline body for ``chat_id``'s foreground project (pure read).
+    async def _statusline_text(self, chat_id: int) -> Optional[str]:
+        """Build the CURRENT statusline body for ``chat_id``'s foreground project (live read).
 
         Reads the chat's ACTIVE (foreground) project's live state — the worktree NAME, the
         effective model + effort, the permission mode, the working/idle marker, and the ctx %
@@ -4186,14 +4215,19 @@ class StreamingSession:
         project (nothing run yet) returns ``None`` (nothing to show). Each field read is
         defensive — a missing store / odd record / ctx call that raises degrades to a safe
         default (``ctx —``, ``gate``) rather than raising. Returns the formatted body, or
-        ``None`` when there is no foreground project to describe. No I/O beyond the best-effort
-        ctx read (which itself never raises).
+        ``None`` when there is no foreground project to describe.
+
+        ⭐ **ASYNC (B1 fix):** the ctx % comes from ``Engine.context_percentage()`` which AWAITS
+        the SDK's coroutine ``get_context_usage()`` — so this method is async and awaits it. The
+        await is still fully best-effort (any raise → ``ctx —``, never a fabricated number); it
+        is the only await here (every other field is a pure in-memory read).
 
         * ``worktree`` — the active project NAME (SB4-validated charset, so inert — SB3).
         * ``model`` — :meth:`_resolve_project_model` reduced by :func:`model_short_label`.
         * ``effort`` — :meth:`_resolve_project_effort` (``None`` → model-only).
-        * ``mode`` — ``yolo`` if the project's policy is allow-all, else ``plan`` if a ``/plan``
-          is armed for the next turn, else ``gate`` (the fail-closed default).
+        * ``mode`` — ``yolo`` if the project's policy is allow-all, else ``plan`` if a plan turn
+          is RUNNING (``in_plan_turn`` — B3) OR a ``/plan`` is armed for the next turn
+          (``plan_next``), else ``gate`` (the fail-closed default).
         * ``working`` — the per-project status enum is a working state (``running`` /
           ``awaiting_*`` / ``queued``) vs ``idle``.
         * ``ctx_pct`` — the live engine's :meth:`~claude_tg.engine.engine.Engine.context_percentage`
@@ -4205,10 +4239,12 @@ class StreamingSession:
         worktree = name  # the SB4-validated project name (no path; SB3-inert).
         model_label = model_short_label(self._resolve_project_model(chat_id, name))
         effort = self._resolve_project_effort(chat_id, name)
-        # mode: yolo (allow-all) wins; else an armed /plan; else the fail-closed gate.
+        # mode: yolo (allow-all) wins; else plan — either a plan turn is RUNNING NOW
+        # (``in_plan_turn``, B3 — ``plan_next`` is already consumed by the time the turn streams)
+        # OR a ``/plan`` is armed for the NEXT turn (``plan_next``); else the fail-closed gate.
         if bool(getattr(rt.policy, "yolo", False)):
             mode = "yolo"
-        elif bool(getattr(rt, "plan_next", False)):
+        elif bool(getattr(rt, "in_plan_turn", False)) or bool(getattr(rt, "plan_next", False)):
             mode = "plan"
         else:
             mode = "gate"
@@ -4217,7 +4253,7 @@ class StreamingSession:
         engine = rt.engine
         if engine is not None:
             try:
-                ctx_pct = engine.context_percentage()
+                ctx_pct = await engine.context_percentage()
             except Exception:  # pragma: no cover - the engine call is already best-effort (RB1)
                 ctx_pct = None
         return format_statusline(
@@ -4267,25 +4303,43 @@ class StreamingSession:
         ``send``/``edit``/``pin``/``unpin`` are injected by ``bot.py`` (the same pattern as the
         existing send/edit/delete closures) targeting THIS chat — so the line is SB1-confined to
         the operator's allowlisted chat (no new outbound surface).
+
+        **⭐ B2 fix — no stale line across a ``/switch``.** The body is built from the FOREGROUND
+        project's state, but the gated send/edit ``await``s the gate's wait — a ``/switch`` in
+        that window would change the foreground. So the body is REBUILT from CURRENT state right
+        before the actual edit/send (inside the gated helpers, AFTER the gate wait); whatever the
+        foreground is at write time, the line that lands describes IT, never a pre-switch
+        snapshot. **Pin-retry** — a send that succeeded while its pin RAISED leaves the line
+        UNPINNED (``statusline_pinned`` False); a later update RETRIES the pin even if the text is
+        unchanged, so a transient pin failure self-heals instead of sticking unpinned forever.
         """
         try:
-            body = self._statusline_text(chat_id)
+            body = await self._statusline_text(chat_id)  # async (B1: awaits the SDK ctx %)
             if not body:
                 return  # no foreground project to describe — nothing to pin/edit.
             state = self._chat(chat_id)
+            # Pin-retry: if we hold a sent id whose pin FAILED, retry the pin even on identical
+            # text (the identical-text skip below would otherwise leave it unpinned forever).
+            if (
+                state.statusline_message_id is not None
+                and not state.statusline_pinned
+                and body == state.statusline_text
+            ):
+                await self._statusline_pin(state, state.statusline_message_id, pin=pin)
+                return
             if body == state.statusline_text:
                 # Identical to what's pinned — skip BEFORE the gate so an unchanged refresh
                 # never consumes a send slot and never triggers a no-op "not modified" edit.
                 return
             if state.statusline_message_id is None:
-                await self._statusline_send_and_pin(state, body, send=send, pin=pin)
+                await self._statusline_send_and_pin(chat_id, state, send=send, pin=pin)
                 return
             try:
-                await self._gated_edit(
-                    state, edit,
-                    message_id=state.statusline_message_id, text=body, parse_mode="HTML",
+                # B2: rebuild the body AFTER the gate wait (inside _statusline_gated_edit) so a
+                # /switch during the wait writes the now-current line, never the stale snapshot.
+                await self._statusline_gated_edit(
+                    chat_id, state, state.statusline_message_id, edit=edit
                 )
-                state.statusline_text = body
             except Exception:
                 # Orphan recovery (design §4 RB1): the pinned line is gone (unpinned/deleted by
                 # the operator) / too old / an API hiccup. Clear the dead id, best-effort UNPIN
@@ -4295,54 +4349,92 @@ class StreamingSession:
                 stale_id = state.statusline_message_id
                 state.statusline_message_id = None
                 state.statusline_text = None
+                state.statusline_pinned = False
                 try:
                     await unpin(message_id=stale_id)
                 except Exception:
                     log.debug("stale statusline unpin failed (ignored)", exc_info=True)
-                await self._statusline_send_and_pin(state, body, send=send, pin=pin)
+                await self._statusline_send_and_pin(chat_id, state, send=send, pin=pin)
         except Exception:
             # ⭐ The make-or-break swallow (RB1): NOTHING the statusline does may escape to the
             # turn. A build/gate/closure failure is logged at debug and dropped — the next state
             # change re-creates the line.
             log.debug("statusline update failed for chat (ignored)", exc_info=True)
 
+    async def _statusline_gated_edit(
+        self, chat_id: int, state: _ChatState, message_id: int, *, edit: EditFn
+    ) -> None:
+        """Edit the pinned line through the gate, REBUILDING the body AFTER the gate wait (B2).
+
+        Reserves the per-chat gate slot and awaits its wait (non-verbatim — RB5), THEN re-derives
+        the statusline body from CURRENT state and performs the raw edit. Rebuilding after the
+        wait closes the ``/switch``-during-wait race: the line that lands always describes the
+        foreground project AT WRITE TIME, never the pre-wait snapshot. If the rebuilt body is
+        empty (the foreground project vanished mid-wait — e.g. ``/rm``) or identical to what is
+        already shown, the edit is SKIPPED (no stale write, no no-op "not modified"). A raise
+        propagates to the caller's orphan-recovery (the message may be gone).
+        """
+        wait = self._gate(state).reserve(verbatim=False)
+        if wait > 0:
+            await self._sleep(wait)
+        body = await self._statusline_text(chat_id)  # rebuilt AFTER the wait (B2)
+        if not body or body == state.statusline_text:
+            return  # foreground vanished mid-wait, or nothing changed → no stale/no-op write.
+        await edit(message_id=message_id, text=body, parse_mode="HTML")
+        state.statusline_text = body
+
     async def _statusline_send_and_pin(
         self,
+        chat_id: int,
         state: _ChatState,
-        body: str,
         *,
         send: SendFn,
         pin: PinFn,
     ) -> None:
         """Send the statusline body (gated, non-verbatim) then PIN it silently (design §3.1).
 
-        The first-use + orphan-recovery primitive: a single gated send followed by a
-        best-effort silent pin (``disable_notification=True`` — a pin must never re-ping the
-        operator). The id/text are stored on the chat ONLY when the send returns an id (so a
-        send that yields ``None`` does not leave a half-set state). A PIN failure is swallowed
-        (RB1) — the line is still sent + tracked, and a later edit keeps it current; only the
-        bar placement is lost, never the turn. Called from :meth:`_update_statusline` inside its
-        best-effort guard, so it does not re-wrap (a raising ``send`` propagates to that guard's
-        swallow); the pin is wrapped here because the send must still be tracked even if pinning
-        fails.
+        The first-use + orphan-recovery primitive: reserve the gate slot, await its wait, THEN
+        rebuild the body from CURRENT state (B2 — a ``/switch`` during the wait sends the
+        now-current line, never the pre-wait snapshot) and send it; a best-effort silent pin
+        follows (``disable_notification=True`` — a pin must never re-ping the operator). The
+        id/text are stored on the chat ONLY when the send returns an id (so a send that yields
+        ``None`` does not leave a half-set state). A PIN failure is swallowed (RB1) AND records
+        ``statusline_pinned=False`` so the next update retries the pin (the line is still sent +
+        tracked; only the bar placement is deferred, never the turn). Called from
+        :meth:`_update_statusline` inside its best-effort guard, so a raising ``send`` propagates
+        to that guard's swallow.
         """
-        mid = await self._gated_send(
-            state, send, verbatim=False,
-            text=body, reply_markup=None, parse_mode="HTML",
-        )
+        wait = self._gate(state).reserve(verbatim=False)
+        if wait > 0:
+            await self._sleep(wait)
+        body = await self._statusline_text(chat_id)  # rebuilt AFTER the wait (B2)
+        if not body:
+            return  # foreground vanished mid-wait — nothing to send.
+        mid = await send(text=body, reply_markup=None, parse_mode="HTML")
         if mid is None:
             # The send produced no id (a closure that returns None) — don't store a half state;
             # the next update will try a fresh send.
             return
         state.statusline_message_id = mid
         state.statusline_text = body
+        state.statusline_pinned = False  # not pinned until the pin call below succeeds.
+        await self._statusline_pin(state, mid, pin=pin)
+
+    async def _statusline_pin(self, state: _ChatState, message_id: int, *, pin: PinFn) -> None:
+        """Best-effort SILENT pin of the statusline message; record whether it stuck (pin-retry).
+
+        A pin must never re-ping (``disable_notification=True``) and never break the turn (RB1).
+        On success ``statusline_pinned`` is set True; on failure it stays/!becomes False and is
+        swallowed — :meth:`_update_statusline` then RETRIES the pin on the next update (even with
+        unchanged text) so a transient pin failure self-heals instead of leaving the line unpinned
+        forever. Only the pinned-bar placement is ever at stake here, never the turn.
+        """
         try:
-            await pin(message_id=mid, disable_notification=True)
+            await pin(message_id=message_id, disable_notification=True)
+            state.statusline_pinned = True
         except Exception:
-            # A failed pin must never break the turn (RB1): the line is sent + tracked, edits
-            # keep it current; only the pinned-bar placement is lost. Mirrors the status-line
-            # best-effort discipline.
-            log.debug("statusline pin failed (ignored)", exc_info=True)
+            state.statusline_pinned = False
+            log.debug("statusline pin failed (will retry on next update)", exc_info=True)
 
     # -- the callback resolve path (LOCK-FREE: SB1 enforced at the bot) ------
 

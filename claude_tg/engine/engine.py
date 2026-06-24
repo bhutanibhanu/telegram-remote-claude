@@ -49,6 +49,7 @@ the engine does.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional, Sequence
@@ -321,7 +322,7 @@ class Engine:
 
     # -- ctx % for the statusline (STATUSLINE T-SL-CORE) ---------------------
 
-    def context_percentage(self) -> Optional[int]:
+    async def context_percentage(self) -> Optional[int]:
         """Best-effort % of the context window currently used, or ``None`` (design §2.1/§5 T5).
 
         Delegates to the substrate's ``context_percentage`` (live ``get_context_usage()`` →
@@ -330,14 +331,20 @@ class Engine:
         via ``getattr`` so a substrate that predates this method (or a fake in a test) simply
         yields ``None`` (the additive-seam discipline, mirroring the optional ``fork`` keyword);
         the call is fully best-effort and NEVER raises — it is an observer off the turn's
-        critical path (RB1). Synchronous (no ``await``): the spike-confirmed live call returns
-        synchronously.
+        critical path (RB1).
+
+        ⭐ **ASYNC (B1 fix):** the substrate awaits the SDK's coroutine ``get_context_usage()``,
+        so this is async too. We accept either a coroutine (await it — the real path) or a plain
+        ``int``/``None`` (a sync fake / a predating substrate), so every existing seam keeps
+        working while the real awaited SDK percentage is actually read.
         """
         getter = getattr(self._substrate, "context_percentage", None)
         if getter is None:
             return None
         try:
             value = getter()
+            if inspect.isawaitable(value):
+                value = await value
         except Exception:  # pragma: no cover - the substrate is already best-effort
             log.debug("context_percentage() failed (ignored)", exc_info=True)
             return None

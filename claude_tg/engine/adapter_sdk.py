@@ -26,6 +26,7 @@ is unit-testable against constructed/fake SDK objects with no live session.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from typing import Any, AsyncIterator, Optional, Sequence
@@ -810,7 +811,7 @@ class SdkSubstrate:
         except Exception:  # pragma: no cover - defensive; never break the receive loop (RB1)
             log.debug("usage capture failed (ignored)", exc_info=True)
 
-    def context_percentage(self) -> Optional[int]:
+    async def context_percentage(self) -> Optional[int]:
         """Best-effort % of the context window currently used — the honest ctx figure (§2.1).
 
         **Primary path:** call the LIVE client's ``get_context_usage()`` and return
@@ -821,10 +822,14 @@ class SdkSubstrate:
         is available (no client AND no completed turn yet) → ``None`` (the caller shows ``ctx —``,
         NEVER a fake 0%).
 
+        ⭐ **ASYNC — the installed SDK's ``ClaudeSDKClient.get_context_usage()`` is a COROUTINE**
+        (verified: ``inspect.iscoroutinefunction`` is True), so it MUST be awaited or the headline
+        percentage is never read (it would return an un-awaited coroutine that the dict-extractor
+        rejects, silently degrading to the usage fallback). We await it when it returns an
+        awaitable, and still accept a plain dict (defensive — a future/sync build keeps working).
+
         Fully best-effort (RB1): this is an observer off the turn's critical path — it NEVER
-        raises. A synchronous read (no ``await``): the spike-confirmed ``get_context_usage()`` on
-        the installed SDK returns the dict synchronously; should a build expose an awaitable
-        instead, that non-dict return is treated as unavailable and the usage fallback is used.
+        raises (any error / no client → usage fallback → ``None``).
         """
         client = self._client
         if client is not None:
@@ -832,6 +837,8 @@ class SdkSubstrate:
                 getter = getattr(client, "get_context_usage", None)
                 if getter is not None:
                     resp = getter()
+                    if inspect.isawaitable(resp):
+                        resp = await resp  # ⭐ the SDK call is a coroutine — AWAIT it (B1 fix).
                     pct = _percentage_of(resp)
                     if pct is not None:
                         return pct

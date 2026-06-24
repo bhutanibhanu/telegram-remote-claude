@@ -1263,70 +1263,94 @@ def test_adapter_does_not_import_sdk_at_module_top_level():
 
 
 class _FakeUsageClient:
-    """A fake ClaudeSDKClient exposing only get_context_usage (the ctx-% spike shape)."""
+    """A fake ClaudeSDKClient exposing only get_context_usage (the ctx-% spike shape).
+
+    ⭐ T-SL-WIRE (B1): ``get_context_usage`` is **ASYNC** — the installed SDK's real
+    ``ClaudeSDKClient.get_context_usage()`` is a coroutine (``inspect.iscoroutinefunction`` is
+    True). The substrate MUST await it; a non-awaited regression now FAILS here (the awaited
+    coroutine yields the dict; an un-awaited call would yield a coroutine the %-extractor
+    rejects → the test's expected % would not be returned).
+    """
 
     def __init__(self, resp):
         self._resp = resp
+        self.calls = 0
 
-    def get_context_usage(self):
+    async def get_context_usage(self):
+        self.calls += 1
         return self._resp
 
 
 class _BoomUsageClient:
-    def get_context_usage(self):
+    async def get_context_usage(self):
         raise RuntimeError("get_context_usage unavailable")
 
 
-def test_context_percentage_live_client_returns_rounded_percentage():
-    # Primary path: a connected client's get_context_usage()['percentage'] → round(%).
+async def test_context_percentage_live_client_returns_rounded_percentage():
+    # ⭐ Primary path (B1): a connected client's AWAITED get_context_usage()['percentage'] →
+    # round(%). Asserts the awaited coroutine was actually called + its % returned (the
+    # make-or-break: the headline figure comes from the real SDK call, not the fallback).
     sub = SdkSubstrate()
-    sub._client = _FakeUsageClient(
+    client = _FakeUsageClient(
         {"percentage": 6, "maxTokens": 200000, "totalTokens": 12998, "model": "claude-opus-4-6"}
     )
-    assert sub.context_percentage() == 6
+    sub._client = client
+    assert await sub.context_percentage() == 6
+    assert client.calls == 1, "the SDK get_context_usage() coroutine must be awaited (B1)"
 
 
-def test_context_percentage_rounds_a_float_percentage():
+async def test_context_percentage_uses_live_call_over_usage_fallback():
+    # ⭐ B1 regression probe: when BOTH a live client AND a stale usage fallback are present, the
+    # AWAITED live % wins. If get_context_usage() were not awaited, the live path would silently
+    # yield None and this would return the (different) fallback % — so this pins "live, awaited".
+    sub = SdkSubstrate()
+    sub._client = _FakeUsageClient({"percentage": 3})  # live says 3%
+    sub._last_usage_tokens = 100000  # a stale fallback that would compute 50%
+    sub._last_context_window = 200000
+    assert await sub.context_percentage() == 3, "the awaited live % must win over the fallback"
+
+
+async def test_context_percentage_rounds_a_float_percentage():
     # design §2.1: round(percentage) — 6.6 → 7, not truncated to 6.
     sub = SdkSubstrate()
     sub._client = _FakeUsageClient({"percentage": 6.6})
-    assert sub.context_percentage() == 7
+    assert await sub.context_percentage() == 7
     sub._client = _FakeUsageClient({"percentage": 6.4})
-    assert sub.context_percentage() == 6
+    assert await sub.context_percentage() == 6
 
 
-def test_context_percentage_no_client_no_usage_is_none():
+async def test_context_percentage_no_client_no_usage_is_none():
     # No live client AND no completed turn → None (the caller shows "ctx —", never a fake 0%).
     sub = SdkSubstrate()
-    assert sub.context_percentage() is None
+    assert await sub.context_percentage() is None
 
 
-def test_context_percentage_raising_client_falls_back_to_none_without_usage():
+async def test_context_percentage_raising_client_falls_back_to_none_without_usage():
     # The live call raises and there is no usage yet → None (NOT a fabricated number).
     sub = SdkSubstrate()
     sub._client = _BoomUsageClient()
-    assert sub.context_percentage() is None
+    assert await sub.context_percentage() is None
 
 
-def test_context_percentage_usage_fallback_math():
+async def test_context_percentage_usage_fallback_math():
     # The honest fallback: round(100 * tokens / window) from the last turn's usage.
     sub = SdkSubstrate()
     sub._last_usage_tokens = 12998
     sub._last_context_window = 200000
     # No client → fallback used directly.
-    assert sub.context_percentage() == round(100 * 12998 / 200000)  # == 6
+    assert await sub.context_percentage() == round(100 * 12998 / 200000)  # == 6
 
 
-def test_context_percentage_raising_client_uses_usage_fallback():
+async def test_context_percentage_raising_client_uses_usage_fallback():
     # The live call raises BUT a last-turn usage is present → the fallback % (not None).
     sub = SdkSubstrate()
     sub._client = _BoomUsageClient()
     sub._last_usage_tokens = 100000
     sub._last_context_window = 200000
-    assert sub.context_percentage() == 50
+    assert await sub.context_percentage() == 50
 
 
-def test_capture_usage_records_tokens_and_window_from_result_message():
+async def test_capture_usage_records_tokens_and_window_from_result_message():
     # _capture_usage carries the fallback inputs off a real ResultMessage (usage + model_usage).
     sub = SdkSubstrate()
     msg = sdk.ResultMessage(
@@ -1357,8 +1381,8 @@ def test_capture_usage_records_tokens_and_window_from_result_message():
     sub._capture_usage(msg)
     assert sub._last_usage_tokens == 12998  # 3 + 12995 + 0
     assert sub._last_context_window == 200000
-    # With no live client, context_percentage now derives from the captured usage.
-    assert sub.context_percentage() == 6
+    # With no live client, context_percentage (awaited — B1) derives from the captured usage.
+    assert await sub.context_percentage() == 6
 
 
 def test_capture_usage_ignores_non_result_message():
@@ -1406,27 +1430,39 @@ def test_stop_clears_ctx_usage_cache():
     assert sub._last_context_window is None
 
 
-def test_engine_context_percentage_delegates_to_substrate():
-    # Engine.context_percentage() delegates to the substrate's method.
+async def test_engine_context_percentage_delegates_to_async_substrate():
+    # ⭐ B1: Engine.context_percentage() AWAITS the substrate's async context_percentage()
+    # (the real SdkSubstrate is async now). The awaited int is returned.
     class _Sub(FakeSubstrate):
-        def context_percentage(self):
+        async def context_percentage(self):
             return 42
 
     eng = Engine(_Sub())
-    assert eng.context_percentage() == 42
+    assert await eng.context_percentage() == 42
 
 
-def test_engine_context_percentage_none_when_substrate_lacks_method():
-    # A substrate predating the method (additive seam) → None, never an error.
-    eng = Engine(FakeSubstrate())
-    assert eng.context_percentage() is None
-
-
-def test_engine_context_percentage_swallows_substrate_error():
-    # A raising substrate method → None (RB1; an observer off the critical path never raises).
+async def test_engine_context_percentage_accepts_sync_substrate_value():
+    # Defensive seam: a substrate whose context_percentage is SYNC (a predating substrate / a
+    # fake) returning a plain int still works — Engine only awaits when the value is awaitable.
     class _Sub(FakeSubstrate):
         def context_percentage(self):
+            return 7
+
+    eng = Engine(_Sub())
+    assert await eng.context_percentage() == 7
+
+
+async def test_engine_context_percentage_none_when_substrate_lacks_method():
+    # A substrate predating the method (additive seam) → None, never an error.
+    eng = Engine(FakeSubstrate())
+    assert await eng.context_percentage() is None
+
+
+async def test_engine_context_percentage_swallows_substrate_error():
+    # A raising substrate method → None (RB1; an observer off the critical path never raises).
+    class _Sub(FakeSubstrate):
+        async def context_percentage(self):
             raise RuntimeError("boom")
 
     eng = Engine(_Sub())
-    assert eng.context_percentage() is None
+    assert await eng.context_percentage() is None
