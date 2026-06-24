@@ -3,9 +3,9 @@
 _From design.md · roadmap-v2 P12 "supervise" · supervised build. Baseline 1248 tests. Both features SDK-spike-PROVEN (plan-mode interception + thinking_delta streaming)._
 
 ## Task list
-- [ ] T-PLAN — Plan-mode approval (`/plan`): per-turn `permission_mode="plan"` plumbing + `/plan` one-shot arm + Approve-resumes/Reject-revises with the C4 contract (post-approval tools STILL gated) + backstop/cancel-safe (reuses the shipped ExitPlanMode→PlanEvent→plan_keyboard→PlanVerdict→P6-hold machinery)
-- [ ] T-THINK — Live thinking (`/thinking on|off`, default off): `ThinkingEvent` + normalize branches (drop signature; redacted→opaque, never raw) + capped/collapsed 🧠 status line (reuse coalesced status + send-gate, cleared at turn end) + per-project toggle that enables `include_partial_messages` + `display:"summarized"` only when on + twin-render/dedup holds with partials on
-- [ ] T-VERIFY — live phone-verify both (plan: arm→plan shown→approve→next tool still gated; reject→revise; thinking: toggle on→🧠 streams→cleared) + 4 gates + HANDOFF + merge
+- [x] T-PLAN — Plan-mode approval (`/plan`) (`9f96099` + marker-lifecycle fix `e76db0b`)
+- [x] T-THINK — Live thinking (`/thinking on|off`, default off) (`724e001`)
+- [x] T-VERIFY — live phone-verify both + 4 gates + merge (+ hold-sequence regression tests `8951a97`)
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (sha) · `[!]` blocked
 
@@ -21,5 +21,10 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done (sha) · `[!]` blocked
 - **Accept:** `/thinking on` (SB1, per-project, default OFF) → the next turns surface reasoning as a coalesced/capped `🧠` line via the existing send-gate, cleared at turn end; `/thinking off` → no thinking, normal turn (partials NOT enabled → no wire cost); `redacted_thinking` never renders raw (opaque indicator only); thinking is capped (no flood); the assistant's final answer is unchanged + not duplicated (twin-render dedup holds with partials on); RB1 — a malformed thinking block never crashes.
 - **Tests:** normalize emits ThinkingEvent for `thinking_delta`/`ThinkingBlock`, drops `signature`, redacted→opaque; partials/`display` enabled ONLY when on; render caps + clears; toggle per-project; **dedup — final answer rendered once with thinking on** (mutation-probe the dedup); SB1 + menu lock-step.
 
-### T-VERIFY — live-verify + merge
-Cross-model Codex QA (iterate to SHIP) → live phone-verify (plan arm→approve→C4-gated; reject→revise; thinking on→stream→clear) → 4 gates → HANDOFF refresh → merge to `main`.
+### T-VERIFY — live-verify + merge — DONE
+- **Codex QA:** round 1 NO_SHIP (1 blocker — `/plan` marker could survive a failed/aborted turn into a later message) → fixed (consume early in `handle_message`, thread `plan_turn` down) → **Codex re-check SHIP** (blocker CLOSED). Independent reviewer: **C4 AGREE + SB3 AGREE** (both mutation-probed with teeth).
+- **Live phone-verify (real Mac, Telegram Web) — PASS:**
+  - **Plan mode:** `/plan` → planning prompt → Claude proposed (didn't execute) → plan rendered with `[✅ Approve] [✋ Reject+feedback]`. Tapped Approve → execution resumed and the subsequent **Write STILL hit the permission gate** (ADR-001 **C4 verified live**) → tapped Deny → **no file created** (deny held, clean).
+  - **Thinking:** `/thinking on` → confirmed it engages the SDK (live CLI args show `--include-partial-messages` + `--permission-mode default`); reasoning prompts → final answer rendered **exactly once** with the done footer (**dedup-with-partials holds live**), no Telegram render crash. (The transient 🧠 line clears too fast to screenshot on short prompts; mechanism is the unit-tested `edit_status` path.)
+- **Robustness finding (investigated → NOT a code bug):** a messy live sequence (approve plan → deny a Write → rapid colliding inputs) left a turn busy ~9 min. Deterministic repro proves `_hold_depth` is correctly balanced across sequential holds + both allow/deny (the 300s liveness timeout DOES re-arm + fire when no hold is open); mutation-probe confirms. Root cause = a **Claude/CLI-side silent stall after the deny sequence** (a known SDK edge case — `read_messages()` hangs with no exception; the liveness bound is the only backstop) and/or input-collision; the P6/H2 mechanism is correct + P12-reachable, not P12-broken. Regression tests added (`8951a97`). **Follow-up (future phase):** tighten the post-deny liveness / kill the stalled subprocess on timeout (the lingering `--permission-mode plan` CLI didn't get reaped).
+- 1288 tests; ruff/mypy/secret_scan clean.
