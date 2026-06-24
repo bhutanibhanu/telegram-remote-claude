@@ -3,9 +3,11 @@
 _From design.md · 3 mobile-native I/O features · supervised build. Baseline 1003 tests. Multimodal image input PROVEN by spike._
 
 ## Task list
-- [ ] T1 — 📸 Screenshots/photos → Claude (native multimodal: thread image content-block into `send`)
-- [ ] T2 — 🎙️ Voice notes → transcribe (pluggable backend, graceful-off) → echo → turn
-- [ ] T3 — 📎 File send/receive (in: doc→cwd path-confined; out: `/get <path>`)
+- [x] T1 — 📸 Screenshots/photos → Claude (native multimodal: image content-block threaded into `send`) (97a191d)
+- [x] T2 — 🎙️ Voice notes → transcribe (pluggable `TRANSCRIBE_CMD`, injection-safe, graceful-off) → echo → turn (39da452→) (commit after T3)
+- [x] T3 — 📎 File send/receive (in: doc→cwd SB2-confined; out: `/get <path>`) (39da452)
+
+_Built; 1090 tests. T1 send-path threading mirrors P9 model-kwarg (text path byte-identical). T3 confinement mutation-probed. T2 subprocess injection-probed + graceful-off (no transcriber installed → live-verify of voice deferred to owner enabling one)._
 
 Legend: `[ ]` todo · `[x]` done (sha) · `[!]` blocked · (T4 rich tool-output rendering DEFERRED)
 
