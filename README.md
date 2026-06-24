@@ -186,7 +186,9 @@ reference (status, logs, the systemd-on-Linux alternative) is in
 Every command is allowlist-gated. Anything that isn't a registered command below — e.g.
 `/grill`, `/pipeline`, `/scaffold` — is **forwarded verbatim to Claude** and runs as a skill
 in the session (it is not a bot command). Plain (non-command) text is sent to Claude as a
-turn.
+turn. You can also **send a photo** (Claude sees it), **a file** (saved into the project for
+Claude to read; `/get` pulls one back), or **a voice note** — with a transcriber configured
+(see [Voice notes](#voice-notes-streaming-mode)) it's transcribed and run as a turn.
 
 | Command | What it does |
 |---|---|
@@ -235,6 +237,40 @@ turns one chat into many independent workspaces:
 See [ADR-004](docs/adr/ADR-004-multi-project-sessions.md) (projects) and
 [ADR-005](docs/adr/ADR-005-concurrency-correlation.md) (concurrency) for the design.
 
+## Voice notes (streaming mode)
+
+Voice transcription is **pluggable and off by default** — no transcriber is bundled. Send a
+voice note with nothing configured and the bot replies with a one-line "install a transcriber
+and set `TRANSCRIBE_CMD`" message (it never crashes, and you can always just type). To enable
+it, point `TRANSCRIBE_CMD` at any local or API transcriber:
+
+1. Install a transcriber + a model, e.g. [whisper.cpp](https://github.com/ggml-org/whisper.cpp):
+
+   ```sh
+   brew install whisper-cpp
+   # download a model (e.g. ggml-base.en.bin) per the whisper.cpp README
+   ```
+
+2. Set `TRANSCRIBE_CMD` (and `ENGINE_MODE=streaming`) in `.env`. It is a command **template**
+   with two placeholders — `{audio}` (the input audio path) and `{out}` (an optional output
+   basename):
+
+   ```sh
+   # whisper.cpp writes <out>.txt; the bot reads it:
+   TRANSCRIBE_CMD=whisper-cli -m /Users/you/models/ggml-base.en.bin -f {audio} -otxt -of {out}
+
+   # an STT CLI that prints the transcript to stdout (no {out}):
+   TRANSCRIBE_CMD=my-stt --file {audio}
+   ```
+
+If the template mentions `{out}` the transcript is read from `<out>.txt`; otherwise it's read
+from the command's **stdout**. When a voice note arrives the bot downloads it to a temp file,
+runs the transcriber over it, **echoes the transcript back quoted** (so you see what it heard),
+and runs that text as a normal turn. The template is split with `shlex` and run via `exec` —
+**never** a shell — so the audio path can't be used for command injection. The audio (and any
+transcript file) is cleaned up after each note. `TRANSCRIBE_TIMEOUT_SECONDS` (default `120`)
+bounds the transcriber subprocess.
+
 ## Configuration (`.env`)
 
 Loaded by `claude_tg/config.py` (`Config.from_env`). `.env.example` lists every variable at
@@ -257,6 +293,10 @@ its default; only the first two are required.
 | `RENDER_CHAT_SEND_INTERVAL_SECONDS` | | `1.0` | *(streaming)* Min seconds between outbound sends to one chat (rate-limit spacing). `0` disables spacing; negative → fails loud. |
 | `STREAM_MESSAGE_TIMEOUT_SECONDS` | | `300.0` | *(streaming)* Max seconds to wait for Claude's next message before declaring it wedged. Generous (also bounds approved long-running tools); suspended while an approval prompt is open. Positive; else fails loud. |
 | `ANSWER_BACKSTOP_SECONDS` | | `3600` | *(streaming)* Seconds to hold a pending Allow/Deny or ask/plan prompt before auto-denying + notifying. Positive integer. |
+| `IMAGE_MAX_BYTES` | | `5242880` (5 MB) | *(streaming)* Max size of an inbound photo/screenshot threaded to Claude as an image. Larger → refused. Positive integer; else fails loud. |
+| `FILE_MAX_BYTES` | | `20971520` (20 MB) | *(streaming)* Max size of an inbound saved file / outbound `/get` file. Larger → refused. Positive integer; else fails loud. |
+| `TRANSCRIBE_CMD` | | empty (voice off) | *(streaming)* Command **template** to transcribe a voice note. Placeholders `{audio}` (input path) and `{out}` (output basename → read `<out>.txt`; omit → read stdout). Unset → voice gracefully off. See [Voice notes](#voice-notes-streaming-mode). |
+| `TRANSCRIBE_TIMEOUT_SECONDS` | | `120.0` | *(streaming)* Max seconds the `TRANSCRIBE_CMD` subprocess may run before it's killed. Positive number; else fails loud. |
 
 The `*(streaming)*` variables are only consulted when `ENGINE_MODE=streaming`.
 

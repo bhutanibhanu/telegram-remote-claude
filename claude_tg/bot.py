@@ -7,6 +7,8 @@ import base64
 import html
 import logging
 import os
+import shutil
+import tempfile
 import time
 
 from telegram import BotCommand, InputFile, Update
@@ -42,6 +44,7 @@ from .session_store import (
 )
 from .stream_session import StreamingBusy, StreamingSession
 from .util import _redact_sid_in_text, expand_macro, split_message
+from .voice import TranscriptionError, TranscriptionUnavailable, transcribe
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +52,9 @@ HELP_TEXT = (
     "🤖 *Claude Code remote*\n\n"
     "Just send me a message and I'll run it through Claude Code on the Mac and reply.\n"
     "Send a photo and Claude sees it; send a file and it's saved into the project for "
-    "Claude to read (streaming mode); pull a file back with /get.\n\n"
+    "Claude to read (streaming mode); pull a file back with /get. Send a voice note and, "
+    "with a transcriber configured, it's transcribed and run as a turn (otherwise you get "
+    "a quick setup tip).\n\n"
     "Commands:\n"
     "/help — this help\n"
     "/status — health: uptime, mode, gate, runs, per-project status + cost\n"
@@ -144,6 +149,15 @@ DEFAULT_IMAGE_PROMPT = "Look at this image and tell me what you see / help me wi
 #: usable ``file_name`` (or one that sanitizes to nothing). Saved into the active project's
 #: cwd so Claude can Read it; never executed.
 DEFAULT_INBOUND_FILENAME = "upload.bin"
+
+#: P10 T2 (voice): the graceful-off message when no ``TRANSCRIBE_CMD`` is configured. Voice
+#: transcription is operator-provided infra (no hard dependency); with none set up, a voice
+#: note gets this clean, actionable setup message instead of a crash (RB2).
+VOICE_SETUP_MESSAGE = (
+    "🎙️ Voice transcription isn't set up. Install a transcriber "
+    "(e.g. `brew install whisper-cpp` + a model) and set TRANSCRIBE_CMD — "
+    "or just type your message."
+)
 
 
 def _safe_filename(name: str | None) -> str:
@@ -1419,6 +1433,121 @@ class TelegramClaudeBot:
             reply_to_message_id=self._reply_to_id(update),
         )
 
+    async def on_voice(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """P10 T2 — a voice note / audio → transcribe (pluggable) → run as a turn (SB1).
+
+        **SB1 security boundary.** Registered with the ``allowed`` chat filter AND this
+        explicit :meth:`_ok` recheck — a new inbound surface gets the same allowlist gate as
+        every other handler (defense in depth). A non-allowlisted chat never reaches the
+        download / transcriber.
+
+        **Pluggable + graceful-off.** Transcription is operator-provided infra, NOT a hard
+        dependency. When ``TRANSCRIBE_CMD`` is unset (the default), a voice note gets the clean
+        :data:`VOICE_SETUP_MESSAGE` ("…install a transcriber and set TRANSCRIBE_CMD…") — never
+        a crash (RB2). When it IS set, the bot:
+
+        1. downloads the Telegram voice ``.ogg``/opus (or audio) to a per-turn TEMP dir;
+        2. runs the configured transcriber over it (see :mod:`claude_tg.voice` for the
+           ``{audio}`` / ``{out}`` placeholder contract + injection-safety — the template is
+           split with ``shlex`` and run via ``create_subprocess_exec``, NEVER a shell);
+        3. **echoes the transcript back quoted** (``🎙️ "…"``) so the operator sees what was
+           heard;
+        4. fires the transcript as a NORMAL turn (the same ``_run_turn`` path a typed message
+           takes) against the active project.
+
+        **Streaming-only.** Running the transcript as a turn rides the streaming turn path; in
+        one-shot mode it replies a clean "needs streaming mode" notice (the message-as-turn
+        machinery + per-project session live there — mirrors :meth:`on_document`). The audio (+
+        any transcript ``.txt`` the transcriber writes) lives under a ``TemporaryDirectory`` and
+        is cleaned in a ``finally`` (RB1). **SB3:** only a size SUMMARY is logged — never the
+        audio bytes nor the raw transcript (the transcript echo to the chat is by design; the
+        logs stay body-free).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._maybe_welcome(update)
+        msg = update.message
+        chat_id = update.effective_chat.id
+        # The attachment is a Telegram Voice (opus .ogg) or an Audio (music/voice file). The
+        # registration filter guarantees one is present; be defensive (RB1) about neither.
+        attachment = msg.voice or msg.audio
+        if attachment is None:
+            return
+        # Graceful-off FIRST: with no transcriber configured we never download — just point the
+        # operator at the setup (RB2). The Markdown is balanced (a single backtick span).
+        if not (self.config.transcribe_cmd or "").strip():
+            await msg.reply_text(VOICE_SETUP_MESSAGE, parse_mode="Markdown")
+            return
+        # Streaming-only: the transcript runs as a turn (a per-project streaming concept). In
+        # one-shot mode reply a clean notice rather than transcribing into nothing.
+        if self.streaming is None:
+            await msg.reply_text(
+                "🎙️ Voice notes need streaming mode (ENGINE_MODE=streaming) — the transcript "
+                "runs as a turn against a project. In one-shot mode, please type your message."
+            )
+            return
+        # Download + transcribe under a per-turn temp dir, cleaned in finally (RB1). The audio
+        # path is a temp file the bot names (never operator-controlled), so the transcribe
+        # subprocess gets only a controlled path (SB3/injection-safety — see voice.py).
+        tmpdir = tempfile.mkdtemp(prefix="tg-voice-")
+        try:
+            audio_path = os.path.join(tmpdir, "audio.ogg")
+            try:
+                tg_file = await attachment.get_file()
+                raw = await tg_file.download_as_bytearray()
+            except Exception:
+                # RB1: a transient download failure must never crash the handler.
+                log.debug("voice download failed for chat %s", chat_id, exc_info=True)
+                await msg.reply_text(
+                    "⚠️ Couldn't download that voice note — please try sending it again."
+                )
+                return
+            # SB3: log a SIZE SUMMARY only — never the audio bytes.
+            log.info("chat %s received a voice note (%d KB)", chat_id, len(raw) // 1024)
+            try:
+                with open(audio_path, "wb") as fh:
+                    fh.write(bytes(raw))
+            except OSError:
+                log.debug("voice temp write failed for chat %s", chat_id, exc_info=True)
+                await msg.reply_text("⚠️ Couldn't process that voice note — check the bot logs.")
+                return
+            try:
+                transcript = await transcribe(
+                    template=self.config.transcribe_cmd,
+                    audio_path=audio_path,
+                    work_dir=tmpdir,
+                    timeout=self.config.transcribe_timeout_seconds,
+                )
+            except TranscriptionUnavailable:
+                # Defensive: the cmd was set at handler entry but normalizes to empty here —
+                # treat as graceful-off (RB2). (The entry guard above normally catches this.)
+                await msg.reply_text(VOICE_SETUP_MESSAGE, parse_mode="Markdown")
+                return
+            except TranscriptionError as exc:
+                # A real transcriber failure — bot-authored, body-free message (SB3); the raw
+                # detail is already logged at DEBUG inside voice.transcribe. ``str(exc)`` is a
+                # fixed bot-authored summary (exit code / "timed out" / "empty"), never raw stderr.
+                log.debug("transcription failed for chat %s: %s", chat_id, exc)
+                await msg.reply_text(
+                    f"⚠️ Couldn't transcribe that voice note — {exc}. "
+                    "Check TRANSCRIBE_CMD and the bot logs, or type your message."
+                )
+                return
+        finally:
+            # RB1: always clean the temp dir (audio + any transcript .txt the transcriber wrote),
+            # even on an early return / exception. Best-effort — a cleanup failure never raises.
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        # Echo the transcript back QUOTED so the operator sees what was heard (R6: escape it so
+        # a stray </>& renders inert; the transcript is operator speech, not a command).
+        await msg.reply_text(
+            f'🎙️ "{html.escape(transcript, quote=False)}"', parse_mode="HTML"
+        )
+        # Fire the transcript as a NORMAL turn — the exact path a typed message takes.
+        await self._run_turn(
+            update, ctx, chat_id, transcript,
+            reply_to_message_id=self._reply_to_id(update),
+        )
+
     async def cmd_get(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """P10 T3 — ``/get <path>`` uploads an in-root file back to the chat (SB1/SB2/RB2).
 
@@ -1923,6 +2052,16 @@ class TelegramClaudeBot:
             MessageHandler(
                 allowed & filters.Document.ALL & ~filters.Document.IMAGE, self.on_document
             )
+        )
+        # P10 T2 (voice): a voice note OR an audio file → on_voice (transcribe → run as a turn).
+        # SB1: the SAME `allowed` chat filter as every other handler (the `_ok` recheck inside
+        # on_voice is defense in depth). filters.VOICE matches Telegram's opus voice note;
+        # filters.AUDIO matches an audio file. Neither overlaps PHOTO/Document/TEXT/COMMAND, so
+        # it never collides with the photo/document handlers above or the skill passthrough
+        # below. Voice is pluggable + graceful-off: with no TRANSCRIBE_CMD configured the
+        # handler replies a clean setup message (not a command — no COMMAND_MENU change).
+        app.add_handler(
+            MessageHandler(allowed & (filters.VOICE | filters.AUDIO), self.on_voice)
         )
         # P3 skill-launch passthrough (D1): forward any *unregistered* slash-command verbatim
         # to the session. Registered AFTER the specific CommandHandlers above so PTB's

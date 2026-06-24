@@ -34,6 +34,8 @@ def make_config(
     render_chat_send_interval_seconds=0.0,
     image_max_bytes=5 * 1024 * 1024,
     file_max_bytes=20 * 1024 * 1024,
+    transcribe_cmd="",
+    transcribe_timeout_seconds=120.0,
 ):
     # P5/T8: default the per-chat send-gate interval to 0.0 in tests so the gate never
     # introduces a real ``asyncio.sleep`` under the frozen test clock (these tests assert
@@ -56,6 +58,8 @@ def make_config(
         allow_any_path=allow_any_path,
         image_max_bytes=image_max_bytes,
         file_max_bytes=file_max_bytes,
+        transcribe_cmd=transcribe_cmd,
+        transcribe_timeout_seconds=transcribe_timeout_seconds,
     )
 
 
@@ -3611,3 +3615,314 @@ def test_get_in_command_menu_and_help():
 
     assert "get" in {cmd for cmd, _desc in COMMAND_MENU}
     assert "/get" in HELP_TEXT
+
+
+# ===========================================================================
+# P10 T2 — voice notes (pluggable transcription, graceful-off)
+# ===========================================================================
+
+import os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+from claude_tg.bot import VOICE_SETUP_MESSAGE  # noqa: E402
+from claude_tg.voice import TranscriptionError  # noqa: E402
+
+
+def make_voice_update(chat_id=1, *, raw=b"OggS-fake-opus-bytes", kind="voice"):
+    """A fake Update carrying a Telegram VOICE note (or an AUDIO file).
+
+    ``get_file().download_as_bytearray()`` returns ``raw`` (the fake audio bytes).
+    """
+    upd = MagicMock()
+    upd.effective_chat.id = chat_id
+    upd.message.text = None
+    upd.message.caption = None
+    upd.message.reply_text = AsyncMock()
+    upd.message.reply_to_message = None
+    upd.effective_message = upd.message
+
+    tg_file = MagicMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(raw))
+    attachment = MagicMock()
+    attachment.file_size = len(raw)
+    attachment.get_file = AsyncMock(return_value=tg_file)
+
+    if kind == "voice":
+        upd.message.voice = attachment
+        upd.message.audio = None
+    else:  # an audio file
+        upd.message.voice = None
+        upd.message.audio = attachment
+    upd.message.photo = []
+    upd.message.document = None
+    return upd
+
+
+def _voice_bot(*, allowed=(1,), transcribe_cmd="stt -f {audio}", streaming=True):
+    """A streaming (or one-shot) bot with TRANSCRIBE_CMD set (or empty for graceful-off)."""
+    fake_streaming = FakeStreaming() if streaming else None
+    mode = "streaming" if streaming else "oneshot"
+    bot = TelegramClaudeBot(
+        make_config(allowed=allowed, engine_mode=mode, transcribe_cmd=transcribe_cmd),
+        FakeRunner(), streaming=fake_streaming,
+    )
+    bot._welcomed.add(1)
+    return bot, fake_streaming
+
+
+# ---- graceful-off: no TRANSCRIBE_CMD configured -----------------------------
+
+
+async def test_on_voice_graceful_off_when_no_transcribe_cmd():
+    # No TRANSCRIBE_CMD → a clean setup message, NO download, NO turn (RB2, no crash).
+    bot, streaming = _voice_bot(transcribe_cmd="")
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    upd.message.voice.get_file.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert reply == VOICE_SETUP_MESSAGE
+    assert "TRANSCRIBE_CMD" in reply
+
+
+async def test_on_voice_graceful_off_whitespace_cmd():
+    bot, streaming = _voice_bot(transcribe_cmd="   ")
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert upd.message.reply_text.await_args.args[0] == VOICE_SETUP_MESSAGE
+
+
+# ---- happy path: transcript echoed + turn fired -----------------------------
+
+
+async def test_on_voice_transcribes_echoes_and_fires_turn(monkeypatch):
+    bot, streaming = _voice_bot()
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        # The handler must hand us a real, existing temp audio path it downloaded.
+        assert os.path.isfile(audio_path)
+        return "build me a parser"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+
+    # The transcript was echoed back QUOTED before the turn ran.
+    echo = upd.message.reply_text.await_args_list[0].args[0]
+    assert "🎙️" in echo and "build me a parser" in echo
+    # And the transcript fired as a NORMAL turn (no image) against the active project.
+    assert len(streaming.handle_message_calls) == 1
+    chat_id, prompt, _rt = streaming.handle_message_calls[0]
+    assert (chat_id, prompt) == (1, "build me a parser")
+    assert streaming.images_calls[0] is None
+
+
+async def test_on_voice_audio_file_also_handled(monkeypatch):
+    bot, streaming = _voice_bot()
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        return "from an audio file"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    upd = make_voice_update(1, kind="audio")
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls[0][1] == "from an audio file"
+
+
+async def test_on_voice_echo_escapes_html(monkeypatch):
+    # A transcript with </>& is HTML-escaped in the quoted echo (it's parse_mode=HTML).
+    bot, streaming = _voice_bot()
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        return "fix <Foo> & <Bar>"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    echo = upd.message.reply_text.await_args_list[0].args[0]
+    assert "&lt;Foo&gt;" in echo and "&amp;" in echo
+    # The turn still fires the RAW transcript (Claude gets the real text).
+    assert streaming.handle_message_calls[0][1] == "fix <Foo> & <Bar>"
+
+
+# ---- transcriber fails → clean error, no turn -------------------------------
+
+
+async def test_on_voice_transcriber_failure_clean_error_no_turn(monkeypatch):
+    bot, streaming = _voice_bot()
+
+    async def boom(*, template, audio_path, work_dir, timeout):
+        raise TranscriptionError("the transcriber failed (exit 1)")
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", boom)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    # No turn fired; a clean (body-free) error message was sent.
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "transcribe" in reply.lower()
+    assert "exit 1" in reply
+
+
+async def test_on_voice_download_failure_clean_message(monkeypatch):
+    bot, streaming = _voice_bot()
+    monkeypatch.setattr("claude_tg.bot.transcribe", AsyncMock())
+    upd = make_voice_update(1)
+    upd.message.voice.get_file = AsyncMock(side_effect=RuntimeError("net down"))
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert "download" in upd.message.reply_text.await_args.args[0].lower()
+
+
+# ---- SB1: unauthorized voice → nothing --------------------------------------
+
+
+async def test_on_voice_sb1_unauthorized_chat_no_download_no_turn(monkeypatch):
+    bot, streaming = _voice_bot(allowed=(1,))
+    called = {"n": 0}
+
+    async def spy(*a, **k):
+        called["n"] += 1
+        return "x"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", spy)
+    upd = make_voice_update(chat_id=999)  # not in the allowlist
+    await bot.on_voice(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert called["n"] == 0
+    upd.message.voice.get_file.assert_not_awaited()
+    upd.message.reply_text.assert_not_awaited()
+
+
+# ---- oneshot mode → clean "needs streaming" notice --------------------------
+
+
+async def test_on_voice_oneshot_mode_refuses_needs_streaming():
+    bot, _ = _voice_bot(streaming=False)
+    assert bot.streaming is None
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    # No download even attempted; a clean streaming-only notice.
+    upd.message.voice.get_file.assert_not_awaited()
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+# ---- SB3: never log the audio bytes or the raw transcript -------------------
+
+
+async def test_on_voice_never_logs_audio_or_transcript_sb3(monkeypatch, caplog):
+    import logging
+
+    bot, _streaming = _voice_bot()
+    secret_audio = b"SECRET-AUDIO-PAYLOAD-DO-NOT-LOG-9876543210"
+    secret_transcript = "SECRET-SPOKEN-WORDS-DO-NOT-LOG"
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        return secret_transcript
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    with caplog.at_level(logging.DEBUG):
+        upd = make_voice_update(1, raw=secret_audio)
+        await bot.on_voice(upd, make_ctx())
+    full_log = "\n".join(r.getMessage() for r in caplog.records)
+    assert secret_transcript not in full_log
+    assert "SECRET-AUDIO-PAYLOAD" not in full_log
+    # But a size SUMMARY is logged (so an operator sees a voice note arrived).
+    assert "received a voice note" in full_log
+
+
+# ---- temp files cleaned (RB1) -----------------------------------------------
+
+
+async def test_on_voice_temp_files_cleaned(monkeypatch, tmp_path):
+    bot, _streaming = _voice_bot()
+    workdir = tmp_path / "tg-voice-fixed"
+
+    def fake_mkdtemp(*a, **k):
+        workdir.mkdir()
+        return str(workdir)
+
+    monkeypatch.setattr("claude_tg.bot.tempfile.mkdtemp", fake_mkdtemp)
+
+    async def fake_transcribe(*, template, audio_path, work_dir, timeout):
+        # The audio is on disk under the temp dir while transcribing; we also drop a fake
+        # transcript .txt to prove EVERYTHING under the dir is swept.
+        assert os.path.isfile(audio_path)
+        (workdir / "transcript.txt").write_text("hi", encoding="utf-8")
+        return "ok"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", fake_transcribe)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    # The whole temp dir (audio + any .txt) is gone after the handler returns.
+    assert not workdir.exists()
+
+
+async def test_on_voice_temp_cleaned_even_on_failure(monkeypatch, tmp_path):
+    bot, _streaming = _voice_bot()
+    workdir = tmp_path / "tg-voice-fail"
+
+    def fake_mkdtemp(*a, **k):
+        workdir.mkdir()
+        return str(workdir)
+
+    monkeypatch.setattr("claude_tg.bot.tempfile.mkdtemp", fake_mkdtemp)
+
+    async def boom(*, template, audio_path, work_dir, timeout):
+        raise TranscriptionError("boom")
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", boom)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    assert not workdir.exists()  # finally cleaned it even though transcribe raised
+
+
+# ---- end-to-end through a REAL transcriber subprocess (no shell injection) ---
+
+
+async def test_on_voice_real_transcriber_no_shell_injection(tmp_path):
+    # Use a REAL python "transcriber" via TRANSCRIBE_CMD that just prints a fixed transcript.
+    # The downloaded temp audio path is passed as {audio}; prove no shell runs it (the handler
+    # path uses exec, not a shell). A separate injection probe of the path tokenization lives
+    # in test_voice.py; here we prove the bot handler wires a real subprocess end to end.
+    sentinel = tmp_path / "PWNED"
+    template = f'{_sys.executable} -c "print(\'real voice transcript\')" {{audio}}'
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", transcribe_cmd=template),
+        FakeRunner(), streaming=streaming,
+    )
+    bot._welcomed.add(1)
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    # The transcript was produced by the real subprocess and fired as a turn.
+    assert streaming.handle_message_calls[0][1] == "real voice transcript"
+    assert not sentinel.exists()
+
+
+# ---- registration: SB1 chat filter; NOT a command (no menu change) ----------
+
+
+def test_build_application_registers_voice_handler():
+    from telegram.ext import MessageHandler
+
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming()
+    )
+    app = bot.build_application()
+    voice_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, MessageHandler) and h.callback == bot.on_voice
+    ]
+    assert len(voice_handlers) == 1
+
+
+def test_voice_is_not_a_command_no_menu_change():
+    # The voice handler is a MessageHandler, NOT a command — COMMAND_MENU must not gain a
+    # "voice" entry (the lock-step menu test would otherwise fail).
+    from claude_tg.bot import COMMAND_MENU
+
+    assert "voice" not in {cmd for cmd, _desc in COMMAND_MENU}

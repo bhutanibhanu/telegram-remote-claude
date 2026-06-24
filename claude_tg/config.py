@@ -287,6 +287,39 @@ def parse_image_max_bytes(raw: str | None) -> int:
     return value
 
 
+#: Default voice-transcription subprocess timeout (P10 T2): 120 s. A configured
+#: ``TRANSCRIBE_CMD`` (a local whisper.cpp run, an API CLI, …) is run under this wall-clock
+#: bound; if it does not finish in time it is killed and the operator gets a clean timeout
+#: error (RB2) rather than the handler hanging forever. 120 s comfortably covers a short
+#: voice note through a small local model on a Mac while bounding a wedged transcriber.
+#: Configurable via ``TRANSCRIBE_TIMEOUT_SECONDS``.
+DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS = 120.0
+
+
+def parse_transcribe_timeout_seconds(raw: str | None) -> float:
+    """Parse + validate TRANSCRIBE_TIMEOUT_SECONDS (default 120 s; P10 T2, voice notes).
+
+    The wall-clock bound the configured ``TRANSCRIBE_CMD`` subprocess runs under; on
+    timeout it is killed and the operator gets a clean error (RB2). Parsing mirrors
+    :func:`parse_stream_message_timeout_seconds`: empty/unset → the default; must be a
+    **positive** number (a ``0``/negative bound would kill every transcribe instantly —
+    nothing could transcribe — so it is a configuration error and fails loud at startup
+    rather than silently breaking voice). So ``""``/unset → 120.0; ``"300"`` → 300.0;
+    ``"0"``/``"-1"``/``"x"`` → raise.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"TRANSCRIBE_TIMEOUT_SECONDS must be a number, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError("TRANSCRIBE_TIMEOUT_SECONDS must be positive")
+    return value
+
+
 def parse_file_max_bytes(raw: str | None) -> int:
     """Parse + validate FILE_MAX_BYTES (default 20 MB; P10 T3, file send/receive).
 
@@ -387,6 +420,21 @@ class Config:
     # 0/negative/non-integer → fail loud (parse_file_max_bytes). Only consulted in streaming
     # mode (the inbound save + /get are streaming-mode surfaces — see bot.py).
     file_max_bytes: int = DEFAULT_FILE_MAX_BYTES
+    # P10 T2 (voice notes, PLUGGABLE backend): the shell-command TEMPLATE the bot runs to
+    # transcribe a downloaded voice note. EMPTY/unset (the default) = voice is GRACEFULLY OFF
+    # — a voice note gets a clean "transcription isn't set up" setup message (never a crash).
+    # When set it is a template with placeholders the bot substitutes safely (split into argv
+    # — NEVER shell=True with interpolated data): ``{audio}`` = the input audio path (a temp
+    # file the bot controls) and ``{out}`` = an output basename. The transcript is read from
+    # the command's STDOUT, or — if the template contains ``{out}`` — from the produced
+    # ``{out}.txt`` (whisper.cpp's ``-otxt -of {out}`` convention). See claude_tg/voice.py
+    # for the full contract. Env: ``TRANSCRIBE_CMD``. Only consulted in streaming mode.
+    transcribe_cmd: str = ""
+    # P10 T2: the wall-clock bound the TRANSCRIBE_CMD subprocess runs under (seconds); on
+    # timeout it is killed and the operator gets a clean error (RB2). Default 120 s; unset →
+    # default; 0/negative/non-numeric → fail loud (parse_transcribe_timeout_seconds). Only
+    # consulted in streaming mode (and only when TRANSCRIBE_CMD is set).
+    transcribe_timeout_seconds: float = DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls, dotenv_path: str | os.PathLike[str] | None = ".env") -> "Config":
@@ -443,6 +491,13 @@ class Config:
         )
         image_max_bytes = parse_image_max_bytes(os.environ.get("IMAGE_MAX_BYTES"))
         file_max_bytes = parse_file_max_bytes(os.environ.get("FILE_MAX_BYTES"))
+        # P10 T2 (voice, pluggable): the transcriber command template — empty/unset =
+        # graceful-off (a voice note gets a clean setup message). Whitespace-only normalizes
+        # to "" (off). The timeout bounds the subprocess (positive; else fail loud).
+        transcribe_cmd = (os.environ.get("TRANSCRIBE_CMD") or "").strip()
+        transcribe_timeout_seconds = parse_transcribe_timeout_seconds(
+            os.environ.get("TRANSCRIBE_TIMEOUT_SECONDS")
+        )
 
         # SB2 /cd confinement. Default the allow-list to the workdir so an unset
         # ALLOWED_ROOTS still confines /cd (ON by default); ALLOW_ANY_PATH=true is the
@@ -473,4 +528,6 @@ class Config:
             allow_any_path=allow_any_path,
             image_max_bytes=image_max_bytes,
             file_max_bytes=file_max_bytes,
+            transcribe_cmd=transcribe_cmd,
+            transcribe_timeout_seconds=transcribe_timeout_seconds,
         )
