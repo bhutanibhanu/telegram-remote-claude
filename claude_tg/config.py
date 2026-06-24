@@ -141,6 +141,14 @@ DEFAULT_CHAT_SEND_INTERVAL_SECONDS = 1.0
 #: ``STREAM_MESSAGE_TIMEOUT_SECONDS``; only consulted in streaming mode.
 DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS = 300.0
 
+#: Default max inbound image size (P10 T1, multimodal): 5 MB. A photo/screenshot the
+#: operator sends is downloaded, base64-encoded, and threaded into a turn as an image
+#: content block; an image larger than this is REJECTED with a clean message at the
+#: handler (never downloaded into a turn). The cap protects host memory + the SDK/model
+#: request size; 5 MB comfortably covers a phone screenshot while bounding abuse.
+#: Configurable via ``IMAGE_MAX_BYTES``. Only consulted in streaming mode.
+DEFAULT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
 
 def parse_answer_backstop_seconds(raw: str | None) -> int:
     """Parse + validate ANSWER_BACKSTOP_SECONDS (default 3600 = 60 min).
@@ -247,6 +255,28 @@ def parse_stream_message_timeout_seconds(raw: str | None) -> float:
     return value
 
 
+def parse_image_max_bytes(raw: str | None) -> int:
+    """Parse + validate IMAGE_MAX_BYTES (default 5 MB; P10 T1, multimodal).
+
+    The max size (in BYTES) of an inbound photo/screenshot the bot will accept and thread
+    into a turn as an image content block; a larger image is refused with a clean message
+    at the handler (never downloaded into a turn). Parsing mirrors
+    :func:`parse_stream_message_timeout_seconds`: empty/unset → the default; must be a
+    **positive** integer (a ``0``/negative cap would reject every image — so it is a
+    configuration error and fails loud at startup rather than silently disabling images).
+    So ``""``/unset → 5 MB; ``"1048576"`` → 1 MB; ``"0"``/``"-1"``/``"x"`` → raise.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_IMAGE_MAX_BYTES
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"IMAGE_MAX_BYTES must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError("IMAGE_MAX_BYTES must be positive")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -309,6 +339,13 @@ class Config:
     # SB2 explicit opt-out: ALLOW_ANY_PATH=true disables /cd containment entirely (the
     # owner takes the wheel). Default False — confinement is the safe default (SB6).
     allow_any_path: bool = False
+    # P10 T1 (multimodal): the max size in BYTES of an inbound photo/screenshot the bot
+    # accepts and threads into a turn as an image content block. An image larger than this
+    # is refused at the handler with a clean message (never downloaded into a turn) — it
+    # bounds host memory + the SDK/model request size. Default 5 MB; unset → default;
+    # 0/negative/non-integer → fail loud (parse_image_max_bytes). Only consulted in
+    # streaming mode (the multimodal turn path is streaming-only — see bot.py).
+    image_max_bytes: int = DEFAULT_IMAGE_MAX_BYTES
 
     @classmethod
     def from_env(cls, dotenv_path: str | os.PathLike[str] | None = ".env") -> "Config":
@@ -363,6 +400,7 @@ class Config:
         stream_message_timeout_seconds = parse_stream_message_timeout_seconds(
             os.environ.get("STREAM_MESSAGE_TIMEOUT_SECONDS")
         )
+        image_max_bytes = parse_image_max_bytes(os.environ.get("IMAGE_MAX_BYTES"))
 
         # SB2 /cd confinement. Default the allow-list to the workdir so an unset
         # ALLOWED_ROOTS still confines /cd (ON by default); ALLOW_ANY_PATH=true is the
@@ -391,4 +429,5 @@ class Config:
             stream_message_timeout_seconds=stream_message_timeout_seconds,
             allowed_roots=allowed_roots,
             allow_any_path=allow_any_path,
+            image_max_bytes=image_max_bytes,
         )

@@ -410,6 +410,42 @@ def decision_to_substrate(
     raise TypeError(f"unsupported decision type: {type(decision).__name__}")
 
 
+# ---------------------------------------------------------------------------
+# Multimodal input (P10 T1) — an operator-supplied image threaded INTO a turn
+# ---------------------------------------------------------------------------
+
+
+#: The Anthropic image ``media_type`` values the API/SDK accept. Derived from the
+#: inbound file's mime/extension by the bot (jpeg/png/webp/gif); anything else is
+#: rejected at the handler before it ever reaches the engine, so the substrate only
+#: ever sees one of these.
+ImageMediaType = Literal["image/jpeg", "image/png", "image/webp", "image/gif"]
+
+
+@dataclass(frozen=True)
+class ImageInput:
+    """One operator-supplied image to thread INTO a turn (P10 T1, multimodal).
+
+    A normalized, substrate-neutral carrier for a screenshot/photo the operator sent
+    via Telegram: the **already-base64-encoded** pixel ``data`` plus its ``media_type``
+    (one of :data:`ImageMediaType`, derived from the inbound mime/extension). It is an
+    *input* to ``send`` (decisions-in/turn direction), the mirror of the events-out
+    types — not an event. The SDK adapter renders a list of these into the ``image``
+    content-blocks of the streamed ``user`` message (the proven spike mechanism).
+
+    **SB3:** ``data`` is the raw base64 of operator-supplied pixels. It is acceptable to
+    forward to Claude (operator-provided), but it MUST NEVER be logged — log a size
+    summary ("received an image (<N> KB)") only. ``repr`` would dump the base64, so a
+    custom one elides it (defense-in-depth against an accidental ``log.debug(image)``).
+    """
+
+    data: str  # base64-encoded image bytes (NEVER logged — SB3)
+    media_type: ImageMediaType
+
+    def __repr__(self) -> str:  # SB3: never let repr leak the base64 into a log line.
+        return f"ImageInput(media_type={self.media_type!r}, data=<{len(self.data)} b64 chars>)"
+
+
 __all__ = [
     # events
     "TextEvent",
@@ -437,4 +473,7 @@ __all__ = [
     # mapping
     "SubstrateDecision",
     "decision_to_substrate",
+    # multimodal input (P10 T1)
+    "ImageInput",
+    "ImageMediaType",
 ]

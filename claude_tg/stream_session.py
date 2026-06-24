@@ -63,10 +63,10 @@ import html
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Optional, Protocol
+from typing import Any, Literal, Optional, Protocol
 
 from telegram import InlineKeyboardMarkup, LinkPreviewOptions
 
@@ -77,6 +77,7 @@ from .engine import (
     Engine,
     ErrorEvent,
     Event,
+    ImageInput,
     PermissionDecision,
     PermissionEvent,
     PlanEvent,
@@ -1704,8 +1705,18 @@ class StreamingSession:
         delete: Optional[DeleteFn] = None,
         reply_to_message_id: Optional[int] = None,
         command_initiated: bool = False,
+        images: Optional[Sequence[ImageInput]] = None,
     ) -> bool:
         """Drive ONE operator turn (or capture a free-text answer) for ``chat_id``.
+
+        **P10 T1 — optional ``images`` (multimodal).** When an operator sends a photo /
+        image-document, the bot passes the decoded :class:`~claude_tg.engine.ImageInput`
+        list here and the caption (or a default look-at-this prompt) as ``text``. An image
+        turn is ALWAYS a fresh turn — like ``command_initiated``, it never satisfies a
+        pending free-text "Other"/reject hold (you do not answer a question with a
+        screenshot) — so the free-text routing is skipped when ``images`` is present, and
+        the pixels are threaded through ``_drive_turn`` → ``engine.send(images=…)``. The
+        per-project busy-guard / slot / lock path is otherwise identical to a text turn.
 
         Free-text capture takes precedence: if any project is awaiting an "Other" answer /
         plan-reject feedback, this text is routed to ``engine.resolve`` (NOT a new turn)
@@ -1784,9 +1795,12 @@ class StreamingSession:
         # — so a stale reply-to never silently falls through to a NEW turn / a misroute).
         # P9 fix: a command-initiated turn (a macro /run) NEVER captures a pending free-text
         # hold — it always opens a fresh turn — so the routing is skipped entirely for it.
+        # P10 T1: an image turn (images present) is ALWAYS a fresh turn — like a macro
+        # /run it must never be swallowed as the answer to an outstanding free-text hold,
+        # so the routing is skipped for it too.
         armed_name, armed_rt, routed = (
             (None, None, False)
-            if command_initiated
+            if (command_initiated or images)
             else self._route_free_text_target(state, reply_to_message_id)
         )
         if routed:
@@ -1930,6 +1944,7 @@ class StreamingSession:
                     await self._drive_turn(
                         state, chat_id, engine, text,
                         send=send, edit=edit, delete=delete, target=target,
+                        images=images,
                     )
             finally:
                 # SLOT-LEAK SAFETY: release the slot this turn held — exactly once, on every
@@ -2120,8 +2135,13 @@ class StreamingSession:
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
         target: Optional[tuple[str, _ProjectRuntime]] = None,
+        images: Optional[Sequence[ImageInput]] = None,
     ) -> None:
         """Iterate ``engine.send`` → render → Telegram send/edit (coalesced).
+
+        **P10 T1:** ``images`` (default ``None`` → text turn) is forwarded to
+        ``engine.send`` so a multimodal turn streams the prompt + pixels; the render /
+        coalesce / QF3-recovery machinery below is identical for both.
 
         D6 "loud throughout": if the active project's policy has ``/yolo`` on, lead the
         turn with a persistent ``⚠️`` marker (its OWN message, before any event renders)
@@ -2205,8 +2225,13 @@ class StreamingSession:
         # its transient status line (best-effort delete) no matter how the loop exits. The
         # per-project lock is released by handle_message's ``async with`` regardless, so a
         # raised turn frees its lock and leaves OTHER concurrent runs untouched (RB1/RB2).
+        # P10 T1: pass ``images`` to ``engine.send`` ONLY when present, so a pure TEXT turn
+        # calls ``engine.send(prompt)`` with the EXACT pre-P10 signature — every existing
+        # injected fake engine (whose ``send`` has no ``images`` kwarg) keeps working
+        # verbatim. The image path supplies the kwarg to the real Engine (which accepts it).
+        send_kwargs: dict[str, Any] = {"images": images} if images else {}
         try:
-            async for event in engine.send(prompt):
+            async for event in engine.send(prompt, **send_kwargs):
                 # QF3: on the first turn of a resumed session, flag a resume-failure-shaped
                 # error/result. Latch on the first hit (the dead id is the same all turn).
                 if check_resume and not resume_failure_detected and _is_resume_failure_event(event):

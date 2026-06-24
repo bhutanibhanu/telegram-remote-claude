@@ -27,13 +27,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional, Sequence
 
 from .substrate import DecisionCallback
 from .types import (
     AskEvent,
     ErrorEvent,
     Event,
+    ImageInput,
     PlanEvent,
     ResultEvent,
     StatusEvent,
@@ -51,6 +52,48 @@ INCREMENTAL_EVENT_TYPES = {"content_block_delta", "message_delta"}
 # prompts (answered via the decision seam), not ordinary tool use.
 ASK_TOOL = "AskUserQuestion"
 PLAN_TOOL = "ExitPlanMode"
+
+
+def _user_message_with_images(
+    prompt: str, images: Sequence[ImageInput], session_id: str
+) -> dict[str, Any]:
+    """Build the ONE streamed ``user`` dict carrying ``[text, image…]`` content blocks.
+
+    P10 T1 — the spike-proven multimodal mechanism. ``ClaudeSDKClient.query`` accepts a
+    ``str | AsyncIterable[dict]``; for an image turn we feed it an async-iterable that
+    yields exactly this dict, which the SDK streams verbatim so the multimodal model sees
+    the pixels (confirmed live: Claude read text off a PNG with no Read tool). The shape
+    mirrors the Anthropic message API content-block list:
+
+        {"type":"user","message":{"role":"user","content":[
+            {"type":"text","text": <caption/prompt>},
+            {"type":"image","source":{"type":"base64","media_type":…,"data":…}}, …
+        ]},"parent_tool_use_id":None,"session_id": <sid>}
+
+    The ``text`` block is the operator's caption/prompt (always FIRST so the prompt leads
+    the image); one ``image`` block per :class:`~claude_tg.engine.types.ImageInput`. Pure
+    (no I/O, no SDK import) so it is unit-testable; ``images`` is assumed non-empty (the
+    caller only builds this when an image was attached). **SB3:** the base64 ``data`` is
+    placed verbatim for the SDK but is NEVER logged here (or anywhere).
+    """
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for img in images:
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.media_type,
+                    "data": img.data,
+                },
+            }
+        )
+    return {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": None,
+        "session_id": session_id,
+    }
 
 
 def _safe_input_summary(tool_name: str, tool_input: Any) -> str:
@@ -370,13 +413,30 @@ class SdkSubstrate:
         await self._client.connect()
         self.session_id = session_id
 
-    async def send(self, prompt: str, *, timeout: float = 120.0) -> AsyncIterator[Event]:
+    async def send(
+        self,
+        prompt: str,
+        *,
+        timeout: float = 120.0,
+        images: Optional[Sequence[ImageInput]] = None,
+    ) -> AsyncIterator[Event]:
         """Send one turn; async-yield normalized events. Bounded → fail-clean (RB2).
 
         The whole receive loop runs inside a try/except; a per-message
         ``asyncio.wait_for`` timeout OR any driver exception is converted into a
         single ``driver_error`` event and the stream ends. The session is never left
         hanging waiting on the SDK.
+
+        **P10 T1 — multimodal (optional ``images``).** ``images`` defaults to ``None``,
+        in which case this is the unchanged text turn: ``self._client.query(prompt)`` (a
+        plain ``str``). When one or more :class:`~claude_tg.engine.types.ImageInput` are
+        passed, the prompt + pixels are streamed as ONE ``user`` message whose ``content``
+        is ``[text, image…]`` — built by :func:`_user_message_with_images` and fed to the
+        SDK as a single-item async-generator (``query`` accepts ``str | AsyncIterable[dict]``;
+        the SDK streams the dict verbatim so the multimodal model sees the image). The
+        receive loop, the liveness bound, and the decision seam are all IDENTICAL to the
+        text path — only the ``query`` argument differs. **SB3:** the base64 image data is
+        never logged on this path.
 
         **P6/H2/RB2 — the liveness timeout bounds CLAUDE's responsiveness, not the
         operator's approval time.** The ``timeout`` catches a genuinely-silent Claude
@@ -395,7 +455,21 @@ class SdkSubstrate:
             raise RuntimeError("session not started; call start()/resume() first")
 
         try:
-            await self._client.query(prompt)
+            if images:
+                # P10 T1: stream the [text, image…] content-block user dict as a single-item
+                # async-iterable. ``session_id`` rides the dict (the SDK's query default is
+                # "default"); use the captured id when we have one, else "default" so a fresh
+                # first turn still streams cleanly (the SDK assigns the real id on init).
+                user_dict = _user_message_with_images(
+                    prompt, images, self.session_id or "default"
+                )
+
+                async def _one_user_message() -> AsyncIterator[dict[str, Any]]:
+                    yield user_dict
+
+                await self._client.query(_one_user_message())
+            else:
+                await self._client.query(prompt)
             iterator = self._client.receive_response().__aiter__()
             while True:
                 try:
@@ -517,4 +591,9 @@ class SdkSubstrate:
             self._client = None
 
 
-__all__ = ["SdkSubstrate", "normalize", "INCREMENTAL_EVENT_TYPES"]
+__all__ = [
+    "SdkSubstrate",
+    "normalize",
+    "INCREMENTAL_EVENT_TYPES",
+    "_user_message_with_images",
+]

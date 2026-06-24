@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import logging
 import time
@@ -21,6 +22,7 @@ from telegram.ext import (
 
 from .claude_runner import ClaudeBusy, ClaudeRunner
 from .config import Config
+from .engine import ImageInput, ImageMediaType
 from .paths import PathNotAllowed, resolve_within_roots
 from .render import (
     BODY_FREE_ERROR_LINE,
@@ -125,6 +127,59 @@ def _format_uptime(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
+
+
+#: P10 T1 (multimodal): the default prompt when an operator sends a photo with NO caption.
+#: The caption is normally the turn's prompt; with none we give Claude a sensible
+#: look-at-this instruction so a bare screenshot still does something useful.
+DEFAULT_IMAGE_PROMPT = "Look at this image and tell me what you see / help me with it."
+
+#: P10 T1: map a Telegram mime-type / file extension to an Anthropic image ``media_type``.
+#: Telegram compresses inbound *photos* to JPEG (no mime on a PhotoSize), so a photo with
+#: no usable hint defaults to ``image/jpeg``; an image *document* carries a mime_type /
+#: file_name we map explicitly. Only these four are supported by the model; anything else
+#: returns None and the handler refuses it (never guesses a wrong media_type).
+_MIME_TO_MEDIA_TYPE: dict[str, ImageMediaType] = {
+    "image/jpeg": "image/jpeg",
+    "image/jpg": "image/jpeg",
+    "image/png": "image/png",
+    "image/webp": "image/webp",
+    "image/gif": "image/gif",
+}
+_EXT_TO_MEDIA_TYPE: dict[str, ImageMediaType] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _media_type_for(
+    *, mime_type: str | None, file_name: str | None, is_photo: bool
+) -> ImageMediaType | None:
+    """Derive the Anthropic image ``media_type`` from a Telegram attachment's hints.
+
+    Precedence: an explicit ``mime_type`` (image documents carry one) wins; else the
+    ``file_name`` extension; else — for a compressed Telegram *photo*, which has neither —
+    default to ``image/jpeg`` (Telegram re-encodes photos to JPEG). Returns ``None`` for an
+    unsupported / unknown type so the caller refuses it rather than mislabeling the bytes
+    (which the model would reject). Pure (no I/O); case-insensitive on mime + extension.
+    """
+    if mime_type:
+        mapped = _MIME_TO_MEDIA_TYPE.get(mime_type.strip().casefold())
+        if mapped is not None:
+            return mapped
+        # An explicit non-image (or unsupported image) mime → refuse, never fall through to
+        # a JPEG default (an image document the model can't read must be rejected cleanly).
+        return None
+    if file_name and "." in file_name:
+        ext = "." + file_name.rsplit(".", 1)[1].strip().casefold()
+        mapped = _EXT_TO_MEDIA_TYPE.get(ext)
+        if mapped is not None:
+            return mapped
+    # A compressed photo has no mime/name — Telegram serves it as JPEG.
+    return "image/jpeg" if is_photo else None
 
 
 class TelegramClaudeBot:
@@ -1115,6 +1170,93 @@ class TelegramClaudeBot:
             reply_to_message_id=self._reply_to_id(update),
         )
 
+    async def on_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """P10 T1 — a photo / image-document → a native multimodal turn (SB1-gated).
+
+        **SB1 security boundary.** Registered with the ``allowed`` chat filter, AND this
+        explicit :meth:`_ok` recheck — a new inbound surface gets the same allowlist gate as
+        every other handler (defense in depth). A non-allowlisted chat never reaches the
+        download / engine.
+
+        Flow: take the LARGEST photo size (Telegram sends a size ladder) or the image
+        ``Document``, **size-cap** it (refuse > ``config.image_max_bytes`` with a clean
+        message — never download an oversized image into a turn), download the bytes,
+        base64-encode them, derive the ``media_type`` from the mime/extension (a compressed
+        photo with no hint → JPEG; an unsupported type is refused), and run the turn with the
+        caption as the prompt (a sensible default when there is no caption). The pixels thread
+        through ``_run_turn`` → ``handle_message`` → ``engine.send(images=…)``.
+
+        **SB3 — never log the image bytes / base64.** We log only a size summary ("received
+        an image (<N> KB)"); the base64 ``data`` is placed on the
+        :class:`~claude_tg.engine.ImageInput` (whose ``repr`` elides it) and never logged.
+        The pixels are operator-supplied (acceptable to forward to Claude). RB1: any
+        download/decode failure is caught and surfaced as a clean message, never a crash.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._maybe_welcome(update)
+        msg = update.message
+        # Resolve the attachment: prefer a photo (largest size = last in the ladder), else an
+        # image document. The registration filter guarantees one of these is present, but be
+        # defensive (RB1) — a message with neither is a clean no-op.
+        photo = msg.photo[-1] if msg.photo else None
+        document = msg.document if (msg.document is not None and not photo) else None
+        if photo is None and document is None:
+            return
+        is_photo = photo is not None
+        media_type = _media_type_for(
+            mime_type=getattr(document, "mime_type", None),
+            file_name=getattr(document, "file_name", None),
+            is_photo=is_photo,
+        )
+        if media_type is None:
+            # An image document of an unsupported type (or a non-image document that slipped
+            # past the filter) — refuse cleanly rather than mislabel the bytes (RB2/SB6).
+            await msg.reply_text(
+                "🖼️ I can only read JPEG, PNG, WebP, or GIF images. "
+                "Send the screenshot as a photo, or a supported image file."
+            )
+            return
+        # Size-cap BEFORE download (SB3/RB2): Telegram reports file_size on both PhotoSize and
+        # Document. A missing/odd size (defensive) falls through to download + a post-download
+        # cap so an over-cap image can never reach the engine either way.
+        cap = self.config.image_max_bytes
+        attachment = photo if is_photo else document
+        declared = getattr(attachment, "file_size", None)
+        if isinstance(declared, int) and declared > cap:
+            await msg.reply_text(
+                f"🖼️ That image is too large ({declared // 1024} KB) — "
+                f"the limit is {cap // 1024} KB. Send a smaller screenshot."
+            )
+            return
+        try:
+            tg_file = await attachment.get_file()
+            raw = await tg_file.download_as_bytearray()
+        except Exception:
+            # RB1: a transient download failure must never crash the handler — clean message.
+            log.debug("image download failed for chat %s", update.effective_chat.id, exc_info=True)
+            await msg.reply_text("⚠️ Couldn't download that image — please try sending it again.")
+            return
+        # Post-download cap (defense-in-depth: a missing declared size, or a server that
+        # under-reported it). Never thread an over-cap image into a turn (SB3/RB2).
+        if len(raw) > cap:
+            await msg.reply_text(
+                f"🖼️ That image is too large ({len(raw) // 1024} KB) — "
+                f"the limit is {cap // 1024} KB. Send a smaller screenshot."
+            )
+            return
+        # SB3: log a SIZE SUMMARY only — never the bytes / base64.
+        log.info("chat %s received an image (%d KB)", update.effective_chat.id, len(raw) // 1024)
+        data_b64 = base64.b64encode(bytes(raw)).decode("ascii")
+        image = ImageInput(data=data_b64, media_type=media_type)
+        # The caption is the prompt; a bare image gets a sensible default look-at-this prompt.
+        prompt = (msg.caption or "").strip() or DEFAULT_IMAGE_PROMPT
+        await self._run_turn(
+            update, ctx, update.effective_chat.id, prompt,
+            reply_to_message_id=self._reply_to_id(update),
+            images=[image],
+        )
+
     async def on_skill_command(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward any *unregistered* slash-command verbatim to the active session (P3, D1).
 
@@ -1152,6 +1294,7 @@ class TelegramClaudeBot:
         *,
         reply_to_message_id: int | None = None,
         command_initiated: bool = False,
+        images: list[ImageInput] | None = None,
     ) -> None:
         """Run ``text`` as one turn for ``chat_id`` — the shared dispatch both the message
         handler and the skill-launch passthrough route through (one path, no duplication).
@@ -1164,12 +1307,33 @@ class TelegramClaudeBot:
         is likewise forwarded so the streaming session opens a FRESH turn instead of letting
         the expanded text satisfy a pending free-text hold; one-shot mode has no holds, so it
         ignores the flag and just runs the text.
+
+        **P10 T1 — ``images`` (multimodal).** When the operator sends a photo/image-document
+        the handler passes the decoded :class:`~claude_tg.engine.ImageInput` list here. It is
+        a STREAMING-only path (the SDK's ``--input-format stream-json`` is the proven
+        mechanism; oneshot multimodal is the deferred bigger lift), so in one-shot mode the
+        turn is refused with a clean "images need streaming mode" message rather than silently
+        dropping the pixels and running text-only. In streaming mode the images thread through
+        to ``handle_message`` → ``engine.send(images=…)``.
         """
         if self.streaming is not None:
             await self._on_message_streaming(
                 update, ctx, chat_id, text,
                 reply_to_message_id=reply_to_message_id,
                 command_initiated=command_initiated,
+                images=images,
+            )
+            return
+
+        # P10 T1 oneshot fallback (documented choice): the multimodal turn needs the SDK's
+        # streaming ``--input-format stream-json`` path, which one-shot mode does not run. The
+        # lower-risk behavior is a clean refusal (NOT silently running the caption text-only,
+        # which would hide that the image was ignored). The text/turn path is otherwise 100%
+        # unchanged for one-shot.
+        if images:
+            await update.message.reply_text(
+                "🖼️ Sending an image needs streaming mode (ENGINE_MODE=streaming). "
+                "In one-shot mode I can't see attached images yet."
             )
             return
 
@@ -1237,6 +1401,7 @@ class TelegramClaudeBot:
         *,
         reply_to_message_id: int | None = None,
         command_initiated: bool = False,
+        images: list[ImageInput] | None = None,
     ) -> None:
         """Drive the streaming engine for one message (delegates to StreamingSession).
 
@@ -1246,7 +1411,8 @@ class TelegramClaudeBot:
         reply the same "still working" notice as one-shot mode. SB4: the text is the
         engine's prompt, never interpolated into a shell command/argument.
         ``reply_to_message_id`` (D5) is forwarded so a reply to a free-text prompt routes
-        the answer to the project that owns that prompt.
+        the answer to the project that owns that prompt. **P10 T1:** ``images`` (the decoded
+        photo/screenshot) is forwarded so the turn is multimodal.
         """
         assert self.streaming is not None
         bot = ctx.bot
@@ -1278,10 +1444,16 @@ class TelegramClaudeBot:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
 
         try:
+            # P10 T1: pass ``images`` ONLY when present, so a pure TEXT turn calls
+            # handle_message with the EXACT pre-P10 signature — every existing FakeStreaming
+            # (whose handle_message has no ``images`` kwarg) keeps working verbatim. The image
+            # path supplies the kwarg to the real StreamingSession (which accepts it).
+            extra = {"images": images} if images else {}
             captured_free_text = await self.streaming.handle_message(
                 chat_id, text, send=send, edit=edit, delete=delete,
                 reply_to_message_id=reply_to_message_id,
                 command_initiated=command_initiated,
+                **extra,
             )
         except StreamingBusy:
             await update.message.reply_text(
@@ -1479,6 +1651,15 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("macros", self.cmd_macros, filters=allowed))
         app.add_handler(CommandHandler("unsave", self.cmd_unsave, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))
+        # P10 T1 (multimodal): a photo OR an image-document → on_photo (a native multimodal
+        # turn). SB1: the SAME `allowed` chat filter as every other handler (the `_ok` recheck
+        # inside on_photo is defense in depth). filters.Document.IMAGE matches image/* sent as
+        # an uncompressed file (so a PNG screenshot keeps full fidelity); filters.PHOTO matches
+        # Telegram's compressed photo. Registered BEFORE the COMMAND passthrough; neither
+        # overlaps a TEXT/COMMAND message, so handler ordering is unaffected.
+        app.add_handler(
+            MessageHandler(allowed & (filters.PHOTO | filters.Document.IMAGE), self.on_photo)
+        )
         # P3 skill-launch passthrough (D1): forward any *unregistered* slash-command verbatim
         # to the session. Registered AFTER the specific CommandHandlers above so PTB's
         # first-match-wins routing lets a real bot command (/reset, /cd, …) be consumed by
