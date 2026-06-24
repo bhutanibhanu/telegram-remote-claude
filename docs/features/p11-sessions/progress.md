@@ -6,7 +6,13 @@ _From design.md · Universal Session Control Plane · supervised build. Baseline
 - [x] T1 — Session discovery adapter + `/sessions` read-only listing (see ALL Mac sessions, incl. the live one; merged+deduped with bot projects; running/idle) (ccbddbc)
 - [x] T2 — Attach/switch to any session (idle→continue, live-OR-uncertain→FORK; SB2 on out-of-root cwd; fork-on-doubt safe default) (f620a84)
 - [~] T3 — (stretch) Live-mirror `/watch <id>` — DEFERRED to its own clean cycle after T1+T2 merge (phase ran long; design says "may defer")
-- [>] T4 — verify + Codex QA + live-verify + merge (T1+T2)
+- [x] T4 — verify + Codex QA + live-verify + merge (T1+T2)
+
+## T4 result
+- **Cross-model Codex QA:** round 1 NO_SHIP (3 never-co-drive blockers under failure/restart/race) → all fixed → round 2 **SHIP** (B1/B2/B3 CLOSED). See `qa.md`/`qa-round2.md`.
+- **Independent reviewer:** AGREE — never-co-drive holds under failure+restart+race; all mutation-probes fail-closed.
+- **Live-verify (real Mac, 110 sessions, Telegram Web):** `/sessions` lists all sessions capped 15 + honest "of 110" footer + active/idle/**running** markers — **the live orchestrator `c4119af0` shows 🟢 running** ("even this one"); the original overflow crash is gone. `/attach` (button) → idempotent switch + honest reply, SB1 ok, no crash; the resumed session drove a turn with the **correct restored context** (recalled its original "BRAVO"), clean `(done) · 1 turn · $0.05`.
+- 1193 tests; ruff/mypy/secret_scan clean.
 
 Legend: `[ ]` todo · `[x]` done (sha) · `[!]` blocked
 
