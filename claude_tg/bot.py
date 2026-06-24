@@ -583,7 +583,7 @@ class TelegramClaudeBot:
         else:
             await update.message.reply_text("Nothing in flight to cancel.")
 
-    async def cmd_yolo(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_yolo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Turn ON ``/yolo`` — every tool runs with NO approval prompt this session (P2, D6).
 
         Streaming mode only (the permission gate is a streaming-engine concept; one-shot
@@ -602,8 +602,10 @@ class TelegramClaudeBot:
             return
         self.streaming.set_yolo(update.effective_chat.id, True)
         await update.message.reply_text(yolo_banner())
+        # STATUSLINE T-SL-WIRE: 🔒 gate → 🔒 yolo flips live on the pinned line.
+        await self._refresh_statusline(ctx.bot, update.effective_chat.id)
 
-    async def cmd_unyolo(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_unyolo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Turn OFF ``/yolo`` — restore the fail-closed per-tool permission gate (P2, D6).
 
         Streaming mode only (mirrors :meth:`cmd_yolo`). After this, risky tools are held
@@ -621,8 +623,10 @@ class TelegramClaudeBot:
         await update.message.reply_text(
             "✅ Gating restored — risky tools will ask for approval again (/yolo is off)."
         )
+        # STATUSLINE T-SL-WIRE: 🔒 yolo → 🔒 gate flips live on the pinned line.
+        await self._refresh_statusline(ctx.bot, update.effective_chat.id)
 
-    async def cmd_plan(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_plan(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """``/plan`` — run the NEXT message in plan mode and show the plan for approval (P12).
 
         Arms a per-project, ONE-SHOT plan marker on the active project (via
@@ -650,6 +654,8 @@ class TelegramClaudeBot:
         await update.message.reply_text(
             "📋 Next message runs in plan mode — I'll show the plan for approval."
         )
+        # STATUSLINE T-SL-WIRE: 🔒 gate → 🔒 plan flips live (the armed-next-turn marker).
+        await self._refresh_statusline(ctx.bot, update.effective_chat.id)
 
     async def cmd_thinking(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """``/thinking on|off`` — toggle the live reasoning stream for this project (P12 T-THINK).
@@ -733,6 +739,8 @@ class TelegramClaudeBot:
                 f"(Applies to the next session; a turn in flight keeps its current effort.)\n"
                 f"Usage: /effort <{levels}>",
             )
+            # STATUSLINE T-SL-WIRE: the 🤖 model·effort suffix updates live (effort cleared).
+            await self._refresh_statusline(ctx.bot, update.effective_chat.id)
             return
         if arg not in EFFORT_LEVELS:
             # RB1: an unrecognized level is a clean error listing the valid levels — never a
@@ -751,9 +759,11 @@ class TelegramClaudeBot:
             "your next turn. A turn in flight keeps its current effort.",
             parse_mode="HTML",
         )
+        # STATUSLINE T-SL-WIRE: the 🤖 model·effort suffix updates live (e.g. opus·max).
+        await self._refresh_statusline(ctx.bot, update.effective_chat.id)
 
     async def _set_model(
-        self, update: Update, label: str, model: str | None
+        self, update: Update, label: str, model: str | None, *, bot=None
     ) -> None:
         """Shared body for ``/fast`` · ``/deep`` · ``/auto`` (T4 / P9; streaming mode only).
 
@@ -764,6 +774,9 @@ class TelegramClaudeBot:
         a session-creation param; never hot-swapped mid-turn). One-shot mode has no per-project
         registry, so the model toggles apply to the streaming engine only. ``model`` is a fixed,
         operator-chosen id (a config/SDK constant), never interpolated into a shell command.
+
+        STATUSLINE T-SL-WIRE: ``bot`` (the caller's ``ctx.bot``) drives the live statusline
+        refresh so the 🤖 model label flips immediately; ``None`` (defensive) skips it.
         """
         if self.streaming is None:
             await update.message.reply_text(
@@ -783,18 +796,22 @@ class TelegramClaudeBot:
                 "applies to your next turn. A turn in flight keeps its current model.",
                 parse_mode="HTML",
             )
+        # STATUSLINE T-SL-WIRE: the 🤖 model label updates live (/fast → haiku, /deep → opus,
+        # /auto → the configured default's label).
+        if bot is not None:
+            await self._refresh_statusline(bot, update.effective_chat.id)
 
-    async def cmd_fast(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_fast(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """``/fast`` — route the active project to the fast model (Haiku) on the next turn."""
         if not await self._ok(update) or update.message is None:
             return
-        await self._set_model(update, "fast", self.config.fast_model)
+        await self._set_model(update, "fast", self.config.fast_model, bot=ctx.bot)
 
-    async def cmd_deep(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_deep(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """``/deep`` — route the active project to the deep model (Opus) on the next turn."""
         if not await self._ok(update) or update.message is None:
             return
-        await self._set_model(update, "deep", self.config.deep_model)
+        await self._set_model(update, "deep", self.config.deep_model, bot=ctx.bot)
 
     async def cmd_auto(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """``/auto`` (and ``/model default``) — clear the per-project model override.
@@ -806,7 +823,7 @@ class TelegramClaudeBot:
         """
         if not await self._ok(update) or update.message is None:
             return
-        await self._set_model(update, "default", None)
+        await self._set_model(update, "default", None, bot=ctx.bot)
 
     async def cmd_pwd(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
@@ -1156,6 +1173,9 @@ class TelegramClaudeBot:
             return
         reply, parse_mode = self._switch_active(chat_id, name)
         await update.message.reply_text(reply, parse_mode=parse_mode)
+        # STATUSLINE T-SL-WIRE: rewrite the pinned line for the newly-active project (its
+        # worktree + per-project model/effort/mode all change). Best-effort (RB1).
+        await self._refresh_statusline(ctx.bot, chat_id)
 
     def _switch_active(self, chat_id: int, name: str) -> tuple[str, str | None]:
         """Switch the chat's active project to ``name``; return ``(reply, parse_mode)`` (T6/P9).
@@ -2019,21 +2039,26 @@ class TelegramClaudeBot:
             )
             return
         assert self.streaming is not None  # _require_scheduling guaranteed it
-        send, edit, delete = self._make_chat_io(ctx.bot, chat_id)
+        send, edit, delete, pin, unpin = self._make_chat_io(ctx.bot, chat_id)
         # fire_schedule sends the header, audits, drives the gated turn, and is RB1-total
         # (a busy project / fire error is a clean body-free skip — never propagates here).
-        await self.streaming.fire_schedule(schedule, send=send, edit=edit, delete=delete)
+        await self.streaming.fire_schedule(
+            schedule, send=send, edit=edit, delete=delete, pin=pin, unpin=unpin
+        )
 
     def _make_chat_io(self, bot, chat_id: int):
-        """Build ``(send, edit, delete)`` Telegram closures over ``bot`` for ``chat_id`` (P14 T-FIRE).
+        """Build ``(send, edit, delete, pin, unpin)`` Telegram closures over ``bot`` for ``chat_id``.
 
         The proactive firing path (the scheduler driver + ``/runnow``) has no incoming
-        ``update``/``ctx`` to build the per-chat send/edit/delete closures from (a scheduled
-        fire is machine-initiated), so it builds the IDENTICAL closures the message path builds
+        ``update``/``ctx`` to build the per-chat closures from (a scheduled fire is
+        machine-initiated), so it builds the IDENTICAL closures the message path builds
         (:meth:`on_message`) over the persistent :class:`~telegram.Bot` captured at startup
         (PTB hands the ``Application`` — and thus ``app.bot`` — to ``post_init``). The closures
         are byte-for-byte the same shape the render layer + per-chat send gate expect, so a
-        proactive turn renders exactly like a typed one. Pure factory (no I/O here).
+        proactive turn renders exactly like a typed one. **STATUSLINE T-SL-WIRE:** the ``pin``/
+        ``unpin`` closures (over ``Bot.pin_chat_message``/``unpin_chat_message``) let a proactive
+        turn refresh the pinned statusline through the SAME path a typed turn does — SB1-confined
+        to this ``chat_id`` (no new outbound surface). Pure factory (no I/O here).
         """
 
         async def send(
@@ -2056,7 +2081,45 @@ class TelegramClaudeBot:
         async def delete(*, message_id: int) -> None:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
 
-        return send, edit, delete
+        async def pin(*, message_id: int, disable_notification: bool = True) -> None:
+            # STATUSLINE T-SL-WIRE: silent pin (no re-ping — design §3.1); SB1-confined to this
+            # chat_id. Best-effort upstream (the session swallows a pin failure, RB1).
+            await bot.pin_chat_message(
+                chat_id=chat_id, message_id=message_id,
+                disable_notification=disable_notification,
+            )
+
+        async def unpin(*, message_id: int) -> None:
+            # STATUSLINE T-SL-WIRE: unpin a stale statusline message on orphan-recovery (the
+            # one-pin invariant). SB1-confined to this chat_id; best-effort upstream (RB1).
+            await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
+
+        return send, edit, delete, pin, unpin
+
+    async def _refresh_statusline(self, bot, chat_id: int) -> None:
+        """Refresh the chat's pinned statusline after a COMMAND-driven state change (T-SL-WIRE).
+
+        The ``/switch`` + knob commands (``/yolo``·``/unyolo``, ``/effort``, ``/fast``·``/deep``·
+        ``/auto``, ``/plan``) change a field the statusline shows (worktree / mode / model /
+        effort), so the pinned line is re-rendered to reflect it live (design §3.1). These
+        commands ALWAYS act on the chat's ACTIVE (foreground) project, so the foreground gate is
+        bypassed (``for_project=None``) — the command path IS the foreground by definition.
+
+        Builds this chat's pin/edit/send closures over the persistent ``bot`` (SB1-confined to
+        ``chat_id``) and delegates to the session's :meth:`_update_statusline` (fully best-effort,
+        RB1 — a pin/edit failure can never break the command). A no-op in one-shot mode (no
+        streaming session) and wrapped so a build/dispatch error never escapes the command.
+        """
+        if self.streaming is None:
+            return
+        try:
+            send, edit, _delete, pin, unpin = self._make_chat_io(bot, chat_id)
+            await self.streaming._maybe_update_statusline(
+                chat_id, send=send, edit=edit, pin=pin, unpin=unpin, for_project=None,
+            )
+        except Exception:
+            # RB1: a statusline refresh must never break the command that triggered it.
+            log.debug("command statusline refresh failed for chat %s (ignored)", chat_id, exc_info=True)
 
     # ---- messages -----------------------------------------------------------
     @staticmethod
@@ -2752,6 +2815,21 @@ class TelegramClaudeBot:
             # stale one does not linger (best-effort; the session swallows failures).
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
 
+        async def pin(*, message_id: int, disable_notification: bool = True) -> None:
+            # STATUSLINE T-SL-WIRE: pin the chat's statusline message SILENTLY (no re-ping —
+            # design §3.1). SB1: targets THIS allowlisted chat_id only (same boundary as the
+            # send/edit closures — no new outbound surface). Best-effort upstream (the session
+            # swallows a pin failure, RB1).
+            await bot.pin_chat_message(
+                chat_id=chat_id, message_id=message_id,
+                disable_notification=disable_notification,
+            )
+
+        async def unpin(*, message_id: int) -> None:
+            # STATUSLINE T-SL-WIRE: unpin a STALE statusline message on orphan-recovery (the
+            # one-pin invariant). SB1-confined to this chat_id; best-effort upstream (RB1).
+            await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
+
         try:
             # P10 T1: pass ``images`` ONLY when present, so a pure TEXT turn calls
             # handle_message with the EXACT pre-P10 signature — every existing FakeStreaming
@@ -2765,6 +2843,7 @@ class TelegramClaudeBot:
             extra: dict[str, Any] = {"images": images} if images else {}
             captured_free_text = await self.streaming.handle_message(
                 chat_id, text, send=send, edit=edit, delete=delete,
+                pin=pin, unpin=unpin,
                 reply_to_message_id=reply_to_message_id,
                 command_initiated=command_initiated,
                 **extra,
@@ -2786,7 +2865,7 @@ class TelegramClaudeBot:
             except Exception:
                 log.debug("quick-reply chip dismissal failed", exc_info=True)
 
-    async def on_callback(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def on_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Inline-keyboard tap handler — **the SB1 security boundary**.
 
         A callback tap is new attack surface (SB1). PTB's ``CallbackQueryHandler`` cannot
@@ -2839,6 +2918,9 @@ class TelegramClaudeBot:
                 await query.message.reply_text(reply, parse_mode=parse_mode)
             except Exception:
                 log.debug("switch-button reply send failed", exc_info=True)
+            # STATUSLINE T-SL-WIRE: the [Open <project>] tap shares /switch's core, so refresh
+            # the pinned line for the newly-active project here too (parallel to cmd_switch).
+            await self._refresh_statusline(ctx.bot, chat.id)
             return
         # P11 T2: an [Attach] tap routes by session id. The session decoded + validated the id
         # (the session-id shape) and returned it on ``attach_session_id``; the bot performs the
@@ -2954,9 +3036,9 @@ class TelegramClaudeBot:
         """
         if self.streaming is None:
             return False
-        send, edit, delete = self._make_chat_io(bot, schedule.chat_id)
+        send, edit, delete, pin, unpin = self._make_chat_io(bot, schedule.chat_id)
         return await self.streaming.fire_schedule(
-            schedule, send=send, edit=edit, delete=delete
+            schedule, send=send, edit=edit, delete=delete, pin=pin, unpin=unpin
         )
 
     async def _post_shutdown(self, _app: Application) -> None:

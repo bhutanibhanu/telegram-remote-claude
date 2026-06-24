@@ -54,7 +54,6 @@ from claude_tg.render import (
     coalesce_stream,
     code_path,
     decode_callback,
-    done_footer_suffix,
     encode_attach_callback,
     encode_callback,
     encode_switch_callback,
@@ -242,13 +241,16 @@ def test_result_with_text_renders_verbatim_final_answer():
     assert "The answer is 42" in action.text
 
 
-def test_result_without_text_renders_compact_footer():
+def test_result_without_text_renders_bare_done():
+    # STATUSLINE T-SL-WIRE: a result with no prose renders a bare "✅ done (success)" — the
+    # "· N turns · $X.XX" footer is gone (cost moved to /status), even with SDK usage present.
     res = ResultEvent(
         session_id="s1", is_error=False, subtype="success", num_turns=3, total_cost_usd=0.0123
     )
     action = render_event(res)
     assert action.op == "new"
-    assert "done" in action.text and "3 turns" in action.text
+    assert action.text == "✅ done (success)"
+    assert "$" not in action.text and "turns" not in action.text
 
 
 def test_assembled_text_is_new_message_verbatim():
@@ -1279,15 +1281,17 @@ def test_prose_html_escapes_stray_angle_brackets_from_claude():
     assert "a < b && c" in "".join(action.plain_chunks)  # raw preserved verbatim
 
 
-def test_done_footer_stays_plain_text_no_html():
-    # The bot-generated done-footer (no result_text) is NOT prose -> plain, no parse_mode.
+def test_bare_done_stays_plain_text_no_html():
+    # The bot-generated bare done line (no result_text) is NOT prose -> plain, no parse_mode.
+    # STATUSLINE T-SL-WIRE: it is now a bare "✅ done (success)" — no turn-count / $ footer.
     res = ResultEvent(
         session_id="s1", is_error=False, subtype="success", num_turns=3, total_cost_usd=0.0123
     )
     action = render_event(res)
     assert action.parse_mode is None
     assert action.plain_chunks == ()
-    assert "done" in action.text and "3 turns" in action.text
+    assert action.text == "✅ done (success)"
+    assert "$" not in action.text and "turns" not in action.text
 
 
 def test_error_block_stays_plain_text():
@@ -1508,56 +1512,38 @@ def test_chat_send_gate_rejects_negative_interval():
 
 
 # ===========================================================================
-# P9 / T3 — cost + usage surfacing on the done message (num_turns + cost).
+# STATUSLINE T-SL-WIRE (design §1/§3.3) — the done-footer DOLLARS are GONE.
 #
-# ResultEvent already carries total_cost_usd + num_turns; the per-turn done render
-# used to drop them whenever there was result_text. done_footer_suffix builds the
-# "· N turns · $X.XX" suffix (only the fields the SDK provided), and _render_result
-# appends it onto the prose's last chunk (and the bare footer).
+# The per-turn "· N turns · $X.XX" footer is removed from routine output: the pinned
+# statusline is now the persistent "state after the turn" surface, and the turn's
+# cumulative cost survives ONLY on the explicit /status health view (test_bot_streaming
+# covers that /status still shows cost). _render_result therefore renders the answer prose
+# alone, or a bare "✅ done (<subtype>)" — never a $ suffix. (These replace the old P9/T3
+# done_footer_suffix tests, which asserted the now-removed dollar footer.)
 # ===========================================================================
 
 
-def test_done_footer_suffix_both_present():
-    res = ResultEvent(
-        session_id="s", is_error=False, subtype="success", num_turns=3, total_cost_usd=0.012
-    )
-    assert done_footer_suffix(res) == " · 3 turns · $0.01"
-
-
-def test_done_footer_suffix_only_turns():
-    res = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=5)
-    assert done_footer_suffix(res) == " · 5 turns"
-
-
-def test_done_footer_suffix_only_cost():
-    res = ResultEvent(
-        session_id="s", is_error=False, subtype="success", total_cost_usd=1.5
-    )
-    assert done_footer_suffix(res) == " · $1.50"
-
-
-def test_done_footer_suffix_absent_is_empty():
-    # oneshot / a partial result may carry neither — omit gracefully (no dangling separator).
-    res = ResultEvent(session_id="s", is_error=False, subtype="success")
-    assert done_footer_suffix(res) == ""
-
-
-def test_result_with_text_appends_turns_and_cost():
-    # T3: the turns+cost are surfaced on the done message even WHEN there is result_text
-    # (previously dropped). The suffix lands on the last chunk; the plain fallback gets it
-    # too (positionally parallel).
+def test_result_with_text_has_no_dollar_or_turn_footer():
+    # ⭐ Even when the SDK reports num_turns + total_cost_usd, the result render is the prose
+    # ALONE — no "· N turns · $X.XX" tail anywhere (the dollars moved to /status). Mutation
+    # probe: if _render_result re-appended the footer, both the "$" and "turns" asserts fail.
     res = ResultEvent(
         session_id="s", is_error=False, subtype="success",
         num_turns=2, total_cost_usd=0.0734, result_text="All done — see **above**.",
     )
     action = render_event(res)
-    assert action.text.endswith(" · 2 turns · $0.07")
-    assert "above" in action.text
-    assert action.plain_chunks[-1].endswith(" · 2 turns · $0.07")
+    assert "$" not in action.text
+    assert "turns" not in action.text
+    assert "0.07" not in action.text
+    assert "above" in action.text  # the prose itself is unchanged
+    # The plain-text fallback is equally dollar-free (positionally parallel).
+    assert "$" not in action.plain_chunks[-1]
+    assert "turns" not in action.plain_chunks[-1]
 
 
-def test_result_with_text_omits_suffix_when_sdk_absent():
-    # No num_turns + no cost (oneshot-shaped) → the prose is sent UNCHANGED, no suffix.
+def test_result_with_text_renders_prose_unchanged():
+    # A prose result (no SDK usage) renders exactly the answer — no suffix (as before, but now
+    # this is the rule for ALL results, not just SDK-absent ones).
     res = ResultEvent(
         session_id="s", is_error=False, subtype="success", result_text="Just the answer.",
     )
@@ -1566,24 +1552,32 @@ def test_result_with_text_omits_suffix_when_sdk_absent():
     assert action.plain_chunks == ("Just the answer.",)
 
 
-def test_done_footer_suffix_carries_no_secret():
-    # SB3: the suffix is two SDK-reported numbers — never tool input/output or a path.
+def test_bare_done_has_no_dollar_footer():
+    # A result with NO prose renders a bare "✅ done (success)" — no "· N turns · $X.XX" tail,
+    # even when the SDK provided both figures (the footer used to append here too).
     res = ResultEvent(
-        session_id="s", is_error=False, subtype="success", num_turns=1, total_cost_usd=0.01
+        session_id="s", is_error=False, subtype="success", num_turns=3, total_cost_usd=0.012
     )
-    suffix = done_footer_suffix(res)
-    assert suffix == " · 1 turn · $0.01"  # only digits + the $ glyph (singular: "1 turn")
+    action = render_event(res)
+    assert action.text == "✅ done (success)"
+    assert "$" not in action.text
+    assert "turns" not in action.text
 
 
-def test_done_footer_suffix_pluralizes_turn():
-    # Cosmetic (UX): "1 turn" (singular) but "N turns" for N != 1 — never the ungrammatical
-    # "1 turns". Cover the singular, the plural, and the zero-edge (also plural: "0 turns").
-    one = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=1)
-    assert done_footer_suffix(one) == " · 1 turn"
-    many = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=2)
-    assert done_footer_suffix(many) == " · 2 turns"
-    zero = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=0)
-    assert done_footer_suffix(zero) == " · 0 turns"
+def test_no_render_path_emits_a_dollar_amount():
+    # SB3 / the "no dollars anywhere routine" invariant: sweep the common result renders and
+    # assert NONE carries a "$". (Cost lives on /status only — covered in test_bot_streaming.)
+    for res in (
+        ResultEvent(session_id="s", is_error=False, subtype="success",
+                    num_turns=1, total_cost_usd=0.01, result_text="prose"),
+        ResultEvent(session_id="s", is_error=False, subtype="success",
+                    num_turns=5, total_cost_usd=1.5),
+        ResultEvent(session_id="s", is_error=False, subtype="success"),
+    ):
+        action = render_event(res)
+        assert "$" not in (action.text or "")
+        for chunk in (action.plain_chunks or ()):
+            assert "$" not in chunk
 
 
 # ===========================================================================

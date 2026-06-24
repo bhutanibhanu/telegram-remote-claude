@@ -136,9 +136,10 @@ class FakeStreaming:
         self.resolve_calls: list[tuple[int, object]] = []
 
     async def handle_message(
-        self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
-        command_initiated=False,
+        self, chat_id, text, *, send, edit, delete=None, pin=None, unpin=None,
+        reply_to_message_id=None, command_initiated=False,
     ):
+        # STATUSLINE T-SL-WIRE: + pin/unpin (the statusline closures threaded by the bot).
         self.handle_message_calls.append((chat_id, text))
 
     def resolve_callback(self, chat_id, data):

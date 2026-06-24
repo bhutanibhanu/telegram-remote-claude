@@ -2911,6 +2911,8 @@ class StreamingSession:
         send: SendFn,
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
+        pin: Optional[PinFn] = None,
+        unpin: Optional[UnpinFn] = None,
     ) -> bool:
         """Fire ONE scheduled task as a fully-gated PROACTIVE turn (P14 T-FIRE ⭐).
 
@@ -3000,6 +3002,8 @@ class StreamingSession:
                 send=send,
                 edit=edit,
                 delete=delete,
+                pin=pin,
+                unpin=unpin,
                 command_initiated=True,
                 proactive=True,
                 project_override=schedule.project,
@@ -3036,6 +3040,8 @@ class StreamingSession:
         send: SendFn,
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
+        pin: Optional[PinFn] = None,
+        unpin: Optional[UnpinFn] = None,
         reply_to_message_id: Optional[int] = None,
         command_initiated: bool = False,
         images: Optional[Sequence[ImageInput]] = None,
@@ -3326,7 +3332,8 @@ class StreamingSession:
                         )
                     await self._drive_turn(
                         state, chat_id, engine, text,
-                        send=send, edit=edit, delete=delete, target=target,
+                        send=send, edit=edit, delete=delete,
+                        pin=pin, unpin=unpin, target=target,
                         images=images, proactive=proactive,
                     )
             finally:
@@ -3517,6 +3524,8 @@ class StreamingSession:
         send: SendFn,
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
+        pin: Optional[PinFn] = None,
+        unpin: Optional[UnpinFn] = None,
         target: Optional[tuple[str, _ProjectRuntime]] = None,
         images: Optional[Sequence[ImageInput]] = None,
         proactive: bool = False,
@@ -3592,6 +3601,13 @@ class StreamingSession:
         turn_rt.status_message_id = None
         turn_rt.status_text = None
         turn_rt.status = "running"
+        # STATUSLINE T-SL-WIRE (design §3.1): turn START → flip the working ⚙️ marker ON (and
+        # refresh model/effort/mode/worktree). FOREGROUND-ONLY — gated on ``turn_name`` so a
+        # BACKGROUND concurrent turn never stomps the foreground line (the make-or-break
+        # invariant). Best-effort (RB1): pins/edits can't break the turn (the helper swallows).
+        await self._maybe_update_statusline(
+            chat_id, send=send, edit=edit, pin=pin, unpin=unpin, for_project=turn_name,
+        )
         # D6 "loud throughout" — but only inline for a FOREGROUND turn (a backgrounded run is
         # silent inline, D4; its yolo posture still shows on each foreground turn + via
         # /projects is not yolo-aware, so this is the loud surface when watched). Verbatim
@@ -3794,6 +3810,16 @@ class StreamingSession:
             # ADR-005 D7: the turn is over → this project is idle again (no runtime → idle is
             # the /projects default; a running/awaiting project that just ended → idle).
             turn_rt.status = "idle"
+            # STATUSLINE T-SL-WIRE (design §3.1): turn END → flip the working ⚙️ marker OFF and
+            # refresh ctx % (the context just grew, and the engine is still alive here — its
+            # teardown for a driver_error/resume-failure happens AFTER this finally — so
+            # _statusline_text's engine.context_percentage() reads the fresh figure). FOREGROUND-
+            # ONLY (``turn_name``) so a background turn's end never stomps the foreground line.
+            # In the finally + fully best-effort (RB1), so it fires on EVERY exit path (clean
+            # end, mid-stream raise, cancel) and can never mask the turn's own exception.
+            await self._maybe_update_statusline(
+                chat_id, send=send, edit=edit, pin=pin, unpin=unpin, for_project=turn_name,
+            )
             # ADR-005 D3: drop any pending-index entries this turn's project left open (an
             # ask/plan/permission the operator never answered — the engine has stopped
             # awaiting it now the stream drained / the turn died, so a late tap on it is a
@@ -4100,6 +4126,51 @@ class StreamingSession:
             rt.status_text = body
 
     # -- the pinned mobile statusline (STATUSLINE T-SL-CORE, design §3.1/§4) --
+
+    async def _maybe_update_statusline(
+        self,
+        chat_id: int,
+        *,
+        send: Optional[SendFn],
+        edit: Optional[EditFn],
+        pin: Optional[PinFn],
+        unpin: Optional[UnpinFn],
+        for_project: Optional[str] = None,
+    ) -> None:
+        """Refresh the pinned statusline IFF this is the chat's FOREGROUND project (T-SL-WIRE).
+
+        ⭐ **The make-or-break wiring invariant (design §3.1).** The pinned line reflects the
+        chat's ACTIVE (foreground) project — the one the operator is watching. A BACKGROUND
+        concurrent turn (a non-active project running under P5 concurrency) must NEVER rewrite
+        the line, or two concurrent turns would stomp each other's state and the single pinned
+        line would stop describing "what you're looking at". So the turn-start / turn-end
+        triggers route through HERE, which:
+
+        * **skips** when ``for_project`` is not the chat's foreground (:meth:`_is_foreground`) —
+          a background turn leaves the foreground line untouched;
+        * **skips** when any closure is missing (a caller/test that didn't inject pin/unpin —
+          back-compat: the statusline simply isn't driven, the turn is unaffected);
+        * otherwise delegates to :meth:`_update_statusline` (itself fully best-effort, RB1).
+
+        ``for_project=None`` means "the caller already knows this is foreground" (the command
+        paths: ``/switch`` + the knob setters always act on the active project), so the
+        foreground gate is bypassed but the closure-presence gate still applies. The whole call
+        is wrapped so a foreground-check / build error can never escape to the turn (RB1) — the
+        statusline is an observer off the turn's critical path.
+        """
+        if send is None or edit is None or pin is None or unpin is None:
+            return  # no closures injected (a test / a caller that didn't wire them) → no-op.
+        try:
+            if for_project is not None and not self._is_foreground(chat_id, for_project):
+                # ⭐ Foreground-only: a BACKGROUND turn never rewrites the foreground line.
+                return
+            await self._update_statusline(
+                chat_id, send=send, edit=edit, pin=pin, unpin=unpin
+            )
+        except Exception:
+            # RB1: a foreground-check / dispatch error must never break the turn (the inner
+            # _update_statusline already swallows its own I/O; this guards the gate itself).
+            log.debug("statusline trigger failed for chat (ignored)", exc_info=True)
 
     def _statusline_text(self, chat_id: int) -> Optional[str]:
         """Build the CURRENT statusline body for ``chat_id``'s foreground project (pure read).

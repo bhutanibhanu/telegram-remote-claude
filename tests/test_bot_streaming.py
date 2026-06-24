@@ -132,13 +132,13 @@ class FakeStreaming:
         self.store = None
 
     async def handle_message(
-        self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
-        command_initiated=False, images=None,
+        self, chat_id, text, *, send, edit, delete=None, pin=None, unpin=None,
+        reply_to_message_id=None, command_initiated=False, images=None,
     ):
         # P5/T9: handle_message gained reply_to_message_id (the D5 reply-to escape hatch);
         # P9 fix: + command_initiated (a macro /run skips free-text capture). P10 T1: + images
-        # (the multimodal photo/screenshot). Record them so the wiring tests can assert they
-        # are threaded through from on_message / cmd_run / on_photo.
+        # (the multimodal photo/screenshot). STATUSLINE T-SL-WIRE: + pin/unpin (the statusline
+        # closures threaded down to _drive_turn). Record what the wiring tests assert.
         self.handle_message_calls.append((chat_id, text, reply_to_message_id))
         self.command_initiated_calls.append(command_initiated)
         self.images_calls.append(images)
@@ -149,12 +149,20 @@ class FakeStreaming:
         # False; the free-text-capture behavior is covered against a REAL session.
         return False
 
-    async def fire_schedule(self, schedule, *, send, edit, delete=None):
-        # P14 T-FIRE: /runnow delegates here (the proactive fire path). Record the schedule so
-        # the wiring test asserts delegation; the deep fire behavior is covered against a REAL
-        # session in test_stream_session.
+    async def fire_schedule(self, schedule, *, send, edit, delete=None, pin=None, unpin=None):
+        # P14 T-FIRE: /runnow delegates here (the proactive fire path). STATUSLINE T-SL-WIRE: +
+        # pin/unpin (accepted so the bot's _make_chat_io 5-tuple threads through). Record the
+        # schedule so the wiring test asserts delegation; deep fire behavior is covered against
+        # a REAL session in test_stream_session.
         self.fire_schedule_calls.append(schedule)
         return True
+
+    async def _maybe_update_statusline(self, chat_id, *, send, edit, pin, unpin, for_project=None):
+        # STATUSLINE T-SL-WIRE: the command-trigger refresh (_refresh_statusline) calls this on
+        # the streaming session after /switch + the knob commands. This stand-in is a no-op (the
+        # statusline pin/edit lifecycle is covered against a REAL session in test_stream_session);
+        # accepting the call keeps the bot's command-handler wiring exercised here without I/O.
+        return None
 
     def resolve_callback(self, chat_id, data):
         self.resolve_calls.append((chat_id, data))
@@ -366,11 +374,13 @@ async def test_streaming_passes_working_delete_closure():
 
     class CapturingStreaming(FakeStreaming):
         async def handle_message(
-            self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
-            command_initiated=False,
+            self, chat_id, text, *, send, edit, delete=None, pin=None, unpin=None,
+            reply_to_message_id=None, command_initiated=False,
         ):
             self.handle_message_calls.append((chat_id, text, reply_to_message_id))
             captured["delete"] = delete
+            captured["pin"] = pin
+            captured["unpin"] = unpin
 
     streaming = CapturingStreaming()
     bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
@@ -3225,8 +3235,8 @@ async def test_free_text_capture_dismisses_chips():
     streaming = FakeStreaming()
 
     async def captured_handle(
-        chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
-        command_initiated=False,
+        chat_id, text, *, send, edit, delete=None, pin=None, unpin=None,
+        reply_to_message_id=None, command_initiated=False,
     ):
         return True  # this message was a free-text capture
 

@@ -74,12 +74,13 @@ class FakeStreaming:
         self.handle_message_calls: list[tuple[int, str]] = []
 
     async def handle_message(
-        self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
-        command_initiated=False,
+        self, chat_id, text, *, send, edit, delete=None, pin=None, unpin=None,
+        reply_to_message_id=None, command_initiated=False,
     ):
         # P5/T9: handle_message gained reply_to_message_id (D5); P9 fix added
-        # command_initiated (a macro /run skips free-text capture). The skill-launch tests
-        # don't exercise either, so we keep recording just (chat_id, text).
+        # command_initiated (a macro /run skips free-text capture); STATUSLINE T-SL-WIRE added
+        # pin/unpin (the statusline closures). The skill-launch tests don't exercise them, so we
+        # keep recording just (chat_id, text).
         self.handle_message_calls.append((chat_id, text))
 
     def reset(self, chat_id):
