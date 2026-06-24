@@ -5817,3 +5817,127 @@ async def test_background_turn_cost_lands_on_captured_project_not_active(tmp_pat
     assert store.get_cost(1, "alpha") == pytest.approx(0.07)
     # … and NOT on the active/foreground project (beta) — the mutation probe.
     assert store.get_cost(1, "beta") == 0.0
+
+
+# ===========================================================================
+# T4 (P9): per-project model routing threaded into the engine the session builds.
+# The default factory bakes the per-project model (override → CLAUDE_MODEL → SDK
+# default) into the substrate's ClaudeAgentOptions(model=…). These build the engine
+# exactly as _ensure_engine does (through the session's OWN bound default factory).
+# ===========================================================================
+
+
+def _make_config_with_model(tmp_path, *, model=None):
+    return Config(
+        bot_token="t",
+        allowed_chat_ids=frozenset({1}),
+        workdir=tmp_path,
+        claude_bin="claude",
+        model=model,
+        timeout_seconds=5,
+        skip_permissions=True,
+        state_file=None,
+        engine_mode="streaming",
+        answer_backstop_seconds=3600,
+        max_concurrent_runs=3,
+        render_chat_send_interval_seconds=0.0,
+        allowed_roots=(),
+        allow_any_path=True,
+    )
+
+
+def test_default_factory_threads_per_project_model_into_substrate(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    store.set_model(1, "alpha", "claude-haiku-4-5")  # a /fast override on alpha
+
+    session = StreamingSession(
+        _make_config_with_model(tmp_path), session_store=store, clock=lambda: 0.0
+    )
+    # The session resolves alpha's override...
+    assert session._resolve_project_model(1, "alpha") == "claude-haiku-4-5"
+    # ...and the engine it builds carries it into the substrate's ClaudeAgentOptions.
+    engine = session._build_engine(str(tmp_path), PermissionPolicy(), "claude-haiku-4-5")
+    assert engine._substrate._model == "claude-haiku-4-5"
+
+
+def test_resolve_project_model_falls_back_to_config_then_none(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+
+    # No override + a configured CLAUDE_MODEL → the configured default wins.
+    session = StreamingSession(
+        _make_config_with_model(tmp_path, model="claude-opus-4-8"),
+        session_store=store,
+        clock=lambda: 0.0,
+    )
+    assert session._resolve_project_model(1, "alpha") == "claude-opus-4-8"
+
+    # No override + no configured model → None (the SDK default; `model` omitted).
+    session2 = StreamingSession(
+        _make_config_with_model(tmp_path, model=None), session_store=store, clock=lambda: 0.0
+    )
+    assert session2._resolve_project_model(1, "alpha") is None
+    assert session2._build_engine(str(tmp_path), PermissionPolicy(), None)._substrate._model is None
+
+
+def test_set_model_persists_on_active_project_and_get_model_reads_it(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    session = StreamingSession(
+        _make_config_with_model(tmp_path, model="claude-opus-4-8"),
+        session_store=store,
+        clock=lambda: 0.0,
+    )
+    # /deep sets the override on the active project + persists.
+    assert session.set_model(1, "claude-opus-4-8") == "claude-opus-4-8"
+    assert store.get_model(1, "alpha") == "claude-opus-4-8"
+    assert session.get_model(1) == "claude-opus-4-8"
+    # /auto clears it → get_model falls back to the configured default.
+    assert session.set_model(1, None) is None
+    assert store.get_model(1, "alpha") is None
+    assert session.get_model(1) == "claude-opus-4-8"  # configured CLAUDE_MODEL
+
+
+def test_set_model_bad_value_is_safe_falls_back(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    session = StreamingSession(
+        _make_config_with_model(tmp_path, model=None), session_store=store, clock=lambda: 0.0
+    )
+    # An empty/whitespace "model" normalizes to a clear (no override) — never an empty id.
+    assert session.set_model(1, "   ") is None
+    assert store.get_model(1, "alpha") is None
+    # The engine then builds with model=None (SDK default), never a broken empty id.
+    assert session._resolve_project_model(1, "alpha") is None
+
+
+def test_injected_factory_never_receives_model_kwarg(tmp_path):
+    # An injected (test) factory keeps the 3-kwarg contract; _build_engine must NOT pass
+    # `model` to it (it would TypeError). The fixed-3-kwarg lambda below would raise on an
+    # unexpected `model=` — its clean return proves the gate (_factory_accepts_model) works.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    store.set_model(1, "alpha", "claude-haiku-4-5")  # override present, but must not be passed
+    sentinel = object()
+    session = StreamingSession(
+        _make_config_with_model(tmp_path),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: sentinel,
+        clock=lambda: 0.0,
+    )
+    assert session._factory_accepts_model is False
+    # Resolves the override, but builds via the 3-kwarg injected factory without it.
+    model = session._resolve_project_model(1, "alpha")
+    assert model == "claude-haiku-4-5"
+    assert session._build_engine(str(tmp_path), PermissionPolicy(), model) is sentinel

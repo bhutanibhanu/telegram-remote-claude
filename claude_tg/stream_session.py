@@ -162,6 +162,7 @@ def _default_engine_factory(
     allowed_roots: tuple[Path, ...] = (),
     allow_any_path: bool = False,
     send_timeout: float = 120.0,
+    model: Optional[str] = None,
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
@@ -187,6 +188,15 @@ def _default_engine_factory(
     bounds APPROVED long-running tool execution, so the live bot passes the GENEROUS
     ``config.stream_message_timeout_seconds`` via ``_bound_factory``; the 120 s default here
     only keeps a bare/legacy call's behavior unchanged.
+
+    **T4 (P9):** ``model`` is the per-project model override threaded into the substrate's
+    ``ClaudeAgentOptions(model=…)`` at session-creation time (``/fast`` → Haiku, ``/deep`` →
+    Opus, ``/auto`` → ``None`` = the SDK/``CLAUDE_MODEL`` default). ``None`` (the default here,
+    and what ``/auto`` resolves to) omits ``model`` entirely so behavior is unchanged when no
+    override is set. The session resolves the per-project model from the store and passes it
+    via ``_bound_factory`` at each ``_ensure_engine`` build, so a ``/fast``/``/deep`` takes
+    effect on the NEXT fresh session for that project (model is a session-creation param,
+    never hot-swapped mid-session).
     """
     engine: Engine
 
@@ -199,6 +209,7 @@ def _default_engine_factory(
         cwd=cwd,
         permission_mode="default",
         decision_callback=decision_callback,
+        model=model,
     )
     engine = Engine(
         substrate,
@@ -567,10 +578,20 @@ class StreamingSession:
         # layer (or a small liveness bound) build a real Engine with those kwargs directly.
         if engine_factory is not None:
             self._engine_factory: EngineFactory = engine_factory
+            # T4 (P9): an INJECTED factory keeps the proven 3-kwarg contract
+            # (cwd/backstop_seconds/permission_policy) — every existing test factory uses
+            # exactly that signature. So _ensure_engine must NOT pass the per-project `model`
+            # to an injected factory (it would TypeError on the unexpected kwarg). Only the
+            # DEFAULT bound factory below accepts (and threads) `model`; this flag gates that.
+            self._factory_accepts_model = False
         else:
 
             def _bound_factory(
-                *, cwd: str, backstop_seconds: float, permission_policy: PermissionPolicy
+                *,
+                cwd: str,
+                backstop_seconds: float,
+                permission_policy: PermissionPolicy,
+                model: Optional[str] = None,
             ) -> Engine:
                 return _default_engine_factory(
                     cwd=cwd,
@@ -579,9 +600,15 @@ class StreamingSession:
                     allowed_roots=config.allowed_roots,
                     allow_any_path=config.allow_any_path,
                     send_timeout=float(config.stream_message_timeout_seconds),
+                    model=model,
                 )
 
             self._engine_factory = _bound_factory
+            # T4 (P9): the default factory accepts the per-project `model` kwarg, so
+            # _ensure_engine passes the resolved override into it. `model` stays OPTIONAL so a
+            # bare 3-kwarg call (the C2/H2 live-factory-wiring tests + the engine-build path
+            # with no override) is unchanged.
+            self._factory_accepts_model = True
         self._clock = clock
         self._min_edit_interval = min_edit_interval
         # P5 / ADR-005 D8 (T8): the per-chat send-rate budget (seconds between any two
@@ -1022,6 +1049,70 @@ class StreamingSession:
         _name, rt = self._active_runtime(chat_id, create_default=False)
         return bool(rt.policy.yolo) if rt is not None else False
 
+    def set_model(self, chat_id: int, model: Optional[str]) -> Optional[str]:
+        """Set (or clear) the ACTIVE project's per-project model override (T4 / P9).
+
+        ``/fast`` → the fast id, ``/deep`` → the deep id, ``/auto`` → ``None`` (clear the
+        override back to ``CLAUDE_MODEL`` / the SDK default). Persisted on the active project
+        via the store (atomic + ``0600``, RB6) so it survives a restart and a store reload;
+        with no store it is a no-op (a single implicit project, no persistence) — returns the
+        requested ``model`` regardless so the bot can confirm. Auto-creates ``default`` if
+        there is no active project (consistent with starting a turn / ``set_yolo``).
+
+        **Applies on the NEXT fresh session, never mid-turn.** The model is a session-creation
+        param (baked into ``ClaudeAgentOptions`` when the engine's client is built). A project
+        with a live engine/session keeps running its current model until that session ends; the
+        new model takes effect when the next fresh session is built (a ``/reset`` or a
+        dead-resume rebuild). We deliberately do NOT hot-swap a live session. Returns the
+        normalized override that was stored (``None`` for ``/auto``).
+        """
+        normalized = model.strip() if isinstance(model, str) and model.strip() else None
+        # Resolve (and if needed auto-create) the active project so /fast before any turn works.
+        name, _rt = self._active_runtime(chat_id, create_default=True)
+        if self.store is not None and name is not None:
+            try:
+                self.store.set_model(chat_id, name, normalized)
+            except Exception:
+                # RB1: never crash the command over a persist failure (e.g. the project was
+                # /rm'd in a race). The override simply isn't recorded; the next turn uses the
+                # default. Mirrors _persist's swallow-and-log discipline.
+                log.exception("failed to persist model override for chat %s", chat_id)
+        return normalized
+
+    def get_model(self, chat_id: int) -> Optional[str]:
+        """The ACTIVE project's effective model id (override, else the configured default).
+
+        Read-only (RB1): never creates a project/runtime. Returns the per-project override if
+        one is set (``/fast``/``/deep``), else the configured ``CLAUDE_MODEL`` (``config.model``),
+        else ``None`` (the SDK default). Used by ``/status`` to show the active model. The
+        per-project override is stored on the active project; with no store / no active project
+        it falls back to the configured default.
+        """
+        if self.store is not None:
+            active = self.store.get_active(chat_id)
+            if active is not None:
+                override = self.store.get_model(chat_id, active)
+                if override:
+                    return override
+        return self.config.model
+
+    def _resolve_project_model(self, chat_id: int, name: str) -> Optional[str]:
+        """The model id to bake into ``name``'s next session (override → CLAUDE_MODEL → None).
+
+        T4 (P9): the per-project override (``/fast``/``/deep``) wins; absent that, the
+        configured ``CLAUDE_MODEL`` (``config.model``); absent that, ``None`` (omit ``model``
+        → the SDK default). Read-only + fail-safe (RB1): a missing store / project / field
+        reads as no override. Called by :meth:`_ensure_engine` for the project it is building.
+        """
+        if self.store is not None:
+            try:
+                override = self.store.get_model(chat_id, name)
+            except Exception:  # RB1: a bad/odd record never wedges the build
+                override = None
+            if override:
+                return override
+        return self.config.model
+
     def active_run_count(self) -> int:
         """The number of turns currently RUNNING across the whole process (T2 /status).
 
@@ -1115,11 +1206,13 @@ class StreamingSession:
                     name,
                     exc_info=True,
                 )
-        engine = self._engine_factory(
-            cwd=rt.cwd,
-            backstop_seconds=float(self.config.answer_backstop_seconds),
-            permission_policy=rt.policy,
-        )
+        # T4 (P9): resolve THIS project's model (override → CLAUDE_MODEL → SDK default) and
+        # bake it into the engine being built. Passed only to the DEFAULT factory (an injected
+        # test factory keeps the 3-kwarg contract — see _factory_accepts_model). The model is
+        # fixed for the life of THIS fresh session (session-creation param); a later
+        # /fast·/deep·/auto takes effect on the next session this project builds.
+        model = self._resolve_project_model(chat_id, name)
+        engine = self._build_engine(rt.cwd, rt.policy, model)
         rt.engine = engine
         resume_id = self._resume_id(chat_id, name)
         resume_failed = False
@@ -1160,12 +1253,10 @@ class StreamingSession:
                 self._persist(chat_id, session_id=None, name=name)
                 # (c) Build a FRESH engine instance (its _client is None, so its start()
                 #     cannot hit the "already started" guard) and adopt it as the runtime
-                #     engine, replacing the failed one.
-                engine = self._engine_factory(
-                    cwd=rt.cwd,
-                    backstop_seconds=float(self.config.answer_backstop_seconds),
-                    permission_policy=rt.policy,
-                )
+                #     engine, replacing the failed one. T4: same per-project model as the
+                #     first build (resolved once above) — the fresh fallback session honors
+                #     the project's /fast·/deep override too.
+                engine = self._build_engine(rt.cwd, rt.policy, model)
                 rt.engine = engine
                 # (d) Start the FRESH engine — a clean fresh session (the dead id is gone).
                 await engine.start()
@@ -1184,6 +1275,30 @@ class StreamingSession:
             await engine.start()
         rt.started = True
         return engine, resume_failed
+
+    def _build_engine(
+        self, cwd: str, policy: PermissionPolicy, model: Optional[str]
+    ) -> Engine:
+        """Call the engine factory, passing the T4 per-project ``model`` only when supported.
+
+        The DEFAULT bound factory accepts an optional ``model`` kwarg (threaded into
+        ``ClaudeAgentOptions``); an INJECTED test factory keeps the proven 3-kwarg contract
+        (``cwd``/``backstop_seconds``/``permission_policy``) and must NOT receive ``model``
+        (it would ``TypeError`` on the unexpected kwarg). ``_factory_accepts_model`` (set in
+        ``__init__``) gates this so every existing test factory keeps working unchanged.
+        """
+        if self._factory_accepts_model:
+            return self._engine_factory(
+                cwd=cwd,
+                backstop_seconds=float(self.config.answer_backstop_seconds),
+                permission_policy=policy,
+                model=model,  # type: ignore[call-arg]  # default factory accepts model (T4)
+            )
+        return self._engine_factory(
+            cwd=cwd,
+            backstop_seconds=float(self.config.answer_backstop_seconds),
+            permission_policy=policy,
+        )
 
     def _resume_id(self, chat_id: int, name: str) -> Optional[str]:
         """The active project's persisted ``session_id`` to resume from, if any."""

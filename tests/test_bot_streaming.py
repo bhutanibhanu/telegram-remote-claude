@@ -83,6 +83,7 @@ class FakeStreaming:
         self.cancel_calls = []
         self.reset_calls = []
         self.yolo_calls = []
+        self.model_calls = []
         self.reply_prompt_calls = []
         self.to_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
@@ -132,6 +133,11 @@ class FakeStreaming:
 
     def set_yolo(self, chat_id, on):
         self.yolo_calls.append((chat_id, on))
+
+    def set_model(self, chat_id, model):
+        # P9/T4: /fast · /deep · /auto set (or clear) the active project's model override.
+        self.model_calls.append((chat_id, model))
+        return model
 
     def get_cwd(self, chat_id):
         # P9/T1: the first-run welcome reads the active cwd via this accessor.
@@ -2386,3 +2392,227 @@ def test_format_uptime():
     assert _format_uptime(3661) == "1h 1m"
     assert _format_uptime(90061) == "1d 1h 1m"
     assert _format_uptime(-5) == "0s"  # RB1: defensive floor
+
+
+# ===========================================================================
+# T4 (P9): /fast · /deep · /auto — per-project model routing commands.
+# ===========================================================================
+
+
+async def test_cmd_fast_sets_fast_model():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/fast")
+    await bot.cmd_fast(upd, make_cmd_ctx())
+    assert streaming.model_calls == [(1, bot.config.fast_model)]
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "fast" in reply and bot.config.fast_model in reply
+
+
+async def test_cmd_deep_sets_deep_model():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/deep")
+    await bot.cmd_deep(upd, make_cmd_ctx())
+    assert streaming.model_calls == [(1, bot.config.deep_model)]
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "deep" in reply and bot.config.deep_model in reply
+
+
+async def test_cmd_auto_clears_model():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/auto")
+    await bot.cmd_auto(upd, make_cmd_ctx())
+    assert streaming.model_calls == [(1, None)]  # cleared
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "default" in reply.lower()
+
+
+async def test_cmd_fast_unauthorized_ignored():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(999, "/fast")
+    await bot.cmd_fast(upd, make_cmd_ctx())
+    assert streaming.model_calls == []  # SB1: dropped
+    upd.message.reply_text.assert_not_awaited()
+
+
+async def test_cmd_fast_oneshot_mode_notice():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/fast")
+    await bot.cmd_fast(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "streaming mode only" in reply
+
+
+async def test_cmd_status_shows_model_override(tmp_path):
+    # T4: the per-project model override surfaces on the /status per-project line.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.set_model(1, "alpha", "claude-haiku-4-5")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "<code>claude-haiku-4-5</code>" in reply
+
+
+async def test_cmd_status_no_model_override_omits_it(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)  # no override
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "claude-haiku-4-5" not in reply and "claude-opus" not in reply
+
+
+# ===========================================================================
+# T5 (P9): macros — /save · /run · /macros · /unsave.
+# ===========================================================================
+
+
+async def test_cmd_save_run_roundtrip_fires_turn(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    # /save deploy build $1 and ship $*
+    await bot.cmd_save(make_update(1, "/save"), make_cmd_ctx(["deploy", "build", "$1", "and", "ship", "$*"]))
+    assert store.get_macro(1, "deploy") == "build $1 and ship $*"
+    # /run deploy app extra1 extra2  → expands $1=app, $*=app extra1 extra2
+    await bot.cmd_run(make_update(1, "/run"), make_cmd_ctx(["deploy", "app", "extra1", "extra2"]))
+    # The expanded text fired as a normal turn through the streaming session.
+    assert streaming.handle_message_calls
+    fired = streaming.handle_message_calls[-1][1]
+    assert fired == "build app and ship app extra1 extra2"
+
+
+async def test_cmd_save_rejects_bad_name_sb4(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.cmd_save(make_update(1, "/save"), make_cmd_ctx(["../etc", "body"]))
+    # Nothing saved; a clean refusal (the focused escape assertion is the next test).
+    assert store.list_macros(1) == {}
+
+
+async def test_cmd_save_bad_name_reply_is_escaped(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/save")
+    await bot.cmd_save(upd, make_cmd_ctx(["<b>x", "body"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "Invalid macro name" in reply
+    assert "<b>x" not in reply or "&lt;b&gt;x" in reply  # the bad name is escaped
+
+
+async def test_cmd_save_usage_when_missing_args(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/save")
+    await bot.cmd_save(upd, make_cmd_ctx(["onlyname"]))  # no body
+    reply = upd.message.reply_text.await_args.args[0]
+    assert reply.startswith("Usage: /save")
+    assert store.list_macros(1) == {}
+
+
+async def test_cmd_macros_lists(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "deploy", "do the deploy thing")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/macros")
+    await bot.cmd_macros(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "<b>deploy</b>" in reply and "do the deploy thing" in reply
+
+
+async def test_cmd_macros_empty(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/macros")
+    await bot.cmd_macros(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "No macros yet" in reply
+
+
+async def test_cmd_unsave_removes(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "deploy", "x")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.cmd_unsave(make_update(1, "/unsave"), make_cmd_ctx(["deploy"]))
+    assert store.get_macro(1, "deploy") is None
+
+
+async def test_cmd_unsave_unknown_is_clean(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/unsave")
+    await bot.cmd_unsave(upd, make_cmd_ctx(["nope"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "No macro named" in reply
+
+
+async def test_cmd_run_unknown_macro_clean(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/run")
+    await bot.cmd_run(upd, make_cmd_ctx(["nope", "arg"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "No macro named" in reply
+    assert streaming.handle_message_calls == []  # nothing fired
+
+
+async def test_cmd_run_usage_when_no_name(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/run")
+    await bot.cmd_run(upd, make_cmd_ctx([]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert reply.startswith("Usage: /run")
+
+
+async def test_macro_commands_unauthorized_ignored(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(999, "/save")
+    await bot.cmd_save(upd, make_cmd_ctx(["m", "body"]))
+    upd.message.reply_text.assert_not_awaited()  # SB1: dropped
+    assert store.list_macros(1) == {}
+
+
+async def test_macros_work_in_oneshot_mode(monkeypatch, tmp_path):
+    # T5: macros work in BOTH engine modes — in one-shot the /run expansion fires through
+    # the runner. Use a real store on the runner.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "greet", "say hi to $1")
+    runner = FakeRunner(ClaudeResult(ok=True, text="done"))
+    runner.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    bot._welcomed.add(1)  # skip the first-run welcome noise
+    await bot.cmd_run(make_update(1, "/run"), make_cmd_ctx(["greet", "alice"]))
+    assert runner.run_calls == [(1, "say hi to alice")]

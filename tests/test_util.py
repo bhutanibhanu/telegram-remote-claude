@@ -106,3 +106,41 @@ def test_redact_sid_in_text_passes_through_non_uuid_and_empty():
     assert _redact_sid_in_text(None) == ""
     assert _redact_sid_in_text("") == ""
 
+
+
+# ---- T5 (P9): macro expansion ($1..$9 positional, $* = all args) -------------
+
+from claude_tg.util import expand_macro  # noqa: E402
+
+
+def test_expand_macro_positional():
+    assert expand_macro("deploy $1 to $2", ["app", "prod"]) == "deploy app to prod"
+
+
+def test_expand_macro_star_is_all_args():
+    assert expand_macro("run $*", ["a", "b", "c"]) == "run a b c"
+
+
+def test_expand_macro_missing_positional_is_empty():
+    # A $n past the supplied args expands to nothing (documented).
+    assert expand_macro("x=$1 y=$2", ["only"]) == "x=only y="
+
+
+def test_expand_macro_no_placeholders_unchanged():
+    assert expand_macro("plain prompt with no vars", ["ignored"]) == "plain prompt with no vars"
+
+
+def test_expand_macro_non_placeholder_dollars_verbatim():
+    # $0, $a, a bare trailing $, and $$ are NOT placeholders — left as-is. ($1..$9 and $*
+    # ARE placeholders regardless of surrounding text, so e.g. "$5.00" would treat $5 as a
+    # positional — only non-1-9/non-* dollars are verbatim.)
+    assert expand_macro("zero=$0 letter=$a end=$ double=$$", []) == "zero=$0 letter=$a end=$ double=$$"
+
+
+def test_expand_macro_digit_placeholder_substitutes_anywhere():
+    # A $5 is positional arg 5 even when glued to other text (documented).
+    assert expand_macro("price $5 here", ["a", "b", "c", "d", "e"]) == "price e here"
+
+
+def test_expand_macro_star_with_no_args_is_empty():
+    assert expand_macro("go $*", []) == "go "

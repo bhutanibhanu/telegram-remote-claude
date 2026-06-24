@@ -410,6 +410,46 @@ class JsonSessionStore:
         self._save_raw(raw)
         return total
 
+    def set_model(self, chat_id: int, name: str, model: str | None) -> None:
+        """Write the per-project model override to the **named** project (case-insensitive).
+
+        T4 (P9): ``/fast`` · ``/deep`` store a model id here; ``/auto`` clears it (``None``)
+        back to the configured default. Like :meth:`set_session_id` this targets a named
+        project (the active project can move mid-turn now ``/switch`` is free) and is
+        atomic + ``0600`` (RB6) via :meth:`_save_raw`. A non-string / empty ``model`` is
+        normalized to ``None`` (a cleared override) so a bad value can never wedge the
+        project on an unusable id (RB1) — the turn falls back to the default. ``last_active``
+        is bumped; the project's fixed ``cwd``/``session_id`` are left untouched (the model
+        applies on the NEXT fresh session — it is a session-creation param). Raises
+        :class:`UnknownProject` if no such project exists. Persists.
+        """
+        normalized = model.strip() if isinstance(model, str) and model.strip() else None
+        raw = self._load_raw()
+        _chat, projects, key = self._resolve(raw, chat_id, name)
+        record = projects[key]
+        if not isinstance(record, dict):
+            raise UnknownProject(name)
+        if normalized is None:
+            record.pop("model", None)
+        else:
+            record["model"] = normalized
+        record["last_active"] = _now()
+        self._save_raw(raw)
+
+    def get_model(self, chat_id: int, name: str) -> str | None:
+        """The named project's per-project model override (case-insensitive), or ``None``.
+
+        Read-only (never raises): an unknown project, a missing ``model`` field, or a
+        non-string/empty stored value all read as ``None`` (RB1) — meaning "no override",
+        so the turn uses the configured ``CLAUDE_MODEL`` / SDK default. Used by the turn
+        path (thread into ``ClaudeAgentOptions`` / oneshot ``--model``) and ``/status``.
+        """
+        record = self.get_project(chat_id, name)
+        if not isinstance(record, dict):
+            return None
+        value = record.get("model")
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
     def get_cost(self, chat_id: int, name: str) -> float:
         """The named project's cumulative cost in USD (case-insensitive), or ``0.0``.
 
@@ -425,6 +465,88 @@ class JsonSessionStore:
             return float(value) if value is not None else 0.0
         except (TypeError, ValueError):
             return 0.0
+
+    # ---- macros (per-chat prompt templates — T5 / P9) ----------------------
+
+    def save_macro(self, chat_id: int, name: str, body: str) -> None:
+        """Store a prompt template ``body`` under ``name`` for the chat (atomic + ``0600``, RB6).
+
+        T5 (P9): ``/save <name> <prompt…>``. Validates ``name`` against the SB4 rule
+        (``^[A-Za-z0-9_-]{1,32}$``) FIRST — raises :class:`InvalidProjectName` on a bad name
+        **before** any write (so ``../``, spaces, > 32 chars, or empty are rejected, never
+        persisted). Macros live on the chat (``chats[<id>]["macros"]``), separate from the
+        project registry, keyed by the as-given name (overwriting an existing macro of the
+        same name). Creates the chat container if absent. ``body`` is the operator-authored
+        template stored verbatim (no escaping/validation — it is fired as a normal turn).
+        Persists.
+        """
+        validate_project_name(name)
+        raw = self._load_raw()
+        chat = self._ensure_chat(raw, chat_id)
+        macros = chat.setdefault("macros", {})
+        if not isinstance(macros, dict):
+            macros = {}
+            chat["macros"] = macros
+        macros[name] = body
+        self._save_raw(raw)
+
+    def get_macro(self, chat_id: int, name: str) -> str | None:
+        """The macro ``body`` stored under ``name`` for the chat, or ``None`` (case-insensitive).
+
+        Read-only (never raises): an unknown chat / macro, a non-dict ``macros`` map, or a
+        non-string stored body all read as ``None`` (RB1). Matched case-insensitively
+        (mirroring the project-name match) so ``/run WORK`` finds a macro saved as ``work``.
+        """
+        chat = self._chat(self._load_raw(), chat_id)
+        if chat is None:
+            return None
+        macros = chat.get("macros")
+        if not isinstance(macros, dict):
+            return None
+        key = _resolve_name(macros, name)
+        if key is None:
+            return None
+        body = macros[key]
+        return body if isinstance(body, str) else None
+
+    def list_macros(self, chat_id: int) -> dict[str, str]:
+        """``{name: body}`` of the chat's macros — empty if the chat has none (T5 ``/macros``).
+
+        Read-only (never raises): a missing chat / non-dict map reads as ``{}``. A shallow copy
+        with only the well-formed (``str`` name → ``str`` body) entries, in insertion order.
+        """
+        chat = self._chat(self._load_raw(), chat_id)
+        if chat is None:
+            return {}
+        macros = chat.get("macros")
+        if not isinstance(macros, dict):
+            return {}
+        return {
+            name: body
+            for name, body in macros.items()
+            if isinstance(name, str) and isinstance(body, str)
+        }
+
+    def remove_macro(self, chat_id: int, name: str) -> bool:
+        """Delete the macro ``name`` (case-insensitive); return whether one was removed (T5).
+
+        ``/unsave <name>``. Never raises (RB1): a missing chat / macro returns ``False`` (a
+        clean "no such macro" the bot reports). Persists only when something was actually
+        removed.
+        """
+        raw = self._load_raw()
+        chat = self._chat(raw, chat_id)
+        if chat is None:
+            return False
+        macros = chat.get("macros")
+        if not isinstance(macros, dict):
+            return False
+        key = _resolve_name(macros, name)
+        if key is None:
+            return False
+        del macros[key]
+        self._save_raw(raw)
+        return True
 
     # ---- registry internals -----------------------------------------------
 

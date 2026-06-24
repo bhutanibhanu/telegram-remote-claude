@@ -83,6 +83,42 @@ async def test_model_flag(monkeypatch):
     assert "--model" in captured["cmd"] and "claude-opus-4-8" in captured["cmd"]
 
 
+async def test_per_project_model_override_wins_over_config_in_oneshot(monkeypatch, tmp_path):
+    # T4 (P9): a /fast·/deep per-project override (stored on the active project) is used as
+    # --model in the oneshot path, winning over the configured CLAUDE_MODEL.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "default", "/tmp", make_active=True)
+    store.set_model(1, "default", "claude-haiku-4-5")
+    runner = ClaudeRunner(make_config(model="claude-opus-4-8"), session_store=store)
+    captured = {}
+
+    async def fake(cmd, stdin, cwd):
+        captured["cmd"] = cmd
+        return 0, ok_json(), ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    await runner.run(1, "x")
+    assert "--model" in captured["cmd"] and "claude-haiku-4-5" in captured["cmd"]
+    assert "claude-opus-4-8" not in captured["cmd"]  # override beat the config default
+
+
+async def test_no_model_override_and_no_config_omits_model_flag(monkeypatch, tmp_path):
+    # No override + no configured model → --model is omitted (CLI default). RB1: a store
+    # with no model field never wedges the turn.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "default", "/tmp", make_active=True)
+    runner = ClaudeRunner(make_config(model=None), session_store=store)
+    captured = {}
+
+    async def fake(cmd, stdin, cwd):
+        captured["cmd"] = cmd
+        return 0, ok_json(), ""
+
+    monkeypatch.setattr(runner, "_invoke", fake)
+    await runner.run(1, "x")
+    assert "--model" not in captured["cmd"]
+
+
 async def test_skip_permissions_false(monkeypatch):
     runner = ClaudeRunner(make_config(skip_permissions=False))
     captured = {}

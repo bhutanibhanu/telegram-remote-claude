@@ -59,6 +59,39 @@ def _redact_sid_in_text(text: Optional[str]) -> str:
     return _UUID_RE.sub(lambda m: _redact_sid(m.group(0)), text)
 
 
+#: T5 (P9) macro placeholders: ``$1``..``$9`` positional, ``$*`` = all args. Matched
+#: longest-first so ``$*`` wins over a would-be ``$`` and a multi-digit ``$12`` is read as
+#: ``$1`` then literal ``2`` (single-digit positionals only — documented). A ``$`` not
+#: followed by a digit or ``*`` is left verbatim.
+_MACRO_PLACEHOLDER_RE = re.compile(r"\$([1-9]|\*)")
+
+
+def expand_macro(body: str, args: list[str]) -> str:
+    """Expand a macro ``body`` with positional ``$1``..``$9`` and ``$*`` (all args). Pure.
+
+    Substitution rule (T5 / P9):
+
+    * ``$1`` … ``$9`` → the 1-indexed positional arg, or the **empty string** when no such
+      arg was given (a leftover ``$n`` past the supplied args expands to nothing — chosen
+      over leaving it literal so a template never fires a stray ``$3`` at the model).
+    * ``$*`` → all args joined by single spaces (the whole argument tail).
+    * Any other ``$`` (``$0``, ``$a``, a trailing ``$``, ``$$``) is left **verbatim** — only
+      ``$1``..``$9`` and ``$*`` are placeholders.
+
+    Side-effect free + injection-neutral: the result is fired as an ordinary turn (the same
+    path a plain message takes), so there is no shell/HTML context here — args are
+    substituted as-is. ``args`` is the operator's whitespace-split argument list.
+    """
+    def _sub(m: "re.Match[str]") -> str:
+        token = m.group(1)
+        if token == "*":
+            return " ".join(args)
+        index = int(token) - 1  # $1 -> args[0]
+        return args[index] if 0 <= index < len(args) else ""
+
+    return _MACRO_PLACEHOLDER_RE.sub(_sub, body)
+
+
 def _utf16_len(text: str) -> int:
     """Length in UTF-16 code units — what Telegram actually counts against 4096.
 
