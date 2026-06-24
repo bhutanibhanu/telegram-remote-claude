@@ -103,6 +103,10 @@ class FakeStreaming:
         self.handle_message_calls.append((chat_id, text, reply_to_message_id))
         if self._busy:
             raise StreamingBusy()
+        # T6/P9: handle_message now returns whether the message was a free-text capture (the
+        # bot dismisses the quick-reply chips on True). This stand-in drives normal turns →
+        # False; the free-text-capture behavior is covered against a REAL session.
+        return False
 
     def resolve_callback(self, chat_id, data):
         self.resolve_calls.append((chat_id, data))
@@ -149,6 +153,10 @@ class FakeStreaming:
 
     def active_run_count(self):
         # P9/T2: /status reports active-vs-cap run counts.
+        return 0
+
+    def queued_waiting(self, chat_id):
+        # P9/T6: /status surfaces the queued-behind-the-cap counter (0 → no suffix).
         return 0
 
     def project_status(self, chat_id, name):
@@ -2616,3 +2624,152 @@ async def test_macros_work_in_oneshot_mode(monkeypatch, tmp_path):
     bot._welcomed.add(1)  # skip the first-run welcome noise
     await bot.cmd_run(make_update(1, "/run"), make_cmd_ctx(["greet", "alice"]))
     assert runner.run_calls == [(1, "say hi to alice")]
+
+
+# ===========================================================================
+# T6 (P9) — notification polish + chips at the BOT boundary.
+#   * [Open <project>] switch tap → on_callback performs the switch (SB1-gated).
+#   * free-text prompt carries the one-time quick-reply chips.
+#   * a free-text capture dismisses the chips (ReplyKeyboardRemove).
+# ===========================================================================
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove  # noqa: E402
+
+from claude_tg.render import encode_switch_callback  # noqa: E402
+
+
+async def test_switch_button_tap_switches_active_project_at_bot(tmp_path):
+    # T6.2: a [Open beta] tap from an AUTHORIZED chat switches the active project (via the
+    # shared /switch helper, with SB2 path revalidation). Uses a REAL StreamingSession + store.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "alpha"), make_active=True)
+    store.create(1, "beta", str(tmp_path / "beta"), make_active=False)
+    (tmp_path / "beta").mkdir()
+    session = StreamingSession(
+        make_config(engine_mode="streaming", allow_any_path=True),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: None,
+    )
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", allow_any_path=True),
+        FakeRunner(), streaming=session,
+    )
+    upd = make_callback_update(chat_id=1, data=encode_switch_callback("beta"))
+    await bot.on_callback(upd, make_ctx())
+    assert store.get_active(1) == "beta", "the switch tap must change the active project"
+    upd.callback_query.answer.assert_awaited()
+    upd.callback_query.message.reply_text.assert_awaited()
+
+
+async def test_switch_button_tap_from_unauthorized_chat_never_switches(tmp_path):
+    # ⭐ SB1 (mutation probe): a [Open beta] tap from a NON-allowlisted chat must NEVER switch.
+    # If on_callback skipped the _authorized recheck for switch taps, the active project would
+    # flip — this guards that the switch is gated exactly like every other callback.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "alpha"), make_active=True)
+    store.create(1, "beta", str(tmp_path / "beta"), make_active=False)
+    (tmp_path / "beta").mkdir()
+    session = StreamingSession(
+        make_config(engine_mode="streaming", allow_any_path=True),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: None,
+    )
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", allow_any_path=True),
+        FakeRunner(), streaming=session,
+    )
+    upd = make_callback_update(chat_id=999, data=encode_switch_callback("beta"))  # NOT allowlisted
+    await bot.on_callback(upd, make_ctx())
+    assert store.get_active(1) == "alpha", "an unauthorized switch tap must NOT change the active project"
+    upd.callback_query.answer.assert_awaited()  # spinner stops
+    # No switch reply was sent (the handler dropped it before resolve_callback).
+    upd.callback_query.message.reply_text.assert_not_awaited()
+
+
+async def test_free_text_prompt_attaches_quick_reply_chips():
+    # T6.4: an "Other"/reject arm prompts for free text WITH the one-time quick-reply chips.
+    streaming = FakeStreaming(
+        outcome=CallbackOutcome(
+            handled=True, note="Type your answer", expects_text=True,
+            project_name="alpha", tool_use_id="tid",
+        )
+    )
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    upd = make_callback_update(chat_id=1, data="o|tid|0")
+    await bot.on_callback(upd, make_ctx())
+    upd.callback_query.message.reply_text.assert_awaited()
+    _args, kwargs = upd.callback_query.message.reply_text.call_args
+    kb = kwargs.get("reply_markup")
+    assert isinstance(kb, ReplyKeyboardMarkup) and kb.one_time_keyboard is True
+    chips = [b.text for row in kb.keyboard for b in row]
+    assert "proceed" in chips
+
+
+async def test_free_text_capture_dismisses_chips():
+    # ⭐ T6.4 (mutation probe — chip dismissal): when a message is consumed as a free-text
+    # capture (handle_message returns True), the bot sends a ReplyKeyboardRemove so the
+    # one-time chips don't linger over the next turn.
+    streaming = FakeStreaming()
+
+    async def captured_handle(chat_id, text, *, send, edit, delete=None, reply_to_message_id=None):
+        return True  # this message was a free-text capture
+
+    streaming.handle_message = captured_handle
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    bot._welcomed.add(1)
+    upd = make_update(1, "proceed")
+    await bot.on_message(upd, make_ctx())
+    # The dismiss message rode a ReplyKeyboardRemove.
+    upd.message.reply_text.assert_awaited()
+    _args, kwargs = upd.message.reply_text.call_args
+    assert isinstance(kwargs.get("reply_markup"), ReplyKeyboardRemove)
+
+
+async def test_normal_turn_does_not_dismiss_chips():
+    # T6.4: a NORMAL turn (handle_message returns False) does NOT send a ReplyKeyboardRemove —
+    # the chips are scoped to a pending free-text prompt, not every message.
+    streaming = FakeStreaming()  # its handle_message returns False
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    bot._welcomed.add(1)
+    upd = make_update(1, "do something new")
+    await bot.on_message(upd, make_ctx())
+    # No dismissal message sent (reply_text not called for the chip-remove path).
+    upd.message.reply_text.assert_not_awaited()
+
+
+async def test_status_runs_line_shows_queued_counter(tmp_path):
+    # T6.3: /status surfaces the queued-behind-the-cap counter on the runs line.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "alpha"), make_active=True)
+    (tmp_path / "alpha").mkdir()
+    session = StreamingSession(
+        make_config(engine_mode="streaming", allow_any_path=True),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: None,
+    )
+    # Park two waiters behind the cap.
+    from claude_tg.stream_session import _ProjectRuntime, _QueuedTurn
+
+    state = session._chat(1)
+    loop = asyncio.get_running_loop()
+    futures = []
+    for _ in range(2):
+        fut = loop.create_future()
+        futures.append(fut)
+        state.run_queue.append(_QueuedTurn(runtime=_ProjectRuntime(cwd="/x"), future=fut))
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", allow_any_path=True),
+        FakeRunner(), streaming=session,
+    )
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_ctx())
+    _args, kwargs = upd.message.reply_text.call_args
+    text = _args[0] if _args else kwargs.get("text", "")
+    assert "(2 more waiting)" in text
+    for fut in futures:
+        fut.cancel()

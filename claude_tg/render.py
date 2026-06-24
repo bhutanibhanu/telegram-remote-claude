@@ -59,7 +59,13 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Final, Literal, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 from .engine.types import (
     AskEvent,
@@ -186,6 +192,17 @@ KIND_PLAN = "p"
 #: taken) so "m|<~49-byte id>|<action>" stays ~53 B under Telegram's 64-byte limit —
 #: a literal "permission|<id>|session" would be ~68 B and fail _check_limit.
 KIND_PERMISSION = "m"
+#: Switch-active-project kind (T6/P9). A single char ('w'; 'a'/'o'/'p'/'m' are taken) so a
+#: "w|<name>|s" tap stays tiny. UNLIKE the four hold kinds (ask/other/plan/permission) it
+#: does NOT route to a held ``tool_use_id`` — it carries the TARGET PROJECT NAME in the
+#: middle field and a fixed 's' payload. The name is SB4-constrained upstream
+#: (``^[A-Za-z0-9_-]{1,32}$`` — session_store._NAME_RE), so it can never contain the ``|``
+#: separator (decode would reject a 4-field split anyway) and "w|<<=32-byte name>|s" is
+#: <= 36 B, well under the 64-byte limit. The tap is a NAVIGATION action (switch the active
+#: project), gated by the bot's SB1 ``_authorized`` recheck like every callback; it touches
+#: no pending hold and never resolves a decision (so it cannot collide with the
+#: permission/ask/plan/other callback_data — distinct kind char + a name, not an id).
+KIND_SWITCH = "w"
 
 PLAN_APPROVE = "a"
 PLAN_REJECT = "r"
@@ -206,6 +223,11 @@ _PERMISSION_ACTIONS: dict[str, Literal["once", "session", "deny"]] = {
 
 _SEP = "|"
 
+#: A stored project name's lexical shape (mirrors ``session_store._NAME_RE``, SB4). Used by
+#: :func:`decode_callback` to reject a forged/over-long switch-callback name at the trust
+#: boundary BEFORE it reaches the store (defense-in-depth — the store also validates).
+_SWITCH_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
 
 @dataclass(frozen=True)
 class Callback:
@@ -224,12 +246,16 @@ class Callback:
     (T5 turns ``permission_action`` into the engine's ``PermissionDecision``).
     """
 
-    kind: Literal["ask", "other", "plan", "permission"]
+    kind: Literal["ask", "other", "plan", "permission", "switch"]
     tool_use_id: str
     question_index: Optional[int] = None
     option_index: Optional[int] = None
     plan_action: Optional[Literal["approve", "reject"]] = None
     permission_action: Optional[Literal["once", "session", "deny"]] = None
+    #: The TARGET project name of a ``switch`` tap (T6/P9) — the project to make active.
+    #: ``None`` for every other kind (which route by ``tool_use_id``); for a ``switch`` the
+    #: ``tool_use_id`` field is unused (set to a sentinel) and this carries the name.
+    switch_to: Optional[str] = None
 
 
 def _check_limit(data: str) -> str:
@@ -243,6 +269,27 @@ def _check_limit(data: str) -> str:
             f"{data.split(_SEP)[1]!r} too long for the compact scheme"
         )
     return data
+
+
+#: Fixed payload char for a ``switch`` callback (the kind alone + the name carry the
+#: meaning; a constant payload keeps the 3-field scheme uniform). 's' for switch.
+SWITCH_PAYLOAD = "s"
+
+
+def encode_switch_callback(name: str) -> str:
+    """Encode a ``[Open <project>]`` switch tap into <=64-byte ``callback_data`` (T6/P9).
+
+    The switch kind does NOT route by ``tool_use_id`` — it carries the TARGET PROJECT NAME
+    in the middle field (``w|<name>|s``). ``name`` is the project's STORED (SB4-validated,
+    ``^[A-Za-z0-9_-]{1,32}$``) name, so it can never contain the ``|`` separator and the
+    whole string is <= 36 B (well under 64). Round-trips with :func:`decode_callback`.
+    Raises ``ValueError`` on an empty name or one that (defensively) contains ``|``.
+    """
+    if not name:
+        raise ValueError("project name is required for a switch callback")
+    if _SEP in name:
+        raise ValueError(f"project name may not contain {_SEP!r}: {name!r}")
+    return _check_limit(f"{KIND_SWITCH}{_SEP}{name}{_SEP}{SWITCH_PAYLOAD}")
 
 
 def encode_callback(
@@ -262,7 +309,8 @@ def encode_callback(
     permission action char (the permission kind needs no indices; its ``tool_use_id``
     alone routes the verdict). Raises ``ValueError`` if the result would exceed 64
     bytes (loud at build time; see the byte-budget note above) or on a missing/invalid
-    id or payload.
+    id or payload. The ``switch`` kind has its own builder
+    (:func:`encode_switch_callback`) — it carries a project NAME, not a ``tool_use_id``.
     """
     if not tool_use_id:
         raise ValueError("tool_use_id is required for callback_data")
@@ -349,6 +397,18 @@ def decode_callback(data: object) -> Optional[Callback]:
         return Callback(
             kind="permission", tool_use_id=tool_use_id, permission_action=action
         )
+    if kind == KIND_SWITCH:
+        # ``w|<name>|s`` — the middle field is the TARGET PROJECT NAME (not a tool id).
+        # Defensive: the payload must be the fixed switch char and the name must look like
+        # a stored SB4 name (^[A-Za-z0-9_-]{1,32}$) — anything else is a forged/stale tap
+        # → ignorable (None). The 3-field split already rejected a ``|`` in the name.
+        if payload != SWITCH_PAYLOAD:
+            return None
+        if not _SWITCH_NAME_RE.match(tool_use_id):
+            return None
+        # The id field is unused for a switch (the name rides ``switch_to``); keep a sentinel
+        # so the dataclass invariant (non-empty ``tool_use_id``) holds.
+        return Callback(kind="switch", tool_use_id="-", switch_to=tool_use_id)
     return None
 
 
@@ -604,6 +664,86 @@ def permission_keyboard(event: PermissionEvent) -> InlineKeyboardMarkup:
     )
 
 
+def open_project_keyboard(name: str) -> InlineKeyboardMarkup:
+    """Build the ``[Open <project>]`` switch button for a background ping (T6/P9).
+
+    A single inline button whose ``callback_data`` is the compact switch encoding
+    (:func:`encode_switch_callback` → ``w|<name>|s``): a tap routes through
+    :func:`decode_callback` → the bot's ``on_callback`` (SB1-gated by the ``_authorized``
+    recheck there) → switch the chat's active project to ``name`` (reusing ``/switch``'s
+    validation). The button *text* shows the (SB4-validated) name for the operator; the
+    *callback_data* carries it compactly. Attached to a background project's needs-attention
+    + done pings so the operator can jump straight to the project from the ping.
+
+    ``name`` must be the project's STORED name (SB4-validated upstream). The label escapes
+    nothing (the button text is plain, not HTML); :func:`encode_switch_callback` enforces the
+    no-``|`` / byte-budget invariants.
+    """
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    text=f"📂 Open {name}",
+                    callback_data=encode_switch_callback(name),
+                )
+            ]
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Smart-reply chips for a free-text prompt (T6/P9) — one-time ReplyKeyboard
+# ---------------------------------------------------------------------------
+#
+# When a turn is awaiting FREE TEXT (the "Other"/reject-feedback capture path) the bot can
+# attach a small ReplyKeyboardMarkup of common quick answers so the usual replies are one
+# tap (Telegram types the chosen text as the operator's next message — the free-text path
+# is unchanged for a typed answer). SCOPE + DISMISS: the keyboard is ONE-TIME
+# (``one_time_keyboard=True`` — Telegram hides it after one use) and the bot ALSO sends an
+# explicit ``ReplyKeyboardRemove`` once the free text is captured / the prompt resolves
+# (:func:`quick_reply_dismiss`), so the chips never linger globally over later turns.
+#
+# SB3: the chips are FIXED, bot-authored phrases (no event body, no tool input) — they
+# reveal nothing about the held request. Pure render objects; no I/O.
+
+#: The fixed quick-reply phrases offered on a free-text prompt (T6/P9). Common operator
+#: answers so the usual replies are one tap; kept short + generic (no project/event context,
+#: SB3). The operator can always ignore them and type anything.
+_QUICK_REPLY_CHIPS: Final[tuple[tuple[str, ...], ...]] = (
+    ("proceed", "keep it minimal"),
+    ("explain first", "use TypeScript"),
+)
+
+
+def quick_reply_keyboard() -> ReplyKeyboardMarkup:
+    """A one-time ``ReplyKeyboardMarkup`` of common quick answers for a free-text prompt.
+
+    Attached to the ``✏️ <name>: reply…`` free-text prompt so the common replies (e.g.
+    "proceed", "keep it minimal", "explain first", "use TypeScript") are one tap — tapping a
+    chip sends that text as the operator's next message, which the free-text capture path
+    resolves exactly as a typed reply (no behavior change for typed input). ``one_time_keyboard``
+    hides the keyboard after one use; the bot also explicitly removes it on capture
+    (:func:`quick_reply_dismiss`) so it is scoped to the pending prompt and never lingers.
+    ``resize_keyboard`` keeps the chips compact; ``selective`` is left off (the chat is the
+    single allowlisted operator). Pure render object; no I/O. SB3: fixed phrases only.
+    """
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(text=chip) for chip in row] for row in _QUICK_REPLY_CHIPS],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
+
+
+def quick_reply_dismiss() -> ReplyKeyboardRemove:
+    """The ``ReplyKeyboardRemove`` the bot sends to dismiss the quick-reply chips (T6/P9).
+
+    Sent once the free text is captured / the prompt resolves so the one-time chip keyboard
+    (:func:`quick_reply_keyboard`) does not linger over later, unrelated turns (the scope +
+    dismiss requirement). Pure render object; no I/O.
+    """
+    return ReplyKeyboardRemove()
+
+
 # ---------------------------------------------------------------------------
 # /yolo loud indicator (D6) — pure render strings; T5/bot decides WHERE to show them
 # ---------------------------------------------------------------------------
@@ -685,7 +825,20 @@ _NOTIFY_ATTENTION_PHRASE: Final[dict[str, str]] = {
 _NOTIFY_ATTENTION_FALLBACK: Final = "needs attention"
 
 
-def notify_attention(name: str, kind: str) -> str:
+def queued_suffix(queued_waiting: int) -> str:
+    """The ``" (N more waiting)"`` queued-counter suffix for a ping (T6/P9), or ``""``.
+
+    ``queued_waiting`` is the count of turns parked behind the concurrency cap (the relay
+    pulls it from the per-chat run queue). When ≥1 the ping (and the ``/status`` runs line)
+    appends ``" (N more waiting)"`` so the operator knows work is backed up; 0 → ``""`` (no
+    dangling tail). Pure string; no I/O — two numbers, never any tool body (SB3).
+    """
+    if queued_waiting <= 0:
+        return ""
+    return f" ({queued_waiting} more waiting)"
+
+
+def notify_attention(name: str, kind: str, *, queued_waiting: int = 0) -> str:
     """Body-free ping for a BACKGROUND project that needs the operator (D4; SB3).
 
     ``kind`` is the held request's :data:`PendingKind` (``"permission"`` / ``"ask"`` /
@@ -697,37 +850,43 @@ def notify_attention(name: str, kind: str) -> str:
     * ``plan``       → ``🔔 <name> — proposes a plan``
 
     An **unknown** kind degrades to ``🔔 <name> — needs attention`` (RB1) rather than
-    raising. Pure string; no I/O. **SB3:** the phrase is constant per kind — no event
-    field (no question text, plan body, or tool input) is ever interpolated, so a ping
-    cannot leak content. ``name`` is an SB4-validated project name (safe to interpolate
-    unescaped); nothing else unvalidated is interpolated.
+    raising. ``queued_waiting`` (T6/P9) appends a ``" (N more waiting)"`` counter when ≥1
+    project is parked behind the concurrency cap (:func:`queued_suffix`). Pure string; no
+    I/O. **SB3:** the phrase is constant per kind — no event field (no question text, plan
+    body, or tool input) is ever interpolated, so a ping cannot leak content. ``name`` is an
+    SB4-validated project name (safe to interpolate unescaped); the only other interpolated
+    value is the bot-derived queue count (a number).
     """
     phrase = _NOTIFY_ATTENTION_PHRASE.get(kind, _NOTIFY_ATTENTION_FALLBACK)
-    return f"{_NOTIFY_ATTENTION_GLYPH} {name} — {phrase}"
+    return f"{_NOTIFY_ATTENTION_GLYPH} {name} — {phrase}{queued_suffix(queued_waiting)}"
 
 
-def notify_done(name: str) -> str:
+def notify_done(name: str, *, queued_waiting: int = 0) -> str:
     """Body-free ping for a BACKGROUND project that finished cleanly (D4; SB3).
 
-    ``✅ <name> — done``. Pure string; no I/O. Carries only the project name + a fixed
-    ``done`` word — never the result text (SB3); the foreground project still renders its
-    full :class:`ResultEvent` inline (T5/T7 decides inline-vs-notify).
+    ``✅ <name> — done``. ``queued_waiting`` (T6/P9) appends a ``" (N more waiting)"`` counter
+    when ≥1 project is parked behind the cap (:func:`queued_suffix`) — a finishing run frees a
+    slot, so the operator sees how many are still backed up. Pure string; no I/O. Carries only
+    the project name + a fixed ``done`` word (+ the numeric queue count) — never the result
+    text (SB3); the foreground project still renders its full :class:`ResultEvent` inline.
     """
-    return f"{_NOTIFY_DONE_GLYPH} {name} — done"
+    return f"{_NOTIFY_DONE_GLYPH} {name} — done{queued_suffix(queued_waiting)}"
 
 
-def notify_error(name: str, short_error: str) -> str:
+def notify_error(name: str, short_error: str, *, queued_waiting: int = 0) -> str:
     """Body-free ping for a BACKGROUND project that errored (D4; SB3).
 
     ``⚠️ <name> — <short_error>``. ``short_error`` is a **short, already-body-free** error
     label the relay supplies — e.g. the engine's :data:`~claude_tg.engine.types.ErrorKind`
     (``tool_error`` / ``turn_error`` / ``driver_error``) — **never** raw tool input or an
     untrimmed dump. This builder neither re-derives nor expands it (SB3); it only prefixes
-    the glyph + the (SB4-validated) name. A blank ``short_error`` degrades to a generic
-    ``error`` so the ping is never an empty tail (RB1). Pure string; no I/O.
+    the glyph + the (SB4-validated) name. ``queued_waiting`` (T6/P9) appends the
+    ``" (N more waiting)"`` counter when ≥1 project is parked behind the cap. A blank
+    ``short_error`` degrades to a generic ``error`` so the ping is never an empty tail (RB1).
+    Pure string; no I/O.
     """
     label = short_error.strip() or "error"
-    return f"{_NOTIFY_ERROR_GLYPH} {name} — {label}"
+    return f"{_NOTIFY_ERROR_GLYPH} {name} — {label}{queued_suffix(queued_waiting)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1682,7 +1841,9 @@ __all__ = [
     "ask_question_keyboard",
     "plan_keyboard",
     "permission_keyboard",
+    "open_project_keyboard",
     "encode_callback",
+    "encode_switch_callback",
     "decode_callback",
     "Callback",
     "answers_from_ask",
@@ -1693,9 +1854,14 @@ __all__ = [
     "KIND_OTHER",
     "KIND_PLAN",
     "KIND_PERMISSION",
+    "KIND_SWITCH",
+    "SWITCH_PAYLOAD",
     "PERMISSION_ONCE",
     "PERMISSION_SESSION",
     "PERMISSION_DENY",
+    # smart-reply chips (T6/P9)
+    "quick_reply_keyboard",
+    "quick_reply_dismiss",
     # one-liners
     "tool_use_line",
     "status_line",
@@ -1706,6 +1872,7 @@ __all__ = [
     "notify_attention",
     "notify_done",
     "notify_error",
+    "queued_suffix",
     # free-text prompt (name-echoed; D5)
     "free_text_prompt",
     # per-project status labels for /projects (D7)

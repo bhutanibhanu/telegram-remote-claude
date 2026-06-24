@@ -31,7 +31,7 @@ from claude_tg.engine.types import (
     ToolUseEvent,
 )
 from claude_tg.permissions import PermissionPolicy
-from claude_tg.render import RenderAction, encode_callback
+from claude_tg.render import RenderAction, encode_callback, encode_switch_callback
 from claude_tg.stream_session import StreamingBusy, StreamingSession, _ProjectRuntime
 
 
@@ -148,8 +148,16 @@ class Recorder:
         self._next_id = 100
         self._fail_html = fail_html
 
-    async def send(self, *, text, reply_markup=None, parse_mode=None) -> int:
-        self.sends.append({"text": text, "reply_markup": reply_markup, "parse_mode": parse_mode})
+    async def send(self, *, text, reply_markup=None, parse_mode=None, **kwargs) -> int:
+        # T6/P9: notification sends pass link_preview_options=LinkPreviewOptions(is_disabled=
+        # True) to suppress link previews; capture it (via **kwargs) so the no-preview tests
+        # can assert it, while ordinary sends (no such kwarg) still record None.
+        self.sends.append({
+            "text": text,
+            "reply_markup": reply_markup,
+            "parse_mode": parse_mode,
+            "link_preview_options": kwargs.get("link_preview_options"),
+        })
         if self._fail_html and parse_mode == "HTML":
             raise RuntimeError("Telegram BadRequest: can't parse entities")
         self._next_id += 1
@@ -4468,8 +4476,13 @@ async def test_background_same_ask_id_reemit_sends_nothing_new(tmp_path):
     assert len(bells) == 1, "a re-emit of the SAME ask id must not send a 2nd bell"
     # Exactly ONE keyboard-bearing question message (one question, one keyboard) — NOT two.
     # This is the load-bearing assertion: the question body/keyboards must be suppressed too,
-    # not just the bell. With the round-1 bug this is 2 (the keyboard loop re-ran).
-    keyboarded = [s for s in rec.sends if s["reply_markup"] is not None]
+    # not just the bell. With the round-1 bug this is 2 (the keyboard loop re-ran). T6/P9: the
+    # bell line itself now carries an [Open <name>] switch button, so count only the QUESTION
+    # keyboards (exclude the bell) — the original intent.
+    keyboarded = [
+        s for s in rec.sends
+        if s["reply_markup"] is not None and s["text"] != "🔔 alpha — asks a question"
+    ]
     assert len(keyboarded) == 1, (
         "a same-id ask re-emit must NOT re-send the question keyboard(s): "
         f"got {len(keyboarded)} keyboard messages {[s['text'] for s in keyboarded]}"
@@ -4502,7 +4515,12 @@ async def test_background_same_multi_question_ask_id_reemit_sends_nothing_new(tm
     await session._notify_background(state, 1, "alpha", ask, "ask", send=rec.send)
 
     bells = [s for s in rec.sends if s["text"] == "🔔 alpha — asks a question"]
-    keyboarded = [s for s in rec.sends if s["reply_markup"] is not None]
+    # T6/P9: the bell carries an [Open <name>] switch button now, so count only QUESTION
+    # keyboards (exclude the bell line).
+    keyboarded = [
+        s for s in rec.sends
+        if s["reply_markup"] is not None and s["text"] != "🔔 alpha — asks a question"
+    ]
     assert len(bells) == 1, "a re-emit of the SAME multi-q ask id must not send a 2nd bell"
     assert len(keyboarded) == 2, (
         "a same-id multi-q ask re-emit must send each question keyboard exactly ONCE: "
@@ -4537,7 +4555,12 @@ async def test_background_distinct_ask_holds_each_send_keyboard(tmp_path):
     await session._notify_background(state, 1, "alpha", ask2, "ask", send=rec.send)
 
     bells = [s for s in rec.sends if s["text"] == "🔔 alpha — asks a question"]
-    keyboarded = [s for s in rec.sends if s["reply_markup"] is not None]
+    # T6/P9: the bell carries an [Open <name>] switch button now, so count only QUESTION
+    # keyboards (exclude the bell line).
+    keyboarded = [
+        s for s in rec.sends
+        if s["reply_markup"] is not None and s["text"] != "🔔 alpha — asks a question"
+    ]
     assert len(bells) == 2, "a 2nd DISTINCT-id ask must NOT be throttle-suppressed (round-1)"
     assert len(keyboarded) == 2, "each distinct-id ask must send its own question keyboard"
     # Each distinct id is independently answerable via the index against alpha's engine.
@@ -5941,3 +5964,241 @@ def test_injected_factory_never_receives_model_kwarg(tmp_path):
     model = session._resolve_project_model(1, "alpha")
     assert model == "claude-haiku-4-5"
     assert session._build_engine(str(tmp_path), PermissionPolicy(), model) is sentinel
+
+
+# ===========================================================================
+# T6 (P9) — notification polish + chips (SESSION level, mock-only).
+#   1. no link previews on background pings
+#   2. [Open <project>] switch button on attention + done pings; SB1-gated switch routing
+#   3. queued counter "(N more waiting)" when projects are parked behind the cap
+#   4. free-text chip dismissal (handle_message returns True for a free-text capture)
+# ===========================================================================
+from telegram import LinkPreviewOptions  # noqa: E402
+
+
+async def test_background_pings_disable_link_preview(tmp_path):
+    # T6.1: a background hold/terminal ping passes link_preview_options(is_disabled=True) so
+    # a path/URL in the (body-free) ping never balloons into a Telegram preview card.
+    session = StreamingSession(
+        make_config(),
+        session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+        clock=lambda: 100.0,
+        chat_send_interval=0.0,
+        sleep=_no_sleep,
+    )
+    state = session._chat(1)
+    rec = Recorder()
+    perm = PermissionEvent(tool_name="Bash", tool_input_summary="Bash(...)", tool_use_id="p1")
+    await session._notify_background(state, 1, "alpha", perm, "permission", send=rec.send)
+    done = ResultEvent(session_id="s", is_error=False, subtype="success")
+    await session._notify_terminal(state, "alpha", done, send=rec.send)
+    err = ErrorEvent(kind_of_error="turn_error", message="x")
+    await session._notify_terminal(state, "alpha", err, send=rec.send)
+    # EVERY notification send disabled the link preview.
+    assert rec.sends, "expected notification sends"
+    for s in rec.sends:
+        lpo = s["link_preview_options"]
+        assert isinstance(lpo, LinkPreviewOptions) and lpo.is_disabled is True, s["text"]
+
+
+async def test_attention_ping_carries_open_project_button(tmp_path):
+    # T6.2: a background "needs attention" ping (permission) carries BOTH the verdict keyboard
+    # AND an [Open <name>] switch button row.
+    session = StreamingSession(
+        make_config(),
+        session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+        clock=lambda: 100.0,
+        chat_send_interval=0.0,
+        sleep=_no_sleep,
+    )
+    state = session._chat(1)
+    rec = Recorder()
+    perm = PermissionEvent(tool_name="Bash", tool_input_summary="Bash(...)", tool_use_id="p1")
+    await session._notify_background(state, 1, "alpha", perm, "permission", send=rec.send)
+    ping = next(s for s in rec.sends if s["text"].startswith("🔔 alpha"))
+    buttons = [b for row in ping["reply_markup"].inline_keyboard for b in row]
+    texts = [b.text for b in buttons]
+    # The three verdict buttons PLUS the [Open alpha] switch row.
+    assert "📂 Open alpha" in texts
+    assert any(t == "✅ Allow once" for t in texts)
+    # The switch button's callback decodes to a switch for alpha.
+    open_btn = next(b for b in buttons if b.text == "📂 Open alpha")
+    assert open_btn.callback_data == encode_switch_callback("alpha")
+
+
+async def test_done_ping_carries_open_project_button(tmp_path):
+    # T6.2: a background "done" ping carries the [Open <name>] switch button (jump to project).
+    session = StreamingSession(
+        make_config(),
+        session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+        clock=lambda: 100.0,
+        chat_send_interval=0.0,
+        sleep=_no_sleep,
+    )
+    state = session._chat(1)
+    rec = Recorder()
+    done = ResultEvent(session_id="s", is_error=False, subtype="success")
+    await session._notify_terminal(state, "alpha", done, send=rec.send)
+    ping = next(s for s in rec.sends if s["text"].startswith("✅ alpha"))
+    buttons = [b for row in ping["reply_markup"].inline_keyboard for b in row]
+    assert [b.text for b in buttons] == ["📂 Open alpha"]
+    assert buttons[0].callback_data == encode_switch_callback("alpha")
+
+
+async def test_error_ping_has_no_open_button_per_t6_scope(tmp_path):
+    # T6.2 scope: the switch button is on attention + done; an ERROR ping carries none.
+    session = StreamingSession(
+        make_config(),
+        session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+        clock=lambda: 100.0,
+        chat_send_interval=0.0,
+        sleep=_no_sleep,
+    )
+    state = session._chat(1)
+    rec = Recorder()
+    err = ErrorEvent(kind_of_error="tool_error", message="x")
+    await session._notify_terminal(state, "alpha", err, send=rec.send)
+    ping = next(s for s in rec.sends if s["text"].startswith("⚠️ alpha"))
+    assert ping["reply_markup"] is None
+
+
+async def test_switch_button_tap_switches_active_project(tmp_path):
+    # T6.2: tapping [Open <name>] routes a switch outcome carrying the target name. The session
+    # does NOT mutate the store (the bot's /switch helper does the SB2 path revalidation +
+    # write) — it decodes + returns the name.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    session = StreamingSession(
+        make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+    )
+    out = session.resolve_callback(1, encode_switch_callback("beta"))
+    assert out.handled is True
+    assert out.switch_to == "beta"
+    # The session itself does not switch (no SB2 path check available here) — that is the bot.
+    assert store.get_active(1) == "alpha"
+
+
+async def test_switch_button_tap_no_store_is_benign_noop(tmp_path):
+    # RB1: a switch tap with no registry is a benign no-op (nothing to switch within).
+    session = StreamingSession(
+        make_config(),
+        session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+    )
+    out = session.resolve_callback(1, encode_switch_callback("beta"))
+    assert out.handled is False
+    assert out.switch_to is None
+
+
+async def test_switch_button_forged_callback_resolves_nothing(tmp_path):
+    # MUTATION PROBE / SB1 defense-in-depth: a FORGED switch callback (non-SB4 name) decodes
+    # to None → resolve_callback handles nothing and switches nothing.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session = StreamingSession(
+        make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+    )
+    out = session.resolve_callback(1, "w|bad name|s")  # space → decode None
+    assert out.handled is False
+    assert out.switch_to is None
+    assert store.get_active(1) == "alpha"
+
+
+async def test_queued_counter_in_pings_when_projects_queued(tmp_path):
+    # T6.3: with N projects parked behind the cap, the ping shows "(N more waiting)". Build the
+    # queue state directly (a real waiter future) and assert the counter rides the ping.
+    session = StreamingSession(
+        make_config(),
+        session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+        clock=lambda: 100.0,
+        chat_send_interval=0.0,
+        sleep=_no_sleep,
+    )
+    state = session._chat(1)
+    # Two parked (not-done) waiters → "(2 more waiting)".
+    from claude_tg.stream_session import _QueuedTurn
+
+    loop = asyncio.get_running_loop()
+    for _ in range(2):
+        rt = _ProjectRuntime(cwd="/x")
+        state.run_queue.append(_QueuedTurn(runtime=rt, future=loop.create_future()))
+    assert session.queued_waiting(1) == 2
+    rec = Recorder()
+    done = ResultEvent(session_id="s", is_error=False, subtype="success")
+    await session._notify_terminal(state, "alpha", done, send=rec.send)
+    ping = next(s for s in rec.sends if s["text"].startswith("✅ alpha"))
+    assert ping["text"] == "✅ alpha — done (2 more waiting)"
+    # Clean up the futures so the loop has no pending tasks at teardown.
+    for q in state.run_queue:
+        q.future.cancel()
+
+
+async def test_queued_counter_excludes_done_waiters(tmp_path):
+    # T6.3: a transferred/drained waiter (done future) is NOT counted — only live parked turns.
+    session = StreamingSession(
+        make_config(), session_store=None,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: FakeEngine([]),
+        clock=lambda: 100.0, chat_send_interval=0.0, sleep=_no_sleep,
+    )
+    state = session._chat(1)
+    from claude_tg.stream_session import _QueuedTurn
+
+    loop = asyncio.get_running_loop()
+    live = loop.create_future()
+    done_fut = loop.create_future()
+    done_fut.set_result(None)  # already transferred → excluded
+    state.run_queue.append(_QueuedTurn(runtime=_ProjectRuntime(cwd="/x"), future=live))
+    state.run_queue.append(_QueuedTurn(runtime=_ProjectRuntime(cwd="/y"), future=done_fut))
+    assert session.queued_waiting(1) == 1
+    live.cancel()
+
+
+async def test_free_text_capture_returns_true_for_chip_dismissal(tmp_path):
+    # T6.4: handle_message returns True when the message is a free-text capture (so the bot
+    # dismisses the one-time chips), and False for a normal new turn.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    eng = FakeEngine([], session_id="alpha-sid")
+    session = StreamingSession(
+        make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng,
+        clock=lambda: 0.0,
+    )
+    # Arm free-text capture on alpha (as an "Other"/reject tap would).
+    state = session._chat(1)
+    rt = session._runtime(1, "alpha", "/work/alpha")
+    rt.engine = eng
+    rt.started = True
+    ask = AskEvent(
+        questions=[{"question": "Q?", "options": [{"label": "A"}]}],
+        tool_use_id="a-other", session_id="alpha-sid",
+    )
+    session._register_pending(state, "alpha", ask)
+    rt.awaiting_text_for = "a-other"
+    rt.awaiting_text_mode = "ask_other"
+    rt.awaiting_text_question_index = 0
+    rt.awaiting_text_armed_at = session._next_armed_seq(state)
+    rec = Recorder()
+    captured = await session.handle_message(
+        1, "my free text answer", send=rec.send, edit=rec.edit, delete=rec.delete
+    )
+    assert captured is True, "a free-text capture must return True so the bot dismisses chips"
+    # The free text was routed to the engine as the answer (not a new turn).
+    assert eng.resolve_calls and eng.resolve_calls[-1][0] == "a-other"

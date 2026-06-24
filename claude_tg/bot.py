@@ -27,6 +27,8 @@ from .render import (
     code_path,
     free_text_prompt,
     project_status_label,
+    quick_reply_dismiss,
+    quick_reply_keyboard,
     yolo_banner,
 )
 from .session_store import (
@@ -232,7 +234,11 @@ class TelegramClaudeBot:
             lines.append(f"Permission gate: {gate}")
             active_runs = self.streaming.active_run_count()
             cap = self.config.max_concurrent_runs
-            lines.append(f"Runs: {active_runs} active / {cap} max concurrent")
+            # T6/P9: surface the queued counter alongside the active/cap runs so the operator
+            # sees work backed up behind the cap (read-only; 0 → no suffix).
+            queued = self.streaming.queued_waiting(chat_id)
+            queued_suffix = f" ({queued} more waiting)" if queued > 0 else ""
+            lines.append(f"Runs: {active_runs} active / {cap} max concurrent{queued_suffix}")
             projects = self.streaming.store.list_projects(chat_id) if self.streaming.store else {}
             active = self.streaming.store.get_active(chat_id) if self.streaming.store else None
             if projects:
@@ -607,14 +613,31 @@ class TelegramClaudeBot:
         if not name:
             await update.message.reply_text("Usage: /switch <name>")
             return
+        reply, parse_mode = self._switch_active(chat_id, name)
+        await update.message.reply_text(reply, parse_mode=parse_mode)
+
+    def _switch_active(self, chat_id: int, name: str) -> tuple[str, str | None]:
+        """Switch the chat's active project to ``name``; return ``(reply, parse_mode)`` (T6/P9).
+
+        The shared core of ``/switch`` (the typed command) AND the ``[Open <project>]`` ping
+        button (``on_callback``) — extracted so both go through the SAME SB2 path
+        re-validation + store write (no divergence). ``name`` is the requested target
+        (case-insensitive, like the store):
+
+        * no store → "no projects" notice (RB1 — never deref a None store);
+        * unknown name → an error listing the available names (escaped, R6);
+        * SB2/B2: the TARGET project's stored cwd is re-validated against the permitted roots
+          BEFORE activating — a missing/empty or out-of-root cwd is refused and the active
+          project is left UNCHANGED (``store.switch`` never called);
+        * success → ``store.switch`` + a confirmation.
+
+        Returns the operator-facing reply + its ``parse_mode`` (``"HTML"`` for the
+        escaped-name error, ``None`` for the plain confirmations) so the caller just sends it.
+        Pure of Telegram I/O (the caller sends) so the button + command paths share it.
+        """
+        assert self.streaming is not None
         if self.streaming.store is None:
-            # No STATE_FILE configured → no registry to switch within. RB1: never crash on
-            # a streaming + no-persistence deployment (store is None). Mirror the empty
-            # /projects notice rather than dereferencing a None store.
-            await update.message.reply_text(
-                "No projects yet. Create one with /new <name> <path>."
-            )
-            return
+            return ("No projects yet. Create one with /new <name> <path>.", None)
         # Resolve the target record FIRST (case-insensitive). Unknown name → error listing
         # the available names (replaces the old try/except UnknownProject).
         record = self.streaming.store.get_project(chat_id, name)
@@ -630,12 +653,11 @@ class TelegramClaudeBot:
                 )
                 or "(none)"
             )
-            await update.message.reply_text(
+            return (
                 f"❌ No project named <b>{html.escape(name, quote=False)}</b>. "
                 f"Available: {available}",
-                parse_mode="HTML",
+                "HTML",
             )
-            return
         # SB2/B2: re-validate the TARGET project's stored cwd against the permitted roots
         # BEFORE activating (the design says re-validate "on switch/resume"; the resume
         # path is the authoritative gate, this closes the switch-time gap + improves UX).
@@ -643,10 +665,10 @@ class TelegramClaudeBot:
         # active project is left UNCHANGED (store.switch is never called) on any refusal.
         cwd = record.get("cwd")
         if not cwd:
-            await update.message.reply_text(
-                f"❌ {name} has no recorded directory — re-create it with /new <name> <path>."
+            return (
+                f"❌ {name} has no recorded directory — re-create it with /new <name> <path>.",
+                None,
             )
-            return
         try:
             resolve_within_roots(
                 cwd,
@@ -655,14 +677,15 @@ class TelegramClaudeBot:
                 allow_any=self.config.allow_any_path,
             )
         except PathNotAllowed:
-            await update.message.reply_text(
+            return (
                 f"❌ {name}'s directory is no longer within the permitted roots — "
-                "not switching. Use /new <name> <path> to point it somewhere allowed."
+                "not switching. Use /new <name> <path> to point it somewhere allowed.",
+                None,
             )
-            return
         self.streaming.store.switch(chat_id, name)
-        await update.message.reply_text(
-            f"✅ Switched to {name} — your next message resumes that project."
+        return (
+            f"✅ Switched to {name} — your next message resumes that project.",
+            None,
         )
 
     async def cmd_rm(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1173,9 +1196,19 @@ class TelegramClaudeBot:
         assert self.streaming is not None
         bot = ctx.bot
 
-        async def send(*, text: str, reply_markup=None, parse_mode=None) -> int | None:
+        async def send(
+            *, text: str, reply_markup=None, parse_mode=None, link_preview_options=None
+        ) -> int | None:
+            # T6/P9: ``link_preview_options`` (a telegram.LinkPreviewOptions) is set by the
+            # session's notification sends to suppress link previews so a path/URL in a ping
+            # does not balloon into a preview card; it is None (Telegram default) for ordinary
+            # sends. Forwarded straight to Bot.send_message (PTB 21.x API).
             msg = await bot.send_message(
-                chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                link_preview_options=link_preview_options,
             )
             return getattr(msg, "message_id", None)
 
@@ -1190,7 +1223,7 @@ class TelegramClaudeBot:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
 
         try:
-            await self.streaming.handle_message(
+            captured_free_text = await self.streaming.handle_message(
                 chat_id, text, send=send, edit=edit, delete=delete,
                 reply_to_message_id=reply_to_message_id,
             )
@@ -1199,6 +1232,17 @@ class TelegramClaudeBot:
                 "⏳ Still working on your previous message — it'll reply when done. "
                 "Send one message at a time."
             )
+            return
+        # T6/P9: the message was consumed as a free-text capture (a reply to an "Other"/reject
+        # prompt) → dismiss the one-time quick-reply chips so they don't linger over the next,
+        # unrelated turn. Best-effort (RB1): a failed remove must never break the turn — the
+        # chips are one_time_keyboard anyway, so this is the belt-and-braces scope guard. The
+        # remove rides its own minimal message (Telegram has no standalone "remove keyboard").
+        if captured_free_text:
+            try:
+                await update.message.reply_text("✓", reply_markup=quick_reply_dismiss())
+            except Exception:
+                log.debug("quick-reply chip dismissal failed", exc_info=True)
 
     async def on_callback(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Inline-keyboard tap handler — **the SB1 security boundary**.
@@ -1239,19 +1283,41 @@ class TelegramClaudeBot:
             log.exception("error routing callback for chat %s", chat.id if chat else "?")
             await self._answer_callback(query)
             return
+        # T6/P9: a [Open <project>] switch tap routes by project name. The session decoded +
+        # validated the name and returned it on ``switch_to``; the bot performs the actual
+        # switch through the SHARED /switch helper (the SB2 path re-validation the session
+        # can't do). SB1 is already enforced above (the _authorized recheck), so a
+        # non-allowlisted tap never reaches here — it is answered + dropped, switching
+        # nothing. We answer the query (stop the spinner), perform the switch, and reply the
+        # result; nothing else (no free-text arm) applies to a switch.
+        if outcome.switch_to:
+            await self._answer_callback(query, outcome.note if outcome.handled else None)
+            reply, parse_mode = self._switch_active(chat.id, outcome.switch_to)
+            try:
+                await query.message.reply_text(reply, parse_mode=parse_mode)
+            except Exception:
+                log.debug("switch-button reply send failed", exc_info=True)
+            return
         await self._answer_callback(query, outcome.note if outcome.handled else None)
         if outcome.expects_text:
             # D5: name-echo the free-text prompt so the operator knows which project the
             # next message resolves; capture the prompt's message_id -> tool_use_id so a
             # reply-to it routes by id (the reply-to escape hatch). A missing project_name
             # (defensive) falls back to the plain toast note so the prompt is never empty.
+            # T6/P9: attach the one-time quick-reply chips (ReplyKeyboardMarkup) so common
+            # answers ("proceed", "keep it minimal", …) are one tap; they type the operator's
+            # next message and the free-text path resolves it as usual. The chips are
+            # one_time_keyboard AND explicitly removed once the free text is captured (see
+            # _on_message_streaming), so they stay scoped to THIS prompt.
             prompt = (
                 free_text_prompt(outcome.project_name)
                 if outcome.project_name
                 else f"✏️ {outcome.note}…"
             )
             try:
-                sent = await query.message.reply_text(prompt)
+                sent = await query.message.reply_text(
+                    prompt, reply_markup=quick_reply_keyboard()
+                )
             except Exception:
                 sent = None
             self.streaming.register_reply_prompt(

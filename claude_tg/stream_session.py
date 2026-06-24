@@ -67,6 +67,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional, Protocol
 
+from telegram import InlineKeyboardMarkup, LinkPreviewOptions
+
 from .claude_runner import ClaudeResult, ClaudeRunner
 from .config import Config
 from .engine import (
@@ -102,6 +104,7 @@ from .render import (
     notify_attention,
     notify_done,
     notify_error,
+    open_project_keyboard,
     permission_keyboard,
     plan_keyboard,
     strip_telegram_html,
@@ -663,7 +666,13 @@ class StreamingSession:
         return state.send_gate
 
     async def _gated_send(
-        self, state: _ChatState, send: SendFn, *, verbatim: bool, **kwargs
+        self,
+        state: _ChatState,
+        send: SendFn,
+        *,
+        verbatim: bool,
+        disable_link_preview: bool = False,
+        **kwargs,
     ) -> Optional[int]:
         """Send through the per-chat gate: reserve a slot, await the wait, then send (D8).
 
@@ -672,10 +681,20 @@ class StreamingSession:
         coalesced status churn — D8), awaits the gate's computed wait via the injected
         ``self._sleep`` (the gate decides timing; the session does the awaiting — the
         Coalescer pattern), then performs the real ``send``. Returns the sent message id.
+
+        **T6/P9 — no link previews on notifications.** ``disable_link_preview=True`` threads a
+        :class:`~telegram.LinkPreviewOptions` ``is_disabled=True`` into the send so a path /
+        URL in a background ping does not balloon into a Telegram preview card. It is passed
+        as a kwarg the bot's ``send`` closure forwards to ``Bot.send_message``
+        (``link_preview_options`` is the PTB 21.x API; the deprecated
+        ``disable_web_page_preview`` is avoided). Only the notification sends set it; ordinary
+        verbatim/status sends leave Telegram's default preview behavior unchanged.
         """
         wait = self._gate(state).reserve(verbatim=verbatim)
         if wait > 0:
             await self._sleep(wait)
+        if disable_link_preview:
+            kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
         return await send(**kwargs)
 
     async def _gated_edit(
@@ -714,6 +733,31 @@ class StreamingSession:
         if active is None:
             return True  # nothing active yet → treat the turn's project as foreground.
         return isinstance(active, str) and active.casefold() == name.casefold()
+
+    # -- queued counter for notifications + /status (T6/P9) -----------------
+
+    def _queued_waiting(self, state: _ChatState) -> int:
+        """The number of turns parked behind the cap in THIS chat's run queue (T6/P9).
+
+        Pulled straight from the per-chat FIFO :attr:`~_ChatState.run_queue` (D6): the count
+        of still-pending waiters (a drained/transferred entry has a done future, so it is
+        excluded). The notification builders append a ``" (N more waiting)"`` counter when
+        this is ≥1 so the operator knows work is backed up; 0 → no suffix. Read-only / pure
+        (never mutates the queue, never raises) so it is safe to call on any send path. The
+        counter is per-chat (the queue is per-chat — D6); the global RUNNING count is
+        :meth:`active_run_count`.
+        """
+        return sum(1 for q in state.run_queue if not q.future.done())
+
+    def queued_waiting(self, chat_id: int) -> int:
+        """Public read-only view of :meth:`_queued_waiting` for a chat (T6/P9; ``/status``).
+
+        Returns 0 for a chat with no state yet (RB1 — never creates anything). The bot's
+        ``/status`` runs line uses this to show ``" (N more waiting)"`` alongside the
+        ``N active / M max`` counts.
+        """
+        state = self._chats.get(chat_id)
+        return self._queued_waiting(state) if state is not None else 0
 
     # -- proactive notifications for a BACKGROUND project (ADR-005 D4) -------
 
@@ -771,6 +815,26 @@ class StreamingSession:
             return plan_keyboard(event)
         return None
 
+    @staticmethod
+    def _with_open_button(name: str, base: Optional[InlineKeyboardMarkup]):
+        """Append an ``[Open <name>]`` switch row to ``base`` (or build it standalone — T6/P9).
+
+        A background needs-attention ping carries a ``📂 Open <name>`` switch button
+        (:func:`~claude_tg.render.open_project_keyboard`) so the operator can jump to the
+        project from the ping. When the ping also carries the hold's verdict/approve keyboard
+        (permission/plan ``base``), the switch button is appended as an EXTRA ROW beneath it
+        (one inline keyboard per message — the two can't be separate keyboards). When there is
+        no base keyboard (the ask bell line), the switch button stands alone. The switch tap's
+        ``callback_data`` (``w|<name>|s``) is a distinct kind, so it never collides with the
+        hold rows' ask/plan/permission ``callback_data`` on the same keyboard.
+        """
+        open_kb = open_project_keyboard(name)
+        if base is None:
+            return open_kb
+        return InlineKeyboardMarkup(
+            list(base.inline_keyboard) + list(open_kb.inline_keyboard)
+        )
+
     async def _notify_background(
         self,
         state: _ChatState,
@@ -803,11 +867,15 @@ class StreamingSession:
             state, name, kind, dedup_id=getattr(event, "tool_use_id", None)
         ):
             return
+        # T6/P9: the ping carries the hold's verdict/approve keyboard PLUS an [Open <name>]
+        # switch row (the operator can act on the hold OR jump to the project), a queued
+        # counter, and no link preview (a path/URL must not balloon into a card).
         await self._gated_send(
             state, send, verbatim=True,
-            text=notify_attention(name, kind),
-            reply_markup=self._keyboard_for(event),
+            text=notify_attention(name, kind, queued_waiting=self._queued_waiting(state)),
+            reply_markup=self._with_open_button(name, self._keyboard_for(event)),
             parse_mode=None,
+            disable_link_preview=True,
         )
 
     async def _notify_background_ask(
@@ -849,11 +917,15 @@ class StreamingSession:
             state, name, "ask", dedup_id=getattr(ask, "tool_use_id", None)
         ):
             return
+        # T6/P9: the bell line carries the [Open <name>] switch button (the per-question
+        # keyboards below carry the option taps, so the switch button rides the bell), the
+        # queued counter, and no link preview.
         await self._gated_send(
             state, send, verbatim=True,
-            text=notify_attention(name, "ask"),
-            reply_markup=None,
+            text=notify_attention(name, "ask", queued_waiting=self._queued_waiting(state)),
+            reply_markup=open_project_keyboard(name),
             parse_mode=None,
+            disable_link_preview=True,
         )
         for q_idx in range(len(ask.questions)):
             keyboard = ask_question_keyboard(ask, q_idx)
@@ -863,6 +935,7 @@ class StreamingSession:
                     text=ask_question_body_html(ask, q_idx),
                     reply_markup=keyboard,
                     parse_mode="HTML",
+                    disable_link_preview=True,
                 )
             except Exception:
                 await self._gated_send(
@@ -870,6 +943,7 @@ class StreamingSession:
                     text=ask_question_body(ask, q_idx),
                     reply_markup=keyboard,
                     parse_mode=None,
+                    disable_link_preview=True,
                 )
 
     async def _notify_terminal(
@@ -894,11 +968,16 @@ class StreamingSession:
             if not self._should_notify(state, name, "error"):
                 return
             # SB3 (T3-review SB3 check): the body-free ErrorKind, NEVER event.message.
+            # T6/P9: queued counter + no link preview (the error ping carries no switch button
+            # per the T6 scope — that is on the attention + done pings).
             await self._gated_send(
                 state, send, verbatim=True,
-                text=notify_error(name, event.kind_of_error),
+                text=notify_error(
+                    name, event.kind_of_error, queued_waiting=self._queued_waiting(state)
+                ),
                 reply_markup=None,
                 parse_mode=None,
+                disable_link_preview=True,
             )
             return
         if isinstance(event, ResultEvent):
@@ -910,18 +989,25 @@ class StreamingSession:
                     return
                 await self._gated_send(
                     state, send, verbatim=True,
-                    text=notify_error(name, "turn_error"),
+                    text=notify_error(
+                        name, "turn_error", queued_waiting=self._queued_waiting(state)
+                    ),
                     reply_markup=None,
                     parse_mode=None,
+                    disable_link_preview=True,
                 )
                 return
             if not self._should_notify(state, name, "done"):
                 return
+            # T6/P9: the done ping carries the [Open <name>] switch button (jump to the
+            # finished project), a queued counter (a freed slot may unblock waiters), and no
+            # link preview.
             await self._gated_send(
                 state, send, verbatim=True,
-                text=notify_done(name),
-                reply_markup=None,
+                text=notify_done(name, queued_waiting=self._queued_waiting(state)),
+                reply_markup=open_project_keyboard(name),
                 parse_mode=None,
+                disable_link_preview=True,
             )
 
     # -- active-project resolution (the store is the source of truth) --------
@@ -1598,7 +1684,7 @@ class StreamingSession:
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
         reply_to_message_id: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         """Drive ONE operator turn (or capture a free-text answer) for ``chat_id``.
 
         Free-text capture takes precedence: if any project is awaiting an "Other" answer /
@@ -1606,6 +1692,13 @@ class StreamingSession:
         and the held turn — still inside ``engine.send`` — continues. Otherwise it opens
         a new turn via ``engine.send`` and renders the event stream against the **active
         project's** engine (auto-creating ``default`` on the first turn — ADR-004 D6).
+
+        **Returns** ``True`` iff this message was CONSUMED as a free-text capture (a reply to
+        an "Other"/reject prompt — whether or not its target was still live), ``False`` for a
+        normal new turn. T6/P9: the bot uses this to dismiss the one-time quick-reply chips
+        (``ReplyKeyboardRemove``) once the free-text prompt is answered, so the chips don't
+        linger over the next, unrelated turn. Existing callers that ignore the return value
+        are unaffected (Python discards it).
 
         **Free-text routing under concurrency (P5 / ADR-005 D5; T9).** Several projects can
         be awaiting free text at once, so the target is chosen by this precedence (in one
@@ -1667,7 +1760,9 @@ class StreamingSession:
             # else: a free-text reply whose target is gone/ambiguous — no-op (never a
             # misroute, never silently a new turn). The marker (if any) was already cleared
             # by _resolve_free_text on a prior attempt; nothing else to do.
-            return
+            # T6/P9: a free-text reply was consumed (resolved or a stale no-op) — return True
+            # so the bot dismisses the one-time quick-reply chips it attached to the prompt.
+            return True
 
         # P5 / ADR-005 D1 (T5): lock the TARGET project — the active project at message
         # time — NOT the chat. Resolving it (create_default=True) auto-creates `default` on
@@ -1741,7 +1836,7 @@ class StreamingSession:
                 # This is the net invariant: a control command in the transfer window → the turn
                 # NEVER starts; _running returns to 0; no session is persisted.
                 if target_rt.abort.is_set():
-                    return
+                    return False
                 # While this turn was parked in the queue, another message to the SAME project
                 # could have started running it (its lock would now be held). Re-check after the
                 # slot is granted so the per-project one-run invariant holds even across a queue
@@ -1758,7 +1853,7 @@ class StreamingSession:
                     # pre-run await boundary; once _drive_turn starts streaming, a live engine
                     # exists and the command's engine.cancel() unblocks it instead.
                     if target_rt.abort.is_set():
-                        return
+                        return False
                     try:
                         engine, resume_failed = await self._ensure_engine(
                             chat_id, target=target
@@ -1787,7 +1882,7 @@ class StreamingSession:
                             reply_markup=None,
                             parse_mode="HTML",
                         )
-                        return
+                        return False
                     if resume_failed:
                         # RB3: the persisted session could not be resumed; a fresh one was
                         # started. Tell the operator BEFORE driving the turn (it still completes).
@@ -1820,6 +1915,11 @@ class StreamingSession:
             # Pure attribute write — never awaits, never raises — so it can't mask the turn's
             # own exception. After this, the next same-project message is accepted again.
             target_rt.inflight = False
+        # T6/P9: the normal-turn path was taken (not a free-text capture) → False, so the bot
+        # leaves any quick-reply chips alone (they belong to a pending free-text prompt, not a
+        # new turn). Reached only on the clean end of a driven turn; the early returns above
+        # (abort, SB2 refusal) also return False (all non-free-text).
+        return False
 
     # -- the run scheduler: cap + per-chat FIFO queue (ADR-005 D6 / T6) -------
 
@@ -2570,6 +2670,14 @@ class StreamingSession:
         if decoded is None:
             return CallbackOutcome(handled=False, note="ignored")
         state = self._chat(chat_id)
+        # T6/P9: a [Open <project>] switch tap routes by PROJECT NAME, not a tool_use_id, and
+        # touches no pending hold — handle it BEFORE the pending-index lookup. The bot has
+        # already enforced SB1 (the _authorized recheck in on_callback) before reaching here,
+        # so an unauthorized tap never gets this far. The session does NOT mutate the store
+        # for a switch (the bot's /switch helper does the SB2 path re-validation + the store
+        # write); we just decode + return the target name. A switch never resolves a decision.
+        if decoded.kind == "switch":
+            return self._resolve_switch(chat_id, decoded)
         # Route by id: the pending index owns id -> (project, kind, held event). An "Other"
         # tap arms free-text capture (no engine call), but it must still target a KNOWN
         # pending ask, so it too looks the id up first.
@@ -2594,6 +2702,30 @@ class StreamingSession:
         if decoded.kind == "permission":
             return self._resolve_permission(state, engine, ref, decoded)
         return CallbackOutcome(handled=False, note="ignored")
+
+    def _resolve_switch(self, chat_id: int, decoded: Callback) -> "CallbackOutcome":
+        """Route a ``[Open <project>]`` switch tap (T6/P9) — decode-only; bot does the switch.
+
+        The switch tap carries the TARGET PROJECT NAME (``decoded.switch_to``), already
+        lexically validated by :func:`~claude_tg.render.decode_callback` (the SB4 name shape).
+        This returns a :class:`CallbackOutcome` with ``switch_to`` set so the bot's
+        ``on_callback`` performs the actual switch through its shared ``/switch`` helper —
+        which does the SB2 path re-validation (the target project's cwd must still be within
+        the permitted roots) the session has no access to. The session deliberately does NOT
+        mutate the store here (no path check available) and resolves no held decision (a
+        switch is navigation, not an answer). With no store there is nothing to switch within
+        (single implicit project) → a benign no-op note. The bot's SB1 ``_authorized`` recheck
+        already gated this call (a non-allowlisted tap never reaches the session).
+        """
+        name = decoded.switch_to
+        if not name:
+            return CallbackOutcome(handled=False, note="ignored")
+        if self.store is None:
+            # No registry to switch within (single implicit project) — benign no-op (RB1).
+            return CallbackOutcome(handled=False, note="no projects")
+        # Hand the (decoded) name to the bot to switch + path-revalidate; the toast is set by
+        # the bot after the switch. ``handled`` is True (we recognized + routed the tap).
+        return CallbackOutcome(handled=True, note=f"Opening {name}…", switch_to=name)
 
     def _engine_for_pending(
         self, chat_id: int, ref: _PendingRef
@@ -3383,9 +3515,15 @@ class CallbackOutcome:
     * ``tool_use_id``  — the armed request's id (D5): the bot maps the free-text **prompt's**
                          ``message_id -> tool_use_id`` so a reply-to that prompt routes by id
                          (the reply-to escape hatch overriding the most-recent default).
+    * ``switch_to``    — (T6/P9) the TARGET project name of a ``[Open <project>]`` switch tap.
+                         The session does NOT touch the store for a switch (it needs the bot's
+                         SB2 path re-validation, the same as ``/switch``); it decodes + routes
+                         and returns the name so the bot performs the switch via its shared
+                         ``/switch`` helper. ``None`` for every non-switch outcome.
 
     ``project_name`` / ``tool_use_id`` are populated only for an ``expects_text`` outcome
-    (the "Other"/"Reject" arm); they are ``None`` for an immediate resolve / a no-op.
+    (the "Other"/"Reject" arm); ``switch_to`` only for a switch tap; all are ``None``
+    otherwise.
     """
 
     handled: bool
@@ -3393,6 +3531,7 @@ class CallbackOutcome:
     expects_text: bool = False
     project_name: Optional[str] = None
     tool_use_id: Optional[str] = None
+    switch_to: Optional[str] = None
 
 
 __all__ = [

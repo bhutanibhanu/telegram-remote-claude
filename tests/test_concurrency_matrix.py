@@ -187,8 +187,15 @@ class Recorder:
         self.deletes: list[dict] = []
         self._next_id = 100
 
-    async def send(self, *, text, reply_markup=None, parse_mode=None) -> int:
-        self.sends.append({"text": text, "reply_markup": reply_markup, "parse_mode": parse_mode})
+    async def send(self, *, text, reply_markup=None, parse_mode=None, **kwargs) -> int:
+        # T6/P9: notification sends pass link_preview_options to suppress link previews;
+        # absorb it (via **kwargs) and record it so it doesn't TypeError these tests.
+        self.sends.append({
+            "text": text,
+            "reply_markup": reply_markup,
+            "parse_mode": parse_mode,
+            "link_preview_options": kwargs.get("link_preview_options"),
+        })
         self._next_id += 1
         return self._next_id
 
@@ -530,7 +537,12 @@ async def test_background_multi_question_ask_pings_and_each_question_answerable(
     # Wait for the background ask rendering (the 🔔 line + per-question keyboards).
     await _wait(lambda: any(s["text"].startswith("🔔") for s in rec.sends))
     assert any(s["text"].startswith("🔔") and "alpha" in s["text"] for s in rec.sends)
-    keyboarded = [s for s in rec.sends if s["reply_markup"] is not None]
+    # T6/P9: the 🔔 bell line now carries an [Open <name>] switch button, so count only the
+    # per-QUESTION keyboards (exclude the bell line) — the original intent of this assert.
+    keyboarded = [
+        s for s in rec.sends
+        if s["reply_markup"] is not None and not s["text"].startswith("🔔")
+    ]
     assert len(keyboarded) == 2, "a backgrounded multi-q ask sends one keyboard per question"
     assert any("Storage?" in s["text"] for s in keyboarded)
     assert any("CLI?" in s["text"] for s in keyboarded)
