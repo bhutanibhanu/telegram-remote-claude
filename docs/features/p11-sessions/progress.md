@@ -3,10 +3,10 @@
 _From design.md · Universal Session Control Plane · supervised build. Baseline 1098 tests. Spikes PROVEN (discovery+resume+mirror)._
 
 ## Task list
-- [ ] T1 — Session discovery adapter + `/sessions` read-only listing (see ALL Mac sessions, incl. the live one; merged+deduped with bot projects; running/idle)
-- [ ] T2 — Attach/switch to any session (idle→continue, live-elsewhere→FORK; SB2 on out-of-root cwd)
-- [ ] T3 — (stretch) Live-mirror `/watch <id>` (tail transcript → render, SB3-scrubbed, send-queue) — may defer
-- [ ] T4 — verify + Codex QA + live-verify + merge
+- [x] T1 — Session discovery adapter + `/sessions` read-only listing (see ALL Mac sessions, incl. the live one; merged+deduped with bot projects; running/idle) (ccbddbc)
+- [x] T2 — Attach/switch to any session (idle→continue, live-OR-uncertain→FORK; SB2 on out-of-root cwd; fork-on-doubt safe default) (f620a84)
+- [~] T3 — (stretch) Live-mirror `/watch <id>` — DEFERRED to its own clean cycle after T1+T2 merge (phase ran long; design says "may defer")
+- [>] T4 — verify + Codex QA + live-verify + merge (T1+T2)
 
 Legend: `[ ]` todo · `[x]` done (sha) · `[!]` blocked
 
