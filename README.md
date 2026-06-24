@@ -294,7 +294,8 @@ The `*(streaming)*` variables are only consulted when `ENGINE_MODE=streaming`.
   [002 answer-hold](docs/adr/ADR-002-async-answer-hold.md) ·
   [003 permission gating](docs/adr/ADR-003-permission-gating.md) ·
   [004 multi-project](docs/adr/ADR-004-multi-project-sessions.md) ·
-  [005 concurrency](docs/adr/ADR-005-concurrency-correlation.md).
+  [005 concurrency](docs/adr/ADR-005-concurrency-correlation.md) ·
+  [006 known limitations](docs/adr/ADR-006-known-limitations.md).
 - Security: [P6 audit findings + remediation](docs/features/p6-security-audit/findings.md).
 - Keep-alive: [`deploy/README.md`](deploy/README.md).
 - Per-feature specs live under [`docs/features/`](docs/features/).

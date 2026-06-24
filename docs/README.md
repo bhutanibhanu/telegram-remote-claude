@@ -22,6 +22,9 @@ Each ADR captures one load-bearing decision, its context, and its consequences.
 - [ADR-005 — Background concurrency & correlation](adr/ADR-005-concurrency-correlation.md):
   concurrent runs, the FIFO queue, and routing each inbound answer to the project that
   owns the pending prompt.
+- [ADR-006 — Known limitations accepted as-is](adr/ADR-006-known-limitations.md): two
+  deliberately-deferred trade-offs (the unpruned `notify_last` throttle; the
+  `_is_resume_failure` text heuristic) — why each is intentional and where it lives.
 
 ## Feature specs
 

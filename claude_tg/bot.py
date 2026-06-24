@@ -391,9 +391,21 @@ class TelegramClaudeBot:
         # the available names (replaces the old try/except UnknownProject).
         record = self.streaming.store.get_project(chat_id, name)
         if record is None:
-            available = ", ".join(self.streaming.store.list_projects(chat_id)) or "(none)"
+            # R6: style the name like /projects (bold), not a Python repr. ``name`` is
+            # operator input that FAILED the registry lookup (never SB4-validated), so
+            # escape it (defense-in-depth — a hostile name can't break the HTML). The
+            # available names are SB4-validated but escape them too, uniformly.
+            available = (
+                ", ".join(
+                    html.escape(n, quote=False)
+                    for n in self.streaming.store.list_projects(chat_id)
+                )
+                or "(none)"
+            )
             await update.message.reply_text(
-                f"❌ No project named {name!r}. Available: {available}"
+                f"❌ No project named <b>{html.escape(name, quote=False)}</b>. "
+                f"Available: {available}",
+                parse_mode="HTML",
             )
             return
         # SB2/B2: re-validate the TARGET project's stored cwd against the permitted roots
@@ -478,7 +490,12 @@ class TelegramClaudeBot:
         try:
             self.streaming.store.remove(chat_id, name)
         except UnknownProject:
-            await update.message.reply_text(f"❌ No project named {name!r}.")
+            # R6: bold the name like /projects, not a Python repr. ``name`` is operator
+            # input that missed the registry, so escape it (defense-in-depth).
+            await update.message.reply_text(
+                f"❌ No project named <b>{html.escape(name, quote=False)}</b>.",
+                parse_mode="HTML",
+            )
             return
         # B4: purge the project's in-memory runtime too. store.remove only drops the
         # persisted record; the cached _ProjectRuntime (engine + fixed cwd + policy) would
@@ -540,8 +557,14 @@ class TelegramClaudeBot:
         try:
             validate_project_name(name)
         except InvalidProjectName:
+            # R6: bold the name like /projects, not a Python repr. CRITICAL: this echoes
+            # PRE-validation input — the name was just REJECTED by SB4, so it is arbitrary
+            # operator input (may contain <, &, >) and MUST be HTML-escaped so it renders
+            # as inert text, never a live tag.
             await update.message.reply_text(
-                f"❌ Invalid project name {name!r} — use letters, digits, _ or - (≤32 chars)."
+                f"❌ Invalid project name <b>{html.escape(name, quote=False)}</b> — "
+                "use letters, digits, _ or - (≤32 chars).",
+                parse_mode="HTML",
             )
             return
         # SB2: canonicalize (resolves symlinks AND ..) and confine to ALLOWED_ROOTS
