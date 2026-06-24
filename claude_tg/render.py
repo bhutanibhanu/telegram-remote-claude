@@ -973,8 +973,25 @@ def _utf16(text: str) -> int:
 
 
 def tool_use_line(event: ToolUseEvent) -> str:
-    """One-liner for a tool call — uses the SB3-safe summary, never raw input."""
-    return f"▶️ {event.tool_input_summary}"
+    """One-liner for a tool call — the SB3-safe summary, wrapped ``<code>`` (HTML; T2/R6).
+
+    Uses the event's already-body-free ``tool_input_summary`` (lengths-not-bodies, built by
+    :func:`~claude_tg.engine.types.safe_input_summary`) — NEVER raw input, and this module
+    never re-derives it (SB3). The summary is wrapped in ``<code>…</code>`` via
+    :func:`code_path` so Telegram renders any path/command (its ``/segment`` runs) as inert
+    monospace instead of a row of tappable fake command-links (the R6 fix, extended here to
+    the tool-status line). ``code_path`` HTML-escapes the WHOLE summary exactly once, so a
+    tool input carrying HTML metacharacters (a misaligned/injected Claude putting ``<b>`` /
+    ``&`` / ``</code>`` in a ``file_path`` or ``command``) renders as inert text and can
+    never break the message or inject markup. The ``▶️`` glyph is fixed bot scaffolding.
+    The action carrying this line MUST be sent with ``parse_mode="HTML"`` (set by
+    :func:`render_event`) or the literal ``<code>`` tags would show. **Invariant:** unlike
+    the permission prompt (an ``op="new"`` send with a ``plain_chunks`` HTML→plain
+    fallback), the status line goes out via ``_edit_status`` which has NO plain fallback —
+    so this line MUST always be valid, balanced HTML. ``code_path``'s escape-everything-once
+    guarantees that today; anything added here must preserve it (or add a fallback).
+    """
+    return f"▶️ {code_path(event.tool_input_summary)}"
 
 
 #: Friendly, STABLE text for the noisy activity phases. Stability matters: consecutive
@@ -1139,9 +1156,17 @@ def render_event(event: Event) -> RenderAction:
         )
 
     if isinstance(event, PermissionEvent):
+        # The operator's approve/deny surface. The (body-free) summary is wrapped in <code>
+        # so its path/command renders monospace, not /segment fake-links (T2/R6); the prose +
+        # tool name are HTML-escaped (the tool name is attacker-influenceable too). It is thus
+        # an HTML message; the plain body rides along as the raw fallback T7 resends if
+        # Telegram ever rejects the HTML (so the prompt is never dropped — a dropped prompt is
+        # a worse bug than plain text). code_path/_escape_html keep the HTML valid for any input.
         return RenderAction(
             op="new",
-            chunks=_chunk(_render_permission_body(event)),
+            chunks=_chunk(_render_permission_body_html(event)),
+            plain_chunks=_chunk(_render_permission_body(event)),
+            parse_mode="HTML",
             reply_markup=permission_keyboard(event),
             verbatim=True,
         )
@@ -1172,9 +1197,19 @@ def render_event(event: Event) -> RenderAction:
         )
 
     if isinstance(event, ToolUseEvent):
-        return RenderAction(op="edit_status", chunks=(tool_use_line(event),))
+        # The tool-status line wraps its (body-free) summary in <code> (T2/R6 — stop the
+        # /segment auto-linkify), so it is an HTML status edit. The Coalescer carries this
+        # parse_mode forward with the line's text (newest-wins), and _edit_status passes it
+        # to the send/edit; code_path's html.escape keeps the HTML valid for any input.
+        return RenderAction(
+            op="edit_status", chunks=(tool_use_line(event),), parse_mode="HTML"
+        )
 
     if isinstance(event, StatusEvent):
+        # Lifecycle/health line carries no path → stays PLAIN (parse_mode=None). It shares the
+        # coalesced status slot with the HTML tool-use line, but text+parse_mode travel
+        # together (newest-wins), so a plain status replacing an HTML tool line correctly
+        # carries parse_mode=None — the slot never mixes a stale parse_mode with new text.
         return RenderAction(op="edit_status", chunks=(status_line(event),))
 
     # Unknown/foreign event — render nothing rather than crash (RB1 spirit).
@@ -1194,6 +1229,32 @@ def _render_permission_body(event: PermissionEvent) -> str:
     return (
         f"🔐 Permission needed — Claude wants to run {event.tool_name}:\n"
         f"{event.tool_input_summary}\n\n"
+        "Allow once, allow for this session, or deny?"
+    )
+
+
+def _render_permission_body_html(event: PermissionEvent) -> str:
+    """HTML version of :func:`_render_permission_body` (the live send path; T2/R6).
+
+    Same content as the plain body — the fixed prose + the tool name + the
+    **already-body-free** ``tool_input_summary`` (lengths-not-bodies; this module does NOT
+    re-summarize or expand it, SB3) — but rendered for ``parse_mode="HTML"``:
+
+    * the summary is wrapped in ``<code>…</code>`` (via :func:`code_path`) so its path /
+      command renders as inert monospace, not tappable ``/segment`` fake-links (R6, extended
+      to the permission prompt);
+    * the fixed prose and the (attacker-influenceable) ``tool_name`` are HTML-escaped (via
+      :func:`_escape_html`) so a tool name carrying ``<`` / ``&`` can't break the message.
+
+    Every interpolated field is escaped exactly once, so the body is valid HTML for ANY tool
+    input — a hostile ``file_path``/``command`` (``</code><b>…`` etc.) renders as inert text,
+    never markup, and the prompt always sends (Telegram rejecting invalid HTML would mean the
+    operator never sees the approve/deny prompt — a worse failure). The plain
+    :func:`_render_permission_body` is the parallel raw fallback T7 resends on an HTML rejection.
+    """
+    return (
+        f"🔐 Permission needed — Claude wants to run {_escape_html(event.tool_name)}:\n"
+        f"{code_path(event.tool_input_summary)}\n\n"
         "Allow once, allow for this session, or deny?"
     )
 
@@ -1230,6 +1291,13 @@ class _PendingStatus:
     """Buffered status-line state between flushes."""
 
     text: str = ""
+    #: parse_mode of the buffered line — travels WITH ``text`` (newest-wins). A tool-use
+    #: line is HTML (its summary is <code>-wrapped, T2/R6); a lifecycle status is plain.
+    #: Carrying it here is load-bearing: ``_emit_status`` rebuilds the RenderAction, so
+    #: without this the HTML tool line would emit with parse_mode=None and its ``<code>``
+    #: tags would render literally. Replaced atomically with ``text`` so the slot never
+    #: pairs a stale parse_mode with new text.
+    parse_mode: ParseMode = None
     dirty: bool = False  # there is unflushed status content
     last_flush: float = field(default=float("-inf"))  # monotonic seconds
 
@@ -1304,7 +1372,14 @@ class Coalescer:
     def _emit_status(self, t: float) -> RenderAction:
         self._pending.last_flush = t
         self._pending.dirty = False
-        return RenderAction(op="edit_status", chunks=(self._pending.text,))
+        # Carry the buffered line's parse_mode (HTML for a <code>-wrapped tool-use line, None
+        # for a plain lifecycle status) — without it T7 would send the HTML line as plain text
+        # and the <code> tags would show literally (T2/R6).
+        return RenderAction(
+            op="edit_status",
+            chunks=(self._pending.text,),
+            parse_mode=self._pending.parse_mode,
+        )
 
     def _next_due_at(self) -> Optional[float]:
         if not self._pending.dirty:
@@ -1335,8 +1410,11 @@ class Coalescer:
             actions.append(action)
             return FlushResult(actions=tuple(actions), next_due_at=self._next_due_at())
 
-        # op == "edit_status": coalesce. The status line is a REPLACE (newest wins).
+        # op == "edit_status": coalesce. The status line is a REPLACE (newest wins) — its
+        # text AND parse_mode are replaced together so a plain status that replaces an HTML
+        # tool-use line carries the right (plain) parse_mode, and vice versa.
         self._pending.text = action.text
+        self._pending.parse_mode = action.parse_mode
         self._pending.dirty = True
         if self._due(t):
             return FlushResult(

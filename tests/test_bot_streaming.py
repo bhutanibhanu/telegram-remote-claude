@@ -9,6 +9,7 @@ so a NON-allowlisted callback never routes a decision. No live Telegram / Claude
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -894,7 +895,11 @@ async def test_cmd_switch_unknown_name_lists_available(tmp_path):
     upd = make_update(1, "/switch nope")
     await bot.cmd_switch(upd, make_cmd_ctx(args=["nope"]))
     reply = upd.message.reply_text.await_args.args[0]
-    assert "nope" in reply
+    kwargs = upd.message.reply_text.await_args.kwargs
+    # T3/R6: the name is bolded like /projects, not a Python repr (was the odd-quoted
+    # "'nope'"); HTML parse mode so the <b> tags render.
+    assert "<b>nope</b>" in reply
+    assert kwargs.get("parse_mode") == "HTML"
     # The error lists the available names so the operator can pick a real one.
     assert "alpha" in reply and "beta" in reply
     assert store.get_active(1) == "alpha"  # unchanged
@@ -976,7 +981,11 @@ async def test_cmd_rm_unknown_name_errors(tmp_path):
     bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
     upd = make_update(1, "/rm ghost")
     await bot.cmd_rm(upd, make_cmd_ctx(args=["ghost"]))
-    assert "ghost" in upd.message.reply_text.await_args.args[0]
+    reply = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    # T3/R6: bolded name (was the odd-quoted repr "'ghost'"), HTML parse mode.
+    assert "<b>ghost</b>" in reply
+    assert kwargs.get("parse_mode") == "HTML"
     assert "alpha" in store.list_projects(1)
 
 
@@ -1473,8 +1482,42 @@ async def test_cmd_new_invalid_name_refused_no_create(tmp_path):
     )
     upd = make_update(1, "/new bad/name " + str(proj))
     await bot.cmd_new(upd, make_cmd_ctx(args=["bad/name", str(proj)]))
-    assert "invalid project name" in upd.message.reply_text.await_args.args[0].lower()
+    reply = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert "invalid project name" in reply.lower()
+    # T3/R6: the rejected name is bolded like /projects (was the odd-quoted repr
+    # "'bad/name'"); HTML parse mode so the <b> tags render. ``/`` is not an HTML
+    # metachar, so it survives escaping unchanged.
+    assert "<b>bad/name</b>" in reply
+    assert kwargs.get("parse_mode") == "HTML"
     assert store.list_projects(1) == {}  # NOT created
+
+
+async def test_cmd_new_invalid_name_hostile_input_is_html_escaped(tmp_path):
+    # T3 (defense-in-depth): the invalid-name reply echoes PRE-SB4-validation input — the
+    # name was just REJECTED, so it is arbitrary operator input. A name carrying HTML
+    # metacharacters (<b>x, a&b) MUST be escaped: no RAW tag/entity in the (now HTML)
+    # reply, only the escaped form. A raw "<b>x" would otherwise open a live bold tag in
+    # Telegram's HTML parse mode.
+    proj = tmp_path / "work"
+    proj.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allowed_roots=(tmp_path,)),
+        FakeRunner(),
+        streaming=session,
+    )
+    for hostile in ("<b>x", "a&b"):
+        upd = make_update(1, "/new " + hostile + " " + str(proj))
+        await bot.cmd_new(upd, make_cmd_ctx(args=[hostile, str(proj)]))
+        reply = upd.message.reply_text.await_args.args[0]
+        kwargs = upd.message.reply_text.await_args.kwargs
+        assert kwargs.get("parse_mode") == "HTML"
+        # The escaped form is present; the raw hostile string is NOT (it would be a live tag).
+        assert html.escape(hostile, quote=False) in reply
+        assert hostile not in reply
+    assert store.list_projects(1) == {}  # nothing created on any rejection
 
 
 async def test_cmd_new_duplicate_refused(tmp_path):
