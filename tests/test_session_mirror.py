@@ -47,7 +47,9 @@ from claude_tg.session_mirror import (
 from claude_tg.sessions_discovery import DiscoveredSession
 from claude_tg.stream_session import StreamingSession, WatchOutcome
 
-SECRET = "SUPER_SECRET_TOKEN_abcdef0123456789_do_not_leak"
+# NB: value carries a "fake" marker so scripts/secret_scan.py treats it as a
+# placeholder (it is a test fixture asserting the mirror NEVER leaks tool bodies).
+SECRET = "FAKE_SECRET_TOKEN_abcdef0123456789_do_not_leak"
 
 
 # ===========================================================================
