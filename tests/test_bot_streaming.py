@@ -25,6 +25,7 @@ from claude_tg.stream_session import (
     CallbackOutcome,
     StreamingBusy,
     StreamingSession,
+    WatchOutcome,
 )
 
 
@@ -103,6 +104,9 @@ class FakeStreaming:
         self.reply_prompt_calls = []
         self.to_calls = []
         self.attach_calls = []
+        self.watch_calls = []
+        self.unwatch_calls = []
+        self.shutdown_calls = []
         self.command_initiated_calls = []
         self.images_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
@@ -164,6 +168,25 @@ class FakeStreaming:
             ok=True, message=f"✅ Attached {session_id}.", parse_mode="HTML",
             project_name="adopted", forked=False,
         )
+
+    def watch_session(self, chat_id, session_id, *, send):
+        # P11/T3: /watch delegates here with a PERSISTENT send closure (the background tail
+        # task uses it). Record the call (+ that a callable send was threaded) and return a
+        # styled WatchOutcome so the bot-wiring tests assert delegation + the reply send.
+        self.watch_calls.append((chat_id, session_id, callable(send)))
+        return WatchOutcome(
+            ok=True, message=f"👁 Now mirroring {session_id}.", parse_mode="HTML",
+            session_id=session_id,
+        )
+
+    def unwatch(self, chat_id):
+        # P11/T3: /unwatch delegates here; return the operator reply string.
+        self.unwatch_calls.append(chat_id)
+        return "🛑 Stopped mirroring."
+
+    async def shutdown(self):
+        # P11/T3: post_shutdown delegates here (cancels watches + stops engines). Record it.
+        self.shutdown_calls.append(True)
 
     def reset(self, chat_id):
         self.reset_calls.append(chat_id)
@@ -4456,3 +4479,118 @@ def test_attach_command_in_menu_and_help():
 
     assert "attach" in {cmd for cmd, _desc in COMMAND_MENU}
     assert "/attach" in HELP_TEXT
+
+
+# ===========================================================================
+# P11 T3 — /watch + /unwatch bot wiring (the session owns the tail; the bot delegates).
+# SB1, the streaming-only notice, delegation (with a PERSISTENT send closure), the reply
+# send, the lock-step menu/help, and post_shutdown cancelling watches.
+# ===========================================================================
+
+
+async def test_cmd_watch_delegates_with_send_closure_and_replies():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/watch sess-1")
+    await bot.cmd_watch(upd, make_cmd_ctx(args=["sess-1"]))
+    # Delegated with the parsed id AND a callable (persistent) send closure for the tail task.
+    assert streaming.watch_calls == [(1, "sess-1", True)]
+    text = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert "Now mirroring sess-1" in text
+    assert kwargs.get("parse_mode") == "HTML"
+
+
+async def test_cmd_watch_usage_when_no_id():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/watch")
+    await bot.cmd_watch(upd, make_cmd_ctx(args=[]))
+    assert "Usage: /watch" in upd.message.reply_text.await_args.args[0]
+    assert streaming.watch_calls == []  # never delegated on a usage error
+
+
+async def test_cmd_watch_oneshot_replies_streaming_only_notice():
+    # /watch is a streaming-mode concept (per-chat gate + background task) — one-shot notices.
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())  # streaming=None
+    upd = make_update(1, "/watch sess-1")
+    await bot.cmd_watch(upd, make_cmd_ctx(args=["sess-1"]))
+    assert "streaming mode only" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_watch_unauthorized_replies_nothing():
+    # SB1: a non-allowlisted chat's /watch sends nothing and never delegates.
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(999, "/watch sess-1")  # NOT allowlisted
+    await bot.cmd_watch(upd, make_cmd_ctx(args=["sess-1"]))
+    upd.message.reply_text.assert_not_awaited()
+    assert streaming.watch_calls == []
+
+
+async def test_cmd_unwatch_delegates_and_replies():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/unwatch")
+    await bot.cmd_unwatch(upd, make_cmd_ctx())
+    assert streaming.unwatch_calls == [1]
+    assert "Stopped mirroring" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_unwatch_oneshot_replies_streaming_only_notice():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())  # streaming=None
+    upd = make_update(1, "/unwatch")
+    await bot.cmd_unwatch(upd, make_cmd_ctx())
+    assert "streaming mode only" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_unwatch_unauthorized_replies_nothing():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(999, "/unwatch")  # NOT allowlisted
+    await bot.cmd_unwatch(upd, make_cmd_ctx())
+    upd.message.reply_text.assert_not_awaited()
+    assert streaming.unwatch_calls == []
+
+
+def test_watch_unwatch_commands_in_menu_and_help():
+    # Both /watch + /unwatch must be in the native menu (lock-step with the registered
+    # handlers — already pinned by test_command_menu_matches_registered_handlers) AND in HELP.
+    from claude_tg.bot import COMMAND_MENU, HELP_TEXT
+
+    menu = {cmd for cmd, _desc in COMMAND_MENU}
+    assert "watch" in menu and "unwatch" in menu
+    assert "/watch" in HELP_TEXT and "/unwatch" in HELP_TEXT
+
+
+async def test_post_shutdown_delegates_to_streaming_shutdown():
+    # P11 T3: post_shutdown cancels watches + stops engines via streaming.shutdown().
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot._post_shutdown(MagicMock())
+    assert streaming.shutdown_calls == [True]
+
+
+async def test_post_shutdown_oneshot_is_noop():
+    # One-shot mode has no streaming session — post_shutdown is a clean no-op (never raises).
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())  # streaming=None
+    await bot._post_shutdown(MagicMock())  # does not raise
+
+
+async def test_post_shutdown_survives_streaming_shutdown_failure():
+    # RB1: a failure during shutdown must not block the bot from stopping.
+    class BoomStreaming(FakeStreaming):
+        async def shutdown(self):
+            raise RuntimeError("shutdown boom")
+
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=BoomStreaming())
+    await bot._post_shutdown(MagicMock())  # does not raise
+
+
+def test_build_application_registers_post_shutdown():
+    # The post_shutdown hook must be wired so watches/engines are cleaned up on exit. PTB binds
+    # the callback into its own wrapper, so assert one IS registered (not None) rather than
+    # identity — the delegation itself is covered by test_post_shutdown_delegates_*.
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    app = bot.build_application()
+    assert app.post_shutdown is not None
