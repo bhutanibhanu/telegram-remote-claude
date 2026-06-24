@@ -4866,3 +4866,125 @@ async def test_arm_plan_auto_creates_default_project_when_none(tmp_path):
     session.arm_plan(1)  # no active project → auto-creates `default` and arms it
     await _drive_plan_turn(session, 1, "first ever message")
     assert modes == ["plan"]  # the implicit default project's first turn ran in plan mode
+
+
+# --- round-2 QA BLOCKER: the one-shot marker survives NO failed/aborted/refused turn -------
+#
+# The bug: rt.plan_next was read+cleared LATE (inside _ensure_engine, after its SB2 check),
+# and the two pre-engine abort guards `return` BEFORE _ensure_engine — so an armed plan turn
+# that aborted or hit SB2 left the marker ARMED → a LATER unrelated message ran in plan mode.
+# The fix consumes the marker EARLY in handle_message (before _acquire_slot, both abort guards,
+# and _ensure_engine's SB2). These pin every cited path: the marker is ALWAYS consumed once a
+# prompt is taken as the turn, so the NEXT prompt is always normal.
+
+
+async def test_plan_marker_consumed_even_when_turn_aborts_before_engine(tmp_path):
+    # A /plan-armed prompt turn that hits a PRE-ENGINE abort guard (abort.is_set → return False,
+    # the slot-transfer / lock-wait windows) MUST still consume the marker → the NEXT prompt is
+    # a NORMAL turn, never a surprise plan prompt.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, modes = _make_plan_recording_session(store)
+
+    # Force the pre-engine abort: override _acquire_slot to SET this project's abort just before
+    # returning, so the guard right after it (handle_message, after the slot is granted) fires
+    # and the turn returns WITHOUT building an engine. The marker was already consumed by then.
+    real_acquire = session._acquire_slot
+
+    async def acquire_then_abort(state, target_rt, *, send):
+        await real_acquire(state, target_rt, send=send)
+        target_rt.abort.set()  # → the post-slot abort guard returns False (no engine built)
+
+    session._acquire_slot = acquire_then_abort  # type: ignore[assignment]
+
+    session.arm_plan(1)
+    await _drive_plan_turn(session, 1, "build me X")  # armed, but aborts before the engine
+    assert modes == []  # no engine was built at all (aborted pre-engine)
+    rt = session._chats[1].runtimes["alpha"]
+    assert rt.plan_next is False  # ⭐ the marker WAS consumed despite the abort
+
+    # Restore normal slot acquisition; the NEXT prompt must be a NORMAL (default) turn.
+    session._acquire_slot = real_acquire  # type: ignore[assignment]
+    rt.abort.clear()  # (handle_message clears it on the fresh turn anyway; explicit for clarity)
+    await _drive_plan_turn(session, 1, "an unrelated message")
+    assert modes == ["default"]  # ⭐ NOT "plan" — the surprise-plan bug is fixed
+
+
+async def test_plan_marker_consumed_even_when_sb2_refuses_turn(tmp_path):
+    # A /plan-armed prompt turn whose project cwd is OUT of the permitted roots → _ensure_engine
+    # raises PathNotAllowed (SB2 fail-closed) BEFORE building the engine. The marker MUST still
+    # be consumed → the NEXT (in-root) prompt is a NORMAL turn. (Also covers the reviewer's note
+    # that the old _ensure_engine comment overstated the guarantee — the consume now precedes SB2.)
+    root = tmp_path / "root"
+    (root / "inside").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = JsonSessionStore(tmp_path / "state.json")
+    # alpha's cwd is OUTSIDE the permitted root → its turn is refused fail-closed by SB2.
+    store.create(1, "alpha", str(outside), make_active=True)
+
+    modes: list[str] = []
+
+    def factory(
+        *, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default",
+        thinking=False,
+    ):
+        modes.append(permission_mode)
+        return HoldEngine(
+            [ResultEvent(session_id="sid-1", is_error=False, subtype="success", result_text="ok")]
+        )
+
+    # allow_any_path=False so the SB2 resolve_within_roots in _ensure_engine actually raises.
+    session = StreamingSession(
+        make_config(engine_mode="streaming", workdir=str(root), allowed_roots=(root,)),
+        session_store=store,
+        engine_factory=factory,
+        clock=lambda: 0.0,
+    )
+    session._factory_accepts_model = True
+
+    sends: list[str] = []
+
+    async def send(*, text, reply_markup=None, parse_mode=None, link_preview_options=None):
+        sends.append(text)
+        return 1
+
+    async def edit(*, message_id, text, parse_mode=None):
+        return None
+
+    session.arm_plan(1)
+    await asyncio.wait_for(
+        session.handle_message(1, "build me X", send=send, edit=edit), timeout=2.0
+    )
+    assert modes == []  # SB2 refused BEFORE any engine build
+    assert any("permitted roots" in s for s in sends)  # the fail-closed refusal was sent
+    rt = session._chats[1].runtimes["alpha"]
+    assert rt.plan_next is False  # ⭐ the marker WAS consumed despite the SB2 raise
+
+    # Repoint alpha INTO the root and drive a fresh prompt → it must be a NORMAL turn.
+    store.create(1, "beta", str(root / "inside"), make_active=True)
+    await asyncio.wait_for(
+        session.handle_message(1, "now an in-root message", send=send, edit=edit), timeout=2.0
+    )
+    assert modes == ["default"]  # ⭐ NOT "plan" — no leftover armed marker
+
+
+async def test_plan_then_command_does_not_consume_marker(tmp_path):
+    # PROMPT-turn-scoped: /plan followed by a COMMAND (/status here) must NOT consume the
+    # marker — commands route through their cmd_* handlers, never handle_message. So
+    # /plan → /status → a prompt → the PROMPT still runs in plan mode.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session, modes = _make_plan_recording_session(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+
+    session.arm_plan(1)
+    # A command in between — it must leave the one-shot marker untouched.
+    await bot.cmd_status(make_update(1, "/status"), make_cmd_ctx())
+    rt = session._chats[1].runtimes["alpha"]
+    assert rt.plan_next is True  # ⭐ still armed — the command did NOT consume it
+
+    # Now a real prompt turn → it consumes the marker and runs in plan mode.
+    await _drive_plan_turn(session, 1, "build me X")
+    assert modes == ["plan"]  # the prompt (not the command) ran in plan mode
+    assert rt.plan_next is False  # consumed by the prompt turn

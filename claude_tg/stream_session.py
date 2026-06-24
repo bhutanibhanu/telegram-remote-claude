@@ -1445,6 +1445,7 @@ class StreamingSession:
         chat_id: int,
         *,
         target: Optional[tuple[str, _ProjectRuntime]] = None,
+        plan_turn: bool = False,
     ) -> tuple[Engine, bool]:
         """Lazily start (or resume) a project's engine. Idempotent per project.
 
@@ -1452,6 +1453,16 @@ class StreamingSession:
         ``session_id`` was present but ``resume`` raised and we fell back to a fresh
         ``start`` THIS call (so the caller can post the RB3 operator notice). It is False
         for a fresh start, a clean resume, and the already-started fast path.
+
+        **P12 T-PLAN-2 (/plan).** ``plan_turn`` is passed in by the caller, which ALREADY
+        consumed (read + cleared) the project's one-shot ``plan_next`` marker BEFORE this call
+        — so this method NEVER reads or clears the marker itself (round-2 QA fix). When True
+        this turn's session is built in ``permission_mode="plan"`` (mechanism (a) — a FRESH
+        plan-mode session, mirroring how ``model`` is baked at session creation); when False it
+        is the unchanged ``"default"``. Because the caller consumes the marker before BOTH the
+        pre-engine abort guards AND the SB2 ``resolve_within_roots`` check below, the one-shot
+        contract holds on every exit path — a plan turn that aborts or is refused fail-closed
+        still consumed the marker, so the NEXT turn is normal (never a surprise plan prompt).
 
         ``target`` PINS the project to build for (its ``(name, runtime)``). When omitted the
         chat's **active** project is resolved (auto-creating ``default`` if none — a turn
@@ -1496,15 +1507,18 @@ class StreamingSession:
             allowed_roots=self.config.allowed_roots,
             allow_any=self.config.allow_any_path,
         )
-        # P12 T-PLAN-2 (/plan): CONSUME the one-shot plan marker for this project — read it,
-        # then CLEAR it immediately so this is the only turn it affects (one-shot, RB3; even a
-        # failed/aborted turn never re-arms). When armed, this turn's session must run in
-        # ``permission_mode="plan"`` (mechanism (a) — baked at session creation), so the
-        # ``"default"``-mode warm engine below is NOT reused: we force a FRESH plan-mode
-        # session for exactly this turn. The marker is cleared HERE (not at turn end) so a
-        # ``/cancel`` / crash / SB2-refusal of the plan turn still leaves the next turn normal.
-        plan_mode = rt.plan_next
-        rt.plan_next = False
+        # P12 T-PLAN-2 (/plan), round-2 QA fix: the one-shot plan marker was ALREADY consumed
+        # (read + cleared) by the caller (``handle_message``) at the earliest commit point —
+        # BEFORE the pre-engine abort guards AND before the SB2 ``resolve_within_roots`` check
+        # above — so this method just RECEIVES the verdict as ``plan_turn`` and never touches
+        # ``rt.plan_next`` itself. (Consuming inside here was the bug: the SB2 raise above and
+        # the two pre-engine ``return``s in the caller skipped it, leaving the marker armed →
+        # a later unrelated message got a surprise plan prompt.) When armed, this turn's session
+        # must run in ``permission_mode="plan"`` (mechanism (a) — baked at session creation), so
+        # the ``"default"``-mode warm engine below is NOT reused: we force a FRESH plan-mode
+        # session for exactly this turn (which RESUMES the persisted id, so the conversation
+        # continues). A normal turn keeps ``"default"`` and the warm fast-path, byte-for-byte.
+        plan_mode = plan_turn
         permission_mode = "plan" if plan_mode else "default"
         # P12 T-THINK: this project's STICKY live-reasoning flag (set by /thinking; default
         # OFF). UNLIKE the one-shot plan marker it is NOT consumed/cleared — it stays on until
@@ -2701,6 +2715,24 @@ class StreamingSession:
         # under inflight=True (after the busy-guard) — no other turn for this project can run
         # concurrently to observe a transient clear.
         target_rt.abort.clear()
+        # P12 T-PLAN-2 (/plan), round-2 QA BLOCKER — CONSUME the one-shot plan marker HERE, at
+        # the EARLIEST point this PROMPT message is committed to being driven as a turn: after
+        # the busy-guard passed (so we won't reject + leave it armed) and BEFORE _acquire_slot,
+        # the two pre-engine abort guards (the slot-transfer + lock-wait windows below), and
+        # _ensure_engine's SB2 PathNotAllowed check. Read + CLEAR atomically into a local
+        # ``plan_turn`` that is threaded DOWN to _ensure_engine (which no longer reads/clears
+        # the marker). Consuming it this early makes the one-shot contract hold on EVERY exit:
+        # a turn that aborts (abort.is_set → return) or is refused fail-closed (SB2 raise) STILL
+        # consumed the marker, so the NEXT message is ALWAYS a normal turn — never a surprise
+        # plan prompt (the bug: the late read/clear in _ensure_engine was skipped by both the
+        # pre-engine ``return``s and the SB2 raise). PROMPT-turn-scoped: commands (/status,
+        # /plan itself) go through their cmd_* handlers, never handle_message, so they never
+        # reach here and never consume the marker (/plan → /status → a prompt = the PROMPT runs
+        # in plan mode); a free-text "Other"/reject reply returned above (it resolves a hold,
+        # not a new turn) so it doesn't consume either. RB3: ``plan_turn`` is a local; the
+        # marker stays in-memory + un-persisted.
+        plan_turn = target_rt.plan_next
+        target_rt.plan_next = False
         try:
             # P5 / ADR-005 D6 (T6): acquire a run SLOT before driving. Under the cap → run now
             # (the counter is incremented). At the cap → enqueue (per-chat FIFO), set this
@@ -2751,7 +2783,7 @@ class StreamingSession:
                         return False
                     try:
                         engine, resume_failed = await self._ensure_engine(
-                            chat_id, target=target
+                            chat_id, target=target, plan_turn=plan_turn
                         )
                     except PathNotAllowed:
                         # SB2 (T7): the active project's stored cwd drifted out of the permitted
