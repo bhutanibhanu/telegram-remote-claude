@@ -33,6 +33,7 @@ from claude_tg.engine.types import (
     ResultEvent,
     StatusEvent,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
 )
 from claude_tg.render import (
@@ -41,6 +42,8 @@ from claude_tg.render import (
     KIND_ATTACH,
     KIND_PERMISSION,
     KIND_SWITCH,
+    THINKING_HIDDEN_LINE,
+    THINKING_TAIL_MAX,
     ChatSendGate,
     Coalescer,
     RenderAction,
@@ -67,6 +70,7 @@ from claude_tg.render import (
     quick_reply_dismiss,
     quick_reply_keyboard,
     render_event,
+    thinking_line,
     tool_use_line,
     yolo_banner,
     yolo_indicator,
@@ -265,6 +269,83 @@ def test_empty_incremental_text_is_none():
 
 def test_empty_assembled_text_is_none():
     assert render_event(TextEvent(text="", incremental=False)).op == "none"
+
+
+# ---- P12 T-THINK-2: thinking renders as a capped, collapsed 🧠 status line (SB3) ----
+
+
+def test_thinking_renders_as_status_line_with_brain_glyph():
+    action = render_event(ThinkingEvent(text="weighing the options", incremental=True))
+    assert action.op == "edit_status"  # the SAME coalesced status slot (RB5)
+    assert action.verbatim is False  # NOT a permanent message
+    assert action.text.startswith("🧠 ")
+    assert "weighing the options" in action.text
+    assert action.parse_mode is None  # plain — no path, no HTML
+
+
+def test_thinking_is_capped_to_a_recent_tail_never_floods():
+    # A long chain-of-thought must be CAPPED to the recent tail (SB3 — never flood Telegram).
+    long = "".join(f"step{i} " for i in range(500))  # thousands of chars
+    action = render_event(ThinkingEvent(text=long, incremental=True))
+    # The shown text is bounded (glyph + space + ellipsis + the tail), far short of the input.
+    assert len(action.text) <= len("🧠 …") + THINKING_TAIL_MAX
+    assert len(action.text) < len(long)
+    # It keeps the most-RECENT reasoning (the live frontier), marked clipped with a leading "…".
+    assert action.text.startswith("🧠 …")
+    assert action.text.endswith("step499 ".strip()) or "step499" in action.text
+
+
+def test_thinking_collapses_newlines_to_single_status_line():
+    action = render_event(ThinkingEvent(text="line one\n\nline two\nline three", incremental=False))
+    assert "\n" not in action.text
+    assert action.text == "🧠 line one line two line three"
+
+
+def test_redacted_thinking_renders_fixed_opaque_line_never_raw():
+    # SB3: a redacted thinking event renders ONLY the fixed opaque line — never any body, even
+    # if (defensively) one were present. A redacted event ALSO renders even with empty text.
+    action = render_event(
+        ThinkingEvent(text="SECRET_REASONING_MUST_NOT_SHOW", incremental=True, redacted=True)
+    )
+    assert action.op == "edit_status"
+    assert action.text == THINKING_HIDDEN_LINE
+    assert "SECRET_REASONING_MUST_NOT_SHOW" not in action.text
+    # Empty-text redacted still shows the hidden line (it's the whole point).
+    empty_redacted = render_event(ThinkingEvent(text="", incremental=True, redacted=True))
+    assert empty_redacted.op == "edit_status"
+    assert empty_redacted.text == THINKING_HIDDEN_LINE
+
+
+def test_empty_non_redacted_thinking_is_none():
+    # Nothing readable to show (and not redacted) -> op="none" (mirrors empty incremental text).
+    assert render_event(ThinkingEvent(text="", incremental=True)).op == "none"
+
+
+def test_thinking_line_helper_caps_and_marks_clip():
+    short = thinking_line(ThinkingEvent(text="brief", incremental=True))
+    assert short == "🧠 brief"
+    tail = "x" * (THINKING_TAIL_MAX + 50)
+    capped = thinking_line(ThinkingEvent(text=tail, incremental=True))
+    assert capped.startswith("🧠 …")
+    # the body (after the glyph + space) is the last THINKING_TAIL_MAX chars + the "…".
+    assert len(capped) == len("🧠 …") + THINKING_TAIL_MAX
+
+
+def test_burst_of_thinking_deltas_is_bounded_not_n_edits():
+    # The RB5 guarantee for thinking too: a burst of thinking_deltas folds into a BOUNDED
+    # number of in-place edits via the existing Coalescer (mirrors the incremental-text test).
+    clock = FakeClock()
+    coalescer = Coalescer(now=clock, min_interval=2.0)
+    actions: list[RenderAction] = []
+    for i in range(50):
+        actions.extend(coalescer.offer(ThinkingEvent(text=f"reasoning step {i}", incremental=True)).actions)
+    edits = [a for a in actions if a.op == "edit_status"]
+    assert len(edits) == 1  # leading-edge: one edit for the whole burst, the rest buffered
+    assert len(edits) < 50
+    # The buffered newest is the last delta (capped/collapsed), shown on force-flush.
+    flushed = coalescer.flush().actions
+    assert len(flushed) == 1
+    assert "reasoning step 49" in flushed[0].text
 
 
 def test_tool_use_is_one_liner_status_using_safe_summary():

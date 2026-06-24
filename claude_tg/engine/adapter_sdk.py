@@ -40,6 +40,7 @@ from .types import (
     StatusEvent,
     SubstrateDecision,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
 )
 
@@ -140,8 +141,12 @@ def normalize(msg: Any) -> Optional[Event]:
     Mapping (per `normalized_interface.md` §1):
 
     * ``SystemMessage(init)``                  -> ``StatusEvent(phase="init")``
-    * ``StreamEvent`` (content/message delta)  -> incremental ``TextEvent``
+    * ``StreamEvent`` ``text_delta``           -> incremental ``TextEvent``
+    * ``StreamEvent`` ``thinking_delta``       -> incremental ``ThinkingEvent`` (P12)
+    * ``StreamEvent`` ``signature_delta``      -> ``None`` (opaque signature dropped, SB3)
     * ``AssistantMessage`` text blocks         -> assembled ``TextEvent``
+    * ``AssistantMessage`` ``ThinkingBlock``   -> assembled ``ThinkingEvent`` (P12; SB3:
+                                                  signature dropped, never surfaced)
     * ``ToolUseBlock`` ``AskUserQuestion``     -> ``AskEvent``
     * ``ToolUseBlock`` ``ExitPlanMode``        -> ``PlanEvent``
     * ``ToolUseBlock`` (other)                 -> ``ToolUseEvent``
@@ -189,12 +194,34 @@ def normalize(msg: Any) -> Optional[Event]:
         etype = event.get("type")
         if etype in INCREMENTAL_EVENT_TYPES:
             delta = event.get("delta") or {}
-            # Only text deltas carry renderable prose; thinking/signature deltas don't.
-            if delta.get("type") in ("text_delta", "text"):
+            dtype = delta.get("type")
+            # Text deltas carry the answer prose -> incremental TextEvent (status line).
+            if dtype in ("text_delta", "text"):
                 text = delta.get("text") or ""
                 if text:
                     return TextEvent(text=text, incremental=True, session_id=sid)
-        return None  # framing / non-text delta -> no operator-facing event
+            # P12 T-THINK: thinking deltas carry Claude's REASONING -> incremental
+            # ThinkingEvent (the 🧠 status line). The reasoning text rides ``delta["thinking"]``
+            # (exactly parallel to ``text_delta``'s ``delta["text"]`` — spike-verified). SB3:
+            # the opaque ``signature`` arrives as a SEPARATE ``signature_delta`` (handled by the
+            # explicit drop below) and is NEVER carried on a ThinkingEvent.
+            elif dtype == "thinking_delta":
+                text = delta.get("thinking") or ""
+                if text:
+                    return ThinkingEvent(text=text, incremental=True, session_id=sid)
+            # SB3: ``signature_delta`` is the opaque crypto signature — drop it (return None
+            # below), never surface it. (Listed explicitly so the intent is unmistakable; a
+            # bare fall-through would do the same, but this documents the SB3 contract.)
+            elif dtype == "signature_delta":
+                return None
+            # Defensive (RB1/SB3): a future ``redacted_thinking`` stream delta (the API
+            # encrypts some reasoning) carries NO readable text — emit an OPAQUE marker
+            # (``redacted=True``, empty text) so the renderer shows the fixed hidden line,
+            # NEVER raw. The installed SDK never produces this (no block class, no parser
+            # case), so this is a forward-compatible fail-safe, not a live path.
+            elif dtype == "redacted_thinking":
+                return ThinkingEvent(text="", incremental=True, redacted=True, session_id=sid)
+        return None  # framing / other non-content delta -> no operator-facing event
 
     # --- assistant content blocks ------------------------------------------
     if isinstance(msg, AssistantMessage):
@@ -233,13 +260,29 @@ def _normalize_block(block: Any, sid: Optional[str]) -> Optional[Event]:
     import) AND so ``isinstance`` narrows the ``Any`` block to the concrete block
     type for the type checker.
     """
-    from claude_agent_sdk import TextBlock, ToolResultBlock, ToolUseBlock  # lazy
+    from claude_agent_sdk import (  # lazy
+        TextBlock,
+        ThinkingBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+    )
 
     if isinstance(block, TextBlock):
         text = block.text or ""
         if not text:
             return None
         return TextEvent(text=text, incremental=False, session_id=sid)
+
+    # P12 T-THINK: an assembled ThinkingBlock (Claude's reasoning) -> a non-incremental
+    # ThinkingEvent. SB3: the SDK block has ``thinking`` + an opaque ``signature``; we carry
+    # ONLY ``block.thinking`` and DROP ``signature`` (it is never read here, so it cannot
+    # leak). An empty ``thinking`` (e.g. a signature-only block when ``display="omitted"``)
+    # yields no event — there is nothing readable to show, and the signature is dropped.
+    if isinstance(block, ThinkingBlock):
+        text = getattr(block, "thinking", "") or ""
+        if not text:
+            return None
+        return ThinkingEvent(text=text, incremental=False, session_id=sid)
 
     if isinstance(block, ToolUseBlock):
         tool_input = block.input if isinstance(block.input, dict) else {}
@@ -302,11 +345,21 @@ class SdkSubstrate:
         allowed_tools: Optional[list[str]] = None,
         disallowed_tools: Optional[list[str]] = None,
         model: Optional[str] = None,
+        thinking: bool = False,
     ) -> None:
         self._cwd = str(cwd) if cwd is not None else None
         self._permission_mode = permission_mode
         self._decision_callback = decision_callback
         self._include_partial = include_partial_messages
+        # P12 T-THINK: when True, this session surfaces Claude's readable reasoning. The
+        # SDK default (Opus 4.7+) is ``display="omitted"`` (signature only — NO text), so we
+        # must pass ``display="summarized"`` to get text; AND thinking only streams live when
+        # ``include_partial_messages`` is on. So a thinking-ON session forces partials on
+        # below regardless of the ``include_partial_messages`` arg. A thinking-OFF session is
+        # byte-for-byte unchanged: no ``thinking`` option, partials stay as passed (default
+        # False) → no StreamEvent traffic, exactly as before P12. Threaded per project by the
+        # factory (mirrors ``model`` / ``permission_mode``), so it is a session-creation knob.
+        self._thinking = bool(thinking)
         self._allowed_tools = allowed_tools
         self._disallowed_tools = disallowed_tools
         # T4 (P9): the per-project model override threaded into ClaudeAgentOptions(model=…)
@@ -338,8 +391,19 @@ class SdkSubstrate:
 
         kwargs: dict[str, Any] = {
             "permission_mode": self._permission_mode,
-            "include_partial_messages": self._include_partial,
+            # P12 T-THINK: a thinking-ON session REQUIRES partials (thinking only streams as
+            # ``thinking_delta`` StreamEvents, which need ``include_partial_messages``). So OR
+            # the per-session thinking flag in. A thinking-OFF session keeps the configured
+            # value (default False) → no StreamEvent traffic, byte-for-byte unchanged.
+            "include_partial_messages": self._include_partial or self._thinking,
         }
+        if self._thinking:
+            # P12 T-THINK: ask the model for READABLE reasoning. ``adaptive`` lets the model
+            # choose depth; ``display="summarized"`` is the gotcha — without it Opus 4.7+
+            # returns a signature-only ThinkingBlock (no text). Set ONLY when thinking is on,
+            # so a normal turn's options are unchanged (no ``thinking`` key at all). SB3: this
+            # surfaces the reasoning TEXT; the opaque signature is dropped in ``normalize``.
+            kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
         if self._cwd is not None:
             kwargs["cwd"] = self._cwd
         if self._model is not None:

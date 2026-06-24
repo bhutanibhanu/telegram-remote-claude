@@ -69,6 +69,10 @@ HELP_TEXT = (
     "“Other”/“Reject” prompt (streaming mode; or just reply to the prompt)\n"
     "/yolo — run every tool with NO approval prompt this session (streaming mode)\n"
     "/unyolo — restore the per-tool permission gate (streaming mode)\n"
+    "/plan — run your next message in plan mode: Claude proposes a plan and you Approve "
+    "(it executes, still per-tool gated) or Reject with feedback (it revises) (streaming mode)\n"
+    "/thinking on|off — stream Claude's reasoning as a 🧠 line while it works; off by default "
+    "(streaming mode)\n"
     "/fast — use the fast model (Haiku) for this project's next turn (streaming mode)\n"
     "/deep — use the deep model (Opus) for this project's next turn (streaming mode)\n"
     "/auto (or /model default) — clear the model override, back to the default (streaming mode)\n"
@@ -114,6 +118,8 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("to", "Send a free-text answer to a named project's prompt"),
     ("yolo", "Run every tool with NO approval prompt this session"),
     ("unyolo", "Restore the per-tool permission gate"),
+    ("plan", "Run the next message in plan mode (approve the plan first)"),
+    ("thinking", "Toggle the live reasoning stream: /thinking on|off (default off)"),
     ("fast", "Use the fast model (Haiku) for this project's next turn"),
     ("deep", "Use the deep model (Opus) for this project's next turn"),
     ("auto", "Clear the model override (back to the default)"),
@@ -549,6 +555,79 @@ class TelegramClaudeBot:
         await update.message.reply_text(
             "✅ Gating restored — risky tools will ask for approval again (/yolo is off)."
         )
+
+    async def cmd_plan(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/plan`` — run the NEXT message in plan mode and show the plan for approval (P12).
+
+        Arms a per-project, ONE-SHOT plan marker on the active project (via
+        :meth:`~claude_tg.stream_session.StreamingSession.arm_plan`): the next turn for that
+        project is driven in ``permission_mode="plan"``, so Claude reasons + proposes a plan and
+        surfaces ``ExitPlanMode`` through the SHIPPED Approve / Reject+feedback keyboard. Approve
+        resumes execution (still per-tool gated — ADR-001 C4); Reject feeds the feedback back as
+        a revision. The marker is one-shot, so the turn AFTER the planned one is normal.
+
+        Streaming mode only — the plan flow rides the streaming engine's permission gate (one-
+        shot mode has no per-tool holds), so one-shot replies a clear notice rather than half-
+        working (mirrors :meth:`cmd_yolo`). SB1: allowlist-gated by the ``_ok`` recheck first,
+        exactly like every command (an unauthorized chat does nothing). RB3: the marker is
+        transient (never persisted; dropped on restart).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if self.streaming is None:
+            await update.message.reply_text(
+                "Plan mode (/plan) applies to streaming mode only — one-shot mode has no "
+                "per-tool approval prompts to surface a plan for approval."
+            )
+            return
+        self.streaming.arm_plan(update.effective_chat.id)
+        await update.message.reply_text(
+            "📋 Next message runs in plan mode — I'll show the plan for approval."
+        )
+
+    async def cmd_thinking(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/thinking on|off`` — toggle the live reasoning stream for this project (P12 T-THINK).
+
+        When **on**, the active project's NEXT fresh session streams Claude's readable
+        reasoning as a capped, collapsed ``🧠`` status line that updates in place and is
+        cleared at turn end (off by default — the cost + flood posture, so it's an explicit
+        opt-in). When **off**, no reasoning is streamed and there is no extra wire traffic.
+        Per-project + transient (RB3 — dropped on restart). **Applies on the NEXT fresh
+        session**, never mid-turn (it's a session-creation knob, like ``/fast``·``/deep``).
+
+        Streaming mode only — live thinking rides the streaming engine's event stream (one-shot
+        has no streamed events), so one-shot replies a clear notice rather than half-working
+        (mirrors :meth:`cmd_yolo` / :meth:`cmd_plan`). SB1: ``_ok`` allowlist recheck first,
+        exactly like every command (an unauthorized chat does nothing). Bare ``/thinking`` (no
+        arg) shows the usage; an unrecognized arg shows the usage (RB1 — never a crash).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if self.streaming is None:
+            await update.message.reply_text(
+                "Live thinking (/thinking) applies to streaming mode only — one-shot mode "
+                "doesn't stream Claude's reasoning."
+            )
+            return
+        arg = (ctx.args[0].strip().lower() if ctx.args else "")
+        if arg not in ("on", "off"):
+            await update.message.reply_text(
+                "Usage: /thinking on  —  or  /thinking off\n"
+                "Streams Claude's reasoning as a 🧠 line while it works (off by default)."
+            )
+            return
+        on = arg == "on"
+        state = self.streaming.set_thinking(update.effective_chat.id, on)
+        if state:
+            await update.message.reply_text(
+                "🧠 Live thinking ON — I'll stream Claude's reasoning as a 🧠 line while it "
+                "works (cleared at turn end). Applies to your next message. /thinking off to stop."
+            )
+        else:
+            await update.message.reply_text(
+                "🧠 Live thinking OFF — Claude's reasoning won't be shown. "
+                "Applies to your next message."
+            )
 
     async def _set_model(
         self, update: Update, label: str, model: str | None
@@ -2299,6 +2378,14 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("cancel", self.cmd_cancel, filters=allowed))
         app.add_handler(CommandHandler("yolo", self.cmd_yolo, filters=allowed))
         app.add_handler(CommandHandler("unyolo", self.cmd_unyolo, filters=allowed))
+        # P12 T-PLAN-2: /plan arms the next turn as a plan turn (streaming mode only; the
+        # handler replies a streaming-only notice in one-shot). Same `allowed` chat filter
+        # (SB1) + registered BEFORE the on_skill_command COMMAND passthrough so it is consumed
+        # here, not forwarded to the session as a skill.
+        app.add_handler(CommandHandler("plan", self.cmd_plan, filters=allowed))
+        # P12 T-THINK: /thinking on|off toggles the per-project live reasoning stream
+        # (streaming mode only; default OFF — the explicit opt-in, transient RB3).
+        app.add_handler(CommandHandler("thinking", self.cmd_thinking, filters=allowed))
         # T4 (P9): per-project model routing (streaming mode only; the handlers reply a
         # streaming-only notice in one-shot). /model is the alias of /auto (so /model default
         # clears the override); both names route to cmd_auto. Registered with the SAME

@@ -76,6 +76,7 @@ from .engine.types import (
     ResultEvent,
     StatusEvent,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
 )
 from .tg_html import strip_telegram_html, to_telegram_html
@@ -1581,6 +1582,66 @@ def status_line(event: StatusEvent) -> str:
     return " · ".join(bits)
 
 
+# ---------------------------------------------------------------------------
+# Live thinking (P12 T-THINK) — a capped, collapsed 🧠 status line (SB3)
+# ---------------------------------------------------------------------------
+#
+# A ThinkingEvent is Claude's REASONING streamed for live supervision. It rides the SAME
+# coalesced status-line + per-chat send-gate path as the "💭 thinking…" / tool-status line
+# (op="edit_status", REPLACE/newest-wins in the Coalescer), so a burst of thinking_deltas
+# folds into a few in-place edits (RB5), and the bot's turn-end cleanup DELETES the status
+# message — so the reasoning is NEVER a permanent message (it disappears at turn end, like
+# the existing transient line). Off by default (the /thinking opt-in; cost + flood posture).
+#
+# SB3 — two rules this render enforces:
+#   * The shown text is CAPPED to a recent TAIL (THINKING_TAIL_MAX chars). Chain-of-thought
+#     can be thousands of chars; showing only the tail keeps the line phone-sized and the
+#     edit cheap, and never floods Telegram. A leading "…" marks a clip.
+#   * A ``redacted`` ThinkingEvent renders a FIXED opaque line (THINKING_HIDDEN_LINE) and
+#     NEVER its (absent) body. The opaque ``signature`` is dropped upstream (adapter_sdk) and
+#     is structurally absent from a ThinkingEvent, so it can't reach here at all.
+
+#: Brain glyph for the live-thinking status line (distinct from the "💭" activity line so the
+#: operator can tell REASONING from the generic "Claude is thinking…" placeholder).
+_THINKING_GLYPH: Final = "🧠"
+
+#: Max chars of the thinking stream shown on the status line — a recent TAIL, never the whole
+#: chain-of-thought (SB3: cap to avoid flooding Telegram; a long reasoning run can be many KB).
+#: ~280 chars reads as a couple of phone lines and keeps each in-place edit small. Tuned on a
+#: real long reasoning stream during phone-verify (design §8.3). A clip is marked with "…".
+THINKING_TAIL_MAX: Final = 280
+
+#: The FIXED opaque line for a ``redacted`` thinking event (SB3) — the model's reasoning was
+#: encrypted by the API; we show only that reasoning is hidden, NEVER any raw/decoded body.
+THINKING_HIDDEN_LINE: Final = f"{_THINKING_GLYPH} (reasoning hidden)"
+
+
+def thinking_line(event: ThinkingEvent) -> str:
+    """One-liner for a live :class:`ThinkingEvent` — a capped, collapsed ``🧠`` status line.
+
+    * ``redacted`` → the FIXED :data:`THINKING_HIDDEN_LINE` (``🧠 (reasoning hidden)``),
+      regardless of any text (a redacted event carries none anyway) — SB3: never raw.
+    * otherwise → ``🧠 <tail>`` where ``<tail>`` is the LAST :data:`THINKING_TAIL_MAX` chars
+      of the reasoning text (a leading ``…`` marks a clip), with internal newlines collapsed
+      to spaces so the line stays a single status line (the Coalescer replaces it in place).
+
+    Pure (no I/O). The opaque ``signature`` is never present on a :class:`ThinkingEvent`
+    (dropped in the adapter), so it can't appear here. The returned line is plain text
+    (``parse_mode=None`` in :func:`render_event`) — it carries no path/command, so unlike the
+    ``<code>``-wrapped tool-use line it needs no HTML.
+    """
+    if event.redacted:
+        return THINKING_HIDDEN_LINE
+    # Collapse newlines so multi-line reasoning stays ONE status line (a status edit is a
+    # single line that the Coalescer replaces; embedded newlines would bloat it).
+    text = " ".join(event.text.split())
+    if len(text) > THINKING_TAIL_MAX:
+        # Keep the most-recent TAIL (the live frontier of the reasoning), marked with a
+        # leading ellipsis so it's clear earlier reasoning was clipped (SB3 cap).
+        text = "…" + text[-THINKING_TAIL_MAX:]
+    return f"{_THINKING_GLYPH} {text}"
+
+
 #: Error kinds whose ``message`` wraps a RAW EXTERNAL body — tool stderr/stdout
 #: (``tool_error``, from ``ToolResultBlock.content``) or SDK/CLI result text
 #: (``turn_error``, from ``ResultMessage.result``). These can carry file contents or a
@@ -1718,6 +1779,10 @@ def render_event(event: Event) -> RenderAction:
     * ``text`` (incremental) / ``tool_use`` / ``status`` -> a one-liner folded into
       the edit-in-place status line (``op="edit_status"``) — the Coalescer batches
       these (RB5). An empty incremental delta -> ``op="none"``.
+    * ``thinking`` (P12 T-THINK) -> a capped, collapsed ``🧠`` status line
+      (``op="edit_status"``), folded by the Coalescer and CLEARED at turn end (never a
+      permanent message). A ``redacted`` thinking event renders the FIXED opaque
+      ``🧠 (reasoning hidden)`` line, never raw (SB3); an empty non-redacted one -> ``none``.
 
     Returns the action; the :class:`Coalescer` decides *when* edit_status actions are
     flushed, and T7 performs the send/edit.
@@ -1768,6 +1833,18 @@ def render_event(event: Event) -> RenderAction:
 
     if isinstance(event, ResultEvent):
         return _render_result(event)
+
+    if isinstance(event, ThinkingEvent):
+        # P12 T-THINK: live reasoning -> the capped, collapsed 🧠 status line (op="edit_status"),
+        # folded by the Coalescer into a few in-place edits and CLEARED at turn end by the bot's
+        # status-line cleanup (so it is never a permanent message). A ``redacted`` event ALWAYS
+        # renders the fixed opaque line (even with empty text — that's the whole point); a normal
+        # event with empty text is nothing to show (op="none"). Plain text (no path → no HTML).
+        if event.redacted:
+            return RenderAction(op="edit_status", chunks=(THINKING_HIDDEN_LINE,))
+        if not event.text:
+            return RenderAction.none()
+        return RenderAction(op="edit_status", chunks=(thinking_line(event),))
 
     if isinstance(event, TextEvent):
         if event.incremental:
@@ -2265,6 +2342,10 @@ __all__ = [
     # one-liners
     "tool_use_line",
     "status_line",
+    # live thinking (P12 T-THINK)
+    "thinking_line",
+    "THINKING_TAIL_MAX",
+    "THINKING_HIDDEN_LINE",
     # /yolo loud indicator (D6)
     "yolo_banner",
     "yolo_indicator",

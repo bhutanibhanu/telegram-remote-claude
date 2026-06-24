@@ -216,6 +216,8 @@ def _default_engine_factory(
     allow_any_path: bool = False,
     send_timeout: float = 120.0,
     model: Optional[str] = None,
+    permission_mode: str = "default",
+    thinking: bool = False,
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
@@ -250,6 +252,25 @@ def _default_engine_factory(
     via ``_bound_factory`` at each ``_ensure_engine`` build, so a ``/fast``/``/deep`` takes
     effect on the NEXT fresh session for that project (model is a session-creation param,
     never hot-swapped mid-session).
+
+    **P12 T-PLAN-1:** ``permission_mode`` is the per-turn SDK permission mode baked into the
+    substrate's ``ClaudeAgentOptions(permission_mode=…)`` at session-creation time (mechanism
+    (a) — mirrors ``model``). The default ``"default"`` is the unchanged normal turn; the
+    session passes ``"plan"`` for exactly the ONE turn armed by ``/plan`` (the one-shot marker
+    on ``_ProjectRuntime`` — ``_ensure_engine`` builds a FRESH plan-mode session for that
+    turn, then the marker is cleared so the NEXT turn is a normal ``"default"`` session again).
+    A plan turn surfaces Claude's ``ExitPlanMode`` plan through the SHIPPED P6 hold/keyboard;
+    approving it does NOT auto-allow later tools (ADR-001 C4 — every risky tool still hits the
+    permission gate independently, unchanged here). Transient (RB3): the arming never persists.
+
+    **P12 T-THINK:** ``thinking`` is the per-project live-reasoning flag baked into the
+    substrate (mirrors ``model`` / ``permission_mode`` — a session-creation knob). When True
+    the substrate streams Claude's readable reasoning (``thinking={"type":"adaptive",
+    "display":"summarized"}`` + ``include_partial_messages=True``) as ``ThinkingEvent``s →
+    the capped ``🧠`` status line. The default ``False`` is byte-for-byte the pre-P12 turn:
+    no ``thinking`` option, ``include_partial_messages`` stays off → no extra wire traffic.
+    Off by default (cost + flood posture); toggled per project by ``/thinking`` (transient,
+    RB3). SB3: the reasoning TEXT is shown; the opaque signature is dropped in ``normalize``.
     """
     engine: Engine
 
@@ -260,9 +281,10 @@ def _default_engine_factory(
 
     substrate = SdkSubstrate(
         cwd=cwd,
-        permission_mode="default",
+        permission_mode=permission_mode,
         decision_callback=decision_callback,
         model=model,
+        thinking=thinking,
     )
     engine = Engine(
         substrate,
@@ -360,6 +382,45 @@ class _ProjectRuntime:
     # session erroring is never mistaken for a resume failure. Reset on the in-memory
     # runtime only (never persisted).
     resumed_unverified: bool = False
+    # P12 T-PLAN-2 (/plan): a per-project, ONE-SHOT, in-memory marker — True from the moment
+    # ``/plan`` arms this project until the NEXT turn for it consumes it. ``_ensure_engine``
+    # reads + CLEARS it and builds that one turn's session in ``permission_mode="plan"`` (a
+    # FRESH plan-mode session — mechanism (a), mirroring how ``model`` is baked at session
+    # creation), so Claude reasons + proposes a plan and surfaces ``ExitPlanMode`` through the
+    # SHIPPED P6 hold/keyboard. The turn AFTER is a normal ``"default"`` session again (the
+    # marker is one-shot). Transient in-memory like the rest of the runtime (RB3): a process
+    # restart drops it — the supervision posture NEVER silently survives a restart, and it is
+    # never persisted to the registry. Set by :meth:`arm_plan`; consumed (read + cleared) in
+    # :meth:`_ensure_engine`. ADR-001 C4: arming plan mode greenlights NOTHING about tools —
+    # an approved plan's later risky tools still hit the permission gate independently.
+    plan_next: bool = False
+    # P12 T-PLAN: the SDK ``permission_mode`` the CURRENT live engine (``engine``) was built
+    # with — ``"default"`` for an ordinary session, ``"plan"`` for the fresh session built for
+    # an armed ``/plan`` turn. ``_ensure_engine`` records it at build time and consults it in
+    # the warm fast-path: a warm engine is reused ONLY when its mode matches the turn's
+    # requested mode, so (a) a normal turn after a plan turn rebuilds back to ``"default"``
+    # (the plan-mode session is one-shot — it never silently lingers onto the next turn), and
+    # (b) a plan turn never reuses a ``"default"`` warm engine (mechanism (a) is session-
+    # creation — the mode can't be hot-switched). Transient in-memory (RB3); a restart rebuilds
+    # the engine from the persisted id in ``"default"`` (the arming never persists).
+    engine_permission_mode: str = "default"
+    # P12 T-THINK (/thinking): this project's LIVE-REASONING toggle — False by default (cost +
+    # flood posture; the SB5-style explicit opt-in). UNLIKE the one-shot ``plan_next`` this is
+    # a STICKY per-project flag: it stays on until ``/thinking off`` (every turn while on
+    # streams the 🧠 line). ``_ensure_engine`` reads it and, when on, builds the session with
+    # ``thinking={"type":"adaptive","display":"summarized"}`` + ``include_partial_messages=True``
+    # (mechanism (a) — a session-creation knob, mirroring ``model``); a change takes effect on
+    # the NEXT fresh session for the project (a live session keeps streaming as built — we never
+    # hot-swap). Transient in-memory (RB3): a restart drops it back to OFF (supervision posture
+    # never silently survives a restart) — never persisted. Set by :meth:`set_thinking`.
+    thinking: bool = False
+    # P12 T-THINK: the ``thinking`` flag the CURRENT live engine was built with. ``_ensure_engine``
+    # records it at build time and the warm fast-path reuses the engine ONLY when it matches the
+    # turn's requested thinking flag — so toggling ``/thinking`` rebuilds the session on the next
+    # turn (thinking is a session-creation knob; it can't be hot-switched), in EITHER direction
+    # (off→on streams from the next turn; on→off stops the wire traffic from the next turn).
+    # Transient (RB3); a restart rebuilds in the default OFF.
+    engine_thinking: bool = False
     # P11 T2 (attach-fork): True iff this project was ADOPTED from an external session that
     # was LIVE in another process at attach time, so its NEXT resume MUST fork (resume into a
     # fresh id, transcript copied) rather than continue the live id — two writers on one
@@ -674,6 +735,8 @@ class StreamingSession:
                 backstop_seconds: float,
                 permission_policy: PermissionPolicy,
                 model: Optional[str] = None,
+                permission_mode: str = "default",
+                thinking: bool = False,
             ) -> Engine:
                 return _default_engine_factory(
                     cwd=cwd,
@@ -683,6 +746,8 @@ class StreamingSession:
                     allow_any_path=config.allow_any_path,
                     send_timeout=float(config.stream_message_timeout_seconds),
                     model=model,
+                    permission_mode=permission_mode,
+                    thinking=thinking,
                 )
 
             self._engine_factory = _bound_factory
@@ -1283,6 +1348,52 @@ class StreamingSession:
                 log.exception("failed to persist model override for chat %s", chat_id)
         return normalized
 
+    def arm_plan(self, chat_id: int) -> None:
+        """Arm the ACTIVE project's NEXT turn as a plan turn (``/plan``; P12 T-PLAN-2).
+
+        Sets the per-project, ONE-SHOT, in-memory ``plan_next`` marker on the active project's
+        runtime: the next turn for that project is driven in ``permission_mode="plan"``, so
+        Claude reasons + proposes a plan and surfaces ``ExitPlanMode`` through the SHIPPED P6
+        hold/keyboard (Approve → execution resumes; Reject + feedback → revise). The marker is
+        consumed (read + cleared) by :meth:`_ensure_engine` on that one turn, so the turn AFTER
+        is a normal (``"default"``) session again — the operator opts in deliberately, per turn.
+
+        Auto-creates ``default`` if there is no active project (consistent with ``set_yolo`` /
+        ``set_model`` / starting a turn — a ``/plan`` before any turn arms the implicit default
+        project). **RB3 (transient):** the marker is in-memory only and NEVER persisted — a
+        process restart drops it (the supervision posture never silently survives a restart).
+        **ADR-001 C4:** arming plan mode greenlights NOTHING about tools — every risky tool the
+        approved plan later runs still hits the permission gate independently (unchanged here).
+        SB1 is enforced by the bot's ``_ok`` recheck before this is reached.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=True)
+        if rt is not None:
+            rt.plan_next = True
+
+    def set_thinking(self, chat_id: int, on: bool) -> bool:
+        """Toggle the ACTIVE project's live-thinking flag (``/thinking on|off``; P12 T-THINK).
+
+        Sets the STICKY per-project ``thinking`` marker on the active project's runtime (default
+        OFF). When on, that project's NEXT fresh session streams Claude's readable reasoning as
+        the capped ``🧠`` status line (built with ``thinking={"type":"adaptive",
+        "display":"summarized"}`` + ``include_partial_messages=True`` — :meth:`_ensure_engine`);
+        when off, neither option is set and there is no partial-message wire traffic (the pre-P12
+        behavior). **Applies on the NEXT fresh session, never mid-turn** (thinking is a
+        session-creation knob, mirroring ``/fast``·``/deep`` — a turn in flight keeps streaming
+        as it was built; the warm fast-path rebuilds on the next turn because ``engine_thinking``
+        no longer matches). Returns the new flag so the bot can confirm the state.
+
+        Auto-creates ``default`` if there is no active project (consistent with ``set_yolo`` /
+        ``arm_plan``). **RB3 (transient):** in-memory only, NEVER persisted — a restart drops it
+        back to OFF (the supervision posture never silently survives a restart). SB1 is enforced
+        by the bot's ``_ok`` recheck before this is reached.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=True)
+        if rt is not None:
+            rt.thinking = bool(on)
+            return rt.thinking
+        return False
+
     def get_model(self, chat_id: int) -> Optional[str]:
         """The ACTIVE project's effective model id (override, else the configured default).
 
@@ -1334,6 +1445,7 @@ class StreamingSession:
         chat_id: int,
         *,
         target: Optional[tuple[str, _ProjectRuntime]] = None,
+        plan_turn: bool = False,
     ) -> tuple[Engine, bool]:
         """Lazily start (or resume) a project's engine. Idempotent per project.
 
@@ -1341,6 +1453,16 @@ class StreamingSession:
         ``session_id`` was present but ``resume`` raised and we fell back to a fresh
         ``start`` THIS call (so the caller can post the RB3 operator notice). It is False
         for a fresh start, a clean resume, and the already-started fast path.
+
+        **P12 T-PLAN-2 (/plan).** ``plan_turn`` is passed in by the caller, which ALREADY
+        consumed (read + cleared) the project's one-shot ``plan_next`` marker BEFORE this call
+        — so this method NEVER reads or clears the marker itself (round-2 QA fix). When True
+        this turn's session is built in ``permission_mode="plan"`` (mechanism (a) — a FRESH
+        plan-mode session, mirroring how ``model`` is baked at session creation); when False it
+        is the unchanged ``"default"``. Because the caller consumes the marker before BOTH the
+        pre-engine abort guards AND the SB2 ``resolve_within_roots`` check below, the one-shot
+        contract holds on every exit path — a plan turn that aborts or is refused fail-closed
+        still consumed the marker, so the NEXT turn is normal (never a surprise plan prompt).
 
         ``target`` PINS the project to build for (its ``(name, runtime)``). When omitted the
         chat's **active** project is resolved (auto-creating ``default`` if none — a turn
@@ -1385,39 +1507,96 @@ class StreamingSession:
             allowed_roots=self.config.allowed_roots,
             allow_any=self.config.allow_any_path,
         )
+        # P12 T-PLAN-2 (/plan), round-2 QA fix: the one-shot plan marker was ALREADY consumed
+        # (read + cleared) by the caller (``handle_message``) at the earliest commit point —
+        # BEFORE the pre-engine abort guards AND before the SB2 ``resolve_within_roots`` check
+        # above — so this method just RECEIVES the verdict as ``plan_turn`` and never touches
+        # ``rt.plan_next`` itself. (Consuming inside here was the bug: the SB2 raise above and
+        # the two pre-engine ``return``s in the caller skipped it, leaving the marker armed →
+        # a later unrelated message got a surprise plan prompt.) When armed, this turn's session
+        # must run in ``permission_mode="plan"`` (mechanism (a) — baked at session creation), so
+        # the ``"default"``-mode warm engine below is NOT reused: we force a FRESH plan-mode
+        # session for exactly this turn (which RESUMES the persisted id, so the conversation
+        # continues). A normal turn keeps ``"default"`` and the warm fast-path, byte-for-byte.
+        plan_mode = plan_turn
+        permission_mode = "plan" if plan_mode else "default"
+        # P12 T-THINK: this project's STICKY live-reasoning flag (set by /thinking; default
+        # OFF). UNLIKE the one-shot plan marker it is NOT consumed/cleared — it stays on until
+        # /thinking off. The session is built with the live-reasoning options when on; the warm
+        # fast-path below reuses the engine only when its built-with flag matches, so a toggle
+        # rebuilds the session on the next turn (thinking is a session-creation knob).
+        thinking = rt.thinking
         # P5 / ADR-005 D1 (T5): no cross-project stop here. A different project's started
         # engine is left running so N runs can be concurrent (T5 removed P4's
         # _stop_other_started). Only the SAME project's stale/non-started engine is handled
         # by the QF5 discard below.
-        if rt.engine is not None and rt.started:
+        #
+        # P12 T-PLAN: the warm fast-path is taken ONLY when the warm engine's permission mode
+        # already MATCHES the turn's requested mode. This rebuilds the session on a mode change
+        # in EITHER direction — a session built in ``"default"`` can't be hot-switched to plan
+        # mode (mechanism (a) is session-creation), AND a plan-mode session built for the one
+        # ``/plan`` turn must NOT linger onto the next (default) turn (the marker is one-shot).
+        # When the requested mode differs, the started engine is torn down + rebuilt fresh in
+        # the requested mode just below (the same discard the QF5 stale-engine path uses, which
+        # RESUMES the persisted id so the conversation continues). A back-to-back normal turn
+        # keeps the warm fast-path byte-for-byte: both modes are ``"default"`` → matched → reuse.
+        #
+        # P12 T-THINK: the warm fast-path ALSO requires the built-with ``thinking`` flag to match
+        # the turn's requested flag — for the same reason (thinking is a session-creation knob,
+        # not hot-switchable). So /thinking on→off (or off→on) rebuilds the session on the next
+        # turn; a back-to-back same-thinking turn still reuses the warm engine byte-for-byte
+        # (both False pre-P12 → matched → reuse, so a thinking-OFF project is unchanged).
+        if (
+            rt.engine is not None
+            and rt.started
+            and rt.engine_permission_mode == permission_mode
+            and rt.engine_thinking == thinking
+        ):
             return rt.engine, False
-        # Past the warm fast-path: rt is either fresh (engine None) OR holds a NON-started
+        # Past the warm fast-path: rt is either fresh (engine None), holds a NON-started
         # engine — a prior start()/resume() that raised AFTER the adapter allocated its
-        # client (so the engine is non-None but unusable). Never REUSE such an engine: a
-        # start()/resume() on it hits the adapter's "already started" guard → the turn
-        # wedges (the same coupling the QF4 resume-raises path recovers from). So if a
-        # non-started engine is present, best-effort stop() it (free its partial client)
-        # and build a FRESH one — a non-started engine is always discarded + replaced,
-        # never reused. This is the SAME-project QF5 hardening, kept under concurrency.
+        # client (so the engine is non-None but unusable) — OR holds a STARTED engine we are
+        # rebuilding because this is an armed plan turn (``plan_mode``; the warm fast-path was
+        # skipped above so the fresh session can be built in plan mode). Never REUSE such an
+        # engine: a start()/resume() on it hits the adapter's "already started" guard → the
+        # turn wedges (the same coupling the QF4 resume-raises path recovers from). So if ANY
+        # engine is present here, best-effort stop() it (free its client) and build a FRESH one
+        # — it is always discarded + replaced, never reused. This is the SAME-project QF5
+        # hardening, kept under concurrency, now also the plan-mode rebuild path. The plan
+        # rebuild RESUMES the persisted (session_id, cwd) below, so the conversation continues
+        # — only the permission mode of the fresh session differs.
         if rt.engine is not None:
             try:
                 await rt.engine.stop()
             except Exception:
                 log.debug(
-                    "stop of non-started engine raised for chat %s project %s "
-                    "(ignored — building fresh)",
+                    "stop of replaced engine raised for chat %s project %s "
+                    "(ignored — building fresh%s)",
                     chat_id,
                     name,
+                    " in plan mode" if plan_mode else "",
                     exc_info=True,
                 )
+            # A started engine being torn down for a plan rebuild leaves ``started`` True; drop
+            # it so a downstream failure can't mistake the discarded engine for a live one.
+            rt.started = False
         # T4 (P9): resolve THIS project's model (override → CLAUDE_MODEL → SDK default) and
         # bake it into the engine being built. Passed only to the DEFAULT factory (an injected
         # test factory keeps the 3-kwarg contract — see _factory_accepts_model). The model is
         # fixed for the life of THIS fresh session (session-creation param); a later
         # /fast·/deep·/auto takes effect on the next session this project builds.
         model = self._resolve_project_model(chat_id, name)
-        engine = self._build_engine(rt.cwd, rt.policy, model)
+        # P12 T-PLAN: build the session in the resolved permission mode (``"plan"`` for the one
+        # armed turn, else the unchanged ``"default"``). Threaded to the DEFAULT factory only,
+        # alongside ``model`` (an injected test factory keeps its 3-kwarg contract). Record the
+        # mode on the runtime so the warm fast-path reuses this engine only for a same-mode turn
+        # and rebuilds back to ``"default"`` after the one-shot plan turn (the mismatch path).
+        engine = self._build_engine(
+            rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
+        )
         rt.engine = engine
+        rt.engine_permission_mode = permission_mode
+        rt.engine_thinking = thinking  # P12 T-THINK: track the built-with thinking flag
         resume_id = self._resume_id(chat_id, name)
         # ⭐ P11 T2 (B2+B3) — the BINDING fork-vs-continue decision, made HERE at the first
         # write from a FRESH liveness re-probe (not frozen at attach time). When this project
@@ -1489,9 +1668,17 @@ class StreamingSession:
                 #     cannot hit the "already started" guard) and adopt it as the runtime
                 #     engine, replacing the failed one. T4: same per-project model as the
                 #     first build (resolved once above) — the fresh fallback session honors
-                #     the project's /fast·/deep override too.
-                engine = self._build_engine(rt.cwd, rt.policy, model)
+                #     the project's /fast·/deep override too. P12 T-PLAN: and the SAME
+                #     permission mode — a plan turn whose resume failed still starts fresh in
+                #     plan mode (the marker was already consumed above; this re-uses the value).
+                #     P12 T-THINK: and the SAME thinking flag — a thinking-ON project whose
+                #     resume failed still starts fresh with live reasoning on (sticky flag).
+                engine = self._build_engine(
+                    rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
+                )
                 rt.engine = engine
+                rt.engine_permission_mode = permission_mode  # P12 T-PLAN: track the fresh mode
+                rt.engine_thinking = thinking  # P12 T-THINK: track the fresh thinking flag
                 # (d) Start the FRESH engine — a clean fresh session (the dead id is gone).
                 await engine.start()
                 # (e) Signal the caller so handle_message posts the T7 "couldn't resume,
@@ -1526,7 +1713,13 @@ class StreamingSession:
         return engine, resume_failed
 
     def _build_engine(
-        self, cwd: str, policy: PermissionPolicy, model: Optional[str]
+        self,
+        cwd: str,
+        policy: PermissionPolicy,
+        model: Optional[str],
+        *,
+        permission_mode: str = "default",
+        thinking: bool = False,
     ) -> Engine:
         """Call the engine factory, passing the T4 per-project ``model`` only when supported.
 
@@ -1535,6 +1728,18 @@ class StreamingSession:
         (``cwd``/``backstop_seconds``/``permission_policy``) and must NOT receive ``model``
         (it would ``TypeError`` on the unexpected kwarg). ``_factory_accepts_model`` (set in
         ``__init__``) gates this so every existing test factory keeps working unchanged.
+
+        **P12 T-PLAN-1:** ``permission_mode`` rides the SAME default-factory-only gate as
+        ``model`` — mechanism (a) bakes ``"plan"`` into the FRESH session built for the one
+        armed ``/plan`` turn, ``"default"`` otherwise (a normal turn is byte-for-byte
+        unchanged: ``"default"`` was always passed). An injected test factory keeps its 3-kwarg
+        contract and never receives it, so every existing test factory is unaffected.
+
+        **P12 T-THINK:** ``thinking`` rides the SAME default-factory-only gate — True bakes the
+        live-reasoning options (partials + ``display="summarized"``) into the FRESH session for
+        a thinking-ON project, ``False`` (the default, always passed pre-P12) keeps a normal
+        turn byte-for-byte unchanged. An injected test factory never receives it (3-kwarg
+        contract), so every existing test factory is unaffected.
         """
         if self._factory_accepts_model:
             return self._engine_factory(
@@ -1542,6 +1747,8 @@ class StreamingSession:
                 backstop_seconds=float(self.config.answer_backstop_seconds),
                 permission_policy=policy,
                 model=model,  # type: ignore[call-arg]  # default factory accepts model (T4)
+                permission_mode=permission_mode,  # default factory accepts it too (P12 T-PLAN-1)
+                thinking=thinking,  # default factory accepts it too (P12 T-THINK)
             )
         return self._engine_factory(
             cwd=cwd,
@@ -2508,6 +2715,24 @@ class StreamingSession:
         # under inflight=True (after the busy-guard) — no other turn for this project can run
         # concurrently to observe a transient clear.
         target_rt.abort.clear()
+        # P12 T-PLAN-2 (/plan), round-2 QA BLOCKER — CONSUME the one-shot plan marker HERE, at
+        # the EARLIEST point this PROMPT message is committed to being driven as a turn: after
+        # the busy-guard passed (so we won't reject + leave it armed) and BEFORE _acquire_slot,
+        # the two pre-engine abort guards (the slot-transfer + lock-wait windows below), and
+        # _ensure_engine's SB2 PathNotAllowed check. Read + CLEAR atomically into a local
+        # ``plan_turn`` that is threaded DOWN to _ensure_engine (which no longer reads/clears
+        # the marker). Consuming it this early makes the one-shot contract hold on EVERY exit:
+        # a turn that aborts (abort.is_set → return) or is refused fail-closed (SB2 raise) STILL
+        # consumed the marker, so the NEXT message is ALWAYS a normal turn — never a surprise
+        # plan prompt (the bug: the late read/clear in _ensure_engine was skipped by both the
+        # pre-engine ``return``s and the SB2 raise). PROMPT-turn-scoped: commands (/status,
+        # /plan itself) go through their cmd_* handlers, never handle_message, so they never
+        # reach here and never consume the marker (/plan → /status → a prompt = the PROMPT runs
+        # in plan mode); a free-text "Other"/reject reply returned above (it resolves a hold,
+        # not a new turn) so it doesn't consume either. RB3: ``plan_turn`` is a local; the
+        # marker stays in-memory + un-persisted.
+        plan_turn = target_rt.plan_next
+        target_rt.plan_next = False
         try:
             # P5 / ADR-005 D6 (T6): acquire a run SLOT before driving. Under the cap → run now
             # (the counter is incremented). At the cap → enqueue (per-chat FIFO), set this
@@ -2558,7 +2783,7 @@ class StreamingSession:
                         return False
                     try:
                         engine, resume_failed = await self._ensure_engine(
-                            chat_id, target=target
+                            chat_id, target=target, plan_turn=plan_turn
                         )
                     except PathNotAllowed:
                         # SB2 (T7): the active project's stored cwd drifted out of the permitted

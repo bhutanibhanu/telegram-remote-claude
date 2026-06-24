@@ -827,6 +827,136 @@ async def test_engine_ask_plan_route_to_answer_hold_not_permission_gate():
 
 
 # ===========================================================================
+# P12 T-PLAN-3 / ADR-001 C4 — the SECURITY-CRITICAL acceptance.
+#
+# Approving a plan (ExitPlanMode) MUST NOT auto-allow subsequent tools: every risky
+# tool a plan's approved execution then runs MUST still hit the permission gate
+# INDEPENDENTLY. The bot never weakens this — plan mode is an ENTRY (the /plan one-shot
+# arms permission_mode="plan"); approving the plan grants nothing about tools. The gate
+# (Engine.on_tool_request) is the substrate-neutral backstop, so the probe asserts the
+# CONTRACT at the engine seam (where the C4 decision actually lives), independent of the
+# bot's marker plumbing. Mutation-probe shape: if a refactor made plan-approval bypass
+# the later gate (e.g. recording a session-wide allow on approve), the second request
+# would auto-allow and emit NO PermissionEvent — and this test would FAIL.
+# ===========================================================================
+
+
+async def test_c4_plan_approve_does_not_auto_allow_subsequent_write():
+    # The plan turn: ExitPlanMode is APPROVED (the answer-hold), then the model issues a
+    # Write — which MUST still hold for approval (a PermissionEvent reaches the operator),
+    # NOT auto-allow off the back of the plan approval.
+    sub = TwoToolSubstrate(
+        requests=[
+            ("ExitPlanMode", {"plan": "1. edit a.py  2. run tests"}, "tu-plan"),
+            ("Write", {"file_path": "/a.py", "content": "x = 1"}, "tu-write"),
+        ]
+    )
+    eng = _wire(sub)  # fresh default policy: ask/plan answered, risky Write gates
+    await eng.start()
+
+    async def operator():
+        # Approve the plan first.
+        assert await _resolve_when_pending(eng, "tu-plan", PlanVerdict(approve=True)) is True
+        # The subsequent Write MUST open its OWN gate hold — resolve it (allow_once) so the
+        # turn can drain. The KEY assertion is that this hold EXISTS at all (the gate ran).
+        assert (
+            await _resolve_when_pending(eng, "tu-write", PermissionDecision("allow_once"))
+            is True
+        )
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("plan it")), timeout=5)
+    await op
+    await eng.stop()
+
+    # The plan surfaced as a PlanEvent and was APPROVED (allow).
+    plans = [e for e in collected if isinstance(e, PlanEvent)]
+    assert len(plans) == 1 and plans[0].tool_use_id == "tu-plan"
+    assert sub.decisions[0].allow is True  # plan approved
+
+    # ⭐ C4: the post-approval Write STILL hit the gate — a PermissionEvent for it reached the
+    # operator (it was NOT auto-allowed by the plan approval). This is the load-bearing assert:
+    # a mutation that made plan-approve greenlight later tools would emit no such event.
+    perms = [e for e in collected if isinstance(e, PermissionEvent)]
+    assert len(perms) == 1
+    assert perms[0].tool_name == "Write"
+    assert perms[0].tool_use_id == "tu-write"
+    # (And once the operator allowed THAT request, the Write proceeded — second decision allow.)
+    assert sub.decisions[1].allow is True
+
+
+async def test_plan_hold_cancel_aborts_clean_no_auto_allow():
+    # P12 T-PLAN-3 (RB2/RB4): /cancel on an OPEN plan hold (ExitPlanMode parked on the
+    # operator) aborts CLEANLY — the held callback returns a DENY (never auto-allow), the turn
+    # unwinds without hanging, and the session stays usable. Mirrors the shipped ask-cancel
+    # test but pins it for a PLAN hold specifically (the /plan one-shot turn's hold).
+    from claude_tg.engine.types import TextEvent
+
+    sub = HoldingSubstrate(
+        tool_name="ExitPlanMode",
+        tool_input={"plan": "the proposed plan"},
+        tool_use_id="tu-plan-cancel",
+        post_factory=lambda d: TextEvent(text="resumed-after-cancel", session_id="S1"),
+    )
+    eng = Engine(sub, backstop_seconds=100)  # long backstop: prove CANCEL (not backstop) wins
+    sub.decision_callback = eng.on_tool_request
+    await eng.start()
+
+    async def operator():
+        assert await _resolve_when_pending_via_cancel(eng, "tu-plan-cancel") == 1
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("plan it")), timeout=5)  # must NOT hang
+    await op
+    await eng.stop()
+
+    # Cancel resolved the plan hold as a clean abort → DENY (never auto-allow — RB4).
+    assert sub.last_decision.allow is False
+    assert sub.last_decision.message == "cancelled"
+    # The turn unwound cleanly and kept streaming (no wedge).
+    assert any(getattr(e, "text", "") == "resumed-after-cancel" for e in collected)
+
+
+async def _resolve_when_pending_via_cancel(eng, tool_use_id):
+    """Poll the registry (same loop) then CANCEL the held request — deterministic."""
+    for _ in range(2000):
+        if eng._pending.has_pending(tool_use_id):
+            break
+        await asyncio.sleep(0)
+    return eng.cancel(tool_use_id)
+
+
+async def test_c4_plan_approve_then_denied_write_is_denied_not_auto_allowed():
+    # Stronger C4 variant: after approving the plan, the operator DENIES the subsequent Write.
+    # The Write must be DENIED (the gate is authoritative) — proving plan-approval did not
+    # pre-authorize it. If plan-approve had auto-allowed downstream tools, the Write would have
+    # run with no hold and this deny could never take effect.
+    sub = TwoToolSubstrate(
+        requests=[
+            ("ExitPlanMode", {"plan": "do the risky thing"}, "tu-p"),
+            ("Bash", {"command": "rm -rf /tmp/x"}, "tu-b"),
+        ]
+    )
+    eng = _wire(sub)
+    await eng.start()
+
+    async def operator():
+        await _resolve_when_pending(eng, "tu-p", PlanVerdict(approve=True))
+        await _resolve_when_pending(eng, "tu-b", PermissionDecision("deny"))
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("plan it")), timeout=5)
+    await op
+    await eng.stop()
+
+    assert sub.decisions[0].allow is True   # plan approved
+    assert sub.decisions[1].allow is False  # the Bash was gated and DENIED (not auto-allowed)
+    # The Bash surfaced its OWN permission prompt (the gate ran independently of the approval).
+    perms = [e for e in collected if isinstance(e, PermissionEvent)]
+    assert [p.tool_name for p in perms] == ["Bash"]
+
+
+# ===========================================================================
 # T10: dedup the DOUBLE ask/plan path (engine policy in _drain_substrate).
 #
 # A live run (spikes/p1-live-verify/evidence/v3_plan_reject.transcript.txt) showed
