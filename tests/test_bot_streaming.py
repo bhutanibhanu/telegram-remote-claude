@@ -118,6 +118,9 @@ class FakeStreaming:
         self.shutdown_calls = []
         self.command_initiated_calls = []
         self.images_calls = []
+        # P14 T-FIRE: records (schedule) each /runnow (or driver) fire delegated here, so the
+        # bot-wiring test asserts /runnow → fire_schedule. Returns True (fired) by default.
+        self.fire_schedule_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
         self._busy = busy
         # P5/T7: cmd_reset now reads streaming.store.get_active to scope its busy-guard to
@@ -144,6 +147,13 @@ class FakeStreaming:
         # bot dismisses the quick-reply chips on True). This stand-in drives normal turns →
         # False; the free-text-capture behavior is covered against a REAL session.
         return False
+
+    async def fire_schedule(self, schedule, *, send, edit, delete=None):
+        # P14 T-FIRE: /runnow delegates here (the proactive fire path). Record the schedule so
+        # the wiring test asserts delegation; the deep fire behavior is covered against a REAL
+        # session in test_stream_session.
+        self.fire_schedule_calls.append(schedule)
+        return True
 
     def resolve_callback(self, chat_id, data):
         self.resolve_calls.append((chat_id, data))
@@ -5424,15 +5434,69 @@ async def test_schedule_commands_in_command_menu_and_help():
     from claude_tg.bot import COMMAND_MENU, HELP_TEXT
 
     menu = {cmd for cmd, _desc in COMMAND_MENU}
-    for cmd in ("every", "schedules", "unschedule", "pause", "resume"):
+    for cmd in ("every", "schedules", "unschedule", "pause", "resume", "runnow"):
         assert cmd in menu, f"/{cmd} missing from COMMAND_MENU"
         assert f"/{cmd}" in HELP_TEXT, f"/{cmd} missing from HELP_TEXT"
 
 
 async def test_creating_schedule_does_not_fire_a_turn(tmp_path):
-    # This task ships DORMANT DATA — creating a schedule must NOT drive a turn (no firing
-    # until T-FIRE). Assert handle_message was never called by /every.
+    # Creating a schedule must NOT drive a turn (it just persists). Firing is /runnow + the
+    # driver. Assert handle_message was never called by /every.
     bot, store = _sched_bot(tmp_path)
     streaming = bot.streaming
     await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "go"]))
     assert streaming.handle_message_calls == [], "creating a schedule must not fire a turn"
+
+
+# ---------------------------------------------------------------------------
+# P14 T-FIRE — /runnow fires a schedule IMMEDIATELY via the gated proactive path.
+# ---------------------------------------------------------------------------
+
+
+async def test_cmd_runnow_fires_the_named_schedule_now(tmp_path):
+    """/runnow <name> delegates to streaming.fire_schedule for the named schedule (the gated
+    proactive path), without changing its next_run (an out-of-band fire, not a reschedule)."""
+    bot, store = _sched_bot(tmp_path)
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "go"]))
+    next_run_before = store.get_schedule(1, "ci").next_run
+
+    upd = make_update(1, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx(["ci"]))
+
+    # The schedule was fired through fire_schedule (the proactive path).
+    assert [s.name for s in bot.streaming.fire_schedule_calls] == ["ci"]
+    # next_run is UNCHANGED — /runnow is out-of-band, it does not reschedule the cadence.
+    assert store.get_schedule(1, "ci").next_run == next_run_before
+
+
+async def test_cmd_runnow_unknown_name_clean_reply_no_fire(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx(["nope"]))
+    assert bot.streaming.fire_schedule_calls == []  # nothing fired
+    assert "No schedule named" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_runnow_usage_when_no_name(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx([]))
+    assert bot.streaming.fire_schedule_calls == []
+    assert upd.message.reply_text.await_args.args[0] == "Usage: /runnow <name>"
+
+
+async def test_cmd_runnow_unauthorized_ignored(tmp_path):
+    # SB1: an un-allowlisted chat is rejected by _ok BEFORE any effect — no fire, no reply.
+    bot, store = _sched_bot(tmp_path, allowed=(1,))
+    upd = make_update(999, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx(["ci"]))
+    upd.message.reply_text.assert_not_awaited()
+    assert bot.streaming.fire_schedule_calls == []
+
+
+async def test_cmd_runnow_oneshot_replies_notice():
+    # Streaming-only: one-shot replies the clean notice, fires nothing.
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx(["ci"]))
+    assert "streaming mode only" in upd.message.reply_text.await_args.args[0].lower()

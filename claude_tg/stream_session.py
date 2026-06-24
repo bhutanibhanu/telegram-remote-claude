@@ -121,6 +121,7 @@ from .render import (
     strip_telegram_html,
     yolo_indicator,
 )
+from .scheduler import Schedule
 from .session_mirror import (
     TranscriptTailer,
     run_mirror,
@@ -1264,6 +1265,39 @@ class StreamingSession:
         record = self.store.get_project(chat_id, active)
         cwd = (record or {}).get("cwd")
         return active, self._runtime(chat_id, active, cwd)
+
+    def _override_runtime(
+        self, chat_id: int, name: str
+    ) -> tuple[str, _ProjectRuntime]:
+        """Resolve a NAMED project's ``(name, runtime)`` for a pinned turn (P14 T-FIRE).
+
+        Used by :meth:`handle_message` when ``project_override`` is set (a scheduled task
+        targets ITS project, pinned at create). Looks the project up in the store
+        case-insensitively; on a hit it builds/reuses that project's runtime at its stored cwd
+        (the SAME runtime a typed turn for that project would use, so the fire shares the
+        engine + policy + busy-guard). **Fail-soft (RB1):** an unknown/blank name, or no store,
+        falls back to the chat's ACTIVE project (``create_default=True`` — a fire always has a
+        project) so a stale/renamed schedule never silently drops a turn; the scheduler
+        validates the name at create, so the fallback is purely defensive. Returns
+        ``(name, runtime)`` (both non-None — the active fallback guarantees it).
+        """
+        store = self.store
+        if store is not None and name:
+            try:
+                record = store.get_project(chat_id, name)
+            except Exception:  # a misbehaving store must not drop the fire (RB1)
+                record = None
+            if record is not None:
+                # The record is keyed by name in the store (no ``name`` field on the record
+                # itself); the scheduler pins the project name from ``get_active`` at create,
+                # so ``name`` is already canonical. Build/reuse that project's runtime at its
+                # stored cwd (the SAME runtime + policy a typed turn for it would use).
+                cwd = record.get("cwd") if isinstance(record, dict) else None
+                return name, self._runtime(chat_id, name, cwd)
+        # Unknown/blank/no-store → the active project (a fire always lands on a project).
+        active_name, active_rt = self._active_runtime(chat_id, create_default=True)
+        assert active_name is not None and active_rt is not None
+        return active_name, active_rt
 
     def _ensure_default_active(self, chat_id: int) -> str:
         """Auto-create (or switch to) a ``default`` project for a chat with no active one.
@@ -2709,6 +2743,114 @@ class StreamingSession:
             return
         self._chat(chat_id).reply_to_index[message_id] = tool_use_id
 
+    # -- proactive (scheduler-fired) turn (P14 T-FIRE ⭐) --------------------
+
+    async def fire_schedule(
+        self,
+        schedule: Schedule,
+        *,
+        send: SendFn,
+        edit: EditFn,
+        delete: Optional[DeleteFn] = None,
+    ) -> bool:
+        """Fire ONE scheduled task as a fully-gated PROACTIVE turn (P14 T-FIRE ⭐).
+
+        The single entry point both the firing driver and ``/runnow`` use. It REUSES the
+        entire turn stack — it just calls :meth:`handle_message` with the security flags set:
+
+        * ``proactive=True`` → the engine FORCES the permission gate ON for the turn
+          (``/yolo`` + grants treated as off; every risky tool HOLDS and, unattended,
+          backstop-DENIES — RB4). The unattended-action core (design §5.1/§5.2).
+        * ``project_override=schedule.project`` → the turn targets the task's PINNED project
+          (not whatever is active), or the active project if the task pinned none / it is gone.
+        * ``command_initiated=True`` → a FRESH turn that can never be swallowed as the answer
+          to some other project's pending free-text hold (design §2.2 — load-bearing).
+
+        Flow + posture:
+
+        1. **Notify the chat** body-free that a proactive run started — a small ``⏰ <name>
+           (scheduled)`` header through the per-chat send gate (SB3: the schedule NAME only,
+           never the prompt; SB-flood: throttled like any send). The turn's own streamed output
+           IS the result notification (it renders through the gate like any turn).
+        2. **Audit** a body-free ``proactive_fire`` ``session_event`` (the task name + chat —
+           NOT the prompt) so the owner can reconstruct what fired while away (design §5.3).
+        3. **Drive** via :meth:`handle_message`.
+        4. **No stacking (overlap policy, design §3.2):** if the target project/chat is BUSY
+           (:class:`StreamingBusy`) this does NOT queue a second turn on top — it SKIPS this
+           tick with a body-free ``⏰ skipped <name> — still working`` notice + a
+           ``proactive_skip`` audit, and returns ``False`` (the driver reschedules for the next
+           interval). **RB1-total:** ANY other exception from the turn is caught, logged
+           body-free, and audited as a ``proactive_skip`` — a single bad fire NEVER propagates
+           (so it can never kill the firing loop or the bot). Returns ``True`` iff the turn was
+           driven (not skipped/errored). The audit/notify writes are best-effort (RB1): a write
+           failure never blocks the fire.
+        """
+        name = schedule.name
+        state = self._chat(schedule.chat_id)
+        # 1) Body-free "a scheduled run started" header (the operator knows it was machine-
+        #    initiated + which task). Verbatim priority through the D8 gate; best-effort.
+        try:
+            await self._gated_send(
+                state, send, verbatim=True,
+                text=f"⏰ <b>{html.escape(name, quote=False)}</b> (scheduled)…",
+                reply_markup=None, parse_mode="HTML",
+            )
+        except Exception:
+            log.debug("proactive fire header send failed for %s (ignored)", name, exc_info=True)
+        # 2) Audit the fire (body-free session_event: the task name, never the prompt).
+        self.record_audit(
+            KIND_SESSION_EVENT,
+            chat_id=schedule.chat_id,
+            summary=f"proactive_fire ({name})",
+            name=schedule.project,
+        )
+        # 3) Drive the proactive turn through the FULL gated path (force-gate ON).
+        try:
+            await self.handle_message(
+                schedule.chat_id,
+                schedule.prompt,
+                send=send,
+                edit=edit,
+                delete=delete,
+                command_initiated=True,
+                proactive=True,
+                project_override=schedule.project,
+            )
+            return True
+        except StreamingBusy:
+            # Overlap: the project/chat is already running — do NOT stack a second turn. Skip
+            # this tick (the driver reschedules for the next interval), notice + audit body-free.
+            log.info("proactive fire of %s skipped — project busy", name)
+            try:
+                await self._gated_send(
+                    state, send, verbatim=True,
+                    text=f"⏰ skipped <b>{html.escape(name, quote=False)}</b> — still working.",
+                    reply_markup=None, parse_mode="HTML",
+                )
+            except Exception:
+                log.debug("proactive skip notice send failed for %s (ignored)", name, exc_info=True)
+            self.record_audit(
+                KIND_SESSION_EVENT,
+                chat_id=schedule.chat_id,
+                summary=f"proactive_skip ({name})",
+                decision="busy",
+                name=schedule.project,
+            )
+            return False
+        except Exception:
+            # RB1-total: ANY other fire failure (a render bug, an engine build error, a store
+            # hiccup mid-turn) is caught here so it can NEVER propagate to the firing loop /
+            # bot. Logged body-free + audited as a skip so the owner can see the fire faltered.
+            log.exception("proactive fire of %s failed (skipping this tick)", name)
+            self.record_audit(
+                KIND_SESSION_EVENT,
+                chat_id=schedule.chat_id,
+                summary=f"proactive_skip ({name})",
+                decision="error",
+                name=schedule.project,
+            )
+            return False
+
     # -- the turn driver (LOCK-GUARDED: one turn per PROJECT) ----------------
 
     async def handle_message(
@@ -2722,6 +2864,8 @@ class StreamingSession:
         reply_to_message_id: Optional[int] = None,
         command_initiated: bool = False,
         images: Optional[Sequence[ImageInput]] = None,
+        proactive: bool = False,
+        project_override: Optional[str] = None,
     ) -> bool:
         """Drive ONE operator turn (or capture a free-text answer) for ``chat_id``.
 
@@ -2733,6 +2877,23 @@ class StreamingSession:
         screenshot) — so the free-text routing is skipped when ``images`` is present, and
         the pixels are threaded through ``_drive_turn`` → ``engine.send(images=…)``. The
         per-project busy-guard / slot / lock path is otherwise identical to a text turn.
+
+        **P14 T-FIRE — ``proactive`` + ``project_override`` (a SCHEDULER-fired turn).** Both
+        default off, so every existing caller + test is byte-for-byte unchanged. ⭐
+        ``proactive=True`` marks this turn as machine-initiated (no human at fire time): it is
+        threaded down to ``engine.send(proactive=True)`` so the engine FORCES the permission
+        gate ON for the turn — ``/yolo`` + allow-session grants are treated as OFF, every risky
+        tool HOLDS (and, unattended, backstop-DENIES — RB4), without mutating the project's
+        persistent policy (the operator's interactive bypass survives for their own typed
+        turns). A proactive turn is ALWAYS a fresh turn (like ``command_initiated`` — which the
+        scheduler also sets — it never satisfies a pending free-text hold). ``project_override``
+        PINS the target project by name (a scheduled task targets ITS project, not whatever is
+        active) — it is resolved to that project's ``(name, runtime)`` and used as the turn's
+        pinned ``target``; an unknown/blank name falls back to the active project (the
+        scheduler validates the name at create, so this is defensive). The per-project
+        busy-guard / slot / lock / gate / audit path is otherwise identical to a typed turn —
+        the whole point: a proactive fire REUSES the entire turn stack, adding only "force the
+        gate on".
 
         Free-text capture takes precedence: if any project is awaiting an "Other" answer /
         plan-reject feedback, this text is routed to ``engine.resolve`` (NOT a new turn)
@@ -2814,9 +2975,13 @@ class StreamingSession:
         # P10 T1: an image turn (images present) is ALWAYS a fresh turn — like a macro
         # /run it must never be swallowed as the answer to an outstanding free-text hold,
         # so the routing is skipped for it too.
+        # P14 T-FIRE: a proactive (scheduler-fired) turn is ALWAYS a fresh turn — like a
+        # command-initiated /run or an image turn it must NEVER be swallowed as the answer to
+        # an outstanding free-text hold (no human is replying), so the routing is skipped for
+        # it too. (The scheduler also passes command_initiated=True, so this is belt-and-braces.)
         armed_name, armed_rt, routed = (
             (None, None, False)
-            if (command_initiated or images)
+            if (command_initiated or images or proactive)
             else self._route_free_text_target(state, reply_to_message_id)
         )
         if routed:
@@ -2836,7 +3001,16 @@ class StreamingSession:
         # DIFFERENT idle project takes its own lock and runs concurrently. _ensure_engine /
         # _drive_turn re-resolve + pin the active project (the busy-guards keep it stable for
         # the turn in T5; T7 frees /switch but _drive_turn still pins the turn's project).
-        target_name, target_rt = self._active_runtime(chat_id, create_default=True)
+        # P14 T-FIRE: ``project_override`` PINS the target project by name (a scheduled task
+        # targets ITS project, not whatever the chat has active). Resolve it to that project's
+        # (name, runtime); an unknown/blank name (defensive — the scheduler validates at create)
+        # falls back to the active project so a fire is never silently dropped.
+        target_name: Optional[str]
+        target_rt: Optional[_ProjectRuntime]
+        if project_override:
+            target_name, target_rt = self._override_runtime(chat_id, project_override)
+        else:
+            target_name, target_rt = self._active_runtime(chat_id, create_default=True)
         assert target_name is not None and target_rt is not None  # create_default => both
         # Pin the captured (name, runtime) so _ensure_engine + _drive_turn act on THIS
         # project even if the turn QUEUES behind the cap (D6/T6) and the active project moves
@@ -2978,7 +3152,7 @@ class StreamingSession:
                     await self._drive_turn(
                         state, chat_id, engine, text,
                         send=send, edit=edit, delete=delete, target=target,
-                        images=images,
+                        images=images, proactive=proactive,
                     )
             finally:
                 # SLOT-LEAK SAFETY: release the slot this turn held — exactly once, on every
@@ -3170,6 +3344,7 @@ class StreamingSession:
         delete: Optional[DeleteFn] = None,
         target: Optional[tuple[str, _ProjectRuntime]] = None,
         images: Optional[Sequence[ImageInput]] = None,
+        proactive: bool = False,
     ) -> None:
         """Iterate ``engine.send`` → render → Telegram send/edit (coalesced).
 
@@ -3263,7 +3438,14 @@ class StreamingSession:
         # calls ``engine.send(prompt)`` with the EXACT pre-P10 signature — every existing
         # injected fake engine (whose ``send`` has no ``images`` kwarg) keeps working
         # verbatim. The image path supplies the kwarg to the real Engine (which accepts it).
-        send_kwargs: dict[str, Any] = {"images": images} if images else {}
+        # P14 T-FIRE: ⭐ pass ``proactive=True`` to ``engine.send`` ONLY for a proactive turn
+        # (the same additive-kwarg discipline), so the engine FORCES the gate on for it; a
+        # normal turn omits it entirely (the pre-P14 signature is preserved for every fake).
+        send_kwargs: dict[str, Any] = {}
+        if images:
+            send_kwargs["images"] = images
+        if proactive:
+            send_kwargs["proactive"] = True
         try:
             async for event in engine.send(prompt, **send_kwargs):
                 # QF3: on the first turn of a resumed session, flag a resume-failure-shaped

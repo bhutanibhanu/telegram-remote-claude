@@ -10,6 +10,7 @@ import os
 import shutil
 import tempfile
 import time
+from typing import Any
 
 from telegram import BotCommand, InputFile, Update
 from telegram.constants import ChatAction
@@ -54,6 +55,7 @@ from .scheduler import (
     format_interval,
     parse_interval,
 )
+from .scheduler_driver import Scheduler
 from .session_store import (
     DuplicateProject,
     InvalidProjectName,
@@ -123,6 +125,7 @@ HELP_TEXT = (
     "/unschedule <name> — remove a schedule (streaming mode)\n"
     "/pause <name> — pause a schedule without deleting it (streaming mode)\n"
     "/resume <name> — resume a paused schedule (streaming mode)\n"
+    "/runnow <name> — fire a schedule right now (through the same gate; streaming mode)\n"
     "\nAny *other* slash-command (e.g. /grill, /pipeline, /scaffold) is forwarded "
     "verbatim and runs as a skill in the Claude session.\n"
 )
@@ -170,6 +173,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("unschedule", "Remove a schedule: /unschedule <name>"),
     ("pause", "Pause a schedule without deleting it: /pause <name>"),
     ("resume", "Resume a paused schedule: /resume <name>"),
+    ("runnow", "Fire a schedule right now: /runnow <name>"),
 )
 
 
@@ -343,6 +347,12 @@ class TelegramClaudeBot:
         # harmless and the registry's per-chat shape is project-scoped, not a natural home for
         # a UX seen-flag); persisting it is a possible later refinement.
         self._welcomed: set[int] = set()
+        # P14 T-FIRE: the proactive-scheduler firing driver — the single asyncio task that
+        # fires due schedules. Constructed + started in ``_post_init`` (it needs the running
+        # loop + ``app.bot`` for the per-chat send closures) and cancelled in ``_post_shutdown``.
+        # ``None`` until then, and never built in one-shot mode (no streaming session, nowhere
+        # safe for a proactive turn to land — design §3.2). Held so shutdown can cancel it.
+        self._scheduler: Scheduler | None = None
 
     # ---- auth ---------------------------------------------------------------
     def _authorized(self, update: Update) -> bool:
@@ -1800,8 +1810,9 @@ class TelegramClaudeBot:
         await update.message.reply_text(
             f"⏰ Saved schedule <b>{html.escape(name, quote=False)}</b> — "
             f"every {html.escape(format_interval(interval_seconds), quote=False)}. "
-            "See it with /schedules. "
-            "(Scheduled runs go live in a later update; for now this just saves the task.)",
+            "See it with /schedules, fire it now with /runnow. "
+            "It runs through the same approval gate, so an unattended risky tool holds then "
+            "auto-denies — it never silently does anything risky.",
             parse_mode="HTML",
         )
 
@@ -1904,6 +1915,85 @@ class TelegramClaudeBot:
         if not await self._ok(update) or update.message is None:
             return
         await self._set_schedule_paused(update, ctx, paused=False)
+
+    async def cmd_runnow(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/runnow <name>`` — fire a proactive schedule IMMEDIATELY (P14 T-FIRE ⭐). SB1; streaming.
+
+        The manual proactive trigger (design §3.1): fire the named task NOW through the SAME
+        gated proactive path the scheduler uses — ``proactive=True`` so the gate is FORCED ON
+        (``/yolo`` + grants treated as off; a risky tool HOLDS for approval; with the operator
+        present they can tap Allow). It does **NOT** change the task's ``next_run`` (it is an
+        out-of-band fire, not a reschedule — the recurring cadence is untouched).
+
+        SB1 (``_ok``) + streaming-only (``_require_scheduling``) first; then resolve the schedule
+        by name (case-insensitive) → an unknown name replies a clean "no such schedule" (RB1).
+        On a hit, build this chat's send/edit/delete closures over ``ctx.bot`` and delegate to
+        :meth:`~claude_tg.stream_session.StreamingSession.fire_schedule` (which sends the
+        ``⏰ <name> (scheduled)…`` header, audits ``proactive_fire``, drives the gated turn, and
+        is RB1-total — a busy project / a fire error becomes a body-free skip, never a crash).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_scheduling(update):
+            return
+        store = self._schedule_store()
+        if store is None:
+            await update.message.reply_text(
+                "Schedules need persistence — set CLAUDE_STATE_FILE to create one."
+            )
+            return
+        name = (ctx.args[0] if ctx.args else "").strip()
+        if not name:
+            await update.message.reply_text("Usage: /runnow <name>")
+            return
+        chat_id = update.effective_chat.id
+        schedule = store.get_schedule(chat_id, name)
+        if schedule is None:
+            await update.message.reply_text(
+                f"❌ No schedule named <b>{html.escape(name, quote=False)}</b>. "
+                "List them with /schedules.",
+                parse_mode="HTML",
+            )
+            return
+        assert self.streaming is not None  # _require_scheduling guaranteed it
+        send, edit, delete = self._make_chat_io(ctx.bot, chat_id)
+        # fire_schedule sends the header, audits, drives the gated turn, and is RB1-total
+        # (a busy project / fire error is a clean body-free skip — never propagates here).
+        await self.streaming.fire_schedule(schedule, send=send, edit=edit, delete=delete)
+
+    def _make_chat_io(self, bot, chat_id: int):
+        """Build ``(send, edit, delete)`` Telegram closures over ``bot`` for ``chat_id`` (P14 T-FIRE).
+
+        The proactive firing path (the scheduler driver + ``/runnow``) has no incoming
+        ``update``/``ctx`` to build the per-chat send/edit/delete closures from (a scheduled
+        fire is machine-initiated), so it builds the IDENTICAL closures the message path builds
+        (:meth:`on_message`) over the persistent :class:`~telegram.Bot` captured at startup
+        (PTB hands the ``Application`` — and thus ``app.bot`` — to ``post_init``). The closures
+        are byte-for-byte the same shape the render layer + per-chat send gate expect, so a
+        proactive turn renders exactly like a typed one. Pure factory (no I/O here).
+        """
+
+        async def send(
+            *, text: str, reply_markup=None, parse_mode=None, link_preview_options=None
+        ) -> int | None:
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                link_preview_options=link_preview_options,
+            )
+            return getattr(msg, "message_id", None)
+
+        async def edit(*, message_id: int, text: str, parse_mode=None) -> None:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text, parse_mode=parse_mode
+            )
+
+        async def delete(*, message_id: int) -> None:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+
+        return send, edit, delete
 
     # ---- messages -----------------------------------------------------------
     @staticmethod
@@ -2604,7 +2694,12 @@ class TelegramClaudeBot:
             # handle_message with the EXACT pre-P10 signature — every existing FakeStreaming
             # (whose handle_message has no ``images`` kwarg) keeps working verbatim. The image
             # path supplies the kwarg to the real StreamingSession (which accepts it).
-            extra = {"images": images} if images else {}
+            # P10 T1 / P14: pass ``images`` ONLY when present (the additive-kwarg discipline),
+            # so a pure TEXT turn calls handle_message WITHOUT it — every existing FakeStreaming
+            # whose handle_message has no ``images`` kwarg keeps working verbatim. ``extra`` is
+            # typed ``dict[str, Any]`` so the ``**`` unpack type-checks cleanly against the
+            # (now larger) keyword set (mirrors _drive_turn's ``send_kwargs`` discipline).
+            extra: dict[str, Any] = {"images": images} if images else {}
             captured_free_text = await self.streaming.handle_message(
                 chat_id, text, send=send, edit=edit, delete=delete,
                 reply_to_message_id=reply_to_message_id,
@@ -2760,6 +2855,47 @@ class TelegramClaudeBot:
         except Exception:
             log.warning("failed to register the bot command menu (set_my_commands)", exc_info=True)
 
+        # P14 T-FIRE: start the proactive-scheduler firing driver — the single asyncio task
+        # that fires due schedules through the gated proactive path. Started HERE (post_init
+        # runs inside app.run_polling's loop, so the task lives on that loop, and app.bot is
+        # available for the per-chat send closures). STREAMING ONLY (a proactive turn needs the
+        # per-chat send gate + the hold path — one-shot has neither, design §3.2) AND only when
+        # SCHEDULER_ENABLED (default ON; the empty scheduler is zero-risk). Best-effort (RB1): a
+        # failure to start the driver must NEVER block the bot from polling — it just means no
+        # proactive fires until restart. ``Scheduler.start`` re-arms persisted schedules (no
+        # missed-fire replay) then launches the loop, which is itself RB1-total.
+        if (
+            self.streaming is not None
+            and self.streaming.store is not None
+            and getattr(self.config, "scheduler_enabled", True)
+        ):
+            try:
+                self._scheduler = Scheduler(
+                    store=self.streaming.store,
+                    fire=lambda schedule: self._fire_schedule(app.bot, schedule),
+                )
+                self._scheduler.start()
+            except Exception:
+                log.warning("failed to start the proactive scheduler (ignored)", exc_info=True)
+
+    async def _fire_schedule(self, bot, schedule: Schedule) -> bool:
+        """Drive ONE due schedule as a gated proactive turn (the driver's fire seam; P14 T-FIRE).
+
+        The ``fire`` callback the :class:`~claude_tg.scheduler_driver.Scheduler` invokes each
+        time a schedule comes due: build this chat's send/edit/delete closures over the
+        persistent ``bot`` (a fired turn has no incoming ``update``/``ctx``) and delegate to
+        :meth:`~claude_tg.stream_session.StreamingSession.fire_schedule` (force-gate ON; RB1-
+        total — a busy project / fire error is a clean body-free skip, never a crash). Returns
+        whether the turn was driven. Defensive: with no streaming session (shouldn't happen —
+        the driver is only started when one exists) it is a no-op skip.
+        """
+        if self.streaming is None:
+            return False
+        send, edit, delete = self._make_chat_io(bot, schedule.chat_id)
+        return await self.streaming.fire_schedule(
+            schedule, send=send, edit=edit, delete=delete
+        )
+
     async def _post_shutdown(self, _app: Application) -> None:
         """Clean shutdown: stop every engine + cancel every live-mirror watch (P11 T3).
 
@@ -2769,6 +2905,16 @@ class TelegramClaudeBot:
         started engine. Best-effort (RB1): a failure here must never block the shutdown — a
         crash on exit is logged, not raised. No-op in one-shot mode (no streaming session).
         """
+        # P14 T-FIRE: cancel the proactive-scheduler firing loop FIRST so no fire is dispatched
+        # while engines are being torn down (and no driver task outlives the bot). Best-effort
+        # (RB1): a cancel error never blocks the rest of shutdown. ``Scheduler.stop`` is
+        # idempotent + safe when never started.
+        if self._scheduler is not None:
+            try:
+                await self._scheduler.stop()
+            except Exception:
+                log.warning("error stopping the proactive scheduler", exc_info=True)
+            self._scheduler = None
         if self.streaming is None:
             return
         try:
@@ -2877,6 +3023,10 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("unschedule", self.cmd_unschedule, filters=allowed))
         app.add_handler(CommandHandler("pause", self.cmd_pause, filters=allowed))
         app.add_handler(CommandHandler("resume", self.cmd_resume, filters=allowed))
+        # P14 T-FIRE: /runnow fires a schedule immediately through the SAME gated proactive
+        # path the driver uses (force-gate ON). SB1 + streaming-only; registered BEFORE the
+        # skill passthrough so first-match-wins makes it a real command.
+        app.add_handler(CommandHandler("runnow", self.cmd_runnow, filters=allowed))
         # P13 T-AUDIT: /audit — body-free tail of the durable decision trail. Read-only,
         # SB1-gated (the `allowed` filter + the _ok recheck), registered BEFORE the
         # on_skill_command passthrough so first-match-wins makes it a real command (not

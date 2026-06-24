@@ -759,6 +759,39 @@ class JsonSessionStore:
         self._save_raw(raw)
         return True
 
+    def all_schedules(self) -> list["Schedule"]:
+        """EVERY chat's schedules as :class:`~claude_tg.scheduler.Schedule` objects (P14 T-FIRE).
+
+        The flat, cross-chat view the firing driver consults each tick to find what is due
+        (``list_schedules`` is per-chat; the driver fires for ALL chats). Each schedule carries
+        its own ``chat_id`` (so the driver knows where to fire) and the persisted ``next_run``.
+        Read-only / RB1: a missing/non-dict ``chats`` map reads as ``[]``; a malformed chat or
+        schedule record is skipped (never raises). Returned in chat-then-insertion order (a
+        stable, deterministic order so the driver's due-list + tests are reproducible).
+        """
+        raw = self._load_raw()
+        chats = raw.get("chats")
+        if not isinstance(chats, dict):
+            return []
+        out: list[Schedule] = []
+        for chat_key, chat in chats.items():
+            if not isinstance(chat, dict):
+                continue
+            try:
+                chat_id = int(chat_key)
+            except (TypeError, ValueError):
+                continue  # a non-int chat key can't own a routable schedule (defensive)
+            schedules = chat.get("schedules")
+            if not isinstance(schedules, dict):
+                continue
+            for name, record in schedules.items():
+                if not isinstance(name, str) or not isinstance(record, dict):
+                    continue
+                schedule = _deserialize_schedule(name, chat_id, record)
+                if schedule is not None:
+                    out.append(schedule)
+        return out
+
     def rearm_all_schedules(self, now: float) -> None:
         """Re-arm EVERY chat's schedules' ``next_run`` to ``now + interval`` — RB3/RB6.
 
