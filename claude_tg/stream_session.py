@@ -4201,8 +4201,8 @@ class StreamingSession:
             # _update_statusline already swallows its own I/O; this guards the gate itself).
             log.debug("statusline trigger failed for chat (ignored)", exc_info=True)
 
-    async def _statusline_text(self, chat_id: int) -> Optional[str]:
-        """Build the CURRENT statusline body for ``chat_id``'s foreground project (live read).
+    async def _statusline_text(self, chat_id: int) -> Optional[tuple[str, str]]:
+        """Build the CURRENT statusline body + the project it was built FOR (``(text, name)``).
 
         Reads the chat's ACTIVE (foreground) project's live state — the worktree NAME, the
         effective model + effort, the permission mode, the working/idle marker, and the ctx %
@@ -4214,8 +4214,14 @@ class StreamingSession:
         False`` so a statusline refresh NEVER creates a project as a side effect; with no active
         project (nothing run yet) returns ``None`` (nothing to show). Each field read is
         defensive — a missing store / odd record / ctx call that raises degrades to a safe
-        default (``ctx —``, ``gate``) rather than raising. Returns the formatted body, or
-        ``None`` when there is no foreground project to describe.
+        default (``ctx —``, ``gate``) rather than raising.
+
+        ⭐ **Returns ``(text, built_for)``** — the rendered body AND the project NAME it describes
+        — or ``None`` when there is no foreground project. The caller uses ``built_for`` for the
+        FINAL pre-write foreground re-check (B2): the ctx ``await`` below is a switch window, so
+        the only safe guarantee is "the project this text was built for is STILL foreground at the
+        instant just before the write" — a sync check the write helpers do with no await between
+        it and the ``edit``/``send``.
 
         ⭐ **ASYNC (B1 fix):** the ctx % comes from ``Engine.context_percentage()`` which AWAITS
         the SDK's coroutine ``get_context_usage()`` — so this method is async and awaits it. The
@@ -4253,10 +4259,12 @@ class StreamingSession:
         engine = rt.engine
         if engine is not None:
             try:
+                # ⭐ The ONLY await in this builder — and a /switch window (B2): the returned
+                # ``built_for`` lets the write helpers re-check foreground AFTER this await.
                 ctx_pct = await engine.context_percentage()
             except Exception:  # pragma: no cover - the engine call is already best-effort (RB1)
                 ctx_pct = None
-        return format_statusline(
+        body = format_statusline(
             worktree=worktree,
             model_label=model_label,
             effort=effort,
@@ -4264,6 +4272,7 @@ class StreamingSession:
             mode=mode,
             working=working,
         )
+        return body, name
 
     async def _update_statusline(
         self,
@@ -4304,19 +4313,23 @@ class StreamingSession:
         existing send/edit/delete closures) targeting THIS chat — so the line is SB1-confined to
         the operator's allowlisted chat (no new outbound surface).
 
-        **⭐ B2 fix — no stale line across a ``/switch``.** The body is built from the FOREGROUND
-        project's state, but the gated send/edit ``await``s the gate's wait — a ``/switch`` in
-        that window would change the foreground. So the body is REBUILT from CURRENT state right
-        before the actual edit/send (inside the gated helpers, AFTER the gate wait); whatever the
-        foreground is at write time, the line that lands describes IT, never a pre-switch
-        snapshot. **Pin-retry** — a send that succeeded while its pin RAISED leaves the line
-        UNPINNED (``statusline_pinned`` False); a later update RETRIES the pin even if the text is
+        **⭐ B2 fix — no stale line across a ``/switch`` (the FINAL guard).** The body is built
+        from the FOREGROUND project's state, but BOTH the gate's wait AND the ctx ``await`` inside
+        the rebuild are ``/switch`` windows. So the gated write helpers (1) REBUILD the body from
+        CURRENT state after the wait, then (2) do a FINAL **synchronous** foreground re-check — is
+        the project the rebuilt text was BUILT FOR still the chat's active/foreground? — with NO
+        await between that check and issuing the ``edit``/``send``. If a ``/switch`` happened
+        during ANY await, ``built_for`` is no longer foreground → the stale write is SKIPPED (the
+        ``/switch``'s own statusline trigger writes the correct line — no loop, no stale write).
+        **Pin-retry** — a send that succeeded while its pin RAISED leaves the line UNPINNED
+        (``statusline_pinned`` False); a later update RETRIES the pin even if the text is
         unchanged, so a transient pin failure self-heals instead of sticking unpinned forever.
         """
         try:
-            body = await self._statusline_text(chat_id)  # async (B1: awaits the SDK ctx %)
-            if not body:
+            built = await self._statusline_text(chat_id)  # async (B1: awaits the SDK ctx %)
+            if not built:
                 return  # no foreground project to describe — nothing to pin/edit.
+            body, _built_for = built  # body for the skip/decision; the helpers rebuild + re-check
             state = self._chat(chat_id)
             # Pin-retry: if we hold a sent id whose pin FAILED, retry the pin even on identical
             # text (the identical-text skip below would otherwise leave it unpinned forever).
@@ -4364,22 +4377,32 @@ class StreamingSession:
     async def _statusline_gated_edit(
         self, chat_id: int, state: _ChatState, message_id: int, *, edit: EditFn
     ) -> None:
-        """Edit the pinned line through the gate, REBUILDING the body AFTER the gate wait (B2).
+        """Edit the pinned line through the gate, REBUILDING + RE-CHECKING foreground (B2).
 
         Reserves the per-chat gate slot and awaits its wait (non-verbatim — RB5), THEN re-derives
-        the statusline body from CURRENT state and performs the raw edit. Rebuilding after the
-        wait closes the ``/switch``-during-wait race: the line that lands always describes the
-        foreground project AT WRITE TIME, never the pre-wait snapshot. If the rebuilt body is
-        empty (the foreground project vanished mid-wait — e.g. ``/rm``) or identical to what is
-        already shown, the edit is SKIPPED (no stale write, no no-op "not modified"). A raise
-        propagates to the caller's orphan-recovery (the message may be gone).
+        the statusline body + the project it was built for from CURRENT state. Two awaits precede
+        the write — the gate wait AND the ctx ``await`` inside :meth:`_statusline_text` — both
+        ``/switch`` windows. So immediately before the raw edit we do a FINAL **synchronous**
+        foreground re-check (``_is_foreground(built_for)``) with NO await between it and the
+        ``edit``: if a ``/switch`` happened during ANY await, ``built_for`` is no longer
+        foreground → SKIP (the switch's own trigger writes the correct line — no stale write, no
+        loop). An empty rebuild (foreground vanished — e.g. ``/rm``) or identical text also skips.
+        A raise propagates to the caller's orphan-recovery (the message may be gone).
         """
         wait = self._gate(state).reserve(verbatim=False)
         if wait > 0:
             await self._sleep(wait)
-        body = await self._statusline_text(chat_id)  # rebuilt AFTER the wait (B2)
-        if not body or body == state.statusline_text:
-            return  # foreground vanished mid-wait, or nothing changed → no stale/no-op write.
+        built = await self._statusline_text(chat_id)  # rebuilt AFTER the wait (B2)
+        if built is None:
+            return  # foreground vanished mid-wait → no stale write.
+        body, built_for = built
+        if body == state.statusline_text:
+            return  # nothing changed → no no-op "not modified" edit.
+        # ⭐ FINAL sync guard (B2): only write if the project this body describes is STILL the
+        # chat's foreground at THIS instant — no await between here and the edit, so a /switch
+        # during any preceding await is caught. A stale body (built_for switched away) is dropped.
+        if not self._is_foreground(chat_id, built_for):
+            return
         await edit(message_id=message_id, text=body, parse_mode="HTML")
         state.statusline_text = body
 
@@ -4394,22 +4417,32 @@ class StreamingSession:
         """Send the statusline body (gated, non-verbatim) then PIN it silently (design §3.1).
 
         The first-use + orphan-recovery primitive: reserve the gate slot, await its wait, THEN
-        rebuild the body from CURRENT state (B2 — a ``/switch`` during the wait sends the
-        now-current line, never the pre-wait snapshot) and send it; a best-effort silent pin
-        follows (``disable_notification=True`` — a pin must never re-ping the operator). The
-        id/text are stored on the chat ONLY when the send returns an id (so a send that yields
-        ``None`` does not leave a half-set state). A PIN failure is swallowed (RB1) AND records
-        ``statusline_pinned=False`` so the next update retries the pin (the line is still sent +
-        tracked; only the bar placement is deferred, never the turn). Called from
+        rebuild the body + the project it was built for from CURRENT state. Two awaits precede the
+        send — the gate wait AND the ctx ``await`` inside :meth:`_statusline_text` — both
+        ``/switch`` windows (B2). So immediately before the raw send we do a FINAL **synchronous**
+        foreground re-check (``_is_foreground(built_for)``) with NO await between it and the
+        ``send``: a ``/switch`` during any preceding await makes ``built_for`` no longer
+        foreground → SKIP (the switch's own trigger sends the correct line — no stale send, no
+        loop). A best-effort silent pin follows (``disable_notification=True`` — a pin must never
+        re-ping). The id/text are stored ONLY when the send returns an id (so a ``None`` send does
+        not leave a half-set state). A PIN failure is swallowed (RB1) AND records
+        ``statusline_pinned=False`` so the next update retries the pin. Called from
         :meth:`_update_statusline` inside its best-effort guard, so a raising ``send`` propagates
         to that guard's swallow.
         """
         wait = self._gate(state).reserve(verbatim=False)
         if wait > 0:
             await self._sleep(wait)
-        body = await self._statusline_text(chat_id)  # rebuilt AFTER the wait (B2)
-        if not body:
+        built = await self._statusline_text(chat_id)  # rebuilt AFTER the wait (B2)
+        if built is None:
             return  # foreground vanished mid-wait — nothing to send.
+        body, built_for = built
+        # ⭐ FINAL sync guard (B2): only send if the project this body describes is STILL the
+        # chat's foreground at THIS instant — no await between here and the send, so a /switch
+        # during any preceding await (the gate wait OR the ctx await) is caught and the stale
+        # send is dropped (the switch's own statusline trigger sends the correct line).
+        if not self._is_foreground(chat_id, built_for):
+            return
         mid = await send(text=body, reply_markup=None, parse_mode="HTML")
         if mid is None:
             # The send produced no id (a closure that returns None) — don't store a half state;

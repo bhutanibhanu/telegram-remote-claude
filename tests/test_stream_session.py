@@ -7922,13 +7922,27 @@ async def test_ctx_percentage_is_awaited_end_to_end_via_async_engine():
     assert "🧠 ctx 37%" in rec.sends[0]["text"], "the awaited async ctx % must reach the line (B1)"
 
 
-async def test_statusline_text_is_async_and_awaits_ctx():
+async def test_statusline_text_is_async_and_awaits_ctx_and_returns_built_for():
     # B1 at the builder level: _statusline_text is a coroutine that awaits the async ctx source.
+    # B2: it returns (text, built_for_project) — the project the body describes, for the final
+    # pre-write foreground re-check.
     session = make_session(FakeEngine([]))
     eng = FakeEngine([], ctx_pct=21)
-    _prime_statusline_project(session, engine=eng, status="idle")
-    body = await session._statusline_text(1)
-    assert body is not None and "🧠 ctx 21%" in body
+    name, _rt = _prime_statusline_project(session, engine=eng, status="idle")
+    built = await session._statusline_text(1)
+    assert built is not None
+    body, built_for = built
+    assert "🧠 ctx 21%" in body
+    assert built_for == name  # the (text, built_for) contract — B2
+
+
+async def test_statusline_text_none_when_no_foreground(tmp_path):
+    # No active project → None (the write helpers treat None as "nothing to write").
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    session = make_session(FakeEngine([]), store=store)
+    assert await session._statusline_text(1) is None
 
 
 def _two_project_statusline_session(tmp_path):
@@ -8020,6 +8034,120 @@ async def test_switch_after_snapshot_on_edit_writes_current_line(tmp_path):
     assert sl_edits, "an edit happened"
     assert "📁 beta" in sl_edits[-1]["text"], "B2 (edit): the now-current project is written"
     assert "📁 alpha" not in sl_edits[-1]["text"]
+
+
+class _SwitchDuringCtxEngine(FakeEngine):
+    """A FakeEngine whose ASYNC context_percentage() performs a /switch mid-await (the residual
+
+    B2 window Codex flagged): _statusline_text captures the foreground project, THEN awaits
+    context_percentage() — this fake switches the store's active project DURING that await, so the
+    body built by THAT call is for the OLD (pre-switch) project. The final pre-write foreground
+    re-check must then SKIP the stale write.
+
+    ``switch_on_call`` selects WHICH ctx call performs the switch (1-based). _update_statusline
+    calls _statusline_text twice — the top-level snapshot (call 1) and the gated-helper REBUILD
+    (call 2). To exercise the residual race we switch on the REBUILD call so it captures the old
+    project just before its await, then finds itself no-longer-foreground at the guard.
+    """
+
+    def __init__(self, *, store, switch_to, switch_on_call=2, **kw):
+        super().__init__([], **kw)
+        self._store = store
+        self._switch_to = switch_to
+        self._switch_on_call = switch_on_call
+        self._calls = 0
+
+    async def context_percentage(self):
+        self._calls += 1
+        if self._calls == self._switch_on_call:
+            self._store.switch(1, self._switch_to)  # ⭐ /switch lands DURING this ctx await
+        return self._ctx_pct
+
+
+async def test_switch_during_ctx_await_skips_stale_write_send(tmp_path):
+    # ⭐⭐ B2 RESIDUAL (Codex's re-opened probe): the B1 ctx-await is itself a /switch window.
+    # _statusline_text captures alpha, then awaits context_percentage() — which switches active to
+    # beta mid-await — so the rebuilt body is alpha's (built_for="alpha"). The FINAL sync
+    # foreground re-check (built_for still foreground?) is now beta → SKIP the stale alpha write.
+    #
+    # MUTATION PROBE: remove the post-await `_is_foreground(built_for)` guard in
+    # _statusline_send_and_pin and this FAILS — the stale alpha line is sent (exactly Codex's bug).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "a"), make_active=True)
+    store.create(1, "beta", str(tmp_path / "b"), make_active=False)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    eng = _SwitchDuringCtxEngine(store=store, switch_to="beta", ctx_pct=5)
+    cfg = make_config(allowed_roots=(str(tmp_path),), allow_any_path=False)
+    session = StreamingSession(
+        cfg, session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng,
+        clock=lambda: 0.0,
+    )
+    session._runtime(1, "alpha", str(tmp_path / "a")).engine = eng
+    session._runtime(1, "beta", str(tmp_path / "b")).engine = eng
+    rec = Recorder()
+    pins = PinRecorder()
+    # First update (no line yet → the send path). alpha is foreground at the snapshot; the ctx
+    # await switches active→beta; the rebuilt body is alpha's but built_for="alpha" is no longer
+    # foreground → the stale send is SKIPPED.
+    await session._update_statusline(
+        1, send=rec.send, edit=rec.edit, pin=pins.pin, unpin=pins.unpin
+    )
+    # NO stale alpha line was sent (the residual race is closed).
+    assert all("📁 alpha" not in (s.get("text") or "") for s in rec.sends), \
+        "B2 residual: a stale alpha line must NOT be sent when /switch lands during the ctx await"
+    assert pins.pins == [], "nothing pinned (the stale send was skipped)"
+    assert session._chat(1).statusline_message_id is None, "no half-set state from a skipped send"
+    # The foreground is now beta (the switch took effect); a SUBSEQUENT update writes beta.
+    assert store.get_active(1) == "beta"
+
+
+async def test_switch_during_ctx_await_skips_stale_write_edit(tmp_path):
+    # B2 RESIDUAL on the EDIT path: an established (pinned) line, then a later update whose ctx
+    # await switches active→beta → the rebuilt body is alpha's (built_for="alpha", no longer
+    # foreground) → the stale EDIT is SKIPPED (the pinned line keeps its last good text).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "a"), make_active=True)
+    store.create(1, "beta", str(tmp_path / "b"), make_active=False)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    # A plain engine for the FIRST (line-establishing) update; swap in the switching engine after.
+    plain = FakeEngine([], ctx_pct=5)
+    cfg = make_config(allowed_roots=(str(tmp_path),), allow_any_path=False)
+    session = StreamingSession(
+        cfg, session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: plain,
+        clock=lambda: 0.0,
+    )
+    rt_alpha = session._runtime(1, "alpha", str(tmp_path / "a"))
+    rt_alpha.engine = plain
+    rt_alpha.status = "running"  # the first line is the running line
+    session._runtime(1, "beta", str(tmp_path / "b")).engine = plain
+    rec = Recorder()
+    pins = PinRecorder()
+    # 1) Establish + pin alpha's line.
+    await session._update_statusline(
+        1, send=rec.send, edit=rec.edit, pin=pins.pin, unpin=pins.unpin
+    )
+    assert "📁 alpha" in _statusline_sends(rec)[0]["text"]
+    pinned_text_before = session._chat(1).statusline_text
+    # 2) Now alpha's engine switches active→beta DURING the next update's ctx await; alpha's status
+    #    changes so a (stale) edit WOULD be attempted — but the final foreground guard skips it.
+    rt_alpha.engine = _SwitchDuringCtxEngine(store=store, switch_to="beta", ctx_pct=5)
+    rt_alpha.status = "idle"
+    await session._update_statusline(
+        1, send=rec.send, edit=rec.edit, pin=pins.pin, unpin=pins.unpin
+    )
+    # NO stale alpha edit landed (the residual race is closed); the tracked text is unchanged.
+    assert all("📁 alpha" not in (e.get("text") or "") for e in _statusline_edits(rec)), \
+        "B2 residual (edit): a stale alpha edit must NOT land when /switch hits during ctx await"
+    assert session._chat(1).statusline_text == pinned_text_before, "the pinned text is left intact"
+    assert store.get_active(1) == "beta"
 
 
 async def test_plan_turn_shows_plan_mode_while_running_then_gate(tmp_path):
