@@ -1,19 +1,19 @@
-"""Console entry point for the ``claude-telegram-bot`` command (P7/T1, T4).
+"""Console entry point for the ``claude-telegram-bot`` command (P7/T1, T4; B1 hardened).
 
-A thin shim over :func:`main.main` (the existing root ``main.py`` startup): the installed
-console command, ``python -m claude_tg`` (see ``claude_tg/__main__.py``), and the
-long-standing ``python main.py`` flow all start the bot identically — same ``.env``-from-CWD
-load, same logging setup, same one-shot/streaming switch, same ``run_polling``. Keeping the
-startup logic in one place (``main.py``, which ``tests/test_main.py`` also drives) avoids two
-divergent entry points.
+This is the REAL entry: the installed console script, ``python -m claude_tg`` (see
+``claude_tg/__main__.py``), and the long-standing ``python main.py`` all funnel through
+:func:`main` here. The actual startup (``.env``-from-CWD load, logging, the one-shot vs
+streaming switch, ``run_polling``) lives in :mod:`claude_tg.app`.
 
-The only thing this wrapper adds on top of ``main.main`` is a ``--version`` / ``-V`` short
-circuit (T4) so the install is identifiable without booting the bot; any other argv is passed
-straight through (``main.main`` itself ignores argv and just polls).
+B1 (cwd-shadow fix): startup used to live in a top-level ``main`` module and ``cli.py``
+did ``from main import main``. Because ``sys.path[0]`` (the CWD) precedes site-packages,
+an unrelated ``main.py`` in the user's working directory would shadow the real entry for
+the installed tool. Everything is package-internal now (``from claude_tg.app import run``),
+so the entry resolves the same regardless of the CWD's contents.
 
-``main`` is shipped as a top-level module (see ``[tool.setuptools] py-modules`` in
-``pyproject.toml``), so ``from main import main`` resolves both in-repo (pytest's
-``pythonpath = .``) and from a clean ``pip install``.
+On top of the startup logic this entry adds only a ``--version`` / ``-V`` short circuit
+(T4) so the install is identifiable without booting the bot; any other argv is ignored
+(the bot itself takes no positional args — it polls).
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from __future__ import annotations
 import sys
 
 from claude_tg import __version__
-from main import main as _run
 
 __all__ = ["main"]
 
@@ -30,14 +29,18 @@ def main(argv: list[str] | None = None) -> None:
     """Entry point: print the version on ``--version``/``-V``, else start the bot.
 
     ``argv`` defaults to ``sys.argv[1:]`` (override in tests). On the version flag we
-    print and return WITHOUT importing/booting any bot machinery; otherwise we delegate
-    to :func:`main.main` unchanged.
+    print and return WITHOUT importing/booting any bot machinery; otherwise we import
+    :mod:`claude_tg.app` lazily and delegate to :func:`claude_tg.app.run`.
     """
     args = sys.argv[1:] if argv is None else argv
     if any(a in ("--version", "-V") for a in args):
         print(f"claude-telegram-bot {__version__}")
         return
-    _run()
+    # Import lazily so ``--version`` stays light (no PTB / SDK import) and import-time
+    # failures in the bot stack surface only when actually starting the bot.
+    from claude_tg.app import run
+
+    run()
 
 
 if __name__ == "__main__":

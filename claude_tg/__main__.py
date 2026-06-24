@@ -1,11 +1,12 @@
 """``python -m claude_tg`` entry point (P7/T4).
 
 Delegates to :func:`claude_tg.cli.main` — the same entry the ``claude-telegram-bot``
-console script targets, which (apart from a ``--version`` short circuit) reuses the root
-``main.main()`` verbatim. So ``python -m claude_tg``, the installed ``claude-telegram-bot``
-command, and ``python main.py`` all start the bot identically (``.env`` loaded from the CWD,
-then ``run_polling``). This module exists so the launchd/systemd keep-alive can fall back to
-``python -m claude_tg`` when the console script isn't on PATH.
+console script targets (startup logic in :mod:`claude_tg.app`). So ``python -m claude_tg``,
+the installed ``claude-telegram-bot`` command, and ``python main.py`` all start the bot
+identically (``.env`` loaded from the CWD, then ``run_polling``), and all resolve the entry
+from the package — they cannot be cwd-shadowed by an unrelated ``main.py`` (P7/B1). This
+module exists so the launchd/systemd keep-alive can fall back to ``python -m claude_tg``
+when the console script isn't on PATH.
 """
 
 from __future__ import annotations

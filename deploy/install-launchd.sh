@@ -15,7 +15,8 @@
 #
 # IMPORTANT (one instance per token): this agent runs the only poller. Before you start
 # the bot by hand (./run.sh), `launchctl unload` it first (see deploy/README.md), or two
-# pollers will hit a Telegram `Conflict`.
+# pollers will hit a Telegram `Conflict`. As a safety net, install ABORTS if it detects a
+# bot already running by hand (it won't start a second, conflicting poller).
 #
 # Usage:
 #   deploy/install-launchd.sh                 # install + load from this checkout
@@ -59,10 +60,46 @@ uninstall() {
   fi
 }
 
+# B2: list PIDs of any RUNNING bot poller (manual `./run.sh`, `python main.py`,
+# `python -m claude_tg`, or a `claude-telegram-bot` console script), one per line. Used
+# AFTER unloading our own LaunchAgent so anything still alive is a manual poller — starting
+# a second one on the same token would hit a Telegram `Conflict`. Excludes this installer
+# (its own path contains "claude-telegram-bot") and the inner grep/ps via PID filtering.
+running_bot_pids() {
+  # `ps -axww -o pid=,command=`: every process, full (un-truncated) command, no header.
+  # Match the known start forms, then drop our own PID + this script's path so the guard
+  # never trips on itself.
+  ps -axww -o pid=,command= 2>/dev/null | awk -v self="$$" -v script="${BASH_SOURCE[0]}" '
+    {
+      pid = $1
+      # rebuild the command (everything after the pid column)
+      cmd = $0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", cmd)
+      if (pid == self) next            # this installer process
+      if (index(cmd, script)) next     # any invocation of this script (e.g. a subshell)
+      if (cmd ~ /[Cc]laude-telegram-bot/ \
+          || cmd ~ /-m[[:space:]]+claude_tg/ \
+          || cmd ~ /(^|\/)python[0-9.]*[[:space:]]+.*main\.py/ \
+          || cmd ~ /[[:space:]]main\.py($|[[:space:]])/) {
+        print pid
+      }
+    }
+  '
+}
+
 if [ "$MODE" = "uninstall" ]; then
   uninstall
   exit 0
 fi
+
+# XML-escape a value before substituting it into the plist (NB). The plist is XML, so a
+# WorkingDirectory / PATH / argv token containing & < > would otherwise produce an invalid
+# plist that launchd rejects. Order matters: & first (so we don't double-escape the &
+# introduced by < / >), then < and >. (" and ' are legal inside an XML element body, so
+# they need no escaping here.)
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
 
 # --- resolve the bot start command (absolute argv tokens, one per line) ---
 # bash 3.2-compatible (macOS system bash): no `mapfile`/`readarray`.
@@ -110,7 +147,8 @@ ARGV_XML=""
 while IFS= read -r tok; do
   [ -n "$tok" ] || continue
   BOT_ARGV+=("$tok")
-  ARGV_XML+="        <string>${tok}</string>"$'\n'
+  # NB: XML-escape each token before it goes into the plist <string> body.
+  ARGV_XML+="        <string>$(xml_escape "$tok")</string>"$'\n'
 done < <(resolve_bot_command)
 ARGV_XML="${ARGV_XML%$'\n'}"
 
@@ -119,8 +157,19 @@ RESOLVED_PATH="$(resolve_path)"
 render() {
   # Stream the template line-by-line; when we hit the single-token __BOT_COMMAND__
   # <string> line, emit the full (possibly multi-line) argv block instead, then
-  # substitute the scalar placeholders. Done in bash (no awk -v: the argv block has
-  # newlines, which awk's -v can't carry). sed handles the one-line scalar swaps.
+  # substitute the scalar placeholders.
+  #
+  # NB: XML-escape each scalar before it lands in the plist (the values are <string>
+  # bodies). A WorkingDirectory / PATH with & < > would otherwise yield an invalid plist.
+  # The substitution uses bash parameter expansion (literal replace), NOT sed: an escaped
+  # value contains `&`, which sed would treat as "the whole match" in its replacement text,
+  # re-corrupting the output. `${var//find/replace}` has no such metacharacter pitfalls and
+  # is bash 3.2-safe.
+  local wd path_v out_v err_v
+  wd="$(xml_escape "$WORKDIR")"
+  path_v="$(xml_escape "$RESOLVED_PATH")"
+  out_v="$(xml_escape "$STDOUT_LOG")"
+  err_v="$(xml_escape "$STDERR_LOG")"
   local line
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
@@ -128,11 +177,11 @@ render() {
         printf '%s\n' "$ARGV_XML"
         ;;
       *)
-        printf '%s\n' "$line" | sed \
-          -e "s|__WORKING_DIR__|$WORKDIR|g" \
-          -e "s|__PATH__|$RESOLVED_PATH|g" \
-          -e "s|__STDOUT_LOG__|$STDOUT_LOG|g" \
-          -e "s|__STDERR_LOG__|$STDERR_LOG|g"
+        line="${line//__WORKING_DIR__/$wd}"
+        line="${line//__PATH__/$path_v}"
+        line="${line//__STDOUT_LOG__/$out_v}"
+        line="${line//__STDERR_LOG__/$err_v}"
+        printf '%s\n' "$line"
         ;;
     esac
   done < "$TEMPLATE"
@@ -155,9 +204,33 @@ fi
 
 mkdir -p "$LA_DIR" "$LOG_DIR"
 
-# Reload cleanly if already installed (idempotent).
+# Reload cleanly if already installed (idempotent). Unloading FIRST stops the bot this
+# agent manages, so the B2 guard below only sees pollers we don't control (i.e. manual ones).
 if [ -f "$PLIST_DEST" ]; then
   launchctl unload "$PLIST_DEST" 2>/dev/null || true
+  # launchctl unload returns before the child has fully exited; give it a beat so the
+  # guard doesn't misread our own just-stopped agent as a manual poller.
+  sleep 1
+fi
+
+# B2: one token == one poller. After unloading our own agent, anything still polling is a
+# MANUAL bot (./run.sh / python main.py / python -m claude_tg). Loading the always-on agent
+# now would put a SECOND poller on the same token → Telegram `Conflict`. Warn + abort and
+# let the user stop it, rather than silently starting a conflicting poller.
+MANUAL_PIDS="$(running_bot_pids || true)"
+if [ -n "$MANUAL_PIDS" ]; then
+  # shellcheck disable=SC2086
+  PID_LIST="$(echo $MANUAL_PIDS | tr '\n' ' ')"
+  echo "ERROR: a Claude Telegram bot is already running (PID(s): ${PID_LIST%% })." >&2
+  echo "       Installing the keep-alive agent now would start a SECOND poller on the same" >&2
+  echo "       token and Telegram would reject both with a 'Conflict'." >&2
+  echo >&2
+  echo "       Stop the running bot first, then re-run this installer:" >&2
+  echo "         - if it's a foreground ./run.sh: press Ctrl-C in that terminal" >&2
+  echo "         - otherwise: kill ${PID_LIST%% }" >&2
+  echo >&2
+  echo "       (The keep-alive agent must be the ONLY poller — see deploy/README.md.)" >&2
+  exit 1
 fi
 
 render > "$PLIST_DEST"

@@ -51,18 +51,22 @@ dev = [
 ]
 
 [project.scripts]
-# Console entry point: `claude-telegram-bot` starts the bot. The shim in
-# claude_tg/cli.py reuses main.main() verbatim (loads .env from the CWD, then
-# run_polling), so the installed command and `python main.py` are identical.
+# Console entry point: `claude-telegram-bot` starts the bot. The entry lives in
+# claude_tg/cli.py:main (startup logic in claude_tg/app.py), so the installed command,
+# `python -m claude_tg`, and `python main.py` are identical — and self-contained (no
+# top-level `main` module to be cwd-shadowed; see B1 in docs/features/p7-packaging/qa.md).
 claude-telegram-bot = "claude_tg.cli:main"
 
 [tool.setuptools]
-# main.py stays at the repo root (the existing `python main.py` / run.sh / pytest
-# `pythonpath=.` flows depend on it, and tests/test_main.py patches `main.*`). It is a
-# top-level MODULE (not under the package), so ship it explicitly — otherwise an
-# installed claude_tg/cli.py's `from main import main` would not resolve in a clean
-# install.
-py-modules = ["main"]
+# B1 (cwd-shadow fix): explicitly ship NO top-level modules. The package is fully
+# self-contained — the entry is claude_tg.cli:main (startup in claude_tg/app.py). Root
+# main.py is just a thin shim (`from claude_tg.cli import main`) for the `python main.py`
+# flow; it is intentionally NOT installed. An empty `py-modules` also SUPPRESSES
+# setuptools flat-layout auto-discovery, which would otherwise sweep main.py into the
+# wheel as a top-level `main` module — and a shipped top-level `main` is exactly what an
+# unrelated ./main.py in the user's CWD can shadow (CWD precedes site-packages on
+# sys.path). Was previously `py-modules = ["main"]`; removed in B1.
+py-modules = []
 
 [tool.setuptools.packages.find]
 # Deterministic discovery: ONLY the runtime package (+ its sub-packages, e.g.
