@@ -217,6 +217,7 @@ def _default_engine_factory(
     send_timeout: float = 120.0,
     model: Optional[str] = None,
     permission_mode: str = "default",
+    thinking: bool = False,
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
@@ -261,6 +262,15 @@ def _default_engine_factory(
     A plan turn surfaces Claude's ``ExitPlanMode`` plan through the SHIPPED P6 hold/keyboard;
     approving it does NOT auto-allow later tools (ADR-001 C4 — every risky tool still hits the
     permission gate independently, unchanged here). Transient (RB3): the arming never persists.
+
+    **P12 T-THINK:** ``thinking`` is the per-project live-reasoning flag baked into the
+    substrate (mirrors ``model`` / ``permission_mode`` — a session-creation knob). When True
+    the substrate streams Claude's readable reasoning (``thinking={"type":"adaptive",
+    "display":"summarized"}`` + ``include_partial_messages=True``) as ``ThinkingEvent``s →
+    the capped ``🧠`` status line. The default ``False`` is byte-for-byte the pre-P12 turn:
+    no ``thinking`` option, ``include_partial_messages`` stays off → no extra wire traffic.
+    Off by default (cost + flood posture); toggled per project by ``/thinking`` (transient,
+    RB3). SB3: the reasoning TEXT is shown; the opaque signature is dropped in ``normalize``.
     """
     engine: Engine
 
@@ -274,6 +284,7 @@ def _default_engine_factory(
         permission_mode=permission_mode,
         decision_callback=decision_callback,
         model=model,
+        thinking=thinking,
     )
     engine = Engine(
         substrate,
@@ -393,6 +404,23 @@ class _ProjectRuntime:
     # creation — the mode can't be hot-switched). Transient in-memory (RB3); a restart rebuilds
     # the engine from the persisted id in ``"default"`` (the arming never persists).
     engine_permission_mode: str = "default"
+    # P12 T-THINK (/thinking): this project's LIVE-REASONING toggle — False by default (cost +
+    # flood posture; the SB5-style explicit opt-in). UNLIKE the one-shot ``plan_next`` this is
+    # a STICKY per-project flag: it stays on until ``/thinking off`` (every turn while on
+    # streams the 🧠 line). ``_ensure_engine`` reads it and, when on, builds the session with
+    # ``thinking={"type":"adaptive","display":"summarized"}`` + ``include_partial_messages=True``
+    # (mechanism (a) — a session-creation knob, mirroring ``model``); a change takes effect on
+    # the NEXT fresh session for the project (a live session keeps streaming as built — we never
+    # hot-swap). Transient in-memory (RB3): a restart drops it back to OFF (supervision posture
+    # never silently survives a restart) — never persisted. Set by :meth:`set_thinking`.
+    thinking: bool = False
+    # P12 T-THINK: the ``thinking`` flag the CURRENT live engine was built with. ``_ensure_engine``
+    # records it at build time and the warm fast-path reuses the engine ONLY when it matches the
+    # turn's requested thinking flag — so toggling ``/thinking`` rebuilds the session on the next
+    # turn (thinking is a session-creation knob; it can't be hot-switched), in EITHER direction
+    # (off→on streams from the next turn; on→off stops the wire traffic from the next turn).
+    # Transient (RB3); a restart rebuilds in the default OFF.
+    engine_thinking: bool = False
     # P11 T2 (attach-fork): True iff this project was ADOPTED from an external session that
     # was LIVE in another process at attach time, so its NEXT resume MUST fork (resume into a
     # fresh id, transcript copied) rather than continue the live id — two writers on one
@@ -708,6 +736,7 @@ class StreamingSession:
                 permission_policy: PermissionPolicy,
                 model: Optional[str] = None,
                 permission_mode: str = "default",
+                thinking: bool = False,
             ) -> Engine:
                 return _default_engine_factory(
                     cwd=cwd,
@@ -718,6 +747,7 @@ class StreamingSession:
                     send_timeout=float(config.stream_message_timeout_seconds),
                     model=model,
                     permission_mode=permission_mode,
+                    thinking=thinking,
                 )
 
             self._engine_factory = _bound_factory
@@ -1340,6 +1370,30 @@ class StreamingSession:
         if rt is not None:
             rt.plan_next = True
 
+    def set_thinking(self, chat_id: int, on: bool) -> bool:
+        """Toggle the ACTIVE project's live-thinking flag (``/thinking on|off``; P12 T-THINK).
+
+        Sets the STICKY per-project ``thinking`` marker on the active project's runtime (default
+        OFF). When on, that project's NEXT fresh session streams Claude's readable reasoning as
+        the capped ``🧠`` status line (built with ``thinking={"type":"adaptive",
+        "display":"summarized"}`` + ``include_partial_messages=True`` — :meth:`_ensure_engine`);
+        when off, neither option is set and there is no partial-message wire traffic (the pre-P12
+        behavior). **Applies on the NEXT fresh session, never mid-turn** (thinking is a
+        session-creation knob, mirroring ``/fast``·``/deep`` — a turn in flight keeps streaming
+        as it was built; the warm fast-path rebuilds on the next turn because ``engine_thinking``
+        no longer matches). Returns the new flag so the bot can confirm the state.
+
+        Auto-creates ``default`` if there is no active project (consistent with ``set_yolo`` /
+        ``arm_plan``). **RB3 (transient):** in-memory only, NEVER persisted — a restart drops it
+        back to OFF (the supervision posture never silently survives a restart). SB1 is enforced
+        by the bot's ``_ok`` recheck before this is reached.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=True)
+        if rt is not None:
+            rt.thinking = bool(on)
+            return rt.thinking
+        return False
+
     def get_model(self, chat_id: int) -> Optional[str]:
         """The ACTIVE project's effective model id (override, else the configured default).
 
@@ -1452,6 +1506,12 @@ class StreamingSession:
         plan_mode = rt.plan_next
         rt.plan_next = False
         permission_mode = "plan" if plan_mode else "default"
+        # P12 T-THINK: this project's STICKY live-reasoning flag (set by /thinking; default
+        # OFF). UNLIKE the one-shot plan marker it is NOT consumed/cleared — it stays on until
+        # /thinking off. The session is built with the live-reasoning options when on; the warm
+        # fast-path below reuses the engine only when its built-with flag matches, so a toggle
+        # rebuilds the session on the next turn (thinking is a session-creation knob).
+        thinking = rt.thinking
         # P5 / ADR-005 D1 (T5): no cross-project stop here. A different project's started
         # engine is left running so N runs can be concurrent (T5 removed P4's
         # _stop_other_started). Only the SAME project's stale/non-started engine is handled
@@ -1466,7 +1526,18 @@ class StreamingSession:
         # the requested mode just below (the same discard the QF5 stale-engine path uses, which
         # RESUMES the persisted id so the conversation continues). A back-to-back normal turn
         # keeps the warm fast-path byte-for-byte: both modes are ``"default"`` → matched → reuse.
-        if rt.engine is not None and rt.started and rt.engine_permission_mode == permission_mode:
+        #
+        # P12 T-THINK: the warm fast-path ALSO requires the built-with ``thinking`` flag to match
+        # the turn's requested flag — for the same reason (thinking is a session-creation knob,
+        # not hot-switchable). So /thinking on→off (or off→on) rebuilds the session on the next
+        # turn; a back-to-back same-thinking turn still reuses the warm engine byte-for-byte
+        # (both False pre-P12 → matched → reuse, so a thinking-OFF project is unchanged).
+        if (
+            rt.engine is not None
+            and rt.started
+            and rt.engine_permission_mode == permission_mode
+            and rt.engine_thinking == thinking
+        ):
             return rt.engine, False
         # Past the warm fast-path: rt is either fresh (engine None), holds a NON-started
         # engine — a prior start()/resume() that raised AFTER the adapter allocated its
@@ -1506,9 +1577,12 @@ class StreamingSession:
         # alongside ``model`` (an injected test factory keeps its 3-kwarg contract). Record the
         # mode on the runtime so the warm fast-path reuses this engine only for a same-mode turn
         # and rebuilds back to ``"default"`` after the one-shot plan turn (the mismatch path).
-        engine = self._build_engine(rt.cwd, rt.policy, model, permission_mode=permission_mode)
+        engine = self._build_engine(
+            rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
+        )
         rt.engine = engine
         rt.engine_permission_mode = permission_mode
+        rt.engine_thinking = thinking  # P12 T-THINK: track the built-with thinking flag
         resume_id = self._resume_id(chat_id, name)
         # ⭐ P11 T2 (B2+B3) — the BINDING fork-vs-continue decision, made HERE at the first
         # write from a FRESH liveness re-probe (not frozen at attach time). When this project
@@ -1583,11 +1657,14 @@ class StreamingSession:
                 #     the project's /fast·/deep override too. P12 T-PLAN: and the SAME
                 #     permission mode — a plan turn whose resume failed still starts fresh in
                 #     plan mode (the marker was already consumed above; this re-uses the value).
+                #     P12 T-THINK: and the SAME thinking flag — a thinking-ON project whose
+                #     resume failed still starts fresh with live reasoning on (sticky flag).
                 engine = self._build_engine(
-                    rt.cwd, rt.policy, model, permission_mode=permission_mode
+                    rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
                 )
                 rt.engine = engine
                 rt.engine_permission_mode = permission_mode  # P12 T-PLAN: track the fresh mode
+                rt.engine_thinking = thinking  # P12 T-THINK: track the fresh thinking flag
                 # (d) Start the FRESH engine — a clean fresh session (the dead id is gone).
                 await engine.start()
                 # (e) Signal the caller so handle_message posts the T7 "couldn't resume,
@@ -1628,6 +1705,7 @@ class StreamingSession:
         model: Optional[str],
         *,
         permission_mode: str = "default",
+        thinking: bool = False,
     ) -> Engine:
         """Call the engine factory, passing the T4 per-project ``model`` only when supported.
 
@@ -1642,6 +1720,12 @@ class StreamingSession:
         armed ``/plan`` turn, ``"default"`` otherwise (a normal turn is byte-for-byte
         unchanged: ``"default"`` was always passed). An injected test factory keeps its 3-kwarg
         contract and never receives it, so every existing test factory is unaffected.
+
+        **P12 T-THINK:** ``thinking`` rides the SAME default-factory-only gate — True bakes the
+        live-reasoning options (partials + ``display="summarized"``) into the FRESH session for
+        a thinking-ON project, ``False`` (the default, always passed pre-P12) keeps a normal
+        turn byte-for-byte unchanged. An injected test factory never receives it (3-kwarg
+        contract), so every existing test factory is unaffected.
         """
         if self._factory_accepts_model:
             return self._engine_factory(
@@ -1650,6 +1734,7 @@ class StreamingSession:
                 permission_policy=policy,
                 model=model,  # type: ignore[call-arg]  # default factory accepts model (T4)
                 permission_mode=permission_mode,  # default factory accepts it too (P12 T-PLAN-1)
+                thinking=thinking,  # default factory accepts it too (P12 T-THINK)
             )
         return self._engine_factory(
             cwd=cwd,

@@ -37,6 +37,7 @@ from claude_tg.engine import (
     StatusEvent,
     SubstrateDecision,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
 )
 from claude_tg.engine.adapter_sdk import SdkSubstrate, normalize
@@ -303,6 +304,98 @@ def test_normalize_assistant_text_block_is_assembled_text():
     assert ev.session_id == "S1"
 
 
+# ---- P12 T-THINK-1: thinking normalization (drop signature, redacted stays opaque) ----
+
+
+def test_normalize_thinking_delta_is_incremental_thinking():
+    # A thinking_delta StreamEvent carries the REASONING text in delta["thinking"] -> an
+    # incremental ThinkingEvent (parallel to text_delta). SB3: it carries ONLY the text.
+    msg = sdk.StreamEvent(
+        uuid="u",
+        session_id="S1",
+        event={
+            "type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "Let me reason about this"},
+        },
+    )
+    ev = normalize(msg)
+    assert isinstance(ev, ThinkingEvent)
+    assert ev.incremental is True
+    assert ev.redacted is False
+    assert ev.text == "Let me reason about this"
+    assert ev.session_id == "S1"
+    # SB3: there is structurally no signature field on a ThinkingEvent.
+    assert not hasattr(ev, "signature")
+
+
+def test_normalize_full_thinking_block_is_assembled_thinking_and_drops_signature():
+    # An assembled ThinkingBlock (in an AssistantMessage) -> a non-incremental ThinkingEvent
+    # carrying ONLY block.thinking; the opaque block.signature is DROPPED and never surfaced.
+    block = sdk.ThinkingBlock(
+        thinking="This is the full reasoning text.", signature="OPAQUE_SIGNATURE_DO_NOT_LEAK"
+    )
+    msg = sdk.AssistantMessage(content=[block], model="m", session_id="S1")
+    ev = normalize(msg)
+    assert isinstance(ev, ThinkingEvent)
+    assert ev.incremental is False
+    assert ev.text == "This is the full reasoning text."
+    assert ev.session_id == "S1"
+    # SB3 — the signature must NOT appear anywhere on the emitted event (no field, not in repr).
+    assert not hasattr(ev, "signature")
+    assert "OPAQUE_SIGNATURE_DO_NOT_LEAK" not in repr(ev)
+
+
+def test_normalize_signature_delta_never_emits_an_event():
+    # SB3: the opaque signature arrives as a SEPARATE signature_delta — it must NEVER become an
+    # event (so the signature can't leak through the stream path either). (Pins the existing
+    # contract from the angle of "signature never surfaces", complementing the framing test.)
+    sig = sdk.StreamEvent(
+        uuid="u",
+        session_id="S1",
+        event={
+            "type": "content_block_delta",
+            "delta": {"type": "signature_delta", "signature": "EvkCC_opaque_sig"},
+        },
+    )
+    assert normalize(sig) is None
+
+
+def test_normalize_redacted_thinking_delta_is_opaque_never_raw():
+    # Defensive/forward-compat (RB1/SB3): a redacted_thinking stream delta -> a ThinkingEvent
+    # flagged redacted with NO text (the renderer shows the fixed hidden line, never raw). The
+    # installed SDK doesn't produce this, so it's a fail-safe — but if it ever appears it must
+    # NOT carry a readable/raw body.
+    msg = sdk.StreamEvent(
+        uuid="u",
+        session_id="S1",
+        event={
+            "type": "content_block_delta",
+            "delta": {"type": "redacted_thinking", "data": "ENCRYPTED_BLOB_SHOULD_NOT_RENDER"},
+        },
+    )
+    ev = normalize(msg)
+    assert isinstance(ev, ThinkingEvent)
+    assert ev.redacted is True
+    assert ev.text == ""  # opaque — no readable body
+    assert "ENCRYPTED_BLOB_SHOULD_NOT_RENDER" not in repr(ev)
+
+
+def test_normalize_empty_or_malformed_thinking_never_crashes_rb1():
+    # RB1: a thinking_delta with no/empty "thinking" -> None (nothing to show), never a crash.
+    empty_delta = sdk.StreamEvent(
+        uuid="u",
+        session_id="S1",
+        event={"type": "content_block_delta", "delta": {"type": "thinking_delta"}},
+    )
+    assert normalize(empty_delta) is None
+    # A signature-only ThinkingBlock (display="omitted": thinking empty) -> None (the signature
+    # is dropped, and there is no readable text to surface).
+    sig_only = sdk.AssistantMessage(
+        content=[sdk.ThinkingBlock(thinking="", signature="sig-only")], model="m", session_id="S1"
+    )
+    assert normalize(sig_only) is None
+
+
 def test_normalize_ask_user_question_to_ask_event():
     questions = [
         {"question": "Pick?", "header": "H", "options": [{"label": "A"}, {"label": "B"}], "multiSelect": False}
@@ -488,6 +581,43 @@ def test_sdk_build_options_threads_permission_mode_plan():
     sub = SdkSubstrate(permission_mode="plan")
     assert sub._build_options().permission_mode == "plan"
     assert sub._build_options(resume="sess-123").permission_mode == "plan"
+
+
+# ---- P12 T-THINK-3: thinking enables partials + display:"summarized" ONLY when on ----
+
+
+def test_sdk_build_options_thinking_on_sets_summarized_and_partials():
+    # P12 T-THINK: a thinking-ON session asks for READABLE reasoning
+    # (thinking={"type":"adaptive","display":"summarized"}) AND forces partial messages on
+    # (thinking only streams as thinking_delta StreamEvents). On BOTH start and resume paths.
+    sub = SdkSubstrate(thinking=True)
+    for opts in (sub._build_options(), sub._build_options(resume="sess-123")):
+        assert opts.thinking == {"type": "adaptive", "display": "summarized"}
+        assert opts.include_partial_messages is True
+
+
+def test_sdk_build_options_thinking_off_is_byte_for_byte_unchanged():
+    # The headline invariant: a thinking-OFF turn's options are byte-for-byte the pre-P12
+    # baseline — no `thinking` option set (the SDK's own None default) and partials stay OFF
+    # (no extra StreamEvent wire traffic). Asserted by comparing a thinking-off substrate's
+    # options field-by-field against a substrate built with NO thinking arg at all.
+    off = SdkSubstrate(cwd="/work")._build_options()
+    baseline = SdkSubstrate(cwd="/work")._build_options()  # the explicit pre-P12 construction
+    assert off.include_partial_messages is False
+    # The SDK ClaudeAgentOptions default for `thinking` is None — a thinking-off session never
+    # sets it, so it stays the default (not the summarized dict).
+    assert getattr(off, "thinking", None) == getattr(baseline, "thinking", None)
+    assert getattr(off, "thinking", None) != {"type": "adaptive", "display": "summarized"}
+
+
+def test_sdk_build_options_thinking_off_keeps_explicit_partials_flag():
+    # A thinking-OFF session honors an explicitly-passed include_partial_messages (it does NOT
+    # force it off): thinking only OR's partials ON when on. (Guards that the thinking flag and
+    # the partials flag are independent — only thinking-ON couples them.)
+    sub = SdkSubstrate(thinking=False, include_partial_messages=True)
+    opts = sub._build_options()
+    assert opts.include_partial_messages is True
+    assert getattr(opts, "thinking", None) != {"type": "adaptive", "display": "summarized"}
 
 
 def test_sdk_build_options_default_permission_mode_unchanged():

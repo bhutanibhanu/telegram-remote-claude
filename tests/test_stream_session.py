@@ -28,6 +28,7 @@ from claude_tg.engine.types import (
     QuestionAnswer,
     ResultEvent,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
 )
 from claude_tg.permissions import PermissionPolicy
@@ -1159,6 +1160,80 @@ async def test_multi_message_turn_with_distinct_prose_all_render():
     assert sum(1 for t in texts if "First step done." in t) == 1
     assert sum(1 for t in texts if "Second step done" in t) == 1, (
         "the second prose must appear once — not duplicated by the identical result_text"
+    )
+
+
+# ---- P12 T-THINK-4: dedup HOLDS with partial messages on (final answer renders ONCE) ----
+
+
+async def test_thinking_on_final_answer_renders_exactly_once_with_partials():
+    # P12 T-THINK-4 (the headline + mutation-probe): with include_partial_messages ON, a turn
+    # now interleaves thinking_delta + incremental text_delta (TextEvent incremental=True) WITH
+    # the assembled answer (TextEvent incremental=False) and the terminal ResultEvent whose
+    # result_text repeats it. The dedup must STILL render the final answer EXACTLY ONCE:
+    #   * thinking + incremental text are status-line-only (op="edit_status"; transient,
+    #     cleared at turn end) — they never become a permanent message and never feed the dedup;
+    #   * the assembled TextEvent is the ONE verbatim answer; the terminal ResultEvent collapses
+    #     to the ✅ done footer (the _TurnDedup #1 path), not a second copy.
+    # MUTATION-PROBE: if the dedup were broken/removed, the answer prose would appear TWICE
+    # (assembled TextEvent + ResultEvent.result_text) and the first assertion would fail.
+    answer = "The **final** answer with distinctive detail."
+    engine = FakeEngine(
+        [
+            ThinkingEvent(text="First I should consider the constraints", incremental=True),
+            ThinkingEvent(text="…then weigh the trade-offs carefully", incremental=True),
+            TextEvent(text="The ", incremental=True),  # streamed answer fragment (partials ON)
+            TextEvent(text="final answer", incremental=True),  # another fragment
+            TextEvent(text=answer, incremental=False),  # the assembled, verbatim answer
+            ResultEvent(
+                session_id="s", is_error=False, subtype="success", result_text=answer
+            ),
+        ]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit, delete=rec.delete),
+        timeout=2.0,
+    )
+    # The distinctive answer prose is sent EXACTLY ONCE as a verbatim message — NOT duplicated
+    # by the identical result_text (the dedup holds with partials on).
+    bodies = [t for t in _send_texts(rec) if "final" in t and "distinctive detail" in t]
+    assert len(bodies) == 1, (
+        f"the final answer must render exactly once with partials on, got {len(bodies)}: {bodies!r}"
+    )
+    # The compact done footer still appears (the terminal frame collapsed to it).
+    assert any(t.startswith("✅ done") for t in _send_texts(rec)), (
+        "the done footer must still appear after the deduped result"
+    )
+
+
+async def test_thinking_stays_in_transient_status_line_never_a_permanent_message():
+    # T-THINK-4: thinking (and the incremental text) must NOT bleed into a permanent message —
+    # the reasoning rides the status line (op="edit_status") and the status message is DELETED
+    # at turn end, so no 🧠 reasoning is left behind as a verbatim send. The final answer (an
+    # assembled TextEvent) is the only verbatim prose message.
+    engine = FakeEngine(
+        [
+            ThinkingEvent(text="REASONING_TOKEN_should_be_transient", incremental=True),
+            TextEvent(text="ANSWER_TOKEN final answer.", incremental=False),
+            ResultEvent(session_id="s", is_error=False, subtype="success"),
+        ]
+    )
+    session = make_session(engine)  # frozen clock => every status update is "due"
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit, delete=rec.delete),
+        timeout=2.0,
+    )
+    # The reasoning appears only on the STATUS line (a send that creates it and/or an edit),
+    # and that status message is DELETED at turn end — so it never persists as the answer.
+    assert rec.deletes, "the transient status line (carrying the 🧠 reasoning) must be deleted at turn end"
+    # The final answer IS a permanent verbatim message; the reasoning token is NOT mixed into it.
+    answer_msgs = [t for t in _send_texts(rec) if "ANSWER_TOKEN" in t]
+    assert len(answer_msgs) == 1
+    assert "REASONING_TOKEN_should_be_transient" not in answer_msgs[0], (
+        "thinking must not bleed into the final answer message"
     )
 
 

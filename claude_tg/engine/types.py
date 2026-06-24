@@ -53,6 +53,38 @@ class TextEvent:
 
 
 @dataclass(frozen=True)
+class ThinkingEvent:
+    """Claude's extended-thinking / reasoning text (P12 T-THINK; SB3).
+
+    The model's reasoning surfaced for **live supervision** — rendered as a capped,
+    collapsed ``🧠`` status line that updates in place and is cleared at turn end (never a
+    permanent message; see :func:`~claude_tg.render.render_event`). Parallel to
+    :class:`TextEvent`: ``incremental=True`` for a ``thinking_delta`` stream chunk,
+    ``incremental=False`` for an assembled ``ThinkingBlock`` (in an ``AssistantMessage``).
+
+    **SB3 — two hard rules the adapter enforces and this type makes structurally true:**
+
+    * **The opaque ``signature`` is NEVER carried here.** The SDK ``ThinkingBlock`` has a
+      ``signature: str`` (an opaque crypto signature) and the stream emits a separate
+      ``signature_delta``; both are DROPPED by :func:`~claude_tg.engine.adapter_sdk.normalize`
+      and never reach this event. There is deliberately no ``signature`` field — a
+      ``ThinkingEvent`` can only carry reasoning ``text``, so a signature cannot leak through
+      it even by mistake.
+    * **Redacted thinking renders OPAQUE, never raw.** ``redacted=True`` marks a thinking
+      block the API encrypted (the SDK has no ``RedactedThinkingBlock`` class and its parser
+      drops ``redacted_thinking`` silently, so this is a defensive fail-safe). A redacted
+      event carries NO reasoning text (``text=""``); the renderer shows a fixed
+      ``🧠 (reasoning hidden)`` line and never the (absent) body.
+    """
+
+    text: str
+    incremental: bool = False  # True for a thinking_delta, False for an assembled block
+    redacted: bool = False  # True → opaque "reasoning hidden" line; NEVER raw (SB3)
+    session_id: str | None = None
+    kind: Literal["thinking"] = "thinking"
+
+
+@dataclass(frozen=True)
 class ToolUseEvent:
     """The model is about to use a tool (§1 ``tool_use``).
 
@@ -166,6 +198,7 @@ class StatusEvent:
 #: Discriminated union of every event the engine emits.
 Event = Union[
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
     AskEvent,
     PlanEvent,
@@ -449,6 +482,7 @@ class ImageInput:
 __all__ = [
     # events
     "TextEvent",
+    "ThinkingEvent",
     "ToolUseEvent",
     "AskEvent",
     "PlanEvent",

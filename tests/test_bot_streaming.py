@@ -102,6 +102,7 @@ class FakeStreaming:
         self.yolo_calls = []
         self.model_calls = []
         self.plan_calls = []
+        self.thinking_calls = []
         self.reply_prompt_calls = []
         self.to_calls = []
         self.attach_calls = []
@@ -204,6 +205,12 @@ class FakeStreaming:
         # P12 T-PLAN-2: /plan arms the active project's next turn as a plan turn (one-shot).
         self.plan_calls.append(chat_id)
 
+    def set_thinking(self, chat_id, on):
+        # P12 T-THINK-3: /thinking on|off toggles the active project's live-reasoning flag.
+        # Record the (chat_id, on) and echo the new state back (mirrors the real method).
+        self.thinking_calls.append((chat_id, on))
+        return on
+
     def get_cwd(self, chat_id):
         # P9/T1: the first-run welcome reads the active cwd via this accessor.
         # P10/T3: on_document saves into — and /get resolves against — this cwd.
@@ -258,12 +265,14 @@ def make_callback_update(chat_id=1, data="a|tid|0.0"):
     return upd
 
 
-def make_ctx():
+def make_ctx(args=None):
     ctx = MagicMock()
     ctx.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
     ctx.bot.edit_message_text = AsyncMock()
     ctx.bot.send_chat_action = AsyncMock()
-    ctx.args = []
+    # ``args`` is the parsed command arguments (PTB's CommandHandler splits these). Defaults to
+    # [] (the pre-existing behavior); arg-taking commands (e.g. /thinking on|off) pass a list.
+    ctx.args = list(args) if args is not None else []
     return ctx
 
 
@@ -599,6 +608,67 @@ async def test_cmd_plan_unauthorized_ignored():
     upd = make_update(999, "/plan")
     await bot.cmd_plan(upd, make_ctx())
     assert streaming.plan_calls == []
+    upd.message.reply_text.assert_not_awaited()
+
+
+# ---- P12 T-THINK-3: /thinking on|off (SB1, per-project toggle, streaming-only) --------
+
+
+async def test_cmd_thinking_on_toggles_and_confirms():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/thinking on")
+    await bot.cmd_thinking(upd, make_ctx(args=["on"]))
+    assert streaming.thinking_calls == [(1, True)]
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "🧠" in reply and "on" in reply.lower()
+
+
+async def test_cmd_thinking_off_toggles_and_confirms():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/thinking off")
+    await bot.cmd_thinking(upd, make_ctx(args=["off"]))
+    assert streaming.thinking_calls == [(1, False)]
+    assert "off" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_thinking_no_arg_shows_usage_and_does_not_toggle():
+    # RB1: a bare /thinking (no on|off) shows usage and toggles NOTHING.
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/thinking")
+    await bot.cmd_thinking(upd, make_ctx(args=[]))
+    assert streaming.thinking_calls == []
+    assert "usage" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_thinking_bad_arg_shows_usage_and_does_not_toggle():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/thinking maybe")
+    await bot.cmd_thinking(upd, make_ctx(args=["maybe"]))
+    assert streaming.thinking_calls == []
+    assert "usage" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_thinking_oneshot_is_explained_not_applied():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/thinking on")
+    await bot.cmd_thinking(upd, make_ctx(args=["on"]))
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_thinking_unauthorized_ignored():
+    # SB1: an un-allowlisted chat is rejected by _ok BEFORE any effect — set_thinking is never
+    # called and no reply is sent (mirrors test_cmd_yolo_unauthorized_ignored).
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    upd = make_update(999, "/thinking on")
+    await bot.cmd_thinking(upd, make_ctx(args=["on"]))
+    assert streaming.thinking_calls == []
     upd.message.reply_text.assert_not_awaited()
 
 
@@ -4661,7 +4731,10 @@ def _make_plan_recording_session(store):
     """
     modes: list[str] = []
 
-    def factory(*, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default"):
+    def factory(
+        *, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default",
+        thinking=False,
+    ):
         modes.append(permission_mode)
         return HoldEngine(
             [ResultEvent(session_id="sid-1", is_error=False, subtype="success", result_text="ok")]
@@ -4757,7 +4830,10 @@ async def test_plan_turn_rebuild_resumes_persisted_session_for_continuity(tmp_pa
 
     builds: list = []
 
-    def factory(*, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default"):
+    def factory(
+        *, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default",
+        thinking=False,
+    ):
         eng = HoldEngine(
             [ResultEvent(session_id="sid-keep", is_error=False, subtype="success", result_text="ok")]
         )

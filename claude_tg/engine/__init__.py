@@ -44,6 +44,7 @@ from .types import (
     StatusEvent,
     SubstrateDecision,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
     decision_to_substrate,
     safe_input_summary,
@@ -58,6 +59,7 @@ __all__ = [
     "DecisionCallback",
     # events
     "TextEvent",
+    "ThinkingEvent",
     "ToolUseEvent",
     "AskEvent",
     "PlanEvent",
