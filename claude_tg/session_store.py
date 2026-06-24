@@ -475,8 +475,12 @@ class JsonSessionStore:
         (``^[A-Za-z0-9_-]{1,32}$``) FIRST — raises :class:`InvalidProjectName` on a bad name
         **before** any write (so ``../``, spaces, > 32 chars, or empty are rejected, never
         persisted). Macros live on the chat (``chats[<id>]["macros"]``), separate from the
-        project registry, keyed by the as-given name (overwriting an existing macro of the
-        same name). Creates the chat container if absent. ``body`` is the operator-authored
+        project registry. ``get_macro``/``remove_macro`` resolve names case-insensitively, so
+        ``save_macro`` must too: an existing case-insensitive key is **overwritten in place**
+        (mirroring ``create``/``_resolve_name``) — ``/save Work x`` then ``/save work y`` keeps
+        exactly ONE macro (the original-case key, the latest body), never two colliding entries
+        that ``/run work`` could resolve to the wrong one. A genuinely new name is stored
+        as-given. Creates the chat container if absent. ``body`` is the operator-authored
         template stored verbatim (no escaping/validation — it is fired as a normal turn).
         Persists.
         """
@@ -487,7 +491,10 @@ class JsonSessionStore:
         if not isinstance(macros, dict):
             macros = {}
             chat["macros"] = macros
-        macros[name] = body
+        # Overwrite an existing case-insensitive key in place (so a re-save under a different
+        # case never forks a duplicate the case-insensitive get/remove would disagree about).
+        existing = _resolve_name(macros, name)
+        macros[existing or name] = body
         self._save_raw(raw)
 
     def get_macro(self, chat_id: int, name: str) -> str | None:

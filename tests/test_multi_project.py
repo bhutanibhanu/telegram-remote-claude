@@ -368,7 +368,8 @@ async def test_free_switch_and_new_during_answer_hold_then_alpha_still_resolves(
     up_sw = make_update(1, "/switch beta")
     await bot.cmd_switch(up_sw, make_cmd_ctx(args=["beta"]))
     sw_reply = up_sw.message.reply_text.await_args.args[0]
-    assert "switched to beta" in sw_reply.lower(), sw_reply
+    # P9: the project name is bolded + escaped (HTML), uniform with every name-bearing reply.
+    assert "switched to <b>beta</b>" in sw_reply.lower(), sw_reply
     assert store.get_active(1) == "beta"
 
     # /new gamma WHILE alpha is parked → SUCCEEDS, gamma created + active.

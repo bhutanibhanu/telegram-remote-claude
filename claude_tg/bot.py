@@ -47,6 +47,7 @@ HELP_TEXT = (
     "Just send me a message and I'll run it through Claude Code on the Mac and reply.\n\n"
     "Commands:\n"
     "/help — this help\n"
+    "/status — health: uptime, mode, gate, runs, per-project status + cost\n"
     "/reset — start a fresh Claude session (forget context)\n"
     "/cancel [name|all] — abort the in-flight run: the active project, a named project, "
     "or every running/queued project (streaming mode)\n"
@@ -56,7 +57,7 @@ HELP_TEXT = (
     "/unyolo — restore the per-tool permission gate (streaming mode)\n"
     "/fast — use the fast model (Haiku) for this project's next turn (streaming mode)\n"
     "/deep — use the deep model (Opus) for this project's next turn (streaming mode)\n"
-    "/auto — clear the model override, back to the default (streaming mode)\n"
+    "/auto (or /model default) — clear the model override, back to the default (streaming mode)\n"
     "/projects — list your projects and which one is active (streaming mode)\n"
     "/new <name> <path> — create a project at <path> and switch to it; <path> must be an "
     "existing directory inside the permitted roots (streaming mode)\n"
@@ -223,7 +224,9 @@ class TelegramClaudeBot:
         if not await self._ok(update) or update.message is None:
             return
         chat_id = update.effective_chat.id
-        lines = ["📊 <b>Status</b>", f"Uptime: {html.escape(_format_uptime(time.time() - self._start_time))}"]
+        # P9 P2: uptime is a fixed bot-derived duration (digits + ``d/h/m/s`` only — it can
+        # never contain ``& < >``), so it needs no html.escape (names/mode below still are).
+        lines = ["📊 <b>Status</b>", f"Uptime: {_format_uptime(time.time() - self._start_time)}"]
         lines.append(f"Engine mode: <b>{html.escape(self.config.engine_mode, quote=False)}</b>")
         if self.streaming is not None:
             # Gate / yolo posture for the ACTIVE project (the policy is per-project; read it
@@ -258,9 +261,20 @@ class TelegramClaudeBot:
                     model_html = f" · <code>{html.escape(model, quote=False)}</code>" if model else ""
                     cost = self.streaming.store.get_cost(chat_id, name) if self.streaming.store else 0.0
                     cost_html = f" · ${cost:.2f}" if cost > 0 else ""
+                    # P9 fix: /yolo is PER-PROJECT, but the single global "Permission gate" line
+                    # above reflects only the ACTIVE project — a wide-open BACKGROUND project
+                    # would be hidden. Surface each project's yolo posture HERE so an allow-all
+                    # project is never silent on /status (read-only; a project with no runtime
+                    # reads False — the fail-closed default). The ⚠️ glyph mirrors the loud
+                    # enable banner.
+                    yolo_html = (
+                        " · ⚠️ yolo"
+                        if self.streaming.get_project_yolo(chat_id, name)
+                        else ""
+                    )
                     lines.append(
                         f"{marker} <b>{html.escape(str(name), quote=False)}</b> — "
-                        f"{cwd_html} ({status}){model_html}{cost_html}"
+                        f"{cwd_html} ({status}){model_html}{cost_html}{yolo_html}"
                     )
             else:
                 lines.append("Projects: none yet — /new &lt;name&gt; &lt;path&gt;")
@@ -339,15 +353,26 @@ class TelegramClaudeBot:
         # engine aborted PLUS any drained queued-not-yet-running turn. A queued-only cancel
         # therefore returns >= 1 (0 pending requests, but a turn WAS cancelled), so the
         # operator is no longer wrongly told "nothing was in flight" for a turn they killed.
+        is_all = bool(name) and name.casefold() == "all"
         cancelled = self.streaming.handle_cancel(update.effective_chat.id, name)
-        if cancelled:
+        if cancelled and is_all:
+            # P9 wording: ``/cancel all`` is project-scoped — the unit count (pending requests
+            # + drained queued turns) conflates projects with prompts, so for ``all`` we phrase
+            # it as projects, not a raw aborted-unit count. The count stays on the single-project
+            # ``/cancel <name>`` / ``/cancel`` (active) branch below, where one project = one unit
+            # of work the operator was watching.
+            await update.message.reply_text("🛑 Cancelled all running/queued projects.")
+        elif cancelled:
             await update.message.reply_text(f"🛑 Cancelled ({cancelled} aborted).")
         elif name and name.casefold() != "all":
             # A named target with nothing to cancel — not running and not queued. A clear,
             # honest message (NB1: a drained queued turn would have counted above, so reaching
-            # here means the project really had no in-flight or queued turn).
+            # here means the project really had no in-flight or queued turn). P9: the project
+            # name is bolded + escaped (HTML), uniform with every other name-bearing reply.
             await update.message.reply_text(
-                f"Nothing in flight to cancel for {name} (it may have already finished)."
+                f"Nothing in flight to cancel for <b>{html.escape(name, quote=False)}</b> "
+                "(it may have already finished).",
+                parse_mode="HTML",
             )
         else:
             await update.message.reply_text("Nothing in flight to cancel.")
@@ -631,9 +656,11 @@ class TelegramClaudeBot:
           project is left UNCHANGED (``store.switch`` never called);
         * success → ``store.switch`` + a confirmation.
 
-        Returns the operator-facing reply + its ``parse_mode`` (``"HTML"`` for the
-        escaped-name error, ``None`` for the plain confirmations) so the caller just sends it.
-        Pure of Telegram I/O (the caller sends) so the button + command paths share it.
+        Returns the operator-facing reply + its ``parse_mode``. **P9 styling unification:**
+        EVERY reply that names a project renders it as ``<b>{html.escape(name)}</b>`` and is
+        sent ``"HTML"`` (the names are SB4-validated, but escaped anyway, defense-in-depth) —
+        no more bare-``{name}`` interpolation. Pure of Telegram I/O (the caller sends) so the
+        button + command paths share it.
         """
         assert self.streaming is not None
         if self.streaming.store is None:
@@ -664,10 +691,12 @@ class TelegramClaudeBot:
         # Fail-closed: a missing/empty stored cwd is refused rather than crashing, and the
         # active project is left UNCHANGED (store.switch is never called) on any refusal.
         cwd = record.get("cwd")
+        name_html = html.escape(name, quote=False)
         if not cwd:
             return (
-                f"❌ {name} has no recorded directory — re-create it with /new <name> <path>.",
-                None,
+                f"❌ <b>{name_html}</b> has no recorded directory — "
+                "re-create it with /new <name> <path>.",
+                "HTML",
             )
         try:
             resolve_within_roots(
@@ -678,14 +707,14 @@ class TelegramClaudeBot:
             )
         except PathNotAllowed:
             return (
-                f"❌ {name}'s directory is no longer within the permitted roots — "
+                f"❌ <b>{name_html}</b>'s directory is no longer within the permitted roots — "
                 "not switching. Use /new <name> <path> to point it somewhere allowed.",
-                None,
+                "HTML",
             )
         self.streaming.store.switch(chat_id, name)
         return (
-            f"✅ Switched to {name} — your next message resumes that project.",
-            None,
+            f"✅ Switched to <b>{name_html}</b> — your next message resumes that project.",
+            "HTML",
         )
 
     async def cmd_rm(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -721,7 +750,9 @@ class TelegramClaudeBot:
         active = self.streaming.store.get_active(chat_id) if self.streaming.store else None
         if active is not None and name.casefold() == active.casefold():
             await update.message.reply_text(
-                f"❌ {name} is the active project — /switch to another project first."
+                f"❌ <b>{html.escape(name, quote=False)}</b> is the active project — "
+                "/switch to another project first.",
+                parse_mode="HTML",
             )
             return
         # P5 / ADR-005 D9 (round-3 BLOCKERS 1+2): INFLIGHT-AWARE admission. request_remove
@@ -734,8 +765,11 @@ class TelegramClaudeBot:
         # where a window turn would otherwise persist to an already-deleted record (the
         # lock-based is_busy missed the window turn entirely — it holds no lock).
         if not self.streaming.request_remove(chat_id, name):
+            name_html = html.escape(name, quote=False)
             await update.message.reply_text(
-                f"❌ {name} has a turn in flight — /cancel {name} first, then /rm it."
+                f"❌ <b>{name_html}</b> has a turn in flight — "
+                f"/cancel {name_html} first, then /rm it.",
+                parse_mode="HTML",
             )
             return
         try:
@@ -757,7 +791,9 @@ class TelegramClaudeBot:
         # already refused above, so the purged runtime is never the live one.
         await self.streaming.forget_project(chat_id, name)
         await update.message.reply_text(
-            f"🗑️ Removed {name} (its Claude transcript is left on disk)."
+            f"🗑️ Removed <b>{html.escape(name, quote=False)}</b> "
+            "(its Claude transcript is left on disk).",
+            parse_mode="HTML",
         )
 
     async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -847,7 +883,12 @@ class TelegramClaudeBot:
         try:
             self.streaming.store.create(chat_id, name, str(target), make_active=True)
         except DuplicateProject:
-            await update.message.reply_text(f"❌ A project named {name} already exists.")
+            # P9: bold + escape the name (HTML), uniform with every name-bearing reply. The
+            # name passed SB4 above (safe charset) but escape it anyway, defense-in-depth.
+            await update.message.reply_text(
+                f"❌ A project named <b>{html.escape(name, quote=False)}</b> already exists.",
+                parse_mode="HTML",
+            )
             return
         # R6: the resolved cwd is wrapped in <code> (monospace, no auto-linkify); the name
         # is bolded + escaped. HTML parse mode required for the tags to render.
@@ -890,8 +931,10 @@ class TelegramClaudeBot:
         if not name or not text:
             await update.message.reply_text("Usage: /to <name> <your answer>")
             return
+        # P9: resolve_to returns an HTML-styled reply (the project name bolded + escaped),
+        # uniform with every name-bearing operator reply — send it parse_mode="HTML".
         reply = self.streaming.resolve_to(chat_id, name, text)
-        await update.message.reply_text(reply)
+        await update.message.reply_text(reply, parse_mode="HTML")
 
     # ---- macros (T5 / P9; both modes — a macro fires as a normal turn) ------
     def _macro_store(self):
@@ -968,7 +1011,7 @@ class TelegramClaudeBot:
             )
         else:
             await update.message.reply_text(
-                f"No macro named <b>{html.escape(name, quote=False)}</b>.",
+                f"❌ No macro named <b>{html.escape(name, quote=False)}</b>.",
                 parse_mode="HTML",
             )
 
@@ -1020,7 +1063,7 @@ class TelegramClaudeBot:
         body = store.get_macro(chat_id, name)
         if body is None:
             await update.message.reply_text(
-                f"No macro named <b>{html.escape(name, quote=False)}</b>. "
+                f"❌ No macro named <b>{html.escape(name, quote=False)}</b>. "
                 "List them with /macros.",
                 parse_mode="HTML",
             )
@@ -1035,7 +1078,12 @@ class TelegramClaudeBot:
             )
             return
         # Fire as a normal turn (same path a plain message takes) against the active project.
-        await self._run_turn(update, ctx, chat_id, expanded)
+        # command_initiated=True: a macro /run is a DELIBERATE start-a-turn command — it must
+        # NEVER be swallowed as the answer to a pending "Other"/plan-reject free-text hold
+        # (the Codex blocker). The flag tells the streaming session to skip free-text capture
+        # for this turn so the expanded macro always opens a fresh turn through the permission
+        # path. A PLAIN typed message keeps the flag False and still answers a pending prompt.
+        await self._run_turn(update, ctx, chat_id, expanded, command_initiated=True)
 
     # ---- messages -----------------------------------------------------------
     @staticmethod
@@ -1103,6 +1151,7 @@ class TelegramClaudeBot:
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        command_initiated: bool = False,
     ) -> None:
         """Run ``text`` as one turn for ``chat_id`` — the shared dispatch both the message
         handler and the skill-launch passthrough route through (one path, no duplication).
@@ -1111,11 +1160,16 @@ class TelegramClaudeBot:
         it through the runner and replies (chunked). Callers MUST have already done the
         ``_ok`` allowlist recheck and the empty-text guard. ``reply_to_message_id`` (D5) is
         forwarded to the streaming session for free-text reply-to routing; it is ignored in
-        one-shot mode (no interactive holds there).
+        one-shot mode (no interactive holds there). ``command_initiated`` (a macro ``/run``)
+        is likewise forwarded so the streaming session opens a FRESH turn instead of letting
+        the expanded text satisfy a pending free-text hold; one-shot mode has no holds, so it
+        ignores the flag and just runs the text.
         """
         if self.streaming is not None:
             await self._on_message_streaming(
-                update, ctx, chat_id, text, reply_to_message_id=reply_to_message_id
+                update, ctx, chat_id, text,
+                reply_to_message_id=reply_to_message_id,
+                command_initiated=command_initiated,
             )
             return
 
@@ -1182,6 +1236,7 @@ class TelegramClaudeBot:
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        command_initiated: bool = False,
     ) -> None:
         """Drive the streaming engine for one message (delegates to StreamingSession).
 
@@ -1226,6 +1281,7 @@ class TelegramClaudeBot:
             captured_free_text = await self.streaming.handle_message(
                 chat_id, text, send=send, edit=edit, delete=delete,
                 reply_to_message_id=reply_to_message_id,
+                command_initiated=command_initiated,
             )
         except StreamingBusy:
             await update.message.reply_text(

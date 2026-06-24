@@ -59,6 +59,7 @@ tools inside the single allowlisted chat — is unchanged; per-tool gating is P2
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import time
 from collections import deque
@@ -1135,6 +1136,24 @@ class StreamingSession:
         _name, rt = self._active_runtime(chat_id, create_default=False)
         return bool(rt.policy.yolo) if rt is not None else False
 
+    def get_project_yolo(self, chat_id: int, name: str) -> bool:
+        """Whether the NAMED project is in ``/yolo`` allow-all mode (T2 /status, P9 fix).
+
+        Read-only (RB1): never creates a project or runtime. Mirrors :meth:`project_status` —
+        a project with **no in-memory runtime** (never run this process, e.g. just after a
+        restart) reports ``False`` (the fail-closed default; ``/yolo`` is transient + per
+        process). The name is matched case-insensitively against the stored runtime key
+        (like the store), so ``/status`` can mark EACH project's yolo posture independently —
+        a wide-open BACKGROUND project is no longer hidden behind the active project's gate.
+        """
+        state = self._chats.get(chat_id)
+        if state is None:
+            return False
+        key = self._resolve_runtime_key(state.runtimes, name)
+        if key is None:
+            return False
+        return bool(state.runtimes[key].policy.yolo)
+
     def set_model(self, chat_id: int, model: Optional[str]) -> Optional[str]:
         """Set (or clear) the ACTIVE project's per-project model override (T4 / P9).
 
@@ -1684,6 +1703,7 @@ class StreamingSession:
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
         reply_to_message_id: Optional[int] = None,
+        command_initiated: bool = False,
     ) -> bool:
         """Drive ONE operator turn (or capture a free-text answer) for ``chat_id``.
 
@@ -1741,6 +1761,17 @@ class StreamingSession:
         no hang, RB1/SB6). **RB3 resume notice.** If a persisted session could not be
         resumed and a fresh one was started instead, a one-line notice is sent via
         ``send`` BEFORE the turn is driven (the turn still completes — never hangs, RB2).
+
+        **Command-initiated turns bypass free-text capture (P9 fix).** A macro ``/run``
+        expands to text and routes here, but it is a DELIBERATE command to START a fresh
+        turn — it must NEVER be swallowed as the answer to an outstanding "Other"/plan-reject
+        free-text hold. ``command_initiated=True`` therefore skips the free-text routing below
+        so the expanded macro always opens a new turn (through the same permission path a
+        plain message does), against the active project. A PLAIN typed message keeps
+        ``command_initiated=False`` and answers a pending capture EXACTLY as before. (If the
+        active project is the one parked awaiting free text it is ``inflight``, so the fresh
+        ``/run`` turn cleanly raises :class:`StreamingBusy` — the bot replies "still working"
+        — rather than misrouting.)
         """
         state = self._chat(chat_id)
 
@@ -1751,8 +1782,12 @@ class StreamingSession:
         # (reply-to > most-recent) in one resolver. ``routed`` is True iff free-text routing
         # CLAIMED this message (it was a free-text reply, even if the target turned out gone
         # — so a stale reply-to never silently falls through to a NEW turn / a misroute).
-        armed_name, armed_rt, routed = self._route_free_text_target(
-            state, reply_to_message_id
+        # P9 fix: a command-initiated turn (a macro /run) NEVER captures a pending free-text
+        # hold — it always opens a fresh turn — so the routing is skipped entirely for it.
+        armed_name, armed_rt, routed = (
+            (None, None, False)
+            if command_initiated
+            else self._route_free_text_target(state, reply_to_message_id)
         )
         if routed:
             if armed_rt is not None:
@@ -2990,21 +3025,33 @@ class StreamingSession:
           reply-to routes use (lock-free; it unblocks the held turn) and confirm.
 
         ``text`` is the answer/feedback verbatim (SB4 — never interpolated into a shell).
+
+        **P9 styling.** The returned reply names the project as ``<b>{html.escape(name)}</b>``
+        and the bot (``cmd_to``) sends it ``parse_mode="HTML"`` — uniform with every other
+        name-bearing operator reply. ``name`` is operator input here (it may have FAILED the
+        runtime lookup), so escaping is both consistency AND defense-in-depth.
         """
         state = self._chats.get(chat_id)
         if state is None:
-            return f"❌ No project named {name!r} is awaiting a reply."
+            return (
+                f"❌ No project named <b>{html.escape(name, quote=False)}</b> "
+                "is awaiting a reply."
+            )
         key = self._resolve_runtime_key(state.runtimes, name)
         rt = state.runtimes.get(key) if key is not None else None
         if rt is None or rt.awaiting_text_for is None:
             # Unknown name, or the project has no pending "Other"/reject to answer. Clear,
             # body-free no-op — do NOT fall back to the most-recent default (never misroute).
             return (
-                f"❌ {name} is not awaiting a free-text reply "
+                f"❌ <b>{html.escape(name, quote=False)}</b> is not awaiting a free-text reply "
                 "(tap “Other”/“Reject” on its prompt first)."
             )
         self._resolve_free_text(state, chat_id, key, rt, text)
-        return f"✅ Sent your reply to {key}."
+        # ``key`` is non-None here (rt is None whenever key is None, and that path returned
+        # above) — narrow for mypy. It is the stored (SB4-validated) project key; escape it
+        # uniformly anyway (consistency + defense-in-depth).
+        assert key is not None
+        return f"✅ Sent your reply to <b>{html.escape(key, quote=False)}</b>."
 
     # -- cancel --------------------------------------------------------------
 

@@ -709,6 +709,23 @@ def test_list_macros_and_overwrite(tmp_path):
     assert store.list_macros(1)["a"] == "updated"
 
 
+def test_save_macro_case_insensitive_overwrite_no_duplicate(tmp_path):
+    # RED-GREEN (P0 macro case-collision): get_macro/remove_macro resolve case-insensitively,
+    # but save_macro wrote macros[name]=body as-given. So `/save Work x` then `/save work y`
+    # used to make TWO entries — and `/run work` hit the wrong one. save_macro must resolve an
+    # existing case-insensitive key and OVERWRITE it (mirror create/_resolve_name): exactly
+    # ONE macro survives, and a case-insensitive /run returns the LATEST body.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "Work", "x")
+    store.save_macro(1, "work", "y")  # same name, different case → overwrite, not a 2nd entry
+    macros = store.list_macros(1)
+    assert len(macros) == 1, f"expected exactly one macro, got {macros!r}"
+    # The stored (original-case) key is preserved; the body is the latest. /run resolves it.
+    assert list(macros) == ["Work"]
+    assert store.get_macro(1, "work") == "y"
+    assert store.get_macro(1, "WORK") == "y"
+
+
 def test_remove_macro(tmp_path):
     store = JsonSessionStore(tmp_path / "state.json")
     store.save_macro(1, "a", "x")
