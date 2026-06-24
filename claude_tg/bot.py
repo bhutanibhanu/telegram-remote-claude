@@ -67,7 +67,7 @@ HELP_TEXT = (
     "/cd <path> — change the working directory (one-shot mode only; in streaming mode "
     "the cwd is fixed per project — use /new to work elsewhere)\n"
     "/save <name> <text> — save a reusable prompt template (macro)\n"
-    "/run <name> [args…] — run a saved macro (expands $1 $2 … and $* = all args)\n"
+    "/run <name> [args…] — run a saved macro (expands `$1` `$2` … and `$*` = all args)\n"
     "/macros — list your saved macros\n"
     "/unsave <name> — remove a saved macro\n"
     "\nAny *other* slash-command (e.g. /grill, /pipeline, /scaffold) is forwarded "
