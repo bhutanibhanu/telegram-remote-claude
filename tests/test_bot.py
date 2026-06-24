@@ -69,6 +69,10 @@ def make_ctx(args=None):
 async def test_on_message_replies():
     runner = FakeRunner(ClaudeResult(ok=True, text="the answer"))
     bot = TelegramClaudeBot(make_config(), runner)
+    # P9/T1: pre-mark this chat as already-welcomed so the first-run welcome (a new extra
+    # reply on a chat's first message) doesn't perturb this pure-dispatch assertion. The
+    # welcome itself is covered by dedicated onboarding tests below.
+    bot._welcomed.add(1)
     upd = make_update(1, "do it")
     await bot.on_message(upd, make_ctx())
     assert runner.run_calls == [(1, "do it")]
@@ -95,6 +99,8 @@ async def test_on_message_error_result():
 async def test_on_message_empty_result_notice():
     runner = FakeRunner(ClaudeResult(ok=True, text="   "))
     bot = TelegramClaudeBot(make_config(), runner)
+    # P9/T1: pre-mark welcomed so the assert-once below counts only the empty-result notice.
+    bot._welcomed.add(1)
     upd = make_update(1, "go")
     await bot.on_message(upd, make_ctx())
     upd.message.reply_text.assert_awaited_once()

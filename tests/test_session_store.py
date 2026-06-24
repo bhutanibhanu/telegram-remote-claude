@@ -553,3 +553,210 @@ def test_registry_and_flat_view_interoperate(tmp_path):
 
     store.switch(1, "B")  # flat view now follows B
     assert store.load()["1"] == {"cwd": "/b"}  # B has no session yet
+
+
+# ---- P9 / T3 — per-project cumulative cost (add_cost / get_cost) ------------
+
+
+def test_add_cost_accumulates_and_persists_across_reload(tmp_path):
+    """add_cost accumulates per project and survives a store reload (RB6)."""
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    assert store.add_cost(1, "alpha", 0.012) == pytest.approx(0.012)
+    assert store.add_cost(1, "alpha", 0.008) == pytest.approx(0.02)
+    # A fresh store over the same file reads the accumulated total back.
+    reloaded = JsonSessionStore(path)
+    assert reloaded.get_cost(1, "alpha") == pytest.approx(0.02)
+
+
+def test_add_cost_is_case_insensitive(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "Alpha", "/work/alpha", make_active=True)
+    store.add_cost(1, "alpha", 0.5)
+    store.add_cost(1, "ALPHA", 0.25)
+    assert store.get_cost(1, "Alpha") == pytest.approx(0.75)
+
+
+def test_add_cost_ignores_bad_values(tmp_path):
+    """NaN / inf / negative deltas are ignored (RB1) — the running total never corrupts."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.add_cost(1, "alpha", 1.0)
+    assert store.add_cost(1, "alpha", float("nan")) == pytest.approx(1.0)
+    assert store.add_cost(1, "alpha", float("inf")) == pytest.approx(1.0)
+    assert store.add_cost(1, "alpha", -5.0) == pytest.approx(1.0)
+    assert store.get_cost(1, "alpha") == pytest.approx(1.0)
+
+
+def test_add_cost_unknown_project_raises(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    with pytest.raises(UnknownProject):
+        store.add_cost(1, "nope", 1.0)
+
+
+def test_get_cost_unknown_or_unset_is_zero(tmp_path):
+    """get_cost is read-only and never raises — unknown project / unset field → 0.0."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    assert store.get_cost(1, "nope") == 0.0
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    assert store.get_cost(1, "alpha") == 0.0  # never charged yet
+
+
+def test_add_cost_writes_0600(tmp_path):
+    import os
+    import stat
+
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.add_cost(1, "alpha", 0.1)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+# ---- T4 (P9): per-project model override --------------------------------------
+
+
+def test_set_get_model_roundtrip_and_persist(tmp_path):
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    assert store.get_model(1, "alpha") is None  # no override by default
+    store.set_model(1, "alpha", "claude-haiku-4-5")
+    assert store.get_model(1, "alpha") == "claude-haiku-4-5"
+    # Persists across a fresh store over the same file (RB6).
+    store2 = JsonSessionStore(path)
+    assert store2.get_model(1, "alpha") == "claude-haiku-4-5"
+
+
+def test_set_model_clear_removes_override(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.set_model(1, "alpha", "claude-opus-4-8")
+    assert store.get_model(1, "alpha") == "claude-opus-4-8"
+    store.set_model(1, "alpha", None)  # /auto clears
+    assert store.get_model(1, "alpha") is None
+
+
+def test_set_model_case_insensitive_and_empty_clears(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "Alpha", "/work/alpha", make_active=True)
+    store.set_model(1, "alpha", "claude-opus-4-8")  # case-insensitive match
+    assert store.get_model(1, "ALPHA") == "claude-opus-4-8"
+    store.set_model(1, "alpha", "   ")  # whitespace/empty normalizes to a clear
+    assert store.get_model(1, "alpha") is None
+
+
+def test_set_model_unknown_project_raises(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    with pytest.raises(UnknownProject):
+        store.set_model(1, "nope", "claude-haiku-4-5")
+
+
+def test_get_model_unknown_or_unset_is_none(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    assert store.get_model(1, "nope") is None
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    assert store.get_model(1, "alpha") is None
+
+
+def test_set_model_writes_0600(tmp_path):
+    import os
+    import stat
+
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.set_model(1, "alpha", "claude-opus-4-8")
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+# ---- T5 (P9): per-chat macros -------------------------------------------------
+
+
+def test_save_run_macro_roundtrip_and_persist(tmp_path):
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.save_macro(1, "deploy", "run the deploy for $1")
+    assert store.get_macro(1, "deploy") == "run the deploy for $1"
+    # Persists across reload (RB6).
+    store2 = JsonSessionStore(path)
+    assert store2.get_macro(1, "deploy") == "run the deploy for $1"
+
+
+def test_get_macro_case_insensitive(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "Deploy", "go")
+    assert store.get_macro(1, "deploy") == "go"
+    assert store.get_macro(1, "DEPLOY") == "go"
+
+
+@pytest.mark.parametrize("bad", ["../etc", "has space", "x" * 33, "", "a/b", "..", "naïve"])
+def test_save_macro_rejects_bad_name_sb4(tmp_path, bad):
+    store = JsonSessionStore(tmp_path / "state.json")
+    with pytest.raises(InvalidProjectName):
+        store.save_macro(1, bad, "body")
+    # Nothing was persisted (the validate happens before any write).
+    assert store.list_macros(1) == {}
+
+
+def test_list_macros_and_overwrite(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "a", "first")
+    store.save_macro(1, "b", "second")
+    assert store.list_macros(1) == {"a": "first", "b": "second"}
+    store.save_macro(1, "a", "updated")  # overwrite same name
+    assert store.list_macros(1)["a"] == "updated"
+
+
+def test_save_macro_case_insensitive_overwrite_no_duplicate(tmp_path):
+    # RED-GREEN (P0 macro case-collision): get_macro/remove_macro resolve case-insensitively,
+    # but save_macro wrote macros[name]=body as-given. So `/save Work x` then `/save work y`
+    # used to make TWO entries — and `/run work` hit the wrong one. save_macro must resolve an
+    # existing case-insensitive key and OVERWRITE it (mirror create/_resolve_name): exactly
+    # ONE macro survives, and a case-insensitive /run returns the LATEST body.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "Work", "x")
+    store.save_macro(1, "work", "y")  # same name, different case → overwrite, not a 2nd entry
+    macros = store.list_macros(1)
+    assert len(macros) == 1, f"expected exactly one macro, got {macros!r}"
+    # The stored (original-case) key is preserved; the body is the latest. /run resolves it.
+    assert list(macros) == ["Work"]
+    assert store.get_macro(1, "work") == "y"
+    assert store.get_macro(1, "WORK") == "y"
+
+
+def test_remove_macro(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "a", "x")
+    assert store.remove_macro(1, "A") is True  # case-insensitive
+    assert store.get_macro(1, "a") is None
+    assert store.remove_macro(1, "a") is False  # already gone → clean False
+
+
+def test_get_list_remove_macro_no_chat_is_safe(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    assert store.get_macro(1, "x") is None
+    assert store.list_macros(1) == {}
+    assert store.remove_macro(1, "x") is False
+
+
+def test_save_macro_writes_0600(tmp_path):
+    import os
+    import stat
+
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.save_macro(1, "a", "x")
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_macros_independent_of_projects(tmp_path):
+    """Macros live on the chat, separate from the project registry (don't collide)."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.save_macro(1, "alpha", "a macro named the same as a project")
+    # The project and the macro coexist; neither clobbers the other.
+    assert store.get_project(1, "alpha") is not None
+    assert store.get_macro(1, "alpha") == "a macro named the same as a project"
+    assert "alpha" in store.list_projects(1)

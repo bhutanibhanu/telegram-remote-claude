@@ -414,6 +414,26 @@ class _ExplodingClient:
         pass
 
 
+def test_sdk_build_options_threads_model():
+    # T4 (P9): a per-project model override is carried into ClaudeAgentOptions(model=…) at
+    # session-creation time (start AND resume paths use _build_options).
+    sub = SdkSubstrate(model="claude-haiku-4-5")
+    opts = sub._build_options()
+    assert opts.model == "claude-haiku-4-5"
+    # And it rides on the resume path too (the resumed session honors the project's model).
+    resume_opts = sub._build_options(resume="sess-123")
+    assert resume_opts.model == "claude-haiku-4-5"
+
+
+def test_sdk_build_options_no_model_omits_it():
+    # No override → `model` is omitted so the SDK keeps its own default (unchanged pre-T4).
+    sub = SdkSubstrate()
+    opts = sub._build_options()
+    assert getattr(opts, "model", None) is None
+    # An empty/whitespace model is normalized to None (never an empty id).
+    assert SdkSubstrate(model="   ")._build_options().model is None
+
+
 async def test_sdk_send_timeout_yields_driver_error_no_hang():
     sub = SdkSubstrate()
     sub._client = _HangingClient()  # inject; do NOT start a real session

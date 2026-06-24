@@ -92,6 +92,26 @@ class ClaudeRunner:
             log.exception("failed to persist session state for chat %s", chat_id)
 
     # ---- command building / invocation -------------------------------------
+    def _model_for(self, chat_id: int) -> str | None:
+        """The model id for this chat's turn — per-project override, else ``CLAUDE_MODEL``.
+
+        T4 (P9): ``/fast`` · ``/deep`` store a per-project model override in the session
+        store (on the chat's active project — ``default`` in one-shot mode). If one is set
+        it wins; otherwise the configured ``CLAUDE_MODEL`` (``config.model``); otherwise
+        ``None`` (omit ``--model`` → the CLI default). Read-only + fail-safe (RB1): no store,
+        no active project, or a bad record reads as "no override" → fall back to config.
+        """
+        if self.store is not None:
+            try:
+                active = self.store.get_active(chat_id)
+                if active is not None:
+                    override = self.store.get_model(chat_id, active)
+                    if override:
+                        return override
+            except Exception:  # RB1: never wedge a turn over a store read
+                log.debug("model override lookup failed for chat %s", chat_id, exc_info=True)
+        return self.config.model
+
     def _build_cmd(self, chat_id: int) -> list[str]:
         cmd = [self.config.claude_bin, "-p", "--output-format", "json"]
         # SB5 / C1: the allow-all bypass flag is added ONLY when the operator explicitly
@@ -99,8 +119,11 @@ class ClaudeRunner:
         # fresh install runs Claude's tools behind the CLI's approval prompt.
         if self.config.skip_permissions:
             cmd.append("--dangerously-skip-permissions")
-        if self.config.model:
-            cmd += ["--model", self.config.model]
+        # T4 (P9): per-project model override (/fast·/deep) wins over the configured default;
+        # absent both, --model is omitted (the CLI uses its own default).
+        model = self._model_for(chat_id)
+        if model:
+            cmd += ["--model", model]
         session_id = self._sessions.get(chat_id)
         if session_id:
             cmd += ["--resume", session_id]

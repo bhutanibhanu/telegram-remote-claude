@@ -74,10 +74,12 @@ class FakeStreaming:
         self.handle_message_calls: list[tuple[int, str]] = []
 
     async def handle_message(
-        self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None
+        self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
+        command_initiated=False,
     ):
-        # P5/T9: handle_message gained reply_to_message_id (D5); the skill-launch tests
-        # don't exercise reply-to, so we keep recording just (chat_id, text).
+        # P5/T9: handle_message gained reply_to_message_id (D5); P9 fix added
+        # command_initiated (a macro /run skips free-text capture). The skill-launch tests
+        # don't exercise either, so we keep recording just (chat_id, text).
         self.handle_message_calls.append((chat_id, text))
 
     def reset(self, chat_id):
@@ -112,6 +114,8 @@ async def test_skill_command_forwards_verbatim_oneshot():
     """A non-bot command forwards the VERBATIM text (cmd + args, leading /) to runner.run."""
     runner = FakeRunner(ClaudeResult(ok=True, text="launched"))
     bot = TelegramClaudeBot(make_config(), runner)
+    # P9/T1: pre-mark welcomed so the first-run welcome doesn't perturb the assert-once.
+    bot._welcomed.add(1)
     upd = make_update(1, "/grill do X")
     await bot.on_skill_command(upd, make_ctx())
     assert runner.run_calls == [(1, "/grill do X")]  # verbatim — / and args intact

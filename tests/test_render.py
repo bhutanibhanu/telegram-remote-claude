@@ -23,7 +23,7 @@ no bot, no token, no I/O).
 from __future__ import annotations
 
 import pytest
-from telegram import InlineKeyboardMarkup
+from telegram import InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 from claude_tg.engine.types import (
     AskEvent,
@@ -39,6 +39,7 @@ from claude_tg.render import (
     BODY_FREE_ERROR_LINE,
     CALLBACK_LIMIT,
     KIND_PERMISSION,
+    KIND_SWITCH,
     ChatSendGate,
     Coalescer,
     RenderAction,
@@ -49,14 +50,20 @@ from claude_tg.render import (
     coalesce_stream,
     code_path,
     decode_callback,
+    done_footer_suffix,
     encode_callback,
+    encode_switch_callback,
     free_text_prompt,
     notify_attention,
     notify_done,
     notify_error,
+    open_project_keyboard,
     permission_keyboard,
     plan_keyboard,
     project_status_label,
+    queued_suffix,
+    quick_reply_dismiss,
+    quick_reply_keyboard,
     render_event,
     tool_use_line,
     yolo_banner,
@@ -1413,3 +1420,193 @@ def test_chat_send_gate_zero_interval_never_waits():
 def test_chat_send_gate_rejects_negative_interval():
     with pytest.raises(ValueError):
         ChatSendGate(now=FakeClock(), interval=-1.0)
+
+
+# ===========================================================================
+# P9 / T3 — cost + usage surfacing on the done message (num_turns + cost).
+#
+# ResultEvent already carries total_cost_usd + num_turns; the per-turn done render
+# used to drop them whenever there was result_text. done_footer_suffix builds the
+# "· N turns · $X.XX" suffix (only the fields the SDK provided), and _render_result
+# appends it onto the prose's last chunk (and the bare footer).
+# ===========================================================================
+
+
+def test_done_footer_suffix_both_present():
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success", num_turns=3, total_cost_usd=0.012
+    )
+    assert done_footer_suffix(res) == " · 3 turns · $0.01"
+
+
+def test_done_footer_suffix_only_turns():
+    res = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=5)
+    assert done_footer_suffix(res) == " · 5 turns"
+
+
+def test_done_footer_suffix_only_cost():
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success", total_cost_usd=1.5
+    )
+    assert done_footer_suffix(res) == " · $1.50"
+
+
+def test_done_footer_suffix_absent_is_empty():
+    # oneshot / a partial result may carry neither — omit gracefully (no dangling separator).
+    res = ResultEvent(session_id="s", is_error=False, subtype="success")
+    assert done_footer_suffix(res) == ""
+
+
+def test_result_with_text_appends_turns_and_cost():
+    # T3: the turns+cost are surfaced on the done message even WHEN there is result_text
+    # (previously dropped). The suffix lands on the last chunk; the plain fallback gets it
+    # too (positionally parallel).
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success",
+        num_turns=2, total_cost_usd=0.0734, result_text="All done — see **above**.",
+    )
+    action = render_event(res)
+    assert action.text.endswith(" · 2 turns · $0.07")
+    assert "above" in action.text
+    assert action.plain_chunks[-1].endswith(" · 2 turns · $0.07")
+
+
+def test_result_with_text_omits_suffix_when_sdk_absent():
+    # No num_turns + no cost (oneshot-shaped) → the prose is sent UNCHANGED, no suffix.
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success", result_text="Just the answer.",
+    )
+    action = render_event(res)
+    assert action.text == "Just the answer."
+    assert action.plain_chunks == ("Just the answer.",)
+
+
+def test_done_footer_suffix_carries_no_secret():
+    # SB3: the suffix is two SDK-reported numbers — never tool input/output or a path.
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success", num_turns=1, total_cost_usd=0.01
+    )
+    suffix = done_footer_suffix(res)
+    assert suffix == " · 1 turn · $0.01"  # only digits + the $ glyph (singular: "1 turn")
+
+
+def test_done_footer_suffix_pluralizes_turn():
+    # Cosmetic (UX): "1 turn" (singular) but "N turns" for N != 1 — never the ungrammatical
+    # "1 turns". Cover the singular, the plural, and the zero-edge (also plural: "0 turns").
+    one = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=1)
+    assert done_footer_suffix(one) == " · 1 turn"
+    many = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=2)
+    assert done_footer_suffix(many) == " · 2 turns"
+    zero = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=0)
+    assert done_footer_suffix(zero) == " · 0 turns"
+
+
+# ===========================================================================
+# T6 (P9) — notification polish + smart-reply chips (render-layer PURE units).
+#   * switch callback codec round-trip + byte budget + defensive decode.
+#   * [Open <project>] keyboard.
+#   * queued-counter suffix on the notification builders.
+#   * quick-reply chips: ReplyKeyboardMarkup (one-time) + ReplyKeyboardRemove dismiss.
+# ===========================================================================
+
+
+def test_switch_callback_round_trips():
+    # T6: encode_switch_callback -> decode_callback recovers kind="switch" + the project name.
+    data = encode_switch_callback("alpha")
+    assert data == f"{KIND_SWITCH}|alpha|s"
+    cb = decode_callback(data)
+    assert cb is not None
+    assert cb.kind == "switch"
+    assert cb.switch_to == "alpha"
+
+
+def test_switch_callback_within_byte_budget_for_max_name():
+    # T6: a max-length SB4 name (32 chars) stays well under Telegram's 64-byte callback limit.
+    name = "p" * 32
+    data = encode_switch_callback(name)
+    assert len(data.encode("utf-8")) <= CALLBACK_LIMIT
+    cb = decode_callback(data)
+    assert cb is not None and cb.switch_to == name
+
+
+def test_switch_callback_does_not_collide_with_hold_kinds():
+    # T6: the switch kind char 'w' is distinct from ask/other/plan/permission, so a switch
+    # callback never decodes to a hold (and vice versa) — collision-free.
+    assert decode_callback(encode_switch_callback("alpha")).kind == "switch"
+    # An ask/plan/permission callback never decodes to a switch.
+    assert decode_callback(encode_callback("a", REAL_TOOL_USE_ID, question_index=0, option_index=0)).kind == "ask"
+    assert decode_callback(encode_callback("p", REAL_TOOL_USE_ID, plan_action="a")).kind == "plan"
+    assert decode_callback(encode_callback(KIND_PERMISSION, REAL_TOOL_USE_ID, payload="o")).kind == "permission"
+
+
+def test_decode_rejects_forged_switch_name_and_payload():
+    # T6 (SB1 trust boundary): a switch callback with a non-SB4 name (illegal chars / too
+    # long) or a wrong payload char is forged/stale -> decode returns None (resolves nothing).
+    assert decode_callback("w|bad name|s") is None       # space is not in the SB4 charset
+    assert decode_callback("w|" + "p" * 33 + "|s") is None  # over 32 chars
+    assert decode_callback("w|alpha|x") is None           # wrong payload char
+    assert decode_callback("w||s") is None                # empty name
+
+
+def test_encode_switch_callback_rejects_pipe_in_name():
+    # Defensive: a '|' in the name would break the 3-field scheme -> ValueError at build.
+    with pytest.raises(ValueError):
+        encode_switch_callback("a|b")
+    with pytest.raises(ValueError):
+        encode_switch_callback("")
+
+
+def test_open_project_keyboard_carries_switch_callback():
+    # T6: the [Open <name>] button is a single inline button whose callback_data is the
+    # compact switch encoding (decodes back to the project name).
+    kb = open_project_keyboard("beta")
+    assert isinstance(kb, InlineKeyboardMarkup)
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    assert len(buttons) == 1
+    assert buttons[0].text == "📂 Open beta"
+    assert decode_callback(buttons[0].callback_data).switch_to == "beta"
+
+
+def test_queued_suffix():
+    # T6: " (N more waiting)" only when N>=1; 0/negative -> "".
+    assert queued_suffix(0) == ""
+    assert queued_suffix(-3) == ""
+    assert queued_suffix(1) == " (1 more waiting)"
+    assert queued_suffix(4) == " (4 more waiting)"
+
+
+def test_notify_builders_append_queued_counter():
+    # T6: the queued counter rides the attention/done/error pings when >0; omitted at 0.
+    assert notify_attention("alpha", "permission") == "🔔 alpha — Claude needs approval"
+    assert notify_attention("alpha", "permission", queued_waiting=2) == (
+        "🔔 alpha — Claude needs approval (2 more waiting)"
+    )
+    assert notify_done("alpha") == "✅ alpha — done"
+    assert notify_done("alpha", queued_waiting=1) == "✅ alpha — done (1 more waiting)"
+    assert notify_error("alpha", "turn_error") == "⚠️ alpha — turn_error"
+    assert notify_error("alpha", "turn_error", queued_waiting=3) == (
+        "⚠️ alpha — turn_error (3 more waiting)"
+    )
+
+
+def test_notify_builders_body_free_with_queued_counter():
+    # SB3: even with the queued counter, the ping carries ONLY the name + a fixed phrase + a
+    # number — never any event body. A name with no secret + a count is all that appears.
+    msg = notify_attention("proj_42", "plan", queued_waiting=5)
+    assert msg == "🔔 proj_42 — proposes a plan (5 more waiting)"
+    # No tool input / question text / plan body could be here (the builder takes none).
+
+
+def test_quick_reply_keyboard_is_one_time_and_has_common_chips():
+    # T6: the chips are a ReplyKeyboardMarkup, one_time_keyboard=True, with the common answers.
+    kb = quick_reply_keyboard()
+    assert isinstance(kb, ReplyKeyboardMarkup)
+    assert kb.one_time_keyboard is True
+    chips = [b.text for row in kb.keyboard for b in row]
+    for expected in ("proceed", "keep it minimal", "explain first", "use TypeScript"):
+        assert expected in chips, f"missing quick-reply chip {expected!r}"
+
+
+def test_quick_reply_dismiss_is_a_keyboard_remove():
+    # T6: the dismiss object is a ReplyKeyboardRemove (clears the one-time chips after capture).
+    assert isinstance(quick_reply_dismiss(), ReplyKeyboardRemove)

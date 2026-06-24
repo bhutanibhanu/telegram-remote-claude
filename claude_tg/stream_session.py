@@ -59,6 +59,7 @@ tools inside the single allowlisted chat — is unchanged; per-tool gating is P2
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import time
 from collections import deque
@@ -66,6 +67,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional, Protocol
+
+from telegram import InlineKeyboardMarkup, LinkPreviewOptions
 
 from .claude_runner import ClaudeResult, ClaudeRunner
 from .config import Config
@@ -102,6 +105,7 @@ from .render import (
     notify_attention,
     notify_done,
     notify_error,
+    open_project_keyboard,
     permission_keyboard,
     plan_keyboard,
     strip_telegram_html,
@@ -162,6 +166,7 @@ def _default_engine_factory(
     allowed_roots: tuple[Path, ...] = (),
     allow_any_path: bool = False,
     send_timeout: float = 120.0,
+    model: Optional[str] = None,
 ) -> Engine:
     """Production factory: an :class:`Engine` over Substrate A for ``cwd``.
 
@@ -187,6 +192,15 @@ def _default_engine_factory(
     bounds APPROVED long-running tool execution, so the live bot passes the GENEROUS
     ``config.stream_message_timeout_seconds`` via ``_bound_factory``; the 120 s default here
     only keeps a bare/legacy call's behavior unchanged.
+
+    **T4 (P9):** ``model`` is the per-project model override threaded into the substrate's
+    ``ClaudeAgentOptions(model=…)`` at session-creation time (``/fast`` → Haiku, ``/deep`` →
+    Opus, ``/auto`` → ``None`` = the SDK/``CLAUDE_MODEL`` default). ``None`` (the default here,
+    and what ``/auto`` resolves to) omits ``model`` entirely so behavior is unchanged when no
+    override is set. The session resolves the per-project model from the store and passes it
+    via ``_bound_factory`` at each ``_ensure_engine`` build, so a ``/fast``/``/deep`` takes
+    effect on the NEXT fresh session for that project (model is a session-creation param,
+    never hot-swapped mid-session).
     """
     engine: Engine
 
@@ -199,6 +213,7 @@ def _default_engine_factory(
         cwd=cwd,
         permission_mode="default",
         decision_callback=decision_callback,
+        model=model,
     )
     engine = Engine(
         substrate,
@@ -567,10 +582,20 @@ class StreamingSession:
         # layer (or a small liveness bound) build a real Engine with those kwargs directly.
         if engine_factory is not None:
             self._engine_factory: EngineFactory = engine_factory
+            # T4 (P9): an INJECTED factory keeps the proven 3-kwarg contract
+            # (cwd/backstop_seconds/permission_policy) — every existing test factory uses
+            # exactly that signature. So _ensure_engine must NOT pass the per-project `model`
+            # to an injected factory (it would TypeError on the unexpected kwarg). Only the
+            # DEFAULT bound factory below accepts (and threads) `model`; this flag gates that.
+            self._factory_accepts_model = False
         else:
 
             def _bound_factory(
-                *, cwd: str, backstop_seconds: float, permission_policy: PermissionPolicy
+                *,
+                cwd: str,
+                backstop_seconds: float,
+                permission_policy: PermissionPolicy,
+                model: Optional[str] = None,
             ) -> Engine:
                 return _default_engine_factory(
                     cwd=cwd,
@@ -579,9 +604,15 @@ class StreamingSession:
                     allowed_roots=config.allowed_roots,
                     allow_any_path=config.allow_any_path,
                     send_timeout=float(config.stream_message_timeout_seconds),
+                    model=model,
                 )
 
             self._engine_factory = _bound_factory
+            # T4 (P9): the default factory accepts the per-project `model` kwarg, so
+            # _ensure_engine passes the resolved override into it. `model` stays OPTIONAL so a
+            # bare 3-kwarg call (the C2/H2 live-factory-wiring tests + the engine-build path
+            # with no override) is unchanged.
+            self._factory_accepts_model = True
         self._clock = clock
         self._min_edit_interval = min_edit_interval
         # P5 / ADR-005 D8 (T8): the per-chat send-rate budget (seconds between any two
@@ -636,7 +667,13 @@ class StreamingSession:
         return state.send_gate
 
     async def _gated_send(
-        self, state: _ChatState, send: SendFn, *, verbatim: bool, **kwargs
+        self,
+        state: _ChatState,
+        send: SendFn,
+        *,
+        verbatim: bool,
+        disable_link_preview: bool = False,
+        **kwargs,
     ) -> Optional[int]:
         """Send through the per-chat gate: reserve a slot, await the wait, then send (D8).
 
@@ -645,10 +682,20 @@ class StreamingSession:
         coalesced status churn — D8), awaits the gate's computed wait via the injected
         ``self._sleep`` (the gate decides timing; the session does the awaiting — the
         Coalescer pattern), then performs the real ``send``. Returns the sent message id.
+
+        **T6/P9 — no link previews on notifications.** ``disable_link_preview=True`` threads a
+        :class:`~telegram.LinkPreviewOptions` ``is_disabled=True`` into the send so a path /
+        URL in a background ping does not balloon into a Telegram preview card. It is passed
+        as a kwarg the bot's ``send`` closure forwards to ``Bot.send_message``
+        (``link_preview_options`` is the PTB 21.x API; the deprecated
+        ``disable_web_page_preview`` is avoided). Only the notification sends set it; ordinary
+        verbatim/status sends leave Telegram's default preview behavior unchanged.
         """
         wait = self._gate(state).reserve(verbatim=verbatim)
         if wait > 0:
             await self._sleep(wait)
+        if disable_link_preview:
+            kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
         return await send(**kwargs)
 
     async def _gated_edit(
@@ -687,6 +734,31 @@ class StreamingSession:
         if active is None:
             return True  # nothing active yet → treat the turn's project as foreground.
         return isinstance(active, str) and active.casefold() == name.casefold()
+
+    # -- queued counter for notifications + /status (T6/P9) -----------------
+
+    def _queued_waiting(self, state: _ChatState) -> int:
+        """The number of turns parked behind the cap in THIS chat's run queue (T6/P9).
+
+        Pulled straight from the per-chat FIFO :attr:`~_ChatState.run_queue` (D6): the count
+        of still-pending waiters (a drained/transferred entry has a done future, so it is
+        excluded). The notification builders append a ``" (N more waiting)"`` counter when
+        this is ≥1 so the operator knows work is backed up; 0 → no suffix. Read-only / pure
+        (never mutates the queue, never raises) so it is safe to call on any send path. The
+        counter is per-chat (the queue is per-chat — D6); the global RUNNING count is
+        :meth:`active_run_count`.
+        """
+        return sum(1 for q in state.run_queue if not q.future.done())
+
+    def queued_waiting(self, chat_id: int) -> int:
+        """Public read-only view of :meth:`_queued_waiting` for a chat (T6/P9; ``/status``).
+
+        Returns 0 for a chat with no state yet (RB1 — never creates anything). The bot's
+        ``/status`` runs line uses this to show ``" (N more waiting)"`` alongside the
+        ``N active / M max`` counts.
+        """
+        state = self._chats.get(chat_id)
+        return self._queued_waiting(state) if state is not None else 0
 
     # -- proactive notifications for a BACKGROUND project (ADR-005 D4) -------
 
@@ -744,6 +816,26 @@ class StreamingSession:
             return plan_keyboard(event)
         return None
 
+    @staticmethod
+    def _with_open_button(name: str, base: Optional[InlineKeyboardMarkup]):
+        """Append an ``[Open <name>]`` switch row to ``base`` (or build it standalone — T6/P9).
+
+        A background needs-attention ping carries a ``📂 Open <name>`` switch button
+        (:func:`~claude_tg.render.open_project_keyboard`) so the operator can jump to the
+        project from the ping. When the ping also carries the hold's verdict/approve keyboard
+        (permission/plan ``base``), the switch button is appended as an EXTRA ROW beneath it
+        (one inline keyboard per message — the two can't be separate keyboards). When there is
+        no base keyboard (the ask bell line), the switch button stands alone. The switch tap's
+        ``callback_data`` (``w|<name>|s``) is a distinct kind, so it never collides with the
+        hold rows' ask/plan/permission ``callback_data`` on the same keyboard.
+        """
+        open_kb = open_project_keyboard(name)
+        if base is None:
+            return open_kb
+        return InlineKeyboardMarkup(
+            list(base.inline_keyboard) + list(open_kb.inline_keyboard)
+        )
+
     async def _notify_background(
         self,
         state: _ChatState,
@@ -776,11 +868,15 @@ class StreamingSession:
             state, name, kind, dedup_id=getattr(event, "tool_use_id", None)
         ):
             return
+        # T6/P9: the ping carries the hold's verdict/approve keyboard PLUS an [Open <name>]
+        # switch row (the operator can act on the hold OR jump to the project), a queued
+        # counter, and no link preview (a path/URL must not balloon into a card).
         await self._gated_send(
             state, send, verbatim=True,
-            text=notify_attention(name, kind),
-            reply_markup=self._keyboard_for(event),
+            text=notify_attention(name, kind, queued_waiting=self._queued_waiting(state)),
+            reply_markup=self._with_open_button(name, self._keyboard_for(event)),
             parse_mode=None,
+            disable_link_preview=True,
         )
 
     async def _notify_background_ask(
@@ -822,11 +918,15 @@ class StreamingSession:
             state, name, "ask", dedup_id=getattr(ask, "tool_use_id", None)
         ):
             return
+        # T6/P9: the bell line carries the [Open <name>] switch button (the per-question
+        # keyboards below carry the option taps, so the switch button rides the bell), the
+        # queued counter, and no link preview.
         await self._gated_send(
             state, send, verbatim=True,
-            text=notify_attention(name, "ask"),
-            reply_markup=None,
+            text=notify_attention(name, "ask", queued_waiting=self._queued_waiting(state)),
+            reply_markup=open_project_keyboard(name),
             parse_mode=None,
+            disable_link_preview=True,
         )
         for q_idx in range(len(ask.questions)):
             keyboard = ask_question_keyboard(ask, q_idx)
@@ -836,6 +936,7 @@ class StreamingSession:
                     text=ask_question_body_html(ask, q_idx),
                     reply_markup=keyboard,
                     parse_mode="HTML",
+                    disable_link_preview=True,
                 )
             except Exception:
                 await self._gated_send(
@@ -843,6 +944,7 @@ class StreamingSession:
                     text=ask_question_body(ask, q_idx),
                     reply_markup=keyboard,
                     parse_mode=None,
+                    disable_link_preview=True,
                 )
 
     async def _notify_terminal(
@@ -867,11 +969,16 @@ class StreamingSession:
             if not self._should_notify(state, name, "error"):
                 return
             # SB3 (T3-review SB3 check): the body-free ErrorKind, NEVER event.message.
+            # T6/P9: queued counter + no link preview (the error ping carries no switch button
+            # per the T6 scope — that is on the attention + done pings).
             await self._gated_send(
                 state, send, verbatim=True,
-                text=notify_error(name, event.kind_of_error),
+                text=notify_error(
+                    name, event.kind_of_error, queued_waiting=self._queued_waiting(state)
+                ),
                 reply_markup=None,
                 parse_mode=None,
+                disable_link_preview=True,
             )
             return
         if isinstance(event, ResultEvent):
@@ -883,18 +990,25 @@ class StreamingSession:
                     return
                 await self._gated_send(
                     state, send, verbatim=True,
-                    text=notify_error(name, "turn_error"),
+                    text=notify_error(
+                        name, "turn_error", queued_waiting=self._queued_waiting(state)
+                    ),
                     reply_markup=None,
                     parse_mode=None,
+                    disable_link_preview=True,
                 )
                 return
             if not self._should_notify(state, name, "done"):
                 return
+            # T6/P9: the done ping carries the [Open <name>] switch button (jump to the
+            # finished project), a queued counter (a freed slot may unblock waiters), and no
+            # link preview.
             await self._gated_send(
                 state, send, verbatim=True,
-                text=notify_done(name),
-                reply_markup=None,
+                text=notify_done(name, queued_waiting=self._queued_waiting(state)),
+                reply_markup=open_project_keyboard(name),
                 parse_mode=None,
+                disable_link_preview=True,
             )
 
     # -- active-project resolution (the store is the source of truth) --------
@@ -1011,6 +1125,109 @@ class StreamingSession:
         if rt is not None:
             rt.policy.set_yolo(on)
 
+    def get_yolo(self, chat_id: int) -> bool:
+        """Whether the chat's ACTIVE project is in ``/yolo`` allow-all mode (T2 /status).
+
+        Read-only (RB1): never creates a project or runtime — a chat with no active project
+        (or no runtime yet) reports ``False`` (the fail-closed default; the gate is ON). The
+        bypass is per-project + transient (a fresh process / ``/reset`` clears it), so this
+        reflects the live posture of whichever project is currently active.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=False)
+        return bool(rt.policy.yolo) if rt is not None else False
+
+    def get_project_yolo(self, chat_id: int, name: str) -> bool:
+        """Whether the NAMED project is in ``/yolo`` allow-all mode (T2 /status, P9 fix).
+
+        Read-only (RB1): never creates a project or runtime. Mirrors :meth:`project_status` —
+        a project with **no in-memory runtime** (never run this process, e.g. just after a
+        restart) reports ``False`` (the fail-closed default; ``/yolo`` is transient + per
+        process). The name is matched case-insensitively against the stored runtime key
+        (like the store), so ``/status`` can mark EACH project's yolo posture independently —
+        a wide-open BACKGROUND project is no longer hidden behind the active project's gate.
+        """
+        state = self._chats.get(chat_id)
+        if state is None:
+            return False
+        key = self._resolve_runtime_key(state.runtimes, name)
+        if key is None:
+            return False
+        return bool(state.runtimes[key].policy.yolo)
+
+    def set_model(self, chat_id: int, model: Optional[str]) -> Optional[str]:
+        """Set (or clear) the ACTIVE project's per-project model override (T4 / P9).
+
+        ``/fast`` → the fast id, ``/deep`` → the deep id, ``/auto`` → ``None`` (clear the
+        override back to ``CLAUDE_MODEL`` / the SDK default). Persisted on the active project
+        via the store (atomic + ``0600``, RB6) so it survives a restart and a store reload;
+        with no store it is a no-op (a single implicit project, no persistence) — returns the
+        requested ``model`` regardless so the bot can confirm. Auto-creates ``default`` if
+        there is no active project (consistent with starting a turn / ``set_yolo``).
+
+        **Applies on the NEXT fresh session, never mid-turn.** The model is a session-creation
+        param (baked into ``ClaudeAgentOptions`` when the engine's client is built). A project
+        with a live engine/session keeps running its current model until that session ends; the
+        new model takes effect when the next fresh session is built (a ``/reset`` or a
+        dead-resume rebuild). We deliberately do NOT hot-swap a live session. Returns the
+        normalized override that was stored (``None`` for ``/auto``).
+        """
+        normalized = model.strip() if isinstance(model, str) and model.strip() else None
+        # Resolve (and if needed auto-create) the active project so /fast before any turn works.
+        name, _rt = self._active_runtime(chat_id, create_default=True)
+        if self.store is not None and name is not None:
+            try:
+                self.store.set_model(chat_id, name, normalized)
+            except Exception:
+                # RB1: never crash the command over a persist failure (e.g. the project was
+                # /rm'd in a race). The override simply isn't recorded; the next turn uses the
+                # default. Mirrors _persist's swallow-and-log discipline.
+                log.exception("failed to persist model override for chat %s", chat_id)
+        return normalized
+
+    def get_model(self, chat_id: int) -> Optional[str]:
+        """The ACTIVE project's effective model id (override, else the configured default).
+
+        Read-only (RB1): never creates a project/runtime. Returns the per-project override if
+        one is set (``/fast``/``/deep``), else the configured ``CLAUDE_MODEL`` (``config.model``),
+        else ``None`` (the SDK default). Used by ``/status`` to show the active model. The
+        per-project override is stored on the active project; with no store / no active project
+        it falls back to the configured default.
+        """
+        if self.store is not None:
+            active = self.store.get_active(chat_id)
+            if active is not None:
+                override = self.store.get_model(chat_id, active)
+                if override:
+                    return override
+        return self.config.model
+
+    def _resolve_project_model(self, chat_id: int, name: str) -> Optional[str]:
+        """The model id to bake into ``name``'s next session (override → CLAUDE_MODEL → None).
+
+        T4 (P9): the per-project override (``/fast``/``/deep``) wins; absent that, the
+        configured ``CLAUDE_MODEL`` (``config.model``); absent that, ``None`` (omit ``model``
+        → the SDK default). Read-only + fail-safe (RB1): a missing store / project / field
+        reads as no override. Called by :meth:`_ensure_engine` for the project it is building.
+        """
+        if self.store is not None:
+            try:
+                override = self.store.get_model(chat_id, name)
+            except Exception:  # RB1: a bad/odd record never wedges the build
+                override = None
+            if override:
+                return override
+        return self.config.model
+
+    def active_run_count(self) -> int:
+        """The number of turns currently RUNNING across the whole process (T2 /status).
+
+        Mirrors the concurrency counter the queue/cap logic (D6) maintains — read-only. The
+        cap is :attr:`config.max_concurrent_runs`; this is the live numerator the operator
+        sees as ``N active / M max``. Process-global (the cap is per-deployment), matching how
+        the queue admission is accounted.
+        """
+        return self._running
+
     # -- engine lifecycle ----------------------------------------------------
 
     async def _ensure_engine(
@@ -1094,11 +1311,13 @@ class StreamingSession:
                     name,
                     exc_info=True,
                 )
-        engine = self._engine_factory(
-            cwd=rt.cwd,
-            backstop_seconds=float(self.config.answer_backstop_seconds),
-            permission_policy=rt.policy,
-        )
+        # T4 (P9): resolve THIS project's model (override → CLAUDE_MODEL → SDK default) and
+        # bake it into the engine being built. Passed only to the DEFAULT factory (an injected
+        # test factory keeps the 3-kwarg contract — see _factory_accepts_model). The model is
+        # fixed for the life of THIS fresh session (session-creation param); a later
+        # /fast·/deep·/auto takes effect on the next session this project builds.
+        model = self._resolve_project_model(chat_id, name)
+        engine = self._build_engine(rt.cwd, rt.policy, model)
         rt.engine = engine
         resume_id = self._resume_id(chat_id, name)
         resume_failed = False
@@ -1139,12 +1358,10 @@ class StreamingSession:
                 self._persist(chat_id, session_id=None, name=name)
                 # (c) Build a FRESH engine instance (its _client is None, so its start()
                 #     cannot hit the "already started" guard) and adopt it as the runtime
-                #     engine, replacing the failed one.
-                engine = self._engine_factory(
-                    cwd=rt.cwd,
-                    backstop_seconds=float(self.config.answer_backstop_seconds),
-                    permission_policy=rt.policy,
-                )
+                #     engine, replacing the failed one. T4: same per-project model as the
+                #     first build (resolved once above) — the fresh fallback session honors
+                #     the project's /fast·/deep override too.
+                engine = self._build_engine(rt.cwd, rt.policy, model)
                 rt.engine = engine
                 # (d) Start the FRESH engine — a clean fresh session (the dead id is gone).
                 await engine.start()
@@ -1163,6 +1380,30 @@ class StreamingSession:
             await engine.start()
         rt.started = True
         return engine, resume_failed
+
+    def _build_engine(
+        self, cwd: str, policy: PermissionPolicy, model: Optional[str]
+    ) -> Engine:
+        """Call the engine factory, passing the T4 per-project ``model`` only when supported.
+
+        The DEFAULT bound factory accepts an optional ``model`` kwarg (threaded into
+        ``ClaudeAgentOptions``); an INJECTED test factory keeps the proven 3-kwarg contract
+        (``cwd``/``backstop_seconds``/``permission_policy``) and must NOT receive ``model``
+        (it would ``TypeError`` on the unexpected kwarg). ``_factory_accepts_model`` (set in
+        ``__init__``) gates this so every existing test factory keeps working unchanged.
+        """
+        if self._factory_accepts_model:
+            return self._engine_factory(
+                cwd=cwd,
+                backstop_seconds=float(self.config.answer_backstop_seconds),
+                permission_policy=policy,
+                model=model,  # type: ignore[call-arg]  # default factory accepts model (T4)
+            )
+        return self._engine_factory(
+            cwd=cwd,
+            backstop_seconds=float(self.config.answer_backstop_seconds),
+            permission_policy=policy,
+        )
 
     def _resume_id(self, chat_id: int, name: str) -> Optional[str]:
         """The active project's persisted ``session_id`` to resume from, if any."""
@@ -1462,7 +1703,8 @@ class StreamingSession:
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
         reply_to_message_id: Optional[int] = None,
-    ) -> None:
+        command_initiated: bool = False,
+    ) -> bool:
         """Drive ONE operator turn (or capture a free-text answer) for ``chat_id``.
 
         Free-text capture takes precedence: if any project is awaiting an "Other" answer /
@@ -1470,6 +1712,13 @@ class StreamingSession:
         and the held turn — still inside ``engine.send`` — continues. Otherwise it opens
         a new turn via ``engine.send`` and renders the event stream against the **active
         project's** engine (auto-creating ``default`` on the first turn — ADR-004 D6).
+
+        **Returns** ``True`` iff this message was CONSUMED as a free-text capture (a reply to
+        an "Other"/reject prompt — whether or not its target was still live), ``False`` for a
+        normal new turn. T6/P9: the bot uses this to dismiss the one-time quick-reply chips
+        (``ReplyKeyboardRemove``) once the free-text prompt is answered, so the chips don't
+        linger over the next, unrelated turn. Existing callers that ignore the return value
+        are unaffected (Python discards it).
 
         **Free-text routing under concurrency (P5 / ADR-005 D5; T9).** Several projects can
         be awaiting free text at once, so the target is chosen by this precedence (in one
@@ -1512,6 +1761,17 @@ class StreamingSession:
         no hang, RB1/SB6). **RB3 resume notice.** If a persisted session could not be
         resumed and a fresh one was started instead, a one-line notice is sent via
         ``send`` BEFORE the turn is driven (the turn still completes — never hangs, RB2).
+
+        **Command-initiated turns bypass free-text capture (P9 fix).** A macro ``/run``
+        expands to text and routes here, but it is a DELIBERATE command to START a fresh
+        turn — it must NEVER be swallowed as the answer to an outstanding "Other"/plan-reject
+        free-text hold. ``command_initiated=True`` therefore skips the free-text routing below
+        so the expanded macro always opens a new turn (through the same permission path a
+        plain message does), against the active project. A PLAIN typed message keeps
+        ``command_initiated=False`` and answers a pending capture EXACTLY as before. (If the
+        active project is the one parked awaiting free text it is ``inflight``, so the fresh
+        ``/run`` turn cleanly raises :class:`StreamingBusy` — the bot replies "still working"
+        — rather than misrouting.)
         """
         state = self._chat(chat_id)
 
@@ -1522,8 +1782,12 @@ class StreamingSession:
         # (reply-to > most-recent) in one resolver. ``routed`` is True iff free-text routing
         # CLAIMED this message (it was a free-text reply, even if the target turned out gone
         # — so a stale reply-to never silently falls through to a NEW turn / a misroute).
-        armed_name, armed_rt, routed = self._route_free_text_target(
-            state, reply_to_message_id
+        # P9 fix: a command-initiated turn (a macro /run) NEVER captures a pending free-text
+        # hold — it always opens a fresh turn — so the routing is skipped entirely for it.
+        armed_name, armed_rt, routed = (
+            (None, None, False)
+            if command_initiated
+            else self._route_free_text_target(state, reply_to_message_id)
         )
         if routed:
             if armed_rt is not None:
@@ -1531,7 +1795,9 @@ class StreamingSession:
             # else: a free-text reply whose target is gone/ambiguous — no-op (never a
             # misroute, never silently a new turn). The marker (if any) was already cleared
             # by _resolve_free_text on a prior attempt; nothing else to do.
-            return
+            # T6/P9: a free-text reply was consumed (resolved or a stale no-op) — return True
+            # so the bot dismisses the one-time quick-reply chips it attached to the prompt.
+            return True
 
         # P5 / ADR-005 D1 (T5): lock the TARGET project — the active project at message
         # time — NOT the chat. Resolving it (create_default=True) auto-creates `default` on
@@ -1605,7 +1871,7 @@ class StreamingSession:
                 # This is the net invariant: a control command in the transfer window → the turn
                 # NEVER starts; _running returns to 0; no session is persisted.
                 if target_rt.abort.is_set():
-                    return
+                    return False
                 # While this turn was parked in the queue, another message to the SAME project
                 # could have started running it (its lock would now be held). Re-check after the
                 # slot is granted so the per-project one-run invariant holds even across a queue
@@ -1622,7 +1888,7 @@ class StreamingSession:
                     # pre-run await boundary; once _drive_turn starts streaming, a live engine
                     # exists and the command's engine.cancel() unblocks it instead.
                     if target_rt.abort.is_set():
-                        return
+                        return False
                     try:
                         engine, resume_failed = await self._ensure_engine(
                             chat_id, target=target
@@ -1651,7 +1917,7 @@ class StreamingSession:
                             reply_markup=None,
                             parse_mode="HTML",
                         )
-                        return
+                        return False
                     if resume_failed:
                         # RB3: the persisted session could not be resumed; a fresh one was
                         # started. Tell the operator BEFORE driving the turn (it still completes).
@@ -1684,6 +1950,11 @@ class StreamingSession:
             # Pure attribute write — never awaits, never raises — so it can't mask the turn's
             # own exception. After this, the next same-project message is accepted again.
             target_rt.inflight = False
+        # T6/P9: the normal-turn path was taken (not a free-text capture) → False, so the bot
+        # leaves any quick-reply chips alone (they belong to a pending free-text prompt, not a
+        # new turn). Reached only on the clean end of a driven turn; the early returns above
+        # (abort, SB2 refusal) also return False (all non-free-text).
+        return False
 
     # -- the run scheduler: cap + per-chat FIFO queue (ADR-005 D6 / T6) -------
 
@@ -1981,6 +2252,21 @@ class StreamingSession:
                             session_id=event.session_id or engine.session_id,
                             name=turn_name,
                         )
+                        # T3 (P9): accumulate this turn's SDK-reported cost into the
+                        # project's durable cumulative total (shown by /status). Only when
+                        # the SDK gave a cost (oneshot / a partial result may not) and a
+                        # store + named project exist; swallowed like _persist (RB1 — never
+                        # crash a turn over a write). Persisted to THIS turn's CAPTURED
+                        # project (turn_name), same per-project discipline as the session_id.
+                        if event.total_cost_usd is not None and self.store is not None:
+                            try:
+                                self.store.add_cost(
+                                    chat_id, turn_name, event.total_cost_usd
+                                )
+                            except Exception:
+                                log.exception(
+                                    "failed to accumulate project cost for chat %s", chat_id
+                                )
                 # ADR-005 D4: the inline-vs-notify send-decision. Re-read foreground PER
                 # EVENT — /switch is free (T7), so the foreground can change mid-turn; an
                 # event for the foreground project renders inline (as P4), an event for a
@@ -2419,6 +2705,14 @@ class StreamingSession:
         if decoded is None:
             return CallbackOutcome(handled=False, note="ignored")
         state = self._chat(chat_id)
+        # T6/P9: a [Open <project>] switch tap routes by PROJECT NAME, not a tool_use_id, and
+        # touches no pending hold — handle it BEFORE the pending-index lookup. The bot has
+        # already enforced SB1 (the _authorized recheck in on_callback) before reaching here,
+        # so an unauthorized tap never gets this far. The session does NOT mutate the store
+        # for a switch (the bot's /switch helper does the SB2 path re-validation + the store
+        # write); we just decode + return the target name. A switch never resolves a decision.
+        if decoded.kind == "switch":
+            return self._resolve_switch(chat_id, decoded)
         # Route by id: the pending index owns id -> (project, kind, held event). An "Other"
         # tap arms free-text capture (no engine call), but it must still target a KNOWN
         # pending ask, so it too looks the id up first.
@@ -2443,6 +2737,30 @@ class StreamingSession:
         if decoded.kind == "permission":
             return self._resolve_permission(state, engine, ref, decoded)
         return CallbackOutcome(handled=False, note="ignored")
+
+    def _resolve_switch(self, chat_id: int, decoded: Callback) -> "CallbackOutcome":
+        """Route a ``[Open <project>]`` switch tap (T6/P9) — decode-only; bot does the switch.
+
+        The switch tap carries the TARGET PROJECT NAME (``decoded.switch_to``), already
+        lexically validated by :func:`~claude_tg.render.decode_callback` (the SB4 name shape).
+        This returns a :class:`CallbackOutcome` with ``switch_to`` set so the bot's
+        ``on_callback`` performs the actual switch through its shared ``/switch`` helper —
+        which does the SB2 path re-validation (the target project's cwd must still be within
+        the permitted roots) the session has no access to. The session deliberately does NOT
+        mutate the store here (no path check available) and resolves no held decision (a
+        switch is navigation, not an answer). With no store there is nothing to switch within
+        (single implicit project) → a benign no-op note. The bot's SB1 ``_authorized`` recheck
+        already gated this call (a non-allowlisted tap never reaches the session).
+        """
+        name = decoded.switch_to
+        if not name:
+            return CallbackOutcome(handled=False, note="ignored")
+        if self.store is None:
+            # No registry to switch within (single implicit project) — benign no-op (RB1).
+            return CallbackOutcome(handled=False, note="no projects")
+        # Hand the (decoded) name to the bot to switch + path-revalidate; the toast is set by
+        # the bot after the switch. ``handled`` is True (we recognized + routed the tap).
+        return CallbackOutcome(handled=True, note=f"Opening {name}…", switch_to=name)
 
     def _engine_for_pending(
         self, chat_id: int, ref: _PendingRef
@@ -2707,21 +3025,33 @@ class StreamingSession:
           reply-to routes use (lock-free; it unblocks the held turn) and confirm.
 
         ``text`` is the answer/feedback verbatim (SB4 — never interpolated into a shell).
+
+        **P9 styling.** The returned reply names the project as ``<b>{html.escape(name)}</b>``
+        and the bot (``cmd_to``) sends it ``parse_mode="HTML"`` — uniform with every other
+        name-bearing operator reply. ``name`` is operator input here (it may have FAILED the
+        runtime lookup), so escaping is both consistency AND defense-in-depth.
         """
         state = self._chats.get(chat_id)
         if state is None:
-            return f"❌ No project named {name!r} is awaiting a reply."
+            return (
+                f"❌ No project named <b>{html.escape(name, quote=False)}</b> "
+                "is awaiting a reply."
+            )
         key = self._resolve_runtime_key(state.runtimes, name)
         rt = state.runtimes.get(key) if key is not None else None
         if rt is None or rt.awaiting_text_for is None:
             # Unknown name, or the project has no pending "Other"/reject to answer. Clear,
             # body-free no-op — do NOT fall back to the most-recent default (never misroute).
             return (
-                f"❌ {name} is not awaiting a free-text reply "
+                f"❌ <b>{html.escape(name, quote=False)}</b> is not awaiting a free-text reply "
                 "(tap “Other”/“Reject” on its prompt first)."
             )
         self._resolve_free_text(state, chat_id, key, rt, text)
-        return f"✅ Sent your reply to {key}."
+        # ``key`` is non-None here (rt is None whenever key is None, and that path returned
+        # above) — narrow for mypy. It is the stored (SB4-validated) project key; escape it
+        # uniformly anyway (consistency + defense-in-depth).
+        assert key is not None
+        return f"✅ Sent your reply to <b>{html.escape(key, quote=False)}</b>."
 
     # -- cancel --------------------------------------------------------------
 
@@ -3232,9 +3562,15 @@ class CallbackOutcome:
     * ``tool_use_id``  — the armed request's id (D5): the bot maps the free-text **prompt's**
                          ``message_id -> tool_use_id`` so a reply-to that prompt routes by id
                          (the reply-to escape hatch overriding the most-recent default).
+    * ``switch_to``    — (T6/P9) the TARGET project name of a ``[Open <project>]`` switch tap.
+                         The session does NOT touch the store for a switch (it needs the bot's
+                         SB2 path re-validation, the same as ``/switch``); it decodes + routes
+                         and returns the name so the bot performs the switch via its shared
+                         ``/switch`` helper. ``None`` for every non-switch outcome.
 
     ``project_name`` / ``tool_use_id`` are populated only for an ``expects_text`` outcome
-    (the "Other"/"Reject" arm); they are ``None`` for an immediate resolve / a no-op.
+    (the "Other"/"Reject" arm); ``switch_to`` only for a switch tap; all are ``None``
+    otherwise.
     """
 
     handled: bool
@@ -3242,6 +3578,7 @@ class CallbackOutcome:
     expects_text: bool = False
     project_name: Optional[str] = None
     tool_use_id: Optional[str] = None
+    switch_to: Optional[str] = None
 
 
 __all__ = [

@@ -73,6 +73,17 @@ def parse_allowed_roots(raw: str, *, default: Path) -> tuple[Path, ...]:
     return tuple(roots)
 
 
+#: T4 (P9) — the default fast/deep model ids for ``/fast`` · ``/deep`` per-project
+#: routing. ``/fast`` selects :data:`DEFAULT_FAST_MODEL` (Haiku — cheap + quick),
+#: ``/deep`` selects :data:`DEFAULT_DEEP_MODEL` (Opus — the most capable). Both are
+#: env-overridable (``FAST_MODEL`` / ``DEEP_MODEL``) so the operator can re-pin them
+#: without a code change as new model ids ship — kept in ONE place rather than scattered
+#: literals (the ids below are the current sensible defaults; verified against the
+#: claude-api skill). ``/auto`` clears the per-project override → the configured
+#: ``CLAUDE_MODEL`` (or the SDK default if unset).
+DEFAULT_FAST_MODEL = "claude-haiku-4-5"
+DEFAULT_DEEP_MODEL = "claude-opus-4-8"
+
 #: Valid values for ENGINE_MODE (S4 flag). ``oneshot`` keeps today's behavior; the
 #: live bot is never broken until the owner flips to ``streaming``.
 ENGINE_MODES = ("oneshot", "streaming")
@@ -243,6 +254,13 @@ class Config:
     workdir: Path
     claude_bin: str = "claude"
     model: str | None = None
+    # T4 (P9): the fast/deep model ids for the per-project ``/fast`` · ``/deep`` override.
+    # Env-overridable (FAST_MODEL / DEEP_MODEL); default to the sensible current ids
+    # (DEFAULT_FAST_MODEL / DEFAULT_DEEP_MODEL). The per-project CHOICE lives in the session
+    # store; these are just the id each choice resolves to. ``/auto`` clears the override
+    # back to ``model`` (CLAUDE_MODEL) / the SDK default.
+    fast_model: str = DEFAULT_FAST_MODEL
+    deep_model: str = DEFAULT_DEEP_MODEL
     timeout_seconds: int = 600
     # SB5 / C1: the operator approval-gate bypass. Default **False** = the permission
     # gate is ON, so a fresh install (and any bare ``Config(...)``) runs Claude's tools
@@ -311,6 +329,10 @@ class Config:
         workdir = Path(os.environ.get("CLAUDE_WORKDIR") or str(Path.home())).expanduser()
         claude_bin = (os.environ.get("CLAUDE_BIN") or "claude").strip() or "claude"
         model = (os.environ.get("CLAUDE_MODEL") or "").strip() or None
+        # T4 (P9): fast/deep model ids — env-overridable, default to the current sensible
+        # ids. An empty/whitespace override falls back to the default (never an empty id).
+        fast_model = (os.environ.get("FAST_MODEL") or "").strip() or DEFAULT_FAST_MODEL
+        deep_model = (os.environ.get("DEEP_MODEL") or "").strip() or DEFAULT_DEEP_MODEL
 
         raw_timeout = (os.environ.get("CLAUDE_TIMEOUT_SECONDS") or "600").strip()
         try:
@@ -357,6 +379,8 @@ class Config:
             workdir=workdir,
             claude_bin=claude_bin,
             model=model,
+            fast_model=fast_model,
+            deep_model=deep_model,
             timeout_seconds=timeout,
             skip_permissions=skip,
             state_file=state_file,

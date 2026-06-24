@@ -31,6 +31,10 @@ def clean_env(monkeypatch):
     # STREAM_MESSAGE_TIMEOUT_SECONDS (P6/H2/RB2) has no TELEGRAM_/CLAUDE_ prefix either —
     # clear it so a host/CI value can't leak into the liveness-bound parse matrix below.
     monkeypatch.delenv("STREAM_MESSAGE_TIMEOUT_SECONDS", raising=False)
+    # FAST_MODEL / DEEP_MODEL (P9/T4) have no TELEGRAM_/CLAUDE_ prefix — clear them so a
+    # host/CI value can't leak into the model-default assertions below.
+    monkeypatch.delenv("FAST_MODEL", raising=False)
+    monkeypatch.delenv("DEEP_MODEL", raising=False)
 
 
 def test_parse_chat_ids():
@@ -378,3 +382,38 @@ def test_config_bad_stream_message_timeout_fails_loud(monkeypatch, tmp_path):
     monkeypatch.setenv("STREAM_MESSAGE_TIMEOUT_SECONDS", "0")
     with pytest.raises(ValueError):
         Config.from_env(dotenv_path=None)
+
+
+# --- T4 (P9): fast/deep model ids (env-overridable, sensible defaults) ----------
+
+
+def test_fast_deep_model_defaults(monkeypatch):
+    from claude_tg.config import DEFAULT_DEEP_MODEL, DEFAULT_FAST_MODEL
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.fast_model == DEFAULT_FAST_MODEL == "claude-haiku-4-5"
+    assert cfg.deep_model == DEFAULT_DEEP_MODEL == "claude-opus-4-8"
+
+
+def test_fast_deep_model_env_override(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("FAST_MODEL", "custom-fast")
+    monkeypatch.setenv("DEEP_MODEL", "custom-deep")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.fast_model == "custom-fast"
+    assert cfg.deep_model == "custom-deep"
+
+
+def test_fast_deep_model_empty_override_falls_back_to_default(monkeypatch):
+    from claude_tg.config import DEFAULT_DEEP_MODEL, DEFAULT_FAST_MODEL
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("FAST_MODEL", "   ")  # whitespace → default, never an empty id
+    monkeypatch.setenv("DEEP_MODEL", "")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.fast_model == DEFAULT_FAST_MODEL
+    assert cfg.deep_model == DEFAULT_DEEP_MODEL

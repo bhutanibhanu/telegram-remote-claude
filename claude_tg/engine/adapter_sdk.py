@@ -258,6 +258,7 @@ class SdkSubstrate:
         include_partial_messages: bool = False,
         allowed_tools: Optional[list[str]] = None,
         disallowed_tools: Optional[list[str]] = None,
+        model: Optional[str] = None,
     ) -> None:
         self._cwd = str(cwd) if cwd is not None else None
         self._permission_mode = permission_mode
@@ -265,6 +266,13 @@ class SdkSubstrate:
         self._include_partial = include_partial_messages
         self._allowed_tools = allowed_tools
         self._disallowed_tools = disallowed_tools
+        # T4 (P9): the per-project model override threaded into ClaudeAgentOptions(model=…)
+        # at session-creation time (start/resume). None → omit `model` entirely so the SDK
+        # uses its own default (or CLAUDE_MODEL via the CLI env), exactly as before T4. The
+        # model is a session-creation param: it is baked into the options when the client is
+        # built, so it applies to THIS session for its whole life — a change takes effect on
+        # the NEXT fresh session, never mid-session (the session is rebuilt with new options).
+        self._model = str(model).strip() if isinstance(model, str) and str(model).strip() else None
 
         self._client: Any = None  # ClaudeSDKClient | None (lazily typed)
         self.session_id: Optional[str] = None
@@ -291,6 +299,12 @@ class SdkSubstrate:
         }
         if self._cwd is not None:
             kwargs["cwd"] = self._cwd
+        if self._model is not None:
+            # T4 (P9): per-project model override (Haiku/Opus via /fast·/deep, or a custom
+            # CLAUDE_MODEL). Omitted when None so the SDK keeps its own default. Set on every
+            # session-creation path (start AND resume) so a resumed session honors the
+            # project's current model from the next session onward.
+            kwargs["model"] = self._model
         if self._decision_callback is not None:
             kwargs["can_use_tool"] = self._make_can_use_tool()
         if self._allowed_tools is not None:

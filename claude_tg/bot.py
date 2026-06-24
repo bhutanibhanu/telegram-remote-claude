@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import time
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -26,6 +27,8 @@ from .render import (
     code_path,
     free_text_prompt,
     project_status_label,
+    quick_reply_dismiss,
+    quick_reply_keyboard,
     yolo_banner,
 )
 from .session_store import (
@@ -35,7 +38,7 @@ from .session_store import (
     validate_project_name,
 )
 from .stream_session import StreamingBusy, StreamingSession
-from .util import _redact_sid_in_text, split_message
+from .util import _redact_sid_in_text, expand_macro, split_message
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +47,7 @@ HELP_TEXT = (
     "Just send me a message and I'll run it through Claude Code on the Mac and reply.\n\n"
     "Commands:\n"
     "/help — this help\n"
+    "/status — health: uptime, mode, gate, runs, per-project status + cost\n"
     "/reset — start a fresh Claude session (forget context)\n"
     "/cancel [name|all] — abort the in-flight run: the active project, a named project, "
     "or every running/queued project (streaming mode)\n"
@@ -51,6 +55,9 @@ HELP_TEXT = (
     "“Other”/“Reject” prompt (streaming mode; or just reply to the prompt)\n"
     "/yolo — run every tool with NO approval prompt this session (streaming mode)\n"
     "/unyolo — restore the per-tool permission gate (streaming mode)\n"
+    "/fast — use the fast model (Haiku) for this project's next turn (streaming mode)\n"
+    "/deep — use the deep model (Opus) for this project's next turn (streaming mode)\n"
+    "/auto (or /model default) — clear the model override, back to the default (streaming mode)\n"
     "/projects — list your projects and which one is active (streaming mode)\n"
     "/new <name> <path> — create a project at <path> and switch to it; <path> must be an "
     "existing directory inside the permitted roots (streaming mode)\n"
@@ -59,9 +66,65 @@ HELP_TEXT = (
     "/pwd — show the active project's working directory\n"
     "/cd <path> — change the working directory (one-shot mode only; in streaming mode "
     "the cwd is fixed per project — use /new to work elsewhere)\n"
+    "/save <name> <text> — save a reusable prompt template (macro)\n"
+    "/run <name> [args…] — run a saved macro (expands `$1` `$2` … and `$*` = all args)\n"
+    "/macros — list your saved macros\n"
+    "/unsave <name> — remove a saved macro\n"
     "\nAny *other* slash-command (e.g. /grill, /pipeline, /scaffold) is forwarded "
     "verbatim and runs as a skill in the Claude session.\n"
 )
+
+#: T1 (P9): the native Telegram ``/`` command menu — ``set_my_commands`` is called with
+#: this list at startup so the commands are discoverable without the wall-of-text /help.
+#: Each entry is ``(command, one-line description)``. **Invariant (tested):** this list
+#: MUST stay in lock-step with the CommandHandlers registered in :meth:`build_application`
+#: — no documented-but-unregistered command, no registered command missing here. The
+#: ``start`` alias of ``/help`` is intentionally NOT listed (Telegram treats /start
+#: specially and a duplicate menu row is noise). Descriptions are concise (Telegram
+#: truncates long ones) and secret-free.
+COMMAND_MENU: tuple[tuple[str, str], ...] = (
+    ("help", "Show the help text"),
+    ("status", "Health: uptime, mode, runs, per-project status + cost"),
+    ("reset", "Start a fresh Claude session (forget context)"),
+    ("cancel", "Abort the in-flight run (active / a name / all)"),
+    ("to", "Send a free-text answer to a named project's prompt"),
+    ("yolo", "Run every tool with NO approval prompt this session"),
+    ("unyolo", "Restore the per-tool permission gate"),
+    ("fast", "Use the fast model (Haiku) for this project's next turn"),
+    ("deep", "Use the deep model (Opus) for this project's next turn"),
+    ("auto", "Clear the model override (back to the default)"),
+    ("model", "Clear the model override (alias of /auto)"),
+    ("projects", "List your projects and which one is active"),
+    ("new", "Create a project at a path and switch to it"),
+    ("switch", "Switch the active project"),
+    ("rm", "Drop a project from the registry"),
+    ("pwd", "Show the active project's working directory"),
+    ("cd", "Change the working directory (one-shot mode only)"),
+    ("save", "Save a reusable prompt template: /save <name> <text>"),
+    ("run", "Run a saved macro: /run <name> [args…]"),
+    ("macros", "List your saved macros"),
+    ("unsave", "Remove a saved macro: /unsave <name>"),
+)
+
+
+def _format_uptime(seconds: float) -> str:
+    """A compact human uptime like ``3d 4h 5m`` / ``5m 12s`` / ``8s`` (T2 /status).
+
+    Pure + defensive (RB1): a negative/odd value floors at ``0s``. Shows the two most
+    significant non-zero units (days→hours→minutes→seconds) so the line stays short; under
+    a minute it shows whole seconds. No I/O.
+    """
+    total = int(seconds) if seconds and seconds > 0 else 0
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 class TelegramClaudeBot:
@@ -79,6 +142,16 @@ class TelegramClaudeBot:
         # exactly as before — the live one-shot bot is untouched until the owner flips
         # the flag. Streaming-mode methods delegate to this driver.
         self.streaming = streaming if config.engine_mode == "streaming" else None
+        # T2 (P9): process start time for the /status uptime line (monotonic-independent
+        # wall reference; uptime is a human-facing duration so wall time is fine here).
+        self._start_time = time.time()
+        # T1 (P9): one-time first-run onboarding. A chat whose first-ever message fires the
+        # welcome once; the chat id is recorded here so subsequent messages do NOT re-welcome.
+        # CAVEAT: in-memory only (not persisted in the session store) — the welcome re-fires
+        # once after a bot restart. That is an accepted trade-off (a single extra welcome is
+        # harmless and the registry's per-chat shape is project-scoped, not a natural home for
+        # a UX seen-flag); persisting it is a possible later refinement.
+        self._welcomed: set[int] = set()
 
     # ---- auth ---------------------------------------------------------------
     def _authorized(self, update: Update) -> bool:
@@ -97,6 +170,125 @@ class TelegramClaudeBot:
         if not await self._ok(update) or update.message is None:
             return
         await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+    async def _maybe_welcome(self, update: Update) -> None:
+        """T1 (P9): send the one-time first-run welcome for a chat's FIRST-ever message.
+
+        Gated on :meth:`_authorized` by the caller (a non-allowlisted chat never reaches
+        here — SB1), this fires AT MOST ONCE per chat per process: the chat id is recorded
+        in :attr:`_welcomed` so every subsequent message is a no-op. The welcome names the
+        current ``ENGINE_MODE`` + active cwd and points at the ``/`` menu (a hint, not the
+        wall-of-text /help). Best-effort (RB1): a failed send must never break the turn that
+        follows it — the message is dispatched regardless. CAVEAT: the seen-set is in-memory,
+        so the welcome re-fires once after a restart (accepted — see ``__init__``).
+        """
+        chat = update.effective_chat
+        if chat is None or chat.id in self._welcomed:
+            return
+        # Mark BEFORE sending so a send failure (or a racing second message under
+        # concurrent_updates) cannot double-welcome — at-most-once wins over at-least-once.
+        self._welcomed.add(chat.id)
+        if update.message is None:
+            return
+        try:
+            # The active cwd: the streaming session / runner both expose get_cwd (read-only;
+            # never creates a project). Wrapped in <code> (R6) so its /segments are inert.
+            cwd = (
+                self.streaming.get_cwd(chat.id)
+                if self.streaming is not None
+                else self.runner.get_cwd(chat.id)
+            )
+            mode = html.escape(self.config.engine_mode, quote=False)
+            await update.message.reply_text(
+                f"👋 <b>Claude Code remote</b> — engine mode <b>{mode}</b>\n"
+                f"Working in {code_path(cwd)}\n\n"
+                "Send a message, or tap a command — try /projects or /status.",
+                parse_mode="HTML",
+            )
+        except Exception:  # RB1: a failed welcome must never break the message dispatch.
+            log.debug("first-run welcome send failed for chat %s", chat.id, exc_info=True)
+
+    async def cmd_status(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """T2 (P9): an at-a-glance health view — uptime, mode, gate/yolo, runs, projects.
+
+        SB1: allowlist-gated like every command (the ``_ok`` recheck). **Body-free (SB3):**
+        the reply carries only bot-derived health values — uptime, ``ENGINE_MODE``, the
+        permission-gate posture, active-vs-cap run counts, and a per-project line (name +
+        :data:`~claude_tg.render.ProjectStatus` label + cwd in ``<code>`` + cumulative
+        cost) — never tool input/output or file content. Every interpolated value is
+        HTML-escaped (or a fixed/numeric bot value); paths are ``code_path``-wrapped (R6).
+        Reuses the ``/projects`` internals (``store.list_projects`` / ``get_active`` +
+        ``streaming.project_status``) so it never diverges from that surface. RB1: read-only,
+        never crashes on a sparse/odd record (mirrors ``/projects``).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        chat_id = update.effective_chat.id
+        # P9 P2: uptime is a fixed bot-derived duration (digits + ``d/h/m/s`` only — it can
+        # never contain ``& < >``), so it needs no html.escape (names/mode below still are).
+        lines = ["📊 <b>Status</b>", f"Uptime: {_format_uptime(time.time() - self._start_time)}"]
+        lines.append(f"Engine mode: <b>{html.escape(self.config.engine_mode, quote=False)}</b>")
+        if self.streaming is not None:
+            # Gate / yolo posture for the ACTIVE project (the policy is per-project; read it
+            # without mutating — get_yolo is read-only). The gate is ON unless yolo bypasses
+            # it; skip_permissions (one-shot bypass) is reported too for completeness.
+            yolo = self.streaming.get_yolo(chat_id)
+            gate = "OFF (/yolo — all tools auto-allowed)" if yolo else "ON (per-tool approval)"
+            lines.append(f"Permission gate: {gate}")
+            active_runs = self.streaming.active_run_count()
+            cap = self.config.max_concurrent_runs
+            # T6/P9: surface the queued counter alongside the active/cap runs so the operator
+            # sees work backed up behind the cap (read-only; 0 → no suffix).
+            queued = self.streaming.queued_waiting(chat_id)
+            queued_suffix = f" ({queued} more waiting)" if queued > 0 else ""
+            lines.append(f"Runs: {active_runs} active / {cap} max concurrent{queued_suffix}")
+            projects = self.streaming.store.list_projects(chat_id) if self.streaming.store else {}
+            active = self.streaming.store.get_active(chat_id) if self.streaming.store else None
+            if projects:
+                lines.append("Projects:")
+                for name, record in projects.items():
+                    rec = record if isinstance(record, dict) else {}
+                    marker = "→" if name == active else "  "
+                    cwd = rec.get("cwd")
+                    cwd_html = code_path(cwd) if cwd else "(no path)"
+                    status = project_status_label(self.streaming.project_status(chat_id, name))
+                    # T4 (P9): surface the per-project model override on the status line. Only
+                    # shown when an explicit /fast·/deep override is set (no override → the
+                    # configured default, omitted to keep the line short). Read-only; a missing
+                    # field reads as no override (RB1). The id is a config/SDK constant; escape
+                    # it defensively for the HTML message.
+                    model = self.streaming.store.get_model(chat_id, name) if self.streaming.store else None
+                    model_html = f" · <code>{html.escape(model, quote=False)}</code>" if model else ""
+                    cost = self.streaming.store.get_cost(chat_id, name) if self.streaming.store else 0.0
+                    cost_html = f" · ${cost:.2f}" if cost > 0 else ""
+                    # P9 fix: /yolo is PER-PROJECT, but the single global "Permission gate" line
+                    # above reflects only the ACTIVE project — a wide-open BACKGROUND project
+                    # would be hidden. Surface each project's yolo posture HERE so an allow-all
+                    # project is never silent on /status (read-only; a project with no runtime
+                    # reads False — the fail-closed default). The ⚠️ glyph mirrors the loud
+                    # enable banner.
+                    yolo_html = (
+                        " · ⚠️ yolo"
+                        if self.streaming.get_project_yolo(chat_id, name)
+                        else ""
+                    )
+                    lines.append(
+                        f"{marker} <b>{html.escape(str(name), quote=False)}</b> — "
+                        f"{cwd_html} ({status}){model_html}{cost_html}{yolo_html}"
+                    )
+            else:
+                lines.append("Projects: none yet — /new &lt;name&gt; &lt;path&gt;")
+        else:
+            # One-shot mode: the gate posture is the skip_permissions opt-out; no per-project
+            # registry / concurrency (each message runs to completion against one session).
+            gate = (
+                "OFF (CLAUDE_SKIP_PERMISSIONS — all tools auto-allowed)"
+                if self.config.skip_permissions
+                else "ON (CLI approval prompt)"
+            )
+            lines.append(f"Permission gate: {gate}")
+            lines.append(f"Working dir: {code_path(self.runner.get_cwd(chat_id))}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def cmd_reset(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
@@ -161,15 +353,26 @@ class TelegramClaudeBot:
         # engine aborted PLUS any drained queued-not-yet-running turn. A queued-only cancel
         # therefore returns >= 1 (0 pending requests, but a turn WAS cancelled), so the
         # operator is no longer wrongly told "nothing was in flight" for a turn they killed.
+        is_all = bool(name) and name.casefold() == "all"
         cancelled = self.streaming.handle_cancel(update.effective_chat.id, name)
-        if cancelled:
+        if cancelled and is_all:
+            # P9 wording: ``/cancel all`` is project-scoped — the unit count (pending requests
+            # + drained queued turns) conflates projects with prompts, so for ``all`` we phrase
+            # it as projects, not a raw aborted-unit count. The count stays on the single-project
+            # ``/cancel <name>`` / ``/cancel`` (active) branch below, where one project = one unit
+            # of work the operator was watching.
+            await update.message.reply_text("🛑 Cancelled all running/queued projects.")
+        elif cancelled:
             await update.message.reply_text(f"🛑 Cancelled ({cancelled} aborted).")
         elif name and name.casefold() != "all":
             # A named target with nothing to cancel — not running and not queued. A clear,
             # honest message (NB1: a drained queued turn would have counted above, so reaching
-            # here means the project really had no in-flight or queued turn).
+            # here means the project really had no in-flight or queued turn). P9: the project
+            # name is bolded + escaped (HTML), uniform with every other name-bearing reply.
             await update.message.reply_text(
-                f"Nothing in flight to cancel for {name} (it may have already finished)."
+                f"Nothing in flight to cancel for <b>{html.escape(name, quote=False)}</b> "
+                "(it may have already finished).",
+                parse_mode="HTML",
             )
         else:
             await update.message.reply_text("Nothing in flight to cancel.")
@@ -212,6 +415,62 @@ class TelegramClaudeBot:
         await update.message.reply_text(
             "✅ Gating restored — risky tools will ask for approval again (/yolo is off)."
         )
+
+    async def _set_model(
+        self, update: Update, label: str, model: str | None
+    ) -> None:
+        """Shared body for ``/fast`` · ``/deep`` · ``/auto`` (T4 / P9; streaming mode only).
+
+        Sets (or clears, for ``/auto``) the ACTIVE project's per-project model override and
+        confirms. SB1: the caller did the ``_ok`` recheck. The override is persisted on the
+        active project (atomic + ``0600``, RB6) and **applies on the next turn/session** — a
+        project with a live session keeps its current model until that session ends (model is
+        a session-creation param; never hot-swapped mid-turn). One-shot mode has no per-project
+        registry, so the model toggles apply to the streaming engine only. ``model`` is a fixed,
+        operator-chosen id (a config/SDK constant), never interpolated into a shell command.
+        """
+        if self.streaming is None:
+            await update.message.reply_text(
+                "Model routing (/fast · /deep · /auto) applies to streaming mode only."
+            )
+            return
+        chosen = self.streaming.set_model(update.effective_chat.id, model)
+        if chosen is None:
+            await update.message.reply_text(
+                "🔧 Model set to default — your next turn uses the configured default. "
+                "(Applies to the next session; a turn in flight keeps its current model.)"
+            )
+        else:
+            # ``chosen`` is a fixed model id (config constant); escape defensively for HTML.
+            await update.message.reply_text(
+                f"🔧 Model set to <b>{label}</b> (<code>{html.escape(chosen, quote=False)}</code>) — "
+                "applies to your next turn. A turn in flight keeps its current model.",
+                parse_mode="HTML",
+            )
+
+    async def cmd_fast(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/fast`` — route the active project to the fast model (Haiku) on the next turn."""
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._set_model(update, "fast", self.config.fast_model)
+
+    async def cmd_deep(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/deep`` — route the active project to the deep model (Opus) on the next turn."""
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._set_model(update, "deep", self.config.deep_model)
+
+    async def cmd_auto(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/auto`` (and ``/model default``) — clear the per-project model override.
+
+        Clears the active project's override so the next turn falls back to the configured
+        ``CLAUDE_MODEL`` (or the SDK default). ``/model default`` routes here too (registered
+        as the ``model`` command); a bare ``/model`` or ``/model <anything-else>`` also clears
+        (RB2: any unrecognized arg fails safe to the default rather than guessing a model id).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._set_model(update, "default", None)
 
     async def cmd_pwd(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
@@ -379,14 +638,33 @@ class TelegramClaudeBot:
         if not name:
             await update.message.reply_text("Usage: /switch <name>")
             return
+        reply, parse_mode = self._switch_active(chat_id, name)
+        await update.message.reply_text(reply, parse_mode=parse_mode)
+
+    def _switch_active(self, chat_id: int, name: str) -> tuple[str, str | None]:
+        """Switch the chat's active project to ``name``; return ``(reply, parse_mode)`` (T6/P9).
+
+        The shared core of ``/switch`` (the typed command) AND the ``[Open <project>]`` ping
+        button (``on_callback``) — extracted so both go through the SAME SB2 path
+        re-validation + store write (no divergence). ``name`` is the requested target
+        (case-insensitive, like the store):
+
+        * no store → "no projects" notice (RB1 — never deref a None store);
+        * unknown name → an error listing the available names (escaped, R6);
+        * SB2/B2: the TARGET project's stored cwd is re-validated against the permitted roots
+          BEFORE activating — a missing/empty or out-of-root cwd is refused and the active
+          project is left UNCHANGED (``store.switch`` never called);
+        * success → ``store.switch`` + a confirmation.
+
+        Returns the operator-facing reply + its ``parse_mode``. **P9 styling unification:**
+        EVERY reply that names a project renders it as ``<b>{html.escape(name)}</b>`` and is
+        sent ``"HTML"`` (the names are SB4-validated, but escaped anyway, defense-in-depth) —
+        no more bare-``{name}`` interpolation. Pure of Telegram I/O (the caller sends) so the
+        button + command paths share it.
+        """
+        assert self.streaming is not None
         if self.streaming.store is None:
-            # No STATE_FILE configured → no registry to switch within. RB1: never crash on
-            # a streaming + no-persistence deployment (store is None). Mirror the empty
-            # /projects notice rather than dereferencing a None store.
-            await update.message.reply_text(
-                "No projects yet. Create one with /new <name> <path>."
-            )
-            return
+            return ("No projects yet. Create one with /new <name> <path>.", None)
         # Resolve the target record FIRST (case-insensitive). Unknown name → error listing
         # the available names (replaces the old try/except UnknownProject).
         record = self.streaming.store.get_project(chat_id, name)
@@ -402,23 +680,24 @@ class TelegramClaudeBot:
                 )
                 or "(none)"
             )
-            await update.message.reply_text(
+            return (
                 f"❌ No project named <b>{html.escape(name, quote=False)}</b>. "
                 f"Available: {available}",
-                parse_mode="HTML",
+                "HTML",
             )
-            return
         # SB2/B2: re-validate the TARGET project's stored cwd against the permitted roots
         # BEFORE activating (the design says re-validate "on switch/resume"; the resume
         # path is the authoritative gate, this closes the switch-time gap + improves UX).
         # Fail-closed: a missing/empty stored cwd is refused rather than crashing, and the
         # active project is left UNCHANGED (store.switch is never called) on any refusal.
         cwd = record.get("cwd")
+        name_html = html.escape(name, quote=False)
         if not cwd:
-            await update.message.reply_text(
-                f"❌ {name} has no recorded directory — re-create it with /new <name> <path>."
+            return (
+                f"❌ <b>{name_html}</b> has no recorded directory — "
+                "re-create it with /new <name> <path>.",
+                "HTML",
             )
-            return
         try:
             resolve_within_roots(
                 cwd,
@@ -427,14 +706,15 @@ class TelegramClaudeBot:
                 allow_any=self.config.allow_any_path,
             )
         except PathNotAllowed:
-            await update.message.reply_text(
-                f"❌ {name}'s directory is no longer within the permitted roots — "
-                "not switching. Use /new <name> <path> to point it somewhere allowed."
+            return (
+                f"❌ <b>{name_html}</b>'s directory is no longer within the permitted roots — "
+                "not switching. Use /new <name> <path> to point it somewhere allowed.",
+                "HTML",
             )
-            return
         self.streaming.store.switch(chat_id, name)
-        await update.message.reply_text(
-            f"✅ Switched to {name} — your next message resumes that project."
+        return (
+            f"✅ Switched to <b>{name_html}</b> — your next message resumes that project.",
+            "HTML",
         )
 
     async def cmd_rm(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -470,7 +750,9 @@ class TelegramClaudeBot:
         active = self.streaming.store.get_active(chat_id) if self.streaming.store else None
         if active is not None and name.casefold() == active.casefold():
             await update.message.reply_text(
-                f"❌ {name} is the active project — /switch to another project first."
+                f"❌ <b>{html.escape(name, quote=False)}</b> is the active project — "
+                "/switch to another project first.",
+                parse_mode="HTML",
             )
             return
         # P5 / ADR-005 D9 (round-3 BLOCKERS 1+2): INFLIGHT-AWARE admission. request_remove
@@ -483,8 +765,11 @@ class TelegramClaudeBot:
         # where a window turn would otherwise persist to an already-deleted record (the
         # lock-based is_busy missed the window turn entirely — it holds no lock).
         if not self.streaming.request_remove(chat_id, name):
+            name_html = html.escape(name, quote=False)
             await update.message.reply_text(
-                f"❌ {name} has a turn in flight — /cancel {name} first, then /rm it."
+                f"❌ <b>{name_html}</b> has a turn in flight — "
+                f"/cancel {name_html} first, then /rm it.",
+                parse_mode="HTML",
             )
             return
         try:
@@ -506,7 +791,9 @@ class TelegramClaudeBot:
         # already refused above, so the purged runtime is never the live one.
         await self.streaming.forget_project(chat_id, name)
         await update.message.reply_text(
-            f"🗑️ Removed {name} (its Claude transcript is left on disk)."
+            f"🗑️ Removed <b>{html.escape(name, quote=False)}</b> "
+            "(its Claude transcript is left on disk).",
+            parse_mode="HTML",
         )
 
     async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -596,7 +883,12 @@ class TelegramClaudeBot:
         try:
             self.streaming.store.create(chat_id, name, str(target), make_active=True)
         except DuplicateProject:
-            await update.message.reply_text(f"❌ A project named {name} already exists.")
+            # P9: bold + escape the name (HTML), uniform with every name-bearing reply. The
+            # name passed SB4 above (safe charset) but escape it anyway, defense-in-depth.
+            await update.message.reply_text(
+                f"❌ A project named <b>{html.escape(name, quote=False)}</b> already exists.",
+                parse_mode="HTML",
+            )
             return
         # R6: the resolved cwd is wrapped in <code> (monospace, no auto-linkify); the name
         # is bolded + escaped. HTML parse mode required for the tags to render.
@@ -639,8 +931,159 @@ class TelegramClaudeBot:
         if not name or not text:
             await update.message.reply_text("Usage: /to <name> <your answer>")
             return
+        # P9: resolve_to returns an HTML-styled reply (the project name bolded + escaped),
+        # uniform with every name-bearing operator reply — send it parse_mode="HTML".
         reply = self.streaming.resolve_to(chat_id, name, text)
-        await update.message.reply_text(reply)
+        await update.message.reply_text(reply, parse_mode="HTML")
+
+    # ---- macros (T5 / P9; both modes — a macro fires as a normal turn) ------
+    def _macro_store(self):
+        """The session store macros are persisted in, or ``None`` if there is no store.
+
+        Macros are per-chat prompt templates that work in BOTH engine modes (they expand
+        to a normal turn). The store is the streaming session's in streaming mode, else the
+        one-shot runner's; either may be ``None`` if no ``CLAUDE_STATE_FILE`` is configured
+        (RB1: the commands then reply a clean "needs persistence" notice instead of crashing).
+        """
+        if self.streaming is not None:
+            return self.streaming.store
+        return getattr(self.runner, "store", None)
+
+    async def cmd_save(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/save <name> <prompt text…>`` — store a reusable prompt template (T5 / P9).
+
+        SB1: allowlist-gated (the ``_ok`` recheck). The name is validated against the SB4
+        rule (``^[A-Za-z0-9_-]{1,32}$``) — an invalid name (``../``, spaces, > 32 chars,
+        empty) is refused with a clean message and HTML-escaped in the reply (it is
+        pre-validation operator input). The body is the operator-authored template stored
+        verbatim (fired later as a normal turn — no injection concern beyond ordinary turn
+        handling). Persisted atomic + ``0600`` (RB6). RB1: never crashes.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        store = self._macro_store()
+        if store is None:
+            await update.message.reply_text(
+                "Macros need persistence — set CLAUDE_STATE_FILE to save one."
+            )
+            return
+        chat_id = update.effective_chat.id
+        name = ctx.args[0] if ctx.args else ""
+        body = " ".join(ctx.args[1:]).strip() if ctx.args and len(ctx.args) > 1 else ""
+        if not name or not body:
+            await update.message.reply_text("Usage: /save <name> <prompt text…>")
+            return
+        try:
+            store.save_macro(chat_id, name, body)
+        except InvalidProjectName:
+            # CRITICAL: echoes PRE-validation input (the name was just rejected by SB4), so it
+            # is arbitrary operator input — HTML-escape it so it renders as inert text.
+            await update.message.reply_text(
+                f"❌ Invalid macro name <b>{html.escape(name, quote=False)}</b> — "
+                "use letters, digits, _ or - (≤32 chars).",
+                parse_mode="HTML",
+            )
+            return
+        # The name passed SB4 (safe charset) but escape it uniformly for the HTML reply.
+        await update.message.reply_text(
+            f"💾 Saved macro <b>{html.escape(name, quote=False)}</b>. "
+            "Run it with /run " + html.escape(name, quote=False) + " [args…].",
+            parse_mode="HTML",
+        )
+
+    async def cmd_unsave(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/unsave <name>`` — remove a saved macro (T5 / P9). SB1-gated; RB1/RB2 clean."""
+        if not await self._ok(update) or update.message is None:
+            return
+        store = self._macro_store()
+        if store is None:
+            await update.message.reply_text("No macros to remove.")
+            return
+        name = " ".join(ctx.args).strip() if ctx.args else ""
+        if not name:
+            await update.message.reply_text("Usage: /unsave <name>")
+            return
+        removed = store.remove_macro(update.effective_chat.id, name)
+        if removed:
+            await update.message.reply_text(
+                f"🗑️ Removed macro <b>{html.escape(name, quote=False)}</b>.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ No macro named <b>{html.escape(name, quote=False)}</b>.",
+                parse_mode="HTML",
+            )
+
+    async def cmd_macros(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/macros`` — list saved macro names with a short body preview (T5 / P9). SB1."""
+        if not await self._ok(update) or update.message is None:
+            return
+        store = self._macro_store()
+        macros = store.list_macros(update.effective_chat.id) if store is not None else {}
+        if not macros:
+            await update.message.reply_text(
+                "No macros yet. Save one with /save <name> <prompt text…>."
+            )
+            return
+        lines = ["📑 <b>Macros</b>:"]
+        for name, body in macros.items():
+            # Preview the body (truncated) so the list stays compact; escape both name + body
+            # (the body is operator-authored but may contain </>& — render it inert).
+            preview = body if len(body) <= 60 else body[:57] + "…"
+            lines.append(
+                f"• <b>{html.escape(str(name), quote=False)}</b> — "
+                f"<code>{html.escape(preview, quote=False)}</code>"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def cmd_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/run <name> [args…]`` — expand a saved macro and fire it as a normal turn (T5).
+
+        Looks up the macro (case-insensitive), expands ``$1``..``$9`` positionally and ``$*``
+        (all args) via :func:`~claude_tg.util.expand_macro`, then runs the expanded text
+        through the SAME dispatch a plain message uses (:meth:`_run_turn`) against the active
+        project. SB1: allowlist-gated. Unknown name → clean reply (RB2), never crash (RB1). The
+        macro body is operator-authored and fired as an ordinary turn (no injection concern
+        beyond normal turn handling).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        store = self._macro_store()
+        if store is None:
+            await update.message.reply_text(
+                "Macros need persistence — set CLAUDE_STATE_FILE to use one."
+            )
+            return
+        chat_id = update.effective_chat.id
+        name = ctx.args[0] if ctx.args else ""
+        if not name:
+            await update.message.reply_text("Usage: /run <name> [args…]")
+            return
+        body = store.get_macro(chat_id, name)
+        if body is None:
+            await update.message.reply_text(
+                f"❌ No macro named <b>{html.escape(name, quote=False)}</b>. "
+                "List them with /macros.",
+                parse_mode="HTML",
+            )
+            return
+        macro_args = list(ctx.args[1:]) if ctx.args and len(ctx.args) > 1 else []
+        expanded = expand_macro(body, macro_args)
+        if not expanded.strip():
+            # A macro that expands to nothing (empty body, or all-placeholder with no args) —
+            # don't fire an empty turn (RB1/RB2). Tell the operator cleanly.
+            await update.message.reply_text(
+                "That macro expanded to an empty prompt — give it some args, or /macros to review."
+            )
+            return
+        # Fire as a normal turn (same path a plain message takes) against the active project.
+        # command_initiated=True: a macro /run is a DELIBERATE start-a-turn command — it must
+        # NEVER be swallowed as the answer to a pending "Other"/plan-reject free-text hold
+        # (the Codex blocker). The flag tells the streaming session to skip free-text capture
+        # for this turn so the expanded macro always opens a fresh turn through the permission
+        # path. A PLAIN typed message keeps the flag False and still answers a pending prompt.
+        await self._run_turn(update, ctx, chat_id, expanded, command_initiated=True)
 
     # ---- messages -----------------------------------------------------------
     @staticmethod
@@ -663,6 +1106,10 @@ class TelegramClaudeBot:
         text = (update.message.text or "").strip()
         if not text:
             return
+        # T1: first-ever message for this chat → one-time welcome (SB1: only reached for an
+        # authorized chat). At-most-once; subsequent messages are a no-op. Sent before the
+        # turn runs so the welcome appears first.
+        await self._maybe_welcome(update)
         await self._run_turn(
             update, ctx, update.effective_chat.id, text,
             reply_to_message_id=self._reply_to_id(update),
@@ -691,6 +1138,9 @@ class TelegramClaudeBot:
         text = (update.message.text or "").strip()
         if not text:
             return
+        # T1: a skill-launch slash-command can also be a chat's first-ever message — welcome
+        # once here too (at-most-once shared with on_message via the same seen-set).
+        await self._maybe_welcome(update)
         await self._run_turn(update, ctx, update.effective_chat.id, text)
 
     async def _run_turn(
@@ -701,6 +1151,7 @@ class TelegramClaudeBot:
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        command_initiated: bool = False,
     ) -> None:
         """Run ``text`` as one turn for ``chat_id`` — the shared dispatch both the message
         handler and the skill-launch passthrough route through (one path, no duplication).
@@ -709,11 +1160,16 @@ class TelegramClaudeBot:
         it through the runner and replies (chunked). Callers MUST have already done the
         ``_ok`` allowlist recheck and the empty-text guard. ``reply_to_message_id`` (D5) is
         forwarded to the streaming session for free-text reply-to routing; it is ignored in
-        one-shot mode (no interactive holds there).
+        one-shot mode (no interactive holds there). ``command_initiated`` (a macro ``/run``)
+        is likewise forwarded so the streaming session opens a FRESH turn instead of letting
+        the expanded text satisfy a pending free-text hold; one-shot mode has no holds, so it
+        ignores the flag and just runs the text.
         """
         if self.streaming is not None:
             await self._on_message_streaming(
-                update, ctx, chat_id, text, reply_to_message_id=reply_to_message_id
+                update, ctx, chat_id, text,
+                reply_to_message_id=reply_to_message_id,
+                command_initiated=command_initiated,
             )
             return
 
@@ -780,6 +1236,7 @@ class TelegramClaudeBot:
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        command_initiated: bool = False,
     ) -> None:
         """Drive the streaming engine for one message (delegates to StreamingSession).
 
@@ -794,9 +1251,19 @@ class TelegramClaudeBot:
         assert self.streaming is not None
         bot = ctx.bot
 
-        async def send(*, text: str, reply_markup=None, parse_mode=None) -> int | None:
+        async def send(
+            *, text: str, reply_markup=None, parse_mode=None, link_preview_options=None
+        ) -> int | None:
+            # T6/P9: ``link_preview_options`` (a telegram.LinkPreviewOptions) is set by the
+            # session's notification sends to suppress link previews so a path/URL in a ping
+            # does not balloon into a preview card; it is None (Telegram default) for ordinary
+            # sends. Forwarded straight to Bot.send_message (PTB 21.x API).
             msg = await bot.send_message(
-                chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                link_preview_options=link_preview_options,
             )
             return getattr(msg, "message_id", None)
 
@@ -811,15 +1278,27 @@ class TelegramClaudeBot:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
 
         try:
-            await self.streaming.handle_message(
+            captured_free_text = await self.streaming.handle_message(
                 chat_id, text, send=send, edit=edit, delete=delete,
                 reply_to_message_id=reply_to_message_id,
+                command_initiated=command_initiated,
             )
         except StreamingBusy:
             await update.message.reply_text(
                 "⏳ Still working on your previous message — it'll reply when done. "
                 "Send one message at a time."
             )
+            return
+        # T6/P9: the message was consumed as a free-text capture (a reply to an "Other"/reject
+        # prompt) → dismiss the one-time quick-reply chips so they don't linger over the next,
+        # unrelated turn. Best-effort (RB1): a failed remove must never break the turn — the
+        # chips are one_time_keyboard anyway, so this is the belt-and-braces scope guard. The
+        # remove rides its own minimal message (Telegram has no standalone "remove keyboard").
+        if captured_free_text:
+            try:
+                await update.message.reply_text("✓", reply_markup=quick_reply_dismiss())
+            except Exception:
+                log.debug("quick-reply chip dismissal failed", exc_info=True)
 
     async def on_callback(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Inline-keyboard tap handler — **the SB1 security boundary**.
@@ -860,19 +1339,41 @@ class TelegramClaudeBot:
             log.exception("error routing callback for chat %s", chat.id if chat else "?")
             await self._answer_callback(query)
             return
+        # T6/P9: a [Open <project>] switch tap routes by project name. The session decoded +
+        # validated the name and returned it on ``switch_to``; the bot performs the actual
+        # switch through the SHARED /switch helper (the SB2 path re-validation the session
+        # can't do). SB1 is already enforced above (the _authorized recheck), so a
+        # non-allowlisted tap never reaches here — it is answered + dropped, switching
+        # nothing. We answer the query (stop the spinner), perform the switch, and reply the
+        # result; nothing else (no free-text arm) applies to a switch.
+        if outcome.switch_to:
+            await self._answer_callback(query, outcome.note if outcome.handled else None)
+            reply, parse_mode = self._switch_active(chat.id, outcome.switch_to)
+            try:
+                await query.message.reply_text(reply, parse_mode=parse_mode)
+            except Exception:
+                log.debug("switch-button reply send failed", exc_info=True)
+            return
         await self._answer_callback(query, outcome.note if outcome.handled else None)
         if outcome.expects_text:
             # D5: name-echo the free-text prompt so the operator knows which project the
             # next message resolves; capture the prompt's message_id -> tool_use_id so a
             # reply-to it routes by id (the reply-to escape hatch). A missing project_name
             # (defensive) falls back to the plain toast note so the prompt is never empty.
+            # T6/P9: attach the one-time quick-reply chips (ReplyKeyboardMarkup) so common
+            # answers ("proceed", "keep it minimal", …) are one tap; they type the operator's
+            # next message and the free-text path resolves it as usual. The chips are
+            # one_time_keyboard AND explicitly removed once the free text is captured (see
+            # _on_message_streaming), so they stay scoped to THIS prompt.
             prompt = (
                 free_text_prompt(outcome.project_name)
                 if outcome.project_name
                 else f"✏️ {outcome.note}…"
             )
             try:
-                sent = await query.message.reply_text(prompt)
+                sent = await query.message.reply_text(
+                    prompt, reply_markup=quick_reply_keyboard()
+                )
             except Exception:
                 sent = None
             self.streaming.register_reply_prompt(
@@ -899,6 +1400,23 @@ class TelegramClaudeBot:
         except Exception:
             pass
 
+    # ---- startup ------------------------------------------------------------
+    async def _post_init(self, app: Application) -> None:
+        """T1 (P9): register the bot's ``/`` command menu once at startup (set_my_commands).
+
+        PTB calls this after the application is initialized. It pushes :data:`COMMAND_MENU`
+        (the registered commands + concise descriptions) so Telegram shows the native menu.
+        Best-effort (RB1): a Telegram API hiccup is logged but never blocks startup — the bot
+        runs fine without a menu. The menu is global (Telegram has no per-chat allowlist
+        scope at the bot-command layer; SB1 still gates every actual command at dispatch).
+        """
+        try:
+            await app.bot.set_my_commands(
+                [BotCommand(cmd, desc) for cmd, desc in COMMAND_MENU]
+            )
+        except Exception:
+            log.warning("failed to register the bot command menu (set_my_commands)", exc_info=True)
+
     # ---- wiring -------------------------------------------------------------
     def build_application(self) -> Application:
         # concurrent_updates(True) is REQUIRED by the answer-hold design: a streaming turn
@@ -909,13 +1427,32 @@ class TelegramClaudeBot:
         # return). Concurrent dispatch lets the callback handler run while the turn is held
         # (resolve_callback is intentionally lock-free for exactly this). One turn per chat
         # is still enforced by the StreamingBusy guard.
-        app = ApplicationBuilder().token(self.config.bot_token).concurrent_updates(True).build()
+        # T1 (P9): register the native /-menu at startup via post_init. set_my_commands makes
+        # every registered command discoverable in Telegram's UI (derived from COMMAND_MENU,
+        # which the test pins to the registered CommandHandlers below). Best-effort (RB1): a
+        # failed API call must not block the bot from starting — it just means no menu.
+        app = (
+            ApplicationBuilder()
+            .token(self.config.bot_token)
+            .concurrent_updates(True)
+            .post_init(self._post_init)
+            .build()
+        )
         allowed = filters.Chat(chat_id=list(self.config.allowed_chat_ids))
         app.add_handler(CommandHandler(["start", "help"], self.cmd_help, filters=allowed))
+        app.add_handler(CommandHandler("status", self.cmd_status, filters=allowed))
         app.add_handler(CommandHandler("reset", self.cmd_reset, filters=allowed))
         app.add_handler(CommandHandler("cancel", self.cmd_cancel, filters=allowed))
         app.add_handler(CommandHandler("yolo", self.cmd_yolo, filters=allowed))
         app.add_handler(CommandHandler("unyolo", self.cmd_unyolo, filters=allowed))
+        # T4 (P9): per-project model routing (streaming mode only; the handlers reply a
+        # streaming-only notice in one-shot). /model is the alias of /auto (so /model default
+        # clears the override); both names route to cmd_auto. Registered with the SAME
+        # `allowed` chat filter (SB1) and BEFORE the on_skill_command COMMAND passthrough so
+        # they are consumed here, not forwarded to the session as skills.
+        app.add_handler(CommandHandler("fast", self.cmd_fast, filters=allowed))
+        app.add_handler(CommandHandler("deep", self.cmd_deep, filters=allowed))
+        app.add_handler(CommandHandler(["auto", "model"], self.cmd_auto, filters=allowed))
         app.add_handler(CommandHandler("pwd", self.cmd_pwd, filters=allowed))
         app.add_handler(CommandHandler("cd", self.cmd_cd, filters=allowed))
         # P4 multi-project navigation (streaming mode only; the handlers reply a
@@ -932,6 +1469,15 @@ class TelegramClaudeBot:
         # registered BEFORE the skill passthrough (first-match-wins) — no new callback
         # surface.
         app.add_handler(CommandHandler("to", self.cmd_to, filters=allowed))
+        # T5 (P9): macros — /save · /run · /macros · /unsave. Per-chat prompt templates that
+        # work in BOTH engine modes (a /run fires the expanded text as a normal turn). Same
+        # `allowed` chat filter (SB1) + registered BEFORE the on_skill_command COMMAND
+        # passthrough so first-match-wins makes /save · /run real commands (not forwarded
+        # verbatim to the session as skills).
+        app.add_handler(CommandHandler("save", self.cmd_save, filters=allowed))
+        app.add_handler(CommandHandler("run", self.cmd_run, filters=allowed))
+        app.add_handler(CommandHandler("macros", self.cmd_macros, filters=allowed))
+        app.add_handler(CommandHandler("unsave", self.cmd_unsave, filters=allowed))
         app.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_message))
         # P3 skill-launch passthrough (D1): forward any *unregistered* slash-command verbatim
         # to the session. Registered AFTER the specific CommandHandlers above so PTB's

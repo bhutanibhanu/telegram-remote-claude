@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -82,8 +83,10 @@ class FakeStreaming:
         self.cancel_calls = []
         self.reset_calls = []
         self.yolo_calls = []
+        self.model_calls = []
         self.reply_prompt_calls = []
         self.to_calls = []
+        self.command_initiated_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
         self._busy = busy
         # P5/T7: cmd_reset now reads streaming.store.get_active to scope its busy-guard to
@@ -94,13 +97,20 @@ class FakeStreaming:
         self.store = None
 
     async def handle_message(
-        self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None
+        self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
+        command_initiated=False,
     ):
         # P5/T9: handle_message gained reply_to_message_id (the D5 reply-to escape hatch);
-        # record it so the wiring test can assert it is threaded through from on_message.
+        # P9 fix: + command_initiated (a macro /run skips free-text capture). Record both so
+        # the wiring tests can assert they are threaded through from on_message / cmd_run.
         self.handle_message_calls.append((chat_id, text, reply_to_message_id))
+        self.command_initiated_calls.append(command_initiated)
         if self._busy:
             raise StreamingBusy()
+        # T6/P9: handle_message now returns whether the message was a free-text capture (the
+        # bot dismisses the quick-reply chips on True). This stand-in drives normal turns →
+        # False; the free-text-capture behavior is covered against a REAL session.
+        return False
 
     def resolve_callback(self, chat_id, data):
         self.resolve_calls.append((chat_id, data))
@@ -131,6 +141,37 @@ class FakeStreaming:
 
     def set_yolo(self, chat_id, on):
         self.yolo_calls.append((chat_id, on))
+
+    def set_model(self, chat_id, model):
+        # P9/T4: /fast · /deep · /auto set (or clear) the active project's model override.
+        self.model_calls.append((chat_id, model))
+        return model
+
+    def get_cwd(self, chat_id):
+        # P9/T1: the first-run welcome reads the active cwd via this accessor.
+        return "/work"
+
+    def get_yolo(self, chat_id):
+        # P9/T2: /status reads the active project's yolo posture (read-only).
+        return False
+
+    def get_project_yolo(self, chat_id, name):
+        # P9 fix: /status surfaces EACH project's yolo posture (read-only). This stand-in
+        # has no allow-all projects → False (the per-project marker behavior is covered
+        # against a REAL session below).
+        return False
+
+    def active_run_count(self):
+        # P9/T2: /status reports active-vs-cap run counts.
+        return 0
+
+    def queued_waiting(self, chat_id):
+        # P9/T6: /status surfaces the queued-behind-the-cap counter (0 → no suffix).
+        return 0
+
+    def project_status(self, chat_id, name):
+        # P9/T2: /status reuses the per-project status (mirrors /projects).
+        return "idle"
 
 
 def make_update(chat_id=1, text="hello", *, reply_to_message_id=None):
@@ -188,6 +229,8 @@ async def test_oneshot_is_default_and_uses_runner():
     # No streaming passed AND default config => oneshot.
     bot = TelegramClaudeBot(make_config(), runner)
     assert bot.streaming is None
+    # P9/T1: pre-mark welcomed so the first-run welcome doesn't perturb the assert-once.
+    bot._welcomed.add(1)
     upd = make_update(1, "do it")
     await bot.on_message(upd, make_ctx())
     assert runner.run_calls == [(1, "do it")]
@@ -231,7 +274,8 @@ async def test_streaming_passes_working_delete_closure():
 
     class CapturingStreaming(FakeStreaming):
         async def handle_message(
-            self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None
+            self, chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
+            command_initiated=False,
         ):
             self.handle_message_calls.append((chat_id, text, reply_to_message_id))
             captured["delete"] = delete
@@ -542,6 +586,9 @@ class HoldEngine:
         self.resumed = None
         self.stopped = False
         self._gate = asyncio.Event()
+        # Record resolve() calls so a test can assert a free-text answer reached (or did
+        # NOT reach) a given engine (P9 /run-vs-free-text-capture fix).
+        self.resolve_calls: list = []
 
     async def start(self):
         self.started = True
@@ -562,6 +609,7 @@ class HoldEngine:
             yield item
 
     def resolve(self, tool_use_id, decision):
+        self.resolve_calls.append((tool_use_id, decision))
         self._gate.set()
         return True
 
@@ -873,7 +921,8 @@ async def test_cmd_switch_while_busy_succeeds_prior_run_untouched(tmp_path):
     store.switch = orig_switch  # type: ignore[assignment]
 
     reply = upd.message.reply_text.await_args.args[0]
-    assert "switched to beta" in reply.lower(), reply  # success, not a busy refusal
+    # P9: the name is bolded + escaped (HTML), uniform styling. Success, not a busy refusal.
+    assert "switched to <b>beta</b>" in reply.lower(), reply
     assert "/cancel" not in reply
     assert switch_calls, "store.switch MUST be called now that /switch is free mid-run"
     assert store.get_active(1) == "beta"  # active moved
@@ -958,6 +1007,56 @@ async def test_cmd_rm_active_refused(tmp_path):
     reply = upd.message.reply_text.await_args.args[0]
     assert "active" in reply.lower() and "/switch" in reply
     assert "alpha" in store.list_projects(1)  # NOT removed
+
+
+async def test_project_name_replies_use_html_bold_styling(tmp_path):
+    # P9 styling unification: EVERY operator-facing reply that names a project renders it as
+    # <b>{name}</b> and is sent parse_mode="HTML" — no more bare-{name} interpolation. This
+    # pins the common name-bearing replies (/rm success + active-refusal, /new duplicate,
+    # /cancel named-nothing, /switch success) so the styling can't silently drift back.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "alpha"), make_active=True)
+    store.create(1, "beta", str(tmp_path / "beta"), make_active=False)
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / "beta").mkdir()
+    session, _ = make_streaming(store, workdir=str(tmp_path))
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", workdir=str(tmp_path), allow_any_path=True),
+        FakeRunner(),
+        streaming=session,
+    )
+
+    def assert_html_bold(upd, fragment):
+        args, kwargs = upd.message.reply_text.call_args
+        assert kwargs.get("parse_mode") == "HTML", (args, kwargs)
+        assert fragment in args[0], args[0]
+
+    # /rm active-refusal → bold name, HTML.
+    up = make_update(1, "/rm alpha")
+    await bot.cmd_rm(up, make_cmd_ctx(args=["alpha"]))
+    assert_html_bold(up, "<b>alpha</b>")
+
+    # /rm success (non-active beta) → bold name, HTML.
+    up = make_update(1, "/rm beta")
+    await bot.cmd_rm(up, make_cmd_ctx(args=["beta"]))
+    assert_html_bold(up, "<b>beta</b>")
+
+    # /new duplicate → bold name, HTML.
+    up = make_update(1, "/new alpha")
+    await bot.cmd_new(up, make_cmd_ctx(args=["alpha", str(tmp_path / "alpha")]))
+    assert_html_bold(up, "<b>alpha</b>")
+
+    # /cancel named-nothing → bold name, HTML.
+    up = make_update(1, "/cancel gamma")
+    await bot.cmd_cancel(up, make_cmd_ctx(args=["gamma"]))
+    assert_html_bold(up, "<b>gamma</b>")
+
+    # /switch success → bold name, HTML.
+    store.create(1, "delta", str(tmp_path / "delta"), make_active=False)
+    (tmp_path / "delta").mkdir()
+    up = make_update(1, "/switch delta")
+    await bot.cmd_switch(up, make_cmd_ctx(args=["delta"]))
+    assert_html_bold(up, "<b>delta</b>")
 
 
 async def test_cmd_rm_active_refused_case_insensitive(tmp_path):
@@ -2014,6 +2113,24 @@ async def test_cmd_cancel_all_delegates_with_all():
     assert streaming.cancel_calls == [(1, "all")]
 
 
+async def test_cmd_cancel_all_wording_is_project_scoped_no_unit_count(tmp_path):
+    # P9 wording: /cancel all is phrased project-scoped — NOT "(N aborted)" (the unit count
+    # conflates projects vs prompts). The single-project /cancel <name> keeps the count.
+    streaming = FakeStreaming()  # handle_cancel returns 1 (a cancelled unit)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    up_all = make_update(1, "/cancel all")
+    await bot.cmd_cancel(up_all, make_cmd_ctx(args=["all"]))
+    all_reply = up_all.message.reply_text.await_args.args[0]
+    assert all_reply == "🛑 Cancelled all running/queued projects."
+    assert "aborted" not in all_reply  # no raw unit count for the all branch
+
+    # Single-project /cancel <name> KEEPS the unit count.
+    up_one = make_update(1, "/cancel work")
+    await bot.cmd_cancel(up_one, make_cmd_ctx(args=["work"]))
+    one_reply = up_one.message.reply_text.await_args.args[0]
+    assert "aborted" in one_reply and "1" in one_reply
+
+
 async def test_cmd_cancel_no_arg_delegates_active():
     # /cancel (no arg) → handle_cancel(chat_id, None) (the active project).
     streaming = FakeStreaming()
@@ -2162,3 +2279,736 @@ async def test_cmd_cancel_named_aborts_only_that_run_end_to_end(tmp_path):
 
     eng_a.cancel()
     await asyncio.wait_for(turn_a, timeout=2.0)
+
+
+# ===========================================================================
+# P9 / T1 — command menu (set_my_commands) + first-run onboarding.
+# ===========================================================================
+
+
+def _registered_command_names(bot):
+    """The set of command names actually registered as CommandHandlers (excluding the
+    /start alias of /help — intentionally omitted from the native menu)."""
+    from telegram.ext import CommandHandler
+
+    app = bot.build_application()
+    names: set[str] = set()
+    for group in app.handlers.values():
+        for h in group:
+            if isinstance(h, CommandHandler):
+                names |= {c.lstrip("/").lower() for c in h.commands}
+    names.discard("start")
+    return names
+
+
+def test_command_menu_matches_registered_handlers():
+    # T1: COMMAND_MENU must be in lock-step with the registered CommandHandlers — no
+    # documented-but-unregistered command, and no registered command missing from the menu.
+    from claude_tg.bot import COMMAND_MENU
+
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    menu_names = {cmd for cmd, _desc in COMMAND_MENU}
+    assert menu_names == _registered_command_names(bot)
+    # Every menu entry has a non-empty, concise description.
+    assert all(desc and len(desc) <= 100 for _cmd, desc in COMMAND_MENU)
+    # The new /status command is present.
+    assert "status" in menu_names
+
+
+def test_help_text_covers_every_command_menu_entry():
+    # P9 polish: HELP_TEXT must document EVERY command in the native /-menu so the long-form
+    # help can't drift behind the menu (the /status omission that prompted this guard). A
+    # lock-step assertion mirroring test_command_menu_matches_registered_handlers, but for the
+    # wall-of-text help. Extract every /<cmd> token mentioned in HELP_TEXT and require each
+    # COMMAND_MENU command to appear.
+    from claude_tg.bot import COMMAND_MENU, HELP_TEXT
+
+    mentioned = set(re.findall(r"/([a-z]+)", HELP_TEXT))
+    menu_names = {cmd for cmd, _desc in COMMAND_MENU}
+    missing = menu_names - mentioned
+    assert not missing, f"HELP_TEXT is missing menu commands: {sorted(missing)}"
+    # /status specifically must be documented (the bug this guard pins).
+    assert "/status" in HELP_TEXT
+
+
+async def test_post_init_registers_commands_via_set_my_commands():
+    # T1: post_init calls bot.set_my_commands with a BotCommand list matching COMMAND_MENU.
+    from telegram import BotCommand
+
+    from claude_tg.bot import COMMAND_MENU
+
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    app = MagicMock()
+    app.bot.set_my_commands = AsyncMock()
+    await bot._post_init(app)
+    app.bot.set_my_commands.assert_awaited_once()
+    sent = app.bot.set_my_commands.await_args.args[0]
+    assert all(isinstance(c, BotCommand) for c in sent)
+    assert [(c.command, c.description) for c in sent] == list(COMMAND_MENU)
+
+
+async def test_post_init_survives_set_my_commands_failure():
+    # RB1: a Telegram API failure registering the menu must not crash startup.
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    app = MagicMock()
+    app.bot.set_my_commands = AsyncMock(side_effect=RuntimeError("api down"))
+    await bot._post_init(app)  # does not raise
+
+
+async def test_first_message_welcomes_once_then_not_again():
+    # T1: the first-ever message for a chat fires a one-time welcome; subsequent messages
+    # do NOT re-welcome.
+    runner = FakeRunner(ClaudeResult(ok=True, text="ok"))
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    upd1 = make_update(1, "hello")
+    await bot.on_message(upd1, make_ctx())
+    welcome = upd1.message.reply_text.await_args_list[0].args[0]
+    assert welcome.startswith("👋")
+    assert "/status" in welcome and "oneshot" in welcome
+    # Second message: NO welcome (only the turn reply).
+    upd2 = make_update(1, "again")
+    await bot.on_message(upd2, make_ctx())
+    assert not any("👋" in c.args[0] for c in upd2.message.reply_text.await_args_list)
+
+
+async def test_welcome_not_sent_to_unauthorized_chat():
+    # T1/SB1: a non-allowlisted chat never triggers onboarding (and is never marked seen).
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="oneshot"), runner)
+    upd = make_update(999, "hi")
+    await bot.on_message(upd, make_ctx())
+    upd.message.reply_text.assert_not_awaited()
+    assert 999 not in bot._welcomed
+
+
+async def test_welcome_failure_does_not_break_dispatch():
+    # RB1: a welcome send failure must not stop the turn from running.
+    runner = FakeRunner(ClaudeResult(ok=True, text="answer"))
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    upd = make_update(1, "go")
+
+    # First reply (the welcome) raises; later replies (the turn) succeed.
+    upd.message.reply_text = AsyncMock(side_effect=[RuntimeError("boom"), None, None, None])
+    await bot.on_message(upd, make_ctx())
+    assert runner.run_calls == [(1, "go")]  # the turn still ran
+
+
+# ===========================================================================
+# P9 / T2 — /status health command (real StreamingSession + store).
+# ===========================================================================
+
+
+async def test_cmd_status_streaming_fields(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.add_cost(1, "alpha", 0.05)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert kwargs.get("parse_mode") == "HTML"
+    # Uptime, engine mode, gate posture, run counts, the per-project line + cwd + cost.
+    assert "Uptime" in reply
+    assert "streaming" in reply
+    assert "gate" in reply.lower()
+    assert "active" in reply.lower() and "max concurrent" in reply.lower()
+    assert "alpha" in reply
+    assert "<code>/work/alpha</code>" in reply  # R6: cwd wrapped, not auto-linkified
+    assert "$0.05" in reply  # T3 cumulative cost surfaced in /status
+
+
+async def test_cmd_status_unauthorized_ignored(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(999, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    upd.message.reply_text.assert_not_awaited()  # SB1: dropped, nothing leaked
+
+
+async def test_cmd_status_oneshot_mode():
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "oneshot" in reply
+    assert "Uptime" in reply
+    assert "<code>/work</code>" in reply  # working dir wrapped (R6)
+
+
+async def test_cmd_status_body_free_no_secrets(tmp_path):
+    # SB3: /status carries only health values — never tool input/output or file content. We
+    # plant a "secret"-looking session_id in the store and assert it never appears.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.set_session_id(1, "alpha", "SECRET-SESSION-ID-12345")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "SECRET-SESSION-ID-12345" not in reply
+
+
+async def test_cmd_status_multi_project_marker_mixed_cost_and_yolo(tmp_path):
+    # T2: /status with MULTIPLE projects — assert (a) the active-marker placement (→ on the
+    # active project only), (b) a MIXED cost/no-cost rendering (the costed project shows
+    # "$X.XX", the un-costed one shows no cost suffix), and (c) the /yolo-ON gate-disabled
+    # wording shows and stays body-free + HTML-escaped.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)   # active + costed
+    store.create(1, "beta", "/work/beta", make_active=False)    # inactive + no cost
+    store.add_cost(1, "alpha", 0.12)
+    session, _ = make_streaming(store)
+    # Flip the active project into /yolo so the gate-disabled posture renders.
+    session.set_yolo(1, True)
+    assert session.get_yolo(1) is True
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert kwargs.get("parse_mode") == "HTML"
+
+    lines = reply.splitlines()
+    alpha_line = next(line for line in lines if "alpha" in line)
+    beta_line = next(line for line in lines if "beta" in line)
+    # (a) active marker: the → arrow leads the ACTIVE project's line only.
+    assert "→" in alpha_line and "<b>alpha</b>" in alpha_line
+    assert "→" not in beta_line and "<b>beta</b>" in beta_line
+    # (b) mixed cost: alpha shows its cumulative cost, beta (uncharged) shows none.
+    assert "$0.12" in alpha_line
+    assert "$" not in beta_line
+    # (c) /yolo gate-disabled wording is present, loud, and names the toggle.
+    gate_line = next(line for line in lines if line.startswith("Permission gate:"))
+    assert "OFF" in gate_line and "/yolo" in gate_line
+    # Body-free + HTML-escaped: the only "<...>" runs are the bot's own <b>/<code> tags (no
+    # stray angle brackets), and no raw '&' leaks unescaped (every literal & is an entity).
+    assert set(re.findall(r"</?(\w+)", reply)) <= {"b", "code"}
+    for amp in re.findall(r"&\S*", reply):
+        assert amp.startswith(("&amp;", "&lt;", "&gt;")), amp
+
+
+async def test_cmd_status_surfaces_background_project_yolo(tmp_path):
+    # P9 fix: /yolo is PER-PROJECT, but the global "Permission gate" line reflects only the
+    # ACTIVE project — a wide-open BACKGROUND project must NOT be hidden. /status marks each
+    # allow-all project with "⚠️ yolo" on its own line. Here beta (background) is yolo while
+    # alpha (active) is NOT — the global gate line reads ON, but beta's line must flag yolo.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)   # active, gate ON
+    store.create(1, "beta", "/work/beta", make_active=False)    # background
+    session, _ = make_streaming(store)
+    # Flip BETA into /yolo while it is the active project, then switch back to alpha so beta
+    # is a wide-open BACKGROUND project (the exact case the global gate line would hide).
+    store.switch(1, "beta")
+    session.set_yolo(1, True)
+    store.switch(1, "alpha")
+    assert session.get_yolo(1) is False  # the ACTIVE (alpha) gate is ON
+    assert session.get_project_yolo(1, "beta") is True  # but beta is allow-all
+
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    lines = reply.splitlines()
+    # The global gate line reflects the ACTIVE project (alpha) — ON.
+    gate_line = next(line for line in lines if line.startswith("Permission gate:"))
+    assert "ON" in gate_line
+    # The per-project marker exposes beta's allow-all posture; alpha's line carries none.
+    alpha_line = next(line for line in lines if "<b>alpha</b>" in line)
+    beta_line = next(line for line in lines if "<b>beta</b>" in line)
+    assert "yolo" in beta_line, beta_line  # the background allow-all project is NOT hidden
+    assert "yolo" not in alpha_line, alpha_line
+
+
+def test_format_uptime():
+    from claude_tg.bot import _format_uptime
+
+    assert _format_uptime(8) == "8s"
+    assert _format_uptime(72) == "1m 12s"
+    assert _format_uptime(3661) == "1h 1m"
+    assert _format_uptime(90061) == "1d 1h 1m"
+    assert _format_uptime(-5) == "0s"  # RB1: defensive floor
+
+
+# ===========================================================================
+# T4 (P9): /fast · /deep · /auto — per-project model routing commands.
+# ===========================================================================
+
+
+async def test_cmd_fast_sets_fast_model():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/fast")
+    await bot.cmd_fast(upd, make_cmd_ctx())
+    assert streaming.model_calls == [(1, bot.config.fast_model)]
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "fast" in reply and bot.config.fast_model in reply
+
+
+async def test_cmd_deep_sets_deep_model():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/deep")
+    await bot.cmd_deep(upd, make_cmd_ctx())
+    assert streaming.model_calls == [(1, bot.config.deep_model)]
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "deep" in reply and bot.config.deep_model in reply
+
+
+async def test_cmd_auto_clears_model():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/auto")
+    await bot.cmd_auto(upd, make_cmd_ctx())
+    assert streaming.model_calls == [(1, None)]  # cleared
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "default" in reply.lower()
+
+
+async def test_cmd_fast_unauthorized_ignored():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(999, "/fast")
+    await bot.cmd_fast(upd, make_cmd_ctx())
+    assert streaming.model_calls == []  # SB1: dropped
+    upd.message.reply_text.assert_not_awaited()
+
+
+async def test_cmd_fast_oneshot_mode_notice():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/fast")
+    await bot.cmd_fast(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "streaming mode only" in reply
+
+
+async def test_cmd_status_shows_model_override(tmp_path):
+    # T4: the per-project model override surfaces on the /status per-project line.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.set_model(1, "alpha", "claude-haiku-4-5")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "<code>claude-haiku-4-5</code>" in reply
+
+
+async def test_cmd_status_no_model_override_omits_it(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)  # no override
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "claude-haiku-4-5" not in reply and "claude-opus" not in reply
+
+
+# ===========================================================================
+# T5 (P9): macros — /save · /run · /macros · /unsave.
+# ===========================================================================
+
+
+async def test_cmd_save_run_roundtrip_fires_turn(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    # /save deploy build $1 and ship $*
+    await bot.cmd_save(make_update(1, "/save"), make_cmd_ctx(["deploy", "build", "$1", "and", "ship", "$*"]))
+    assert store.get_macro(1, "deploy") == "build $1 and ship $*"
+    # /run deploy app extra1 extra2  → expands $1=app, $*=app extra1 extra2
+    await bot.cmd_run(make_update(1, "/run"), make_cmd_ctx(["deploy", "app", "extra1", "extra2"]))
+    # The expanded text fired as a normal turn through the streaming session.
+    assert streaming.handle_message_calls
+    fired = streaming.handle_message_calls[-1][1]
+    assert fired == "build app and ship app extra1 extra2"
+
+
+async def test_cmd_save_case_collision_run_resolves_latest(tmp_path):
+    # RED-GREEN (P0 macro case-collision) at the BOT boundary: `/save Work x` then
+    # `/save work y` must leave exactly ONE macro, and `/run work` fires the LATEST body (y).
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.cmd_save(make_update(1, "/save"), make_cmd_ctx(["Work", "x"]))
+    await bot.cmd_save(make_update(1, "/save"), make_cmd_ctx(["work", "y"]))  # same name, new case
+    assert len(store.list_macros(1)) == 1, store.list_macros(1)
+    await bot.cmd_run(make_update(1, "/run"), make_cmd_ctx(["work"]))
+    assert streaming.handle_message_calls[-1][1] == "y"  # /run work → the latest body
+
+
+async def test_cmd_save_rejects_bad_name_sb4(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.cmd_save(make_update(1, "/save"), make_cmd_ctx(["../etc", "body"]))
+    # Nothing saved; a clean refusal (the focused escape assertion is the next test).
+    assert store.list_macros(1) == {}
+
+
+async def test_cmd_save_bad_name_reply_is_escaped(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/save")
+    await bot.cmd_save(upd, make_cmd_ctx(["<b>x", "body"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "Invalid macro name" in reply
+    assert "<b>x" not in reply or "&lt;b&gt;x" in reply  # the bad name is escaped
+
+
+async def test_cmd_save_usage_when_missing_args(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/save")
+    await bot.cmd_save(upd, make_cmd_ctx(["onlyname"]))  # no body
+    reply = upd.message.reply_text.await_args.args[0]
+    assert reply.startswith("Usage: /save")
+    assert store.list_macros(1) == {}
+
+
+async def test_cmd_macros_lists(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "deploy", "do the deploy thing")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/macros")
+    await bot.cmd_macros(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "<b>deploy</b>" in reply and "do the deploy thing" in reply
+
+
+async def test_cmd_macros_empty(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/macros")
+    await bot.cmd_macros(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "No macros yet" in reply
+
+
+async def test_cmd_unsave_removes(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "deploy", "x")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    await bot.cmd_unsave(make_update(1, "/unsave"), make_cmd_ctx(["deploy"]))
+    assert store.get_macro(1, "deploy") is None
+
+
+async def test_cmd_unsave_unknown_is_clean(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/unsave")
+    await bot.cmd_unsave(upd, make_cmd_ctx(["nope"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "No macro named" in reply
+
+
+async def test_cmd_run_unknown_macro_clean(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/run")
+    await bot.cmd_run(upd, make_cmd_ctx(["nope", "arg"]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "No macro named" in reply
+    assert streaming.handle_message_calls == []  # nothing fired
+
+
+async def test_cmd_run_usage_when_no_name(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/run")
+    await bot.cmd_run(upd, make_cmd_ctx([]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert reply.startswith("Usage: /run")
+
+
+async def test_macro_commands_unauthorized_ignored(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(999, "/save")
+    await bot.cmd_save(upd, make_cmd_ctx(["m", "body"]))
+    upd.message.reply_text.assert_not_awaited()  # SB1: dropped
+    assert store.list_macros(1) == {}
+
+
+async def test_macros_work_in_oneshot_mode(monkeypatch, tmp_path):
+    # T5: macros work in BOTH engine modes — in one-shot the /run expansion fires through
+    # the runner. Use a real store on the runner.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.save_macro(1, "greet", "say hi to $1")
+    runner = FakeRunner(ClaudeResult(ok=True, text="done"))
+    runner.store = store
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    bot._welcomed.add(1)  # skip the first-run welcome noise
+    await bot.cmd_run(make_update(1, "/run"), make_cmd_ctx(["greet", "alice"]))
+    assert runner.run_calls == [(1, "say hi to alice")]
+
+
+# ---------------------------------------------------------------------------
+# P9 fix — /run must NOT be swallowed by a pending free-text capture.
+# A macro /run is a deliberate command to START a fresh turn; it must go through
+# the normal turn path, never satisfy an outstanding "Other"/plan-reject free-text
+# hold. A plain typed message answering the prompt is UNCHANGED.
+# ---------------------------------------------------------------------------
+
+
+async def test_cmd_run_does_not_consume_pending_free_text_capture(tmp_path):
+    # RED-GREEN (Codex blocker): alpha is mid-turn with an ask hold; the operator taps
+    # "Other" (arming free-text capture on alpha). They then /switch to the IDLE beta and
+    # fire a macro via /run. The macro's expanded text MUST start a fresh turn on beta — it
+    # must NOT be routed to engine.resolve as alpha's captured free-text answer.
+    from claude_tg.render import encode_callback
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.create(1, "beta", "/work/beta", make_active=False)
+    store.save_macro(1, "deploy", "ship it")
+    ask_a = AskEvent(
+        questions=[{"question": "Qa?", "options": [{"label": "A"}]}],
+        tool_use_id="a-ask",
+    )
+    eng_a = HoldEngine([ask_a, HOLD])  # emit ask, then park awaiting the answer
+    eng_b = HoldEngine([])  # beta's fresh turn runs to completion
+    session = make_multi_streaming(store, {"/work/alpha": eng_a, "/work/beta": eng_b})
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+
+    # Drive alpha to the ask hold, then tap "Other" to ARM free-text capture on alpha.
+    turn_a = asyncio.create_task(bot.on_message(make_update(1, "go a"), rec))
+    await _wait(lambda: session.project_status(1, "alpha") == "awaiting_answer")
+    cb = make_callback_update(1, data=encode_callback("o", "a-ask", question_index=0))
+    await bot.on_callback(cb, make_ctx())
+    assert session._chat(1).runtimes["alpha"].awaiting_text_for == "a-ask"  # armed
+
+    # /switch to the idle beta (allowed mid-run), then /run the macro.
+    await bot.cmd_switch(make_update(1, "/switch beta"), make_cmd_ctx(args=["beta"]))
+    assert store.get_active(1) == "beta"
+    await bot.cmd_run(make_update(1, "/run"), make_cmd_ctx(args=["deploy"]))
+
+    # The macro fired a FRESH turn on beta's engine — it did NOT resolve alpha's free-text
+    # hold. Mutation probe: routing /run through the free-text capture would call
+    # eng_a.resolve("a-ask", …) and leave eng_b un-driven (assertions below would fail).
+    assert eng_b.started, "the macro must start a fresh turn on the active (beta) project"
+    assert eng_a.resolve_calls == [], "/run must NOT be consumed as alpha's free-text answer"
+    assert session._chat(1).runtimes["alpha"].awaiting_text_for == "a-ask", (
+        "alpha is still armed — its hold was untouched by /run"
+    )
+
+    eng_a.cancel()
+    await asyncio.wait_for(turn_a, timeout=2.0)
+
+
+async def test_plain_message_still_answers_pending_free_text_capture(tmp_path):
+    # The companion guard: a PLAIN typed message (not a command) answering a pending
+    # free-text prompt resolves it EXACTLY as before — the fix must not regress this.
+    from claude_tg.render import encode_callback
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    ask_a = AskEvent(
+        questions=[{"question": "Qa?", "options": [{"label": "A"}]}],
+        tool_use_id="a-ask",
+    )
+    eng_a = HoldEngine([ask_a, HOLD])
+    session = make_multi_streaming(store, {"/work/alpha": eng_a})
+    bot = TelegramClaudeBot(
+        make_config(engine_mode="streaming", allow_any_path=True), FakeRunner(), streaming=session
+    )
+    rec = make_ctx()
+    rec.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+    turn_a = asyncio.create_task(bot.on_message(make_update(1, "go a"), rec))
+    await _wait(lambda: session.project_status(1, "alpha") == "awaiting_answer")
+    cb = make_callback_update(1, data=encode_callback("o", "a-ask", question_index=0))
+    await bot.on_callback(cb, make_ctx())
+    assert session._chat(1).runtimes["alpha"].awaiting_text_for == "a-ask"
+
+    # A plain typed message answers the prompt — resolves alpha's hold (unchanged behavior).
+    await bot.on_message(make_update(1, "my free-text answer"), rec)
+    assert eng_a.resolve_calls and eng_a.resolve_calls[0][0] == "a-ask"
+    assert session._chat(1).runtimes["alpha"].awaiting_text_for is None  # capture cleared
+
+    await asyncio.wait_for(turn_a, timeout=2.0)
+
+
+# ===========================================================================
+# T6 (P9) — notification polish + chips at the BOT boundary.
+#   * [Open <project>] switch tap → on_callback performs the switch (SB1-gated).
+#   * free-text prompt carries the one-time quick-reply chips.
+#   * a free-text capture dismisses the chips (ReplyKeyboardRemove).
+# ===========================================================================
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove  # noqa: E402
+
+from claude_tg.render import encode_switch_callback  # noqa: E402
+
+
+async def test_switch_button_tap_switches_active_project_at_bot(tmp_path):
+    # T6.2: a [Open beta] tap from an AUTHORIZED chat switches the active project (via the
+    # shared /switch helper, with SB2 path revalidation). Uses a REAL StreamingSession + store.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "alpha"), make_active=True)
+    store.create(1, "beta", str(tmp_path / "beta"), make_active=False)
+    (tmp_path / "beta").mkdir()
+    session = StreamingSession(
+        make_config(engine_mode="streaming", allow_any_path=True),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: None,
+    )
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", allow_any_path=True),
+        FakeRunner(), streaming=session,
+    )
+    upd = make_callback_update(chat_id=1, data=encode_switch_callback("beta"))
+    await bot.on_callback(upd, make_ctx())
+    assert store.get_active(1) == "beta", "the switch tap must change the active project"
+    upd.callback_query.answer.assert_awaited()
+    upd.callback_query.message.reply_text.assert_awaited()
+
+
+async def test_switch_button_tap_from_unauthorized_chat_never_switches(tmp_path):
+    # ⭐ SB1 (mutation probe): a [Open beta] tap from a NON-allowlisted chat must NEVER switch.
+    # If on_callback skipped the _authorized recheck for switch taps, the active project would
+    # flip — this guards that the switch is gated exactly like every other callback.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "alpha"), make_active=True)
+    store.create(1, "beta", str(tmp_path / "beta"), make_active=False)
+    (tmp_path / "beta").mkdir()
+    session = StreamingSession(
+        make_config(engine_mode="streaming", allow_any_path=True),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: None,
+    )
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", allow_any_path=True),
+        FakeRunner(), streaming=session,
+    )
+    upd = make_callback_update(chat_id=999, data=encode_switch_callback("beta"))  # NOT allowlisted
+    await bot.on_callback(upd, make_ctx())
+    assert store.get_active(1) == "alpha", "an unauthorized switch tap must NOT change the active project"
+    upd.callback_query.answer.assert_awaited()  # spinner stops
+    # No switch reply was sent (the handler dropped it before resolve_callback).
+    upd.callback_query.message.reply_text.assert_not_awaited()
+
+
+async def test_free_text_prompt_attaches_quick_reply_chips():
+    # T6.4: an "Other"/reject arm prompts for free text WITH the one-time quick-reply chips.
+    streaming = FakeStreaming(
+        outcome=CallbackOutcome(
+            handled=True, note="Type your answer", expects_text=True,
+            project_name="alpha", tool_use_id="tid",
+        )
+    )
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    upd = make_callback_update(chat_id=1, data="o|tid|0")
+    await bot.on_callback(upd, make_ctx())
+    upd.callback_query.message.reply_text.assert_awaited()
+    _args, kwargs = upd.callback_query.message.reply_text.call_args
+    kb = kwargs.get("reply_markup")
+    assert isinstance(kb, ReplyKeyboardMarkup) and kb.one_time_keyboard is True
+    chips = [b.text for row in kb.keyboard for b in row]
+    assert "proceed" in chips
+
+
+async def test_free_text_capture_dismisses_chips():
+    # ⭐ T6.4 (mutation probe — chip dismissal): when a message is consumed as a free-text
+    # capture (handle_message returns True), the bot sends a ReplyKeyboardRemove so the
+    # one-time chips don't linger over the next turn.
+    streaming = FakeStreaming()
+
+    async def captured_handle(
+        chat_id, text, *, send, edit, delete=None, reply_to_message_id=None,
+        command_initiated=False,
+    ):
+        return True  # this message was a free-text capture
+
+    streaming.handle_message = captured_handle
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    bot._welcomed.add(1)
+    upd = make_update(1, "proceed")
+    await bot.on_message(upd, make_ctx())
+    # The dismiss message rode a ReplyKeyboardRemove.
+    upd.message.reply_text.assert_awaited()
+    _args, kwargs = upd.message.reply_text.call_args
+    assert isinstance(kwargs.get("reply_markup"), ReplyKeyboardRemove)
+
+
+async def test_normal_turn_does_not_dismiss_chips():
+    # T6.4: a NORMAL turn (handle_message returns False) does NOT send a ReplyKeyboardRemove —
+    # the chips are scoped to a pending free-text prompt, not every message.
+    streaming = FakeStreaming()  # its handle_message returns False
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    bot._welcomed.add(1)
+    upd = make_update(1, "do something new")
+    await bot.on_message(upd, make_ctx())
+    # No dismissal message sent (reply_text not called for the chip-remove path).
+    upd.message.reply_text.assert_not_awaited()
+
+
+async def test_status_runs_line_shows_queued_counter(tmp_path):
+    # T6.3: /status surfaces the queued-behind-the-cap counter on the runs line.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "alpha"), make_active=True)
+    (tmp_path / "alpha").mkdir()
+    session = StreamingSession(
+        make_config(engine_mode="streaming", allow_any_path=True),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: None,
+    )
+    # Park two waiters behind the cap.
+    from claude_tg.stream_session import _ProjectRuntime, _QueuedTurn
+
+    state = session._chat(1)
+    loop = asyncio.get_running_loop()
+    futures = []
+    for _ in range(2):
+        fut = loop.create_future()
+        futures.append(fut)
+        state.run_queue.append(_QueuedTurn(runtime=_ProjectRuntime(cwd="/x"), future=fut))
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming", allow_any_path=True),
+        FakeRunner(), streaming=session,
+    )
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_ctx())
+    _args, kwargs = upd.message.reply_text.call_args
+    text = _args[0] if _args else kwargs.get("text", "")
+    assert "(2 more waiting)" in text
+    for fut in futures:
+        fut.cancel()
