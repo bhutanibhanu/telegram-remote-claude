@@ -2009,3 +2009,71 @@ def test_sessions_keyboard_buttons_are_most_relevant_active_first():
     # active + known lead the (capped) buttons despite being the oldest sessions.
     assert ids[0] == "active-1" and ids[1] == "known-1"
     assert len(buttons) == 3
+
+
+# ---------------------------------------------------------------------------
+# P14 T-SCHED — /schedules listing (body-free, HTML-escaped, injected clock)
+# ---------------------------------------------------------------------------
+
+from claude_tg.render import (  # noqa: E402
+    SCHEDULES_EMPTY_NOTICE,
+    schedule_listing,
+)
+from claude_tg.scheduler import Schedule  # noqa: E402
+
+
+def _sch(name="ci", **kw) -> Schedule:
+    base = dict(
+        name=name, interval_seconds=3600, prompt="run tests", chat_id=1,
+        next_run=10_000.0, project=None, paused=False, created_at=0.0,
+    )
+    base.update(kw)
+    return Schedule(**base)
+
+
+def test_schedule_listing_empty_returns_notice():
+    assert schedule_listing([], now=0.0) == SCHEDULES_EMPTY_NOTICE
+
+
+def test_schedule_listing_renders_name_interval_nextrun():
+    out = schedule_listing([_sch(next_run=10_000.0)], now=10_000.0 - 1800)  # due in 30m
+    assert "<b>ci</b>" in out
+    assert "every 1h" in out
+    assert "in 30m" in out
+
+
+def test_schedule_listing_paused_marker_and_word():
+    out = schedule_listing([_sch(paused=True)], now=0.0)
+    assert "⏸️" in out
+    assert "(paused)" in out  # a paused schedule shows "paused" instead of a next-run
+
+
+def test_schedule_listing_pinned_project_shown():
+    out = schedule_listing([_sch(project="proj")], now=0.0)
+    assert "<code>proj</code>" in out
+
+
+def test_schedule_listing_html_escapes_prompt_sb3():
+    # SB3 / R6: a prompt with </>& renders INERT (escaped), never breaking the HTML.
+    out = schedule_listing([_sch(prompt="<b>x</b> & y")], now=0.0)
+    assert "&lt;b&gt;x&lt;/b&gt;" in out and "&amp;" in out
+
+
+def test_schedule_listing_truncates_long_prompt():
+    out = schedule_listing([_sch(prompt="z" * 200)], now=0.0)
+    assert "…" in out
+    assert "z" * 200 not in out  # not the full body (SB3 truncation)
+
+
+def test_schedule_listing_skips_malformed_entry():
+    # RB1: a non-Schedule object missing attributes is skipped, never crashes the listing.
+    class Bad:
+        pass
+
+    out = schedule_listing([Bad(), _sch(name="good")], now=0.0)
+    assert "<b>good</b>" in out
+
+
+def test_schedule_listing_due_now_when_past():
+    out = schedule_listing([_sch(next_run=5.0)], now=10_000.0)
+    assert "due now" in out
