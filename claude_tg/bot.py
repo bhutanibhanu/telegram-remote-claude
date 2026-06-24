@@ -544,7 +544,7 @@ class TelegramClaudeBot:
             # No STATE_FILE configured → no registry to create a project in. RB1: never
             # crash on a streaming + no-persistence deployment (store is None).
             await update.message.reply_text(
-                "Projects need persistence — set STATE_FILE to create one."
+                "Projects need persistence — set CLAUDE_STATE_FILE to create one."
             )
             return
         name = ctx.args[0] if ctx.args else ""
