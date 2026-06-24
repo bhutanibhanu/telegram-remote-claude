@@ -77,10 +77,23 @@ running_bot_pids() {
       sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", cmd)
       if (pid == self) next            # this installer process
       if (index(cmd, script)) next     # any invocation of this script (e.g. a subshell)
-      if (cmd ~ /[Cc]laude-telegram-bot/ \
+      # Lower-cased copy so the interpreter test catches python / python3.x AND the macOS
+      # framework "Python" (capital P) regardless of case. POSIX tolower() — BSD-awk safe.
+      lc = tolower(cmd)
+      # Match the known start forms. NB on boundaries (avoid false positives):
+      #  * claude-telegram-bot: the CONSOLE SCRIPT — its name as an executable basename or a
+      #    bare arg (preceded by start/space/"/", followed by end/space). This is NOT a plain
+      #    substring test, so a process merely RUNNING OUT OF a dir named "claude-telegram-bot*"
+      #    (e.g. ".../claude-telegram-bot/.venv/bin/python -m pytest") does not trip it.
+      #  * a python interpreter (python, python3.x, or the framework "Python") running a
+      #    main.py SCRIPT: require a python interpreter token (at start or after "/", followed
+      #    by whitespace) AND a main.py argument at a path/arg boundary (preceded by
+      #    start/space/"/", followed by end/space). The boundary excludes test_main.py /
+      #    foo_main.py, and the interpreter test excludes editors (vim/nvim /x/main.py).
+      if (cmd ~ /(^|[[:space:]]|\/)[Cc]laude-telegram-bot($|[[:space:]])/ \
           || cmd ~ /-m[[:space:]]+claude_tg/ \
-          || cmd ~ /(^|\/)python[0-9.]*[[:space:]]+.*main\.py/ \
-          || cmd ~ /[[:space:]]main\.py($|[[:space:]])/) {
+          || (lc ~ /(^|\/)python[0-9.]*[[:space:]]/ \
+              && lc ~ /(^|[[:space:]]|\/)main\.py($|[[:space:]])/)) {
         print pid
       }
     }
