@@ -1810,3 +1810,121 @@ def test_relative_age_units_and_rb1():
     assert relative_age(None, now=1000) == "unknown"
     assert relative_age("nope", now=1000) == "unknown"
     assert relative_age(2000, now=1000) == "just now"
+
+
+# ---------------------------------------------------------------------------
+# /sessions sort + cap + truncation footer (P11 T1 live-fix — the >4096 crash)
+# ---------------------------------------------------------------------------
+
+from claude_tg.render import (  # noqa: E402
+    cap_sessions,
+    prioritize_sessions,
+)
+from claude_tg.util import TELEGRAM_MAX, _utf16_len  # noqa: E402
+
+
+def test_prioritize_sessions_active_first_then_known_then_recent():
+    # bucket order: active → bot-known → others-by-recency-desc.
+    s_active = _Sess(session_id="active", last_active=1)        # oldest, but active
+    s_known = _Sess(session_id="known", last_active=2)          # old, but bot-known
+    s_new = _Sess(session_id="plain-new", last_active=1000)     # newest plain
+    s_old = _Sess(session_id="plain-old", last_active=500)      # older plain
+    marks = {"active": ProjectMark(name="A", active=True), "known": ProjectMark(name="K")}
+    ordered = prioritize_sessions([s_old, s_new, s_known, s_active], marks)
+    ids = [s.session_id for s in ordered]
+    # active first (despite being oldest), then bot-known, then plain by recency DESC.
+    assert ids == ["active", "known", "plain-new", "plain-old"]
+
+
+def test_prioritize_sessions_missing_recency_sorts_last_in_bucket():
+    a = _Sess(session_id="has-recency", last_active=100)
+    b = _Sess(session_id="no-recency", last_active=None)
+    ordered = prioritize_sessions([b, a], {})
+    assert [s.session_id for s in ordered] == ["has-recency", "no-recency"]
+
+
+def test_cap_sessions_keeps_all_known_plus_top_recent():
+    # 3 bot-known (incl. active) + 10 plain; limit 5 → all 3 known + top 2 recent = 5.
+    known = [_Sess(session_id=f"k{i}", last_active=i) for i in range(3)]  # old
+    plain = [_Sess(session_id=f"p{i}", last_active=1000 + i) for i in range(10)]
+    marks = {"k0": ProjectMark(name="a", active=True), "k1": ProjectMark(name="b"),
+             "k2": ProjectMark(name="c")}
+    ordered = prioritize_sessions(known + plain, marks)
+    capped = cap_sessions(ordered, marks, limit=5)
+    ids = {s.session_id for s in capped}
+    assert {"k0", "k1", "k2"} <= ids  # ALL bot-known kept even though old
+    assert len(capped) == 5  # exactly the limit
+    # The 2 plain kept are the most-recent (p9, p8), not arbitrary.
+    plain_kept = [s.session_id for s in capped if s.session_id.startswith("p")]
+    assert set(plain_kept) == {"p9", "p8"}
+
+
+def test_cap_sessions_never_hides_known_even_if_known_exceed_limit():
+    # 8 bot-known but limit 3 → all 8 kept (operator's own are never hidden).
+    known = [_Sess(session_id=f"k{i}", last_active=i) for i in range(8)]
+    marks = {f"k{i}": ProjectMark(name=f"n{i}", active=(i == 0)) for i in range(8)}
+    capped = cap_sessions(prioritize_sessions(known, marks), marks, limit=3)
+    assert {s.session_id for s in capped} == {f"k{i}" for i in range(8)}
+
+
+def test_sessions_listing_caps_rows_and_shows_honest_footer():
+    sessions = [_Sess(session_id=f"s{i:04d}aa", cwd=f"/w/{i}", last_active=1000 - i)
+                for i in range(100)]
+    out = sessions_listing(sessions, {}, now=2000.0, limit=15)
+    # Header reports the TRUE total; only `limit` rows are rendered.
+    assert "(100 found)" in out
+    row_lines = [line for line in out.splitlines() if line.startswith(("→", "·"))]
+    assert len(row_lines) == 15
+    # Honest footer names shown-of-total and points at /attach (escaped angle brackets).
+    assert "Showing 15 of 100 sessions" in out
+    assert "<code>/attach &lt;id&gt;</code>" in out
+    # The most-recent 15 are shown (s0000..s0014 by last_active desc), not an arbitrary slice.
+    assert "s0000aa" in out and "s0014aa" in out and "s0015aa" not in out
+
+
+def test_sessions_listing_no_footer_when_all_shown():
+    sessions = [_Sess(session_id=f"s{i}", cwd="/w", last_active=i) for i in range(5)]
+    out = sessions_listing(sessions, {}, now=100.0, limit=15)
+    assert "Showing" not in out  # total (5) ≤ shown → no truncation footer
+
+
+def test_sessions_listing_capped_stays_well_under_4096():
+    # Even with long cwds + titles, the CAPPED listing is comfortably under Telegram's limit.
+    sessions = [
+        _Sess(session_id=f"sess{i:04d}", cwd="/Users/ray/dev/" + "deep/" * 30 + f"proj{i}",
+              title="x" * 500, last_active=2000 - i)
+        for i in range(300)
+    ]
+    out = sessions_listing(sessions, {}, now=3000.0)  # default limit
+    assert _utf16_len(out) <= TELEGRAM_MAX, f"capped listing is {_utf16_len(out)} > 4096"
+
+
+def test_sessions_listing_UNCAPPED_would_overflow_4096_mutation_probe():
+    # ⭐ Mutation-probe for the cap: with the cap effectively REMOVED (a huge limit) the SAME
+    # 300-session input renders a single message FAR over Telegram's 4096 limit — the exact
+    # live crash. This pins that the cap (not luck) is what keeps the message legal: if a
+    # future change rendered everything, this length assertion would fire.
+    sessions = [
+        _Sess(session_id=f"sess{i:04d}", cwd="/Users/ray/dev/" + "deep/" * 30 + f"proj{i}",
+              title="x" * 500, last_active=2000 - i)
+        for i in range(300)
+    ]
+    uncapped = sessions_listing(sessions, {}, now=3000.0, limit=10_000)
+    assert _utf16_len(uncapped) > TELEGRAM_MAX  # proves an uncapped render WOULD overflow
+
+
+def test_sessions_keyboard_buttons_are_most_relevant_active_first():
+    # The attach buttons follow the SAME relevance order as the listing (active → known →
+    # recent), not SDK order — so the capped buttons cover the operator's own + freshest.
+    from claude_tg.render import sessions_keyboard
+
+    s_active = _Sess(session_id="active-1", last_active=1)   # oldest but active
+    s_known = _Sess(session_id="known-1", last_active=2)     # old but known
+    plain = [_Sess(session_id=f"p{i}", last_active=1000 + i) for i in range(10)]  # newest
+    marks = {"active-1": ProjectMark(name="A", active=True), "known-1": ProjectMark(name="K")}
+    kb = sessions_keyboard(plain + [s_known, s_active], marks=marks, cap=3)
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    ids = [decode_callback(b.callback_data).attach_session_id for b in buttons]
+    # active + known lead the (capped) buttons despite being the oldest sessions.
+    assert ids[0] == "active-1" and ids[1] == "known-1"
+    assert len(buttons) == 3

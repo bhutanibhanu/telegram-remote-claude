@@ -800,12 +800,20 @@ class TelegramClaudeBot:
         # P11 T2: in STREAMING mode attach a [📎 Attach <shortid>] button per discovered
         # session so the operator can adopt + drive any of them in one tap (the typed
         # /attach <id> works too, incl. for sessions past the button cap — the id is on the
-        # row). One-shot mode has no project registry to attach into, so it gets the listing
+        # row). The keyboard's buttons are the most-RELEVANT sessions (active → bot-known →
+        # most-recent — the SAME order as the listing rows, via `marks`), not an arbitrary
+        # first-N. One-shot mode has no project registry to attach into, so it gets the listing
         # alone (no keyboard) — discovery there is read-only, exactly as T1. A keyboard is only
-        # attached when there ARE sessions (sessions_keyboard returns None for an empty list,
-        # in which case the empty-listing notice is sent alone). SB1 already gated this above.
-        keyboard = sessions_keyboard(sessions) if self.streaming is not None else None
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+        # attached when there ARE sessions (sessions_keyboard returns None for an empty list).
+        # SB1 already gated this above.
+        keyboard = (
+            sessions_keyboard(sessions, marks=marks) if self.streaming is not None else None
+        )
+        # P11 T1 live-fix: a real Mac can have hundreds of sessions; even after the relevance
+        # cap a listing with long cwds/titles could approach Telegram's 4096-char limit and
+        # throw BadRequest "message too long" (the live bug). Route the reply through the
+        # chunked HTML sender so it can NEVER overflow; the keyboard rides only the last chunk.
+        await self._reply_html_chunked(update, text, keyboard)
 
     async def cmd_attach(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Adopt ANY discovered Claude session as a controllable project (``/attach <id>``, P11 T2).
@@ -1935,6 +1943,30 @@ class TelegramClaudeBot:
             if not chunk.strip():
                 continue
             await update.message.reply_text(chunk)
+
+    async def _reply_html_chunked(
+        self, update: Update, text: str, keyboard=None
+    ) -> None:
+        """Send ``text`` as ``parse_mode="HTML"``, split to Telegram-safe chunks (P11 T1 live-fix).
+
+        The hard backstop against BadRequest "message too long": a ``/sessions`` listing on a
+        machine with hundreds of sessions (or any long HTML reply) is routed through
+        :func:`~claude_tg.util.split_message` so no single send exceeds Telegram's 4096-UTF-16
+        limit. ``split_message`` **prefers to break on a newline**, and every session row is a
+        complete, self-contained line (no ``<code>``/``<b>`` span crosses a ``\\n``), so a chunk
+        boundary never splits an HTML tag and each chunk stays valid HTML. The optional inline
+        ``keyboard`` is attached to the **last** chunk only — never duplicated per chunk. Blank
+        chunks are skipped; an all-blank/empty text still sends one (possibly empty) message so
+        the operator always gets a reply. ``update.message`` is non-None at the call sites.
+        """
+        chunks = [c for c in split_message(text) if c.strip()] or [text]
+        last = len(chunks) - 1
+        for i, chunk in enumerate(chunks):
+            await update.message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                reply_markup=keyboard if i == last else None,
+            )
 
     # ---- streaming mode (ENGINE_MODE=streaming) -----------------------------
     async def _on_message_streaming(

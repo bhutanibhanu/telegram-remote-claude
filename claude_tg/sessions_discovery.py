@@ -190,13 +190,13 @@ def sdk_list_sessions() -> list[_RawSession]:
                 or getattr(info, "first_prompt", None)
                 or getattr(info, "summary", None)
             )
-            last_modified = getattr(info, "last_modified", None)
+            last_modified = _epoch_seconds(getattr(info, "last_modified", None))
             out.append(
                 _RawSession(
                     session_id=str(session_id),
                     cwd=_opt_str(getattr(info, "cwd", None)),
                     title=_opt_str(title),
-                    last_modified=int(last_modified) if isinstance(last_modified, (int, float)) else None,
+                    last_modified=last_modified,  # already normalized to epoch SECONDS
                     git_branch=_opt_str(getattr(info, "git_branch", None)),
                 )
             )
@@ -212,6 +212,31 @@ def _opt_str(value: object) -> Optional[str]:
         return None
     text = str(value)
     return text if text else None
+
+
+#: Threshold (epoch seconds) above which a timestamp is clearly in MILLISECONDS, not seconds.
+#: The SDK's ``SDKSessionInfo.last_modified`` is epoch **milliseconds** (observed live: values
+#: ~1.78e12 for 2026) — but ``relative_age`` / the recency sort want epoch **seconds**, so a
+#: raw ms value made every row read "just now" and broke the age column. ~1e11 s is the year
+#: ~5138, so any real seconds timestamp is far below it and any real ms timestamp far above —
+#: a safe, unit-agnostic discriminator that also survives an SDK that ever switches to seconds.
+_MILLIS_THRESHOLD = 1e11
+
+
+def _epoch_seconds(value: object) -> Optional[int]:
+    """Normalize an SDK timestamp to epoch **seconds** (the unit the render layer expects).
+
+    The SDK reports ``last_modified`` in epoch **milliseconds**; this divides a millisecond-
+    magnitude value (≥ :data:`_MILLIS_THRESHOLD`) by 1000 and leaves an already-seconds value
+    untouched, so both a current ms SDK and a hypothetical future seconds SDK normalize
+    correctly (the live bug was the render layer treating ms as seconds → permanent "just
+    now"). Returns ``None`` for a missing / non-numeric / boolean value (defensive, RB1 — a
+    bad timestamp must not crash discovery or mis-sort). Truncates to ``int`` seconds.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = value / 1000.0 if value >= _MILLIS_THRESHOLD else float(value)
+    return int(seconds)
 
 
 # ---------------------------------------------------------------------------

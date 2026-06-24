@@ -1058,6 +1058,24 @@ _SESSION_ID_PREFIX = 8
 #: first prompt would otherwise dominate the listing). Trailing "…" marks a clip.
 _SESSION_TITLE_MAX = 60
 
+#: Max chars of a session's cwd shown on its row. A deeply-nested path can be 200+ chars; left
+#: whole, even a capped 15-row listing could blow past Telegram's 4096 limit (and a 200-char
+#: path is unreadable on a phone). We keep the most-informative TAIL (the leaf dirs) with a
+#: leading "…". This bounds each row's size so the cap is meaningful; the bot's split_message
+#: is still the hard backstop against any residual overflow.
+_SESSION_CWD_MAX = 48
+
+#: Max session ROWS shown in a ``/sessions`` listing (P11 T1 live-fix). A real Mac can have
+#: hundreds of sessions (~334 observed live); rendering them all blew past Telegram's 4096
+#: limit (BadRequest "message too long") AND is unusable on a phone. We cap the listing to a
+#: sane number and ALWAYS include every active + bot-known session (the operator's own
+#: projects must never be hidden by the cap), filling the remaining budget with the
+#: most-recent others. ``/attach <id>`` still reaches a session past the cap (the id is shown
+#: on a row when visible; the typed command takes any full/short id regardless). The bot's
+#: reply is ALSO routed through ``split_message`` so even a capped listing with long
+#: cwds/titles can never throw "message too long".
+SESSIONS_LIST_LIMIT = 15
+
 
 @dataclass(frozen=True)
 class ProjectMark:
@@ -1103,6 +1121,26 @@ def _session_title(title: object) -> str:
     return _escape_html(text)
 
 
+def _session_cwd_html(cwd: object) -> str:
+    """``<code>``-wrap a session's cwd, truncating a long path to its TAIL (``/sessions`` row).
+
+    A real session cwd can be 200+ chars (deeply-nested), which is both unreadable on a phone
+    and — across a capped listing — enough to push the message past Telegram's 4096 limit. We
+    keep the most-informative TAIL (the leaf directories, where the project name lives) prefixed
+    with ``…`` when the path exceeds :data:`_SESSION_CWD_MAX`, then wrap in ``<code>`` (R6 —
+    inert monospace, escaped exactly once by :func:`code_path`). A missing/empty cwd reads
+    ``"(no path)"``. Pure; no I/O. (The bot's ``split_message`` is still the hard backstop, but
+    this keeps each row bounded so the cap actually controls the message size.)
+    """
+    text = str(cwd).strip() if cwd is not None else ""
+    if not text:
+        return "(no path)"
+    if len(text) > _SESSION_CWD_MAX:
+        # Keep the tail (leaf dirs) — the head is usually a long, uninformative home prefix.
+        text = "…" + text[-(_SESSION_CWD_MAX - 1):]
+    return code_path(text)
+
+
 def relative_age(last_active: object, *, now: float) -> str:
     """A compact relative age like ``"just now"`` / ``"5m ago"`` / ``"3d ago"`` (``/sessions``).
 
@@ -1128,11 +1166,84 @@ def relative_age(last_active: object, *, now: float) -> str:
     return f"{days}d ago"
 
 
+def _session_sort_key(s: object, marks: dict[str, ProjectMark]) -> tuple[int, float]:
+    """The relevance sort key for one session — lower tuple sorts FIRST (P11 T1 live-fix).
+
+    Ordering (the shared order for BOTH the listing and the attach keyboard, so the visible
+    rows and the one-tap buttons agree):
+
+    1. the chat's **active** project (``→``)        — bucket 0
+    2. any other **bot-known** project (``✓``)      — bucket 1
+    3. every other discovered session               — bucket 2, then most-recent first
+
+    Active + bot-known are few and the most relevant, so they always sort ahead of plain
+    sessions regardless of age (point 1 of the fix — never hide the operator's own projects
+    behind a cap). Within a bucket we sort by ``last_active`` **descending** (negated, so the
+    ascending ``sorted`` puts the most recent first). A missing/odd ``last_active`` sorts last
+    within its bucket (treated as ``-inf`` recency → ``+inf`` key). Pure; no I/O.
+    """
+    sid = str(getattr(s, "session_id", "") or "")
+    mark = marks.get(sid)
+    if mark is not None and mark.active:
+        bucket = 0
+    elif mark is not None:
+        bucket = 1
+    else:
+        bucket = 2
+    last_active = getattr(s, "last_active", None)
+    recency = float(last_active) if isinstance(last_active, (int, float)) else float("-inf")
+    # Negate recency so a LARGER (more recent) timestamp yields a SMALLER key (sorts first);
+    # a missing recency (-inf) negates to +inf and sorts last within the bucket.
+    return (bucket, -recency)
+
+
+def prioritize_sessions(
+    sessions: Iterable[object], marks: dict[str, ProjectMark]
+) -> list[object]:
+    """Sort discovered sessions by display relevance (active → bot-known → recent), STABLE.
+
+    The single source of relevance order for the ``/sessions`` listing AND the attach keyboard
+    so the shown rows and the one-tap buttons are consistent (fix point 5). See
+    :func:`_session_sort_key` for the ordering. Stable (Python's ``sorted`` is) so sessions
+    with an equal key keep the SDK's own order. Pure; never mutates the input.
+    """
+    return sorted(sessions, key=lambda s: _session_sort_key(s, marks))
+
+
+def cap_sessions(
+    ordered: list[object], marks: dict[str, ProjectMark], *, limit: int = SESSIONS_LIST_LIMIT
+) -> list[object]:
+    """Trim a relevance-ordered session list to ``limit`` rows WITHOUT dropping the operator's own.
+
+    Guarantees (fix point 2): EVERY active + bot-known session is kept (their ids are in
+    ``marks``) even if that exceeds ``limit`` — the operator's own projects must never be
+    hidden by the cap; the remaining budget is filled with the most-recent OTHER sessions (the
+    head of ``ordered`` after the bot-known ones, which :func:`prioritize_sessions` already put
+    first). So the result is: all bot-known (in relevance order) + the top non-known up to
+    ``limit`` total (or more, if bot-known alone exceed ``limit``). Pure; preserves order.
+    """
+    if limit <= 0:
+        # Degenerate cap: still never hide the operator's own (keep just the bot-known).
+        return [s for s in ordered if str(getattr(s, "session_id", "") or "") in marks]
+    known: list[object] = []
+    others: list[object] = []
+    for s in ordered:
+        sid = str(getattr(s, "session_id", "") or "")
+        (known if sid in marks else others).append(s)
+    budget = max(0, limit - len(known))
+    kept = known + others[:budget]
+    # Re-impose the relevance order on the kept set (known were already first; this keeps a
+    # stable, deterministic final order matching `ordered`).
+    kept_ids = {id(s) for s in kept}
+    return [s for s in ordered if id(s) in kept_ids]
+
+
 def sessions_listing(
     sessions: Iterable[object],
     marks: dict[str, ProjectMark],
     *,
     now: float,
+    limit: int = SESSIONS_LIST_LIMIT,
 ) -> str:
     """Render the ``/sessions`` listing — discovered machine sessions, merged with bot projects.
 
@@ -1149,29 +1260,47 @@ def sessions_listing(
 
         {→|·} {🟢|⚪} <ab12cd34> <code>/cwd</code> — <title> · <age> [✓ <project>]
 
+    **Sort + cap (P11 T1 live-fix).** A real Mac can have hundreds of sessions; the rows are
+    sorted by relevance (active → bot-known → most-recent, :func:`prioritize_sessions`) and
+    capped to ``limit`` (:func:`cap_sessions`) so the message stays small and usable. The cap
+    NEVER hides the operator's own (active + bot-known) sessions — only the long tail of
+    unrelated ones is trimmed. When the cap hides rows, an **honest footer** states how many of
+    the total are shown and points at ``/attach <id>`` for any session (body-free, escaped).
+
     SB3: the title is truncated + escaped; the cwd is ``<code>``-wrapped (R6, inert monospace)
-    and escaped. The reply MUST be sent ``parse_mode="HTML"``. Pure string; no I/O. An empty
-    ``sessions`` yields the no-sessions notice (the RB1 fallback the bot also uses on a
-    discovery failure).
+    and escaped. The reply MUST be sent ``parse_mode="HTML"`` (and the bot routes it through
+    ``split_message`` as a final length backstop). Pure string; no I/O. An empty ``sessions``
+    yields the no-sessions notice (the RB1 fallback the bot also uses on a discovery failure).
     """
-    rows = list(sessions)
-    if not rows:
+    all_rows = list(sessions)
+    total = len(all_rows)
+    if total == 0:
         return SESSIONS_EMPTY_NOTICE
 
-    out: list[str] = [f"🖥️ <b>Sessions</b> ({len(rows)} found):"]
-    for s in rows:
+    shown_rows = cap_sessions(prioritize_sessions(all_rows, marks), marks, limit=limit)
+    shown = len(shown_rows)
+
+    out: list[str] = [f"🖥️ <b>Sessions</b> ({total} found):"]
+    for s in shown_rows:
         sid = getattr(s, "session_id", "")
         mark = marks.get(str(sid))
         active_glyph = "→" if (mark is not None and mark.active) else "·"
         live_glyph = _SESSION_RUNNING_GLYPH if getattr(s, "running", False) else _SESSION_IDLE_GLYPH
-        cwd = getattr(s, "cwd", None)
-        cwd_html = code_path(cwd) if cwd else "(no path)"
+        cwd_html = _session_cwd_html(getattr(s, "cwd", None))
         title = _session_title(getattr(s, "title", None))
         age = relative_age(getattr(s, "last_active", None), now=now)
         suffix = f" ✓ <b>{_escape_html(mark.name)}</b>" if mark is not None else ""
         out.append(
             f"{active_glyph} {live_glyph} <code>{short_session_id(sid)}</code> "
             f"{cwd_html} — {title} · {age}{suffix}"
+        )
+    if total > shown:
+        # Honest truncation footer (only when rows are actually hidden). Body-free: two counts
+        # + a fixed phrase; the /attach <id> hint is HTML-escaped (``&lt;id&gt;``) so the angle
+        # brackets render literally inside the HTML message and never look like a real tag.
+        out.append(
+            f"\n<i>Showing {shown} of {total} sessions (most recent + your projects). Use</i> "
+            f"<code>/attach &lt;id&gt;</code> <i>to reach any session.</i>"
         )
     return "\n".join(out)
 
@@ -1190,7 +1319,10 @@ _SESSIONS_ATTACH_BUTTON_CAP = 8
 
 
 def sessions_keyboard(
-    sessions: Iterable[object], *, cap: int = _SESSIONS_ATTACH_BUTTON_CAP
+    sessions: Iterable[object],
+    *,
+    marks: Optional[dict[str, ProjectMark]] = None,
+    cap: int = _SESSIONS_ATTACH_BUTTON_CAP,
 ) -> Optional[InlineKeyboardMarkup]:
     """Build the ``[📎 Attach <shortid>]`` button column for a ``/sessions`` listing (P11 T2).
 
@@ -1201,14 +1333,22 @@ def sessions_keyboard(
     check + fork-vs-continue). The button *text* shows the SHORT id (what the row shows) so the
     operator can match button↔row; the *callback_data* carries the FULL id compactly.
 
+    **Relevance (P11 T1 live-fix).** The ``cap`` buttons are the most-RELEVANT sessions, in the
+    SAME order as the listing (active → bot-known → most-recent, :func:`prioritize_sessions`)
+    — so the buttons cover the operator's own + freshest sessions, not an arbitrary first-``cap``
+    in SDK order. ``marks`` (the bot-project map) drives that order; ``None`` falls back to
+    most-recent-first (every session is "other"). The button cap is independent of the listing
+    row cap, but both draw from the same relevance order so a visible row's button is present.
+
     Returns ``None`` when there are no sessions (the listing then has no keyboard) OR when an id
     is unusable — a session with a missing/odd id, or one whose id overflows the callback budget
     (defensive: :func:`encode_attach_callback` raises, which we swallow per-row so one bad id
     never sinks the whole keyboard, RB1). The bot attaches the returned markup to the listing
     message; with ``None`` it sends the listing alone (the typed ``/attach <id>`` still works).
     """
+    ordered = prioritize_sessions(sessions, marks or {})
     rows: list[list[InlineKeyboardButton]] = []
-    for s in sessions:
+    for s in ordered:
         if len(rows) >= cap:
             break
         sid = getattr(s, "session_id", None)
@@ -2141,10 +2281,13 @@ __all__ = [
     # /sessions listing (P11 T1) + attach keyboard (P11 T2)
     "sessions_listing",
     "sessions_keyboard",
+    "prioritize_sessions",
+    "cap_sessions",
     "ProjectMark",
     "short_session_id",
     "relative_age",
     "SESSIONS_EMPTY_NOTICE",
+    "SESSIONS_LIST_LIMIT",
     # coalesce / throttle
     "Coalescer",
     "FlushResult",

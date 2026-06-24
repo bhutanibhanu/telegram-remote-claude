@@ -132,6 +132,35 @@ def test_sdk_adapter_missing_module_returns_empty(monkeypatch):
     assert sdk_list_sessions() == []  # RB1 / SB pin: a missing/renamed SDK degrades cleanly
 
 
+def test_epoch_seconds_normalizes_millis_and_passthrough_seconds():
+    # LIVE BUG: the SDK's last_modified is epoch MILLISECONDS (~1.78e12 for 2026); treating it
+    # as seconds made every /sessions row read "just now" + broke the recency sort. The adapter
+    # normalizes ms → s; an already-seconds value (a hypothetical future SDK) passes through.
+    from claude_tg.sessions_discovery import _epoch_seconds
+
+    ms_2026 = 1782300357915  # epoch ms
+    assert _epoch_seconds(ms_2026) == 1782300357  # ms → s (÷1000, truncated)
+    s_2026 = 1782300357  # already seconds
+    assert _epoch_seconds(s_2026) == 1782300357  # passthrough (below the ms threshold)
+    # Defensive (RB1): missing / non-numeric / boolean → None (never crash, never mis-sort).
+    assert _epoch_seconds(None) is None
+    assert _epoch_seconds("nope") is None
+    assert _epoch_seconds(True) is None
+
+
+def test_sdk_adapter_normalizes_last_modified_to_seconds(monkeypatch):
+    # End-to-end: a FakeSDKInfo with a millisecond last_modified surfaces as epoch SECONDS on
+    # the _RawSession (so relative_age / the sort see seconds, not ms).
+    class FakeSDKModule:
+        @staticmethod
+        def list_sessions():
+            return [FakeSDKInfo(session_id="a", last_modified=1782300357915, summary="s")]
+
+    monkeypatch.setitem(__import__("sys").modules, "claude_agent_sdk", FakeSDKModule)
+    out = sdk_list_sessions()
+    assert out[0].last_modified == 1782300357  # normalized to seconds
+
+
 # ---------------------------------------------------------------------------
 # 2. Transcript path + mtime signal
 # ---------------------------------------------------------------------------
