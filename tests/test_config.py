@@ -41,6 +41,11 @@ def clean_env(monkeypatch):
     # clear them so a host/CI value can't leak into the cap-default assertions below.
     monkeypatch.delenv("IMAGE_MAX_BYTES", raising=False)
     monkeypatch.delenv("FILE_MAX_BYTES", raising=False)
+    # P14 T-SCHED: the scheduler knobs have no TELEGRAM_/CLAUDE_ prefix — clear them so a
+    # host/CI value can't leak into the scheduler-default assertions below.
+    monkeypatch.delenv("SCHEDULER_ENABLED", raising=False)
+    monkeypatch.delenv("SCHEDULE_MAX_TASKS_PER_CHAT", raising=False)
+    monkeypatch.delenv("SCHEDULE_MIN_INTERVAL_SECONDS", raising=False)
 
 
 def test_parse_chat_ids():
@@ -467,3 +472,90 @@ def test_config_bad_file_max_bytes_fails_loud(monkeypatch):
     monkeypatch.setenv("FILE_MAX_BYTES", "0")
     with pytest.raises(ValueError):
         Config.from_env(dotenv_path=None)
+
+
+# ---- P14 T-SCHED scheduler knobs -------------------------------------------
+
+from claude_tg.config import (  # noqa: E402
+    DEFAULT_SCHEDULE_MAX_TASKS_PER_CHAT,
+    DEFAULT_SCHEDULE_MIN_INTERVAL_SECONDS,
+    DEFAULT_SCHEDULER_ENABLED,
+    parse_schedule_max_tasks_per_chat,
+    parse_schedule_min_interval_seconds,
+)
+
+
+def test_scheduler_enabled_default_on():
+    assert DEFAULT_SCHEDULER_ENABLED is True
+
+
+def test_parse_schedule_max_tasks_unset_empty_default():
+    assert parse_schedule_max_tasks_per_chat(None) == DEFAULT_SCHEDULE_MAX_TASKS_PER_CHAT == 20
+    assert parse_schedule_max_tasks_per_chat("") == 20
+    assert parse_schedule_max_tasks_per_chat("   ") == 20
+
+
+def test_parse_schedule_max_tasks_positive_value():
+    assert parse_schedule_max_tasks_per_chat("5") == 5
+    assert parse_schedule_max_tasks_per_chat(" 3 ") == 3
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "x", "1.5"])
+def test_parse_schedule_max_tasks_invalid_raises(bad):
+    with pytest.raises(ValueError):
+        parse_schedule_max_tasks_per_chat(bad)
+
+
+def test_parse_schedule_min_interval_unset_empty_default():
+    assert parse_schedule_min_interval_seconds(None) == DEFAULT_SCHEDULE_MIN_INTERVAL_SECONDS == 60
+    assert parse_schedule_min_interval_seconds("") == 60
+
+
+def test_parse_schedule_min_interval_positive_value():
+    assert parse_schedule_min_interval_seconds("30") == 30
+    assert parse_schedule_min_interval_seconds(" 120 ") == 120
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "x", "1.5"])
+def test_parse_schedule_min_interval_invalid_raises(bad):
+    with pytest.raises(ValueError):
+        parse_schedule_min_interval_seconds(bad)
+
+
+def test_from_env_scheduler_defaults(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.scheduler_enabled is True
+    assert cfg.schedule_max_tasks_per_chat == 20
+    assert cfg.schedule_min_interval_seconds == 60
+
+
+def test_from_env_scheduler_overrides(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv("SCHEDULE_MAX_TASKS_PER_CHAT", "7")
+    monkeypatch.setenv("SCHEDULE_MIN_INTERVAL_SECONDS", "30")
+    cfg = Config.from_env(dotenv_path=None)
+    assert cfg.scheduler_enabled is False
+    assert cfg.schedule_max_tasks_per_chat == 7
+    assert cfg.schedule_min_interval_seconds == 30
+
+
+def test_from_env_bad_schedule_knob_fails_loud(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("SCHEDULE_MAX_TASKS_PER_CHAT", "0")
+    with pytest.raises(ValueError):
+        Config.from_env(dotenv_path=None)
+
+
+def test_bare_config_has_scheduler_defaults():
+    # A bare Config(...) (the default-state safety check) must carry the scheduler defaults.
+    from pathlib import Path
+
+    cfg = Config(bot_token="t", allowed_chat_ids=frozenset({1}), workdir=Path("/x"))
+    assert (cfg.scheduler_enabled, cfg.schedule_max_tasks_per_chat, cfg.schedule_min_interval_seconds) == (
+        True, 20, 60,
+    )

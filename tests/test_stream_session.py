@@ -95,6 +95,9 @@ class FakeEngine:
         self.session_id = session_id
         self.resolve_calls: list[tuple[str, object]] = []
         self.cancel_calls: list = []
+        # P14 T-FIRE: records the ``proactive`` flag passed to each send() (the force-gate
+        # signal threaded by _drive_turn) so a fire test can assert it was set.
+        self.proactive_calls: list[bool] = []
         self.started = False
         self.resumed: str | None = None
         self.stopped = False
@@ -114,7 +117,11 @@ class FakeEngine:
     async def stop(self) -> None:
         self.stopped = True
 
-    async def send(self, prompt: str, *, timeout=None):
+    async def send(self, prompt: str, *, timeout=None, proactive=False, **_kwargs):
+        # P14 T-FIRE: ``proactive`` is recorded so a fire test can assert the force-gate flag
+        # was threaded into engine.send; ignored otherwise (the FakeEngine doesn't gate). The
+        # ``**_kwargs`` absorbs ``images`` (P10) so the fake stays signature-compatible.
+        self.proactive_calls.append(proactive)
         for item in self._script:
             if item is HOLD:
                 # Park until the operator resolves (mirrors the held can_use_tool).
@@ -6892,3 +6899,238 @@ def test_mutation_probe_sb2_out_of_root_refusal(tmp_path):
     refused = s_no.attach_session(1, "X")
     assert refused.ok is False, "an out-of-ALLOWED_ROOTS cwd MUST be refused (SB2)"
     assert store_no.list_projects(1) == {}
+
+
+# ===========================================================================
+# P14 T-FIRE ⭐ — fire_schedule: the proactive turn entry point (force-gate +
+# audit + overlap policy). Mock engine; a live AuditLog so the records assert.
+# ===========================================================================
+
+
+def _make_fire_session(engine, tmp_path, *, store=None):
+    """A StreamingSession with a live, body-free AuditLog wired (for proactive_fire/skip)."""
+    from claude_tg.audit import AuditLog
+
+    session = make_session(engine, store=store)
+    session.audit_log = AuditLog(tmp_path / "audit.jsonl")
+    return session
+
+
+def _schedule(name="ci", *, chat_id=1, project=None, prompt="run the tests"):
+    from claude_tg.scheduler import Schedule
+
+    return Schedule(
+        name=name, interval_seconds=60, prompt=prompt, chat_id=chat_id,
+        next_run=0.0, project=project,
+    )
+
+
+async def test_fire_schedule_drives_a_proactive_turn_and_audits_fire(tmp_path):
+    """fire_schedule sends the body-free ⏰ header, audits a ``proactive_fire`` session_event,
+    and drives the turn with ``proactive=True`` (the force-gate signal reaches engine.send)."""
+    engine = FakeEngine([
+        TextEvent(text="all green", session_id="s"),
+        ResultEvent(session_id="s", is_error=False, subtype="success"),
+    ])
+    session = _make_fire_session(engine, tmp_path)
+    rec = Recorder()
+
+    ok = await session.fire_schedule(_schedule("ci"), send=rec.send, edit=rec.edit, delete=rec.delete)
+
+    assert ok is True
+    # The force-gate flag was threaded into engine.send (a proactive turn).
+    assert engine.proactive_calls == [True]
+    # A body-free ⏰ <name> (scheduled) header was sent (the name only, never the prompt).
+    assert any("ci" in s["text"] and "scheduled" in s["text"] for s in rec.sends)
+    assert not any("run the tests" in s["text"] for s in rec.sends)  # prompt never echoed
+    # The fire was audited body-free: a proactive_fire session_event with the task name.
+    events = session.audit_log.tail(20)
+    fires = [e for e in events if e.kind == "session_event" and (e.summary or "").startswith("proactive_fire")]
+    assert len(fires) == 1
+    assert "ci" in (fires[0].summary or "")
+    assert "run the tests" not in (fires[0].summary or "")  # SB3: no prompt in the record
+
+
+async def test_fire_schedule_into_busy_project_skips_no_overlap_and_audits_skip(tmp_path):
+    """⭐ Overlap policy: a fire into a BUSY chat/project does NOT stack a second turn — it is
+    a clean skip (StreamingBusy), with a body-free ⏰ skipped notice + a ``proactive_skip``
+    audit. The other turn keeps running untouched (no two turns over each other)."""
+    # A first turn that PARKS (holds), keeping the project busy.
+    engine = FakeEngine([HOLD, ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = _make_fire_session(engine, tmp_path)
+    rec = Recorder()
+
+    first = asyncio.create_task(session.handle_message(1, "first", send=rec.send, edit=rec.edit))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # Fire a schedule into the SAME (busy) chat — it must skip, not stack.
+    fired = await session.fire_schedule(_schedule("ci"), send=rec.send, edit=rec.edit, delete=rec.delete)
+    assert fired is False  # skipped (busy)
+    assert any("skipped" in s["text"] and "ci" in s["text"] for s in rec.sends)
+    skips = [
+        e for e in session.audit_log.tail(20)
+        if e.kind == "session_event" and (e.summary or "").startswith("proactive_skip")
+    ]
+    assert len(skips) == 1 and skips[0].decision == "busy"
+
+    # The first turn was never disturbed — release + finish it cleanly.
+    engine.cancel()
+    await asyncio.wait_for(first, timeout=2.0)
+
+
+async def test_fire_schedule_rb1_a_turn_error_becomes_a_skip_never_raises(tmp_path):
+    """⭐ RB1-total: if the driven turn raises a NON-busy error, fire_schedule CATCHES it,
+    audits a ``proactive_skip`` (decision=error), and returns False — it NEVER propagates (so a
+    single bad fire can't kill the firing loop or the bot)."""
+    class BoomEngine(FakeEngine):
+        async def send(self, prompt, *, timeout=None, proactive=False, **_kwargs):
+            self.proactive_calls.append(proactive)
+            raise RuntimeError("turn boom")
+            yield  # pragma: no cover - unreachable; makes this an async generator
+
+    engine = BoomEngine([])
+    session = _make_fire_session(engine, tmp_path)
+    rec = Recorder()
+
+    # Must NOT raise despite the turn blowing up.
+    fired = await session.fire_schedule(_schedule("ci"), send=rec.send, edit=rec.edit, delete=rec.delete)
+    assert fired is False
+    skips = [
+        e for e in session.audit_log.tail(20)
+        if e.kind == "session_event" and (e.summary or "").startswith("proactive_skip")
+    ]
+    assert len(skips) == 1 and skips[0].decision == "error"
+
+
+async def test_fire_schedule_pins_the_override_project(tmp_path):
+    """``project_override`` (the task's pinned project) targets THAT project even when another
+    is active — a scheduled task runs its OWN project, not whatever the chat switched to."""
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "alpha"), make_active=True)
+    store.create(1, "beta", str(tmp_path / "beta"), make_active=True)  # beta now active
+    engine = FakeEngine([ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = _make_fire_session(engine, tmp_path, store=store)
+    rec = Recorder()
+
+    # Fire a schedule PINNED to alpha while beta is active.
+    await session.fire_schedule(
+        _schedule("t", project="alpha"), send=rec.send, edit=rec.edit, delete=rec.delete
+    )
+    # The turn ran against alpha's runtime (the pinned project), not the active beta.
+    assert "alpha" in session._chat(1).runtimes
+    # beta remains the store's active project (the fire did not switch it).
+    assert store.get_active(1) == "beta"
+
+
+async def test_handle_message_threads_proactive_into_engine_send():
+    """handle_message(proactive=True) threads the force-gate flag into engine.send; a NORMAL
+    turn passes proactive=False (default). The kwarg-threading guard (independent of
+    fire_schedule), so the engine's force-gate is armed for a proactive turn."""
+    engine = FakeEngine([ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = make_session(engine)
+    rec = Recorder()
+
+    # Normal turn → proactive=False reaches engine.send.
+    await session.handle_message(1, "normal", send=rec.send, edit=rec.edit)
+    assert engine.proactive_calls[-1] is False
+
+    # Proactive turn → proactive=True reaches engine.send (the force-gate signal).
+    await session.handle_message(1, "fire", send=rec.send, edit=rec.edit, proactive=True)
+    assert engine.proactive_calls[-1] is True
+
+
+async def test_handle_message_project_override_pins_named_project(tmp_path):
+    """handle_message(project_override='alpha') runs against alpha even when beta is active —
+    a proactive task targets ITS pinned project (the turn never retargets to the active one)."""
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path / "alpha"), make_active=True)
+    store.create(1, "beta", str(tmp_path / "beta"), make_active=True)  # beta active
+    engine = FakeEngine([ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = make_session(engine, store=store)
+    rec = Recorder()
+
+    await session.handle_message(
+        1, "go", send=rec.send, edit=rec.edit, command_initiated=True, project_override="alpha"
+    )
+    # The turn built alpha's runtime (the pinned project), beta stays the store's active.
+    assert "alpha" in session._chat(1).runtimes
+    assert store.get_active(1) == "beta"
+
+
+async def test_fire_schedule_skips_deauthorized_chat_sb1_at_fire_time(tmp_path):
+    """⭐ Codex-QA BLOCKER 2 — SB1 AT FIRE TIME: a schedule whose chat_id is NO LONGER in the
+    allowlist must NEVER fire (a chat removed from TELEGRAM_ALLOWED_CHAT_IDS since /every). The
+    fire SKIPS — no header, no turn, no proactive_fire — and audits a proactive_skip
+    (decision=unauthorized). MUTATION-PROBE companion: drop the allowlist re-check in
+    fire_schedule and this de-authorized chat would receive a proactive turn → the test fails."""
+    # The session's config allowlists ONLY chat 1; the schedule targets chat 999 (de-authorized).
+    engine = FakeEngine([ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = _make_fire_session(engine, tmp_path)  # make_config default allowed=(1,)
+    rec = Recorder()
+
+    fired = await session.fire_schedule(
+        _schedule("ci", chat_id=999), send=rec.send, edit=rec.edit, delete=rec.delete
+    )
+
+    assert fired is False  # skipped — never fired
+    assert engine.proactive_calls == []  # the turn NEVER ran (engine.send never called)
+    assert rec.sends == []  # NO header sent to the de-authorized chat
+    events = session.audit_log.tail(20)
+    # Audited as unauthorized, NOT as a proactive_fire.
+    skips = [e for e in events if e.kind == "session_event" and (e.summary or "").startswith("proactive_skip")]
+    assert len(skips) == 1 and skips[0].decision == "unauthorized"
+    assert not any((e.summary or "").startswith("proactive_fire") for e in events)
+
+
+async def test_fire_schedule_allowlisted_chat_still_fires(tmp_path):
+    """The companion to the SB1-at-fire test: an ALLOWLISTED chat (1) still fires normally —
+    the re-check only blocks de-authorized chats, it does not break legitimate fires."""
+    engine = FakeEngine([ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = _make_fire_session(engine, tmp_path)  # allowed=(1,)
+    rec = Recorder()
+
+    fired = await session.fire_schedule(
+        _schedule("ci", chat_id=1), send=rec.send, edit=rec.edit, delete=rec.delete
+    )
+    assert fired is True
+    assert engine.proactive_calls == [True]  # the gated turn ran
+    fires = [
+        e for e in session.audit_log.tail(20)
+        if e.kind == "session_event" and (e.summary or "").startswith("proactive_fire")
+    ]
+    assert len(fires) == 1
+
+
+async def test_fire_schedule_busy_skip_sends_only_skip_notice_not_header(tmp_path):
+    """⭐ Codex-QA NON-BLOCKING (header ordering): a fire skipped because the chat is BUSY
+    sends ONLY the ⏰ skipped notice — NOT a start header (the busy pre-check runs BEFORE the
+    header). So a busy-skip never shows a confusing header-then-skip pair."""
+    # A first turn that PARKS, keeping the chat busy.
+    engine = FakeEngine([HOLD, ResultEvent(session_id="s", is_error=False, subtype="success")])
+    session = _make_fire_session(engine, tmp_path)
+    rec = Recorder()
+
+    first = asyncio.create_task(session.handle_message(1, "first", send=rec.send, edit=rec.edit))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    rec.sends.clear()  # ignore anything the first turn sent; focus on the fire's sends
+
+    fired = await session.fire_schedule(_schedule("ci"), send=rec.send, edit=rec.edit, delete=rec.delete)
+    assert fired is False
+    # EXACTLY ONE send from the fire: the skip notice. No "(scheduled)…" start header.
+    assert len(rec.sends) == 1
+    assert "skipped" in rec.sends[0]["text"] and "ci" in rec.sends[0]["text"]
+    assert not any("(scheduled)" in s["text"] for s in rec.sends)
+    # Audited as busy, and NO proactive_fire was recorded for the skipped fire.
+    events = session.audit_log.tail(20)
+    assert any(e.kind == "session_event" and (e.summary or "").startswith("proactive_skip")
+               and e.decision == "busy" for e in events)
+    assert not any((e.summary or "").startswith("proactive_fire") for e in events)
+
+    engine.cancel()
+    await asyncio.wait_for(first, timeout=2.0)

@@ -32,6 +32,10 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # avoid an import cycle at runtime (scheduler imports from this module)
+    from .scheduler import Schedule
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +65,17 @@ class DuplicateProject(ValueError):
 
 class UnknownProject(KeyError):
     """No project with that name (case-insensitive) exists for the chat."""
+
+
+class MaxSchedulesExceeded(ValueError):
+    """A chat already holds the per-chat schedule cap (``SCHEDULE_MAX_TASKS_PER_CHAT``).
+
+    Raised by :meth:`JsonSessionStore.add_schedule` when creating a NEW (non-overwrite)
+    schedule would push the chat over its cap — a fail-closed DoS-by-schedule guard
+    (P14 T2 / design §6). Overwriting an existing same-name schedule never trips it (it
+    does not grow the count). The bot turns this into a clean "you've hit the limit"
+    reply (RB1) rather than silently over-capping.
+    """
 
 
 def validate_project_name(name: str) -> None:
@@ -598,6 +613,220 @@ class JsonSessionStore:
         self._save_raw(raw)
         return True
 
+    # ---- proactive schedules (per-chat, P14 T2) ----------------------------
+    #
+    # Scheduled-task DEFINITIONS persist alongside macros/projects under
+    # ``chats[<id>]["schedules"]`` ({name: record}), reusing the SAME atomic + 0600
+    # write discipline (:meth:`_save_raw`, RB6). A record is the serialized form of a
+    # :class:`~claude_tg.scheduler.Schedule`. This task persists the dormant data only —
+    # nothing here fires a schedule (that is T-FIRE).
+    #
+    # RB3/RB6 — NEVER replay a missed fire. The stored ``next_run`` round-trips faithfully
+    # (so a test can assert the persisted record), but the runtime is meant to RE-ARM every
+    # schedule from *now* at startup via :meth:`rearm_all_schedules` (next_run = now +
+    # interval) BEFORE the firing loop consults them — so a window that elapsed while the bot
+    # was down fires at the NEXT interval, never as a burst of stacked catch-up runs.
+
+    def add_schedule(
+        self, schedule: "Schedule", *, max_per_chat: int | None = None
+    ) -> None:
+        """Persist (create or overwrite) a proactive schedule for its chat (atomic + 0600).
+
+        ``/every`` create. The schedule's name is SB4-validated by :class:`Schedule`'s own
+        constructor (an invalid name can't reach here). Stored under
+        ``chats[<schedule.chat_id>]["schedules"][<name>]`` with the name resolved
+        **case-insensitively** (mirroring :meth:`save_macro`/``create``): an existing
+        same-name (case-insensitive) schedule is **overwritten in place** — so re-creating
+        ``/every 1h CI …`` then ``/every 2h ci …`` keeps exactly ONE schedule (the
+        original-case key, the latest definition), never two colliding entries.
+
+        ``max_per_chat`` (the ``SCHEDULE_MAX_TASKS_PER_CHAT`` cap, T3) is enforced
+        **fail-closed** for a genuinely NEW name: if the chat already holds ``max_per_chat``
+        schedules and this name is not one of them, raises :class:`MaxSchedulesExceeded`
+        **before any write** (a DoS-by-schedule guard). Overwriting an existing name never
+        trips the cap (it does not grow the count). ``None`` (the default) disables the cap
+        check (the pure store stays usable without config). Persists.
+        """
+        raw = self._load_raw()
+        chat = self._ensure_chat(raw, schedule.chat_id)
+        schedules = chat.setdefault("schedules", {})
+        if not isinstance(schedules, dict):
+            schedules = {}
+            chat["schedules"] = schedules
+        existing = _resolve_name(schedules, schedule.name)
+        if (
+            existing is None
+            and max_per_chat is not None
+            and len(schedules) >= max_per_chat
+        ):
+            # Fail-closed: refuse a NEW schedule that would exceed the cap (an overwrite of
+            # an existing name is fine — it does not grow the count). Never silently over-cap.
+            raise MaxSchedulesExceeded(
+                f"chat already has {len(schedules)} schedules (max {max_per_chat})"
+            )
+        schedules[existing or schedule.name] = _serialize_schedule(schedule)
+        self._save_raw(raw)
+
+    def list_schedules(self, chat_id: int) -> list["Schedule"]:
+        """The chat's schedules as :class:`~claude_tg.scheduler.Schedule` objects (``/schedules``).
+
+        Read-only (never raises, RB1): a missing chat / non-dict ``schedules`` map / a
+        malformed record all degrade — a bad record is skipped, an absent chat reads as ``[]``.
+        Returns the schedules **as stored** (the persisted ``next_run`` round-trips faithfully)
+        in insertion order. The runtime re-arms ``next_run`` from now via
+        :meth:`rearm_all_schedules` at startup (RB3) — this accessor itself does not mutate
+        time, so the persisted record is observable for tests + ``/schedules``.
+        """
+        chat = self._chat(self._load_raw(), chat_id)
+        if chat is None:
+            return []
+        raw_schedules = chat.get("schedules")
+        if not isinstance(raw_schedules, dict):
+            return []
+        out: list[Schedule] = []
+        for name, record in raw_schedules.items():
+            if not isinstance(name, str) or not isinstance(record, dict):
+                continue
+            schedule = _deserialize_schedule(name, chat_id, record)
+            if schedule is not None:
+                out.append(schedule)
+        return out
+
+    def get_schedule(self, chat_id: int, name: str) -> "Schedule | None":
+        """The chat's schedule named ``name`` (case-insensitive), or ``None`` (read-only, RB1).
+
+        Mirrors :meth:`get_macro`: a missing chat / schedule / malformed record reads as
+        ``None``. Never raises.
+        """
+        chat = self._chat(self._load_raw(), chat_id)
+        if chat is None:
+            return None
+        raw_schedules = chat.get("schedules")
+        if not isinstance(raw_schedules, dict):
+            return None
+        key = _resolve_name(raw_schedules, name)
+        if key is None:
+            return None
+        record = raw_schedules[key]
+        if not isinstance(record, dict):
+            return None
+        return _deserialize_schedule(key, chat_id, record)
+
+    def remove_schedule(self, chat_id: int, name: str) -> bool:
+        """Delete the schedule ``name`` (case-insensitive); return whether one was removed.
+
+        ``/unschedule <name>``. Never raises (RB1): a missing chat / schedule returns
+        ``False`` (a clean "no such schedule" the bot reports). Persists only when something
+        was actually removed.
+        """
+        raw = self._load_raw()
+        chat = self._chat(raw, chat_id)
+        if chat is None:
+            return False
+        schedules = chat.get("schedules")
+        if not isinstance(schedules, dict):
+            return False
+        key = _resolve_name(schedules, name)
+        if key is None:
+            return False
+        del schedules[key]
+        self._save_raw(raw)
+        return True
+
+    def set_schedule_paused(self, chat_id: int, name: str, paused: bool) -> bool:
+        """Pause/resume the schedule ``name`` (case-insensitive); return whether it was found.
+
+        ``/pause`` · ``/resume``. Flips the persisted ``paused`` flag without disturbing
+        ``next_run`` (so the cadence resumes where it left off). Never raises (RB1): a
+        missing chat / schedule returns ``False`` (the bot reports "no such schedule");
+        a found schedule is updated + persisted and returns ``True``. A flip to the value it
+        already holds still persists + returns ``True`` (idempotent, simplest contract).
+        """
+        raw = self._load_raw()
+        chat = self._chat(raw, chat_id)
+        if chat is None:
+            return False
+        schedules = chat.get("schedules")
+        if not isinstance(schedules, dict):
+            return False
+        key = _resolve_name(schedules, name)
+        if key is None:
+            return False
+        record = schedules[key]
+        if not isinstance(record, dict):
+            return False
+        record["paused"] = bool(paused)
+        self._save_raw(raw)
+        return True
+
+    def all_schedules(self) -> list["Schedule"]:
+        """EVERY chat's schedules as :class:`~claude_tg.scheduler.Schedule` objects (P14 T-FIRE).
+
+        The flat, cross-chat view the firing driver consults each tick to find what is due
+        (``list_schedules`` is per-chat; the driver fires for ALL chats). Each schedule carries
+        its own ``chat_id`` (so the driver knows where to fire) and the persisted ``next_run``.
+        Read-only / RB1: a missing/non-dict ``chats`` map reads as ``[]``; a malformed chat or
+        schedule record is skipped (never raises). Returned in chat-then-insertion order (a
+        stable, deterministic order so the driver's due-list + tests are reproducible).
+        """
+        raw = self._load_raw()
+        chats = raw.get("chats")
+        if not isinstance(chats, dict):
+            return []
+        out: list[Schedule] = []
+        for chat_key, chat in chats.items():
+            if not isinstance(chat, dict):
+                continue
+            try:
+                chat_id = int(chat_key)
+            except (TypeError, ValueError):
+                continue  # a non-int chat key can't own a routable schedule (defensive)
+            schedules = chat.get("schedules")
+            if not isinstance(schedules, dict):
+                continue
+            for name, record in schedules.items():
+                if not isinstance(name, str) or not isinstance(record, dict):
+                    continue
+                schedule = _deserialize_schedule(name, chat_id, record)
+                if schedule is not None:
+                    out.append(schedule)
+        return out
+
+    def rearm_all_schedules(self, now: float) -> None:
+        """Re-arm EVERY chat's schedules' ``next_run`` to ``now + interval`` — RB3/RB6.
+
+        Called ONCE at startup (by the future firing driver, T-FIRE) BEFORE the loop
+        consults the schedules: it rewrites each schedule's ``next_run`` to ``now +
+        interval_seconds`` and persists, so a fire window that elapsed while the bot was
+        down is **never replayed** as a burst — every schedule fires at its NEXT interval
+        from process start (the abandon-and-lazy-resume posture, design §5.5). ``now`` is
+        injected (a float epoch) so it is deterministic in tests; the bot passes
+        ``time.time()``. Paused schedules are re-armed too (so a later ``/resume`` resumes
+        on a fresh cadence, never a stale stored fire). A malformed record is skipped
+        defensively (RB1); persists once if anything changed. Never raises on a normal store.
+        """
+        raw = self._load_raw()
+        chats = raw.get("chats")
+        if not isinstance(chats, dict):
+            return
+        changed = False
+        for chat in chats.values():
+            if not isinstance(chat, dict):
+                continue
+            schedules = chat.get("schedules")
+            if not isinstance(schedules, dict):
+                continue
+            for record in schedules.values():
+                if not isinstance(record, dict):
+                    continue
+                interval = record.get("interval_seconds")
+                if not isinstance(interval, int) or interval <= 0:
+                    continue  # a malformed interval can't be re-armed; leave it for list to skip
+                record["next_run"] = now + interval
+                changed = True
+        if changed:
+            self._save_raw(raw)
+
     # ---- registry internals -----------------------------------------------
 
     @staticmethod
@@ -660,6 +889,63 @@ def _resolve_name(projects: dict, name: str) -> str | None:
         if isinstance(key, str) and key.casefold() == target:
             return key
     return None
+
+
+def _serialize_schedule(schedule: "Schedule") -> dict:
+    """A JSON-serializable record for a :class:`~claude_tg.scheduler.Schedule` (P14 T2).
+
+    The chat id is the dict KEY in the store (``chats[<id>]``) and the name is the
+    schedules-map key, so neither is duplicated into the record body — the record carries
+    the fields that vary per schedule. ``prompt`` is the operator-authored turn text stored
+    verbatim (SB4: it is fired as an engine prompt, never a shell command). Pure (no I/O).
+    """
+    return {
+        "interval_seconds": schedule.interval_seconds,
+        "prompt": schedule.prompt,
+        "project": schedule.project,
+        "next_run": schedule.next_run,
+        "paused": bool(schedule.paused),
+        "created_at": schedule.created_at,
+    }
+
+
+def _deserialize_schedule(name: str, chat_id: int, record: dict) -> "Schedule | None":
+    """Rebuild a :class:`~claude_tg.scheduler.Schedule` from a stored record, or ``None``.
+
+    Defensive (RB1): a record missing/own-bad ``interval_seconds`` (the one field with no
+    safe default — a schedule with no interval is meaningless) yields ``None`` so a
+    hand-edited / corrupt entry is skipped by the caller rather than crashing the listing.
+    A bad ``name`` (SB4) likewise yields ``None`` (the :class:`Schedule` constructor would
+    raise — we catch it). Missing optional fields fall back to safe defaults
+    (``project=None``, ``next_run=0.0``, ``paused=False``, ``created_at=0.0``). The import
+    is local to break the module cycle (scheduler imports from this module).
+    """
+    from .scheduler import InvalidInterval, InvalidScheduleName, Schedule
+
+    interval = record.get("interval_seconds")
+    if not isinstance(interval, int) or isinstance(interval, bool) or interval <= 0:
+        return None
+    next_run = record.get("next_run")
+    next_run_val = float(next_run) if isinstance(next_run, (int, float)) else 0.0
+    created_at = record.get("created_at")
+    created_val = float(created_at) if isinstance(created_at, (int, float)) else 0.0
+    project = record.get("project")
+    project_val = project if isinstance(project, str) and project else None
+    prompt = record.get("prompt")
+    prompt_val = prompt if isinstance(prompt, str) else ""
+    try:
+        return Schedule(
+            name=name,
+            interval_seconds=interval,
+            prompt=prompt_val,
+            chat_id=chat_id,
+            next_run=next_run_val,
+            project=project_val,
+            paused=bool(record.get("paused")),
+            created_at=created_val,
+        )
+    except (InvalidScheduleName, InvalidInterval):
+        return None
 
 
 def _active_project(chat: dict) -> dict | None:

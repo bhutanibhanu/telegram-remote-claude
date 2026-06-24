@@ -28,6 +28,7 @@ You choose which with one environment variable.
 - [Keeping it running (keep-alive)](#keeping-it-running-keep-alive)
 - [Commands](#commands)
 - [Multi-project & concurrency](#multi-project--concurrency-streaming-mode)
+- [Proactive scheduler](#proactive-scheduler-streaming-mode)
 - [Configuration](#configuration-env)
 - [Troubleshooting](#troubleshooting)
 - [Docs](#docs)
@@ -222,6 +223,12 @@ Claude to read; `/get` pulls one back), or **a voice note** — with a transcrib
 | `/switch <name>` | **Streaming.** Switch the active project; your next message resumes it |
 | `/rm <name>` | **Streaming.** Drop a project from the registry (its Claude transcript is left on disk). Can't remove the active or an in-flight project |
 | `/audit [n]` | **Streaming.** Show the recent **body-free** decision trail for this chat (tool allow/deny, plan approve/reject, `/yolo`, attach/switch/watch) streamed back as a compact list — last 20 by default, `/audit <n>` for the last *n* (capped at 100). Read-only (SB1); records contain no command/file bodies. Needs `CLAUDE_STATE_FILE` (or `AUDIT_LOG_FILE`) so the durable log exists |
+| `/every <interval> <name> <prompt>` | **Streaming.** Schedule a recurring prompt fired as a normal **gated** turn (`<interval>` like `30m`/`1h`/`2d`/`90s`; `<name>` is your label; `<prompt>` is the turn text). Runs unattended through the same approval gate — a risky tool holds then auto-denies (see [Proactive scheduler](#proactive-scheduler-streaming-mode)). Needs `CLAUDE_STATE_FILE` so schedules persist |
+| `/schedules` | **Streaming.** List this chat's schedules — name, interval, next run, paused marker, pinned project, and a truncated prompt preview. Body-free |
+| `/unschedule <name>` | **Streaming.** Remove a schedule |
+| `/pause <name>` | **Streaming.** Pause a schedule without deleting it (keeps its place in the cadence) |
+| `/resume <name>` | **Streaming.** Resume a paused schedule |
+| `/runnow <name>` | **Streaming.** Fire a schedule immediately through the same gated proactive path (with you present you can tap *Allow*); does not change its next scheduled run |
 
 The **Streaming**-tagged commands reply with a short "streaming mode only" notice when
 `ENGINE_MODE=oneshot`. Long replies are auto-split into Telegram-sized chunks; a typing
@@ -253,6 +260,32 @@ turns one chat into many independent workspaces:
 
 See [ADR-004](docs/adr/ADR-004-multi-project-sessions.md) (projects) and
 [ADR-005](docs/adr/ADR-005-concurrency-correlation.md) (concurrency) for the design.
+
+## Proactive scheduler (streaming mode)
+
+The bot can also work **on a schedule** without you prompting it: *"run my tests every
+hour and tell me if anything is red,"* *"summarize what changed in this project each
+evening."* Schedule a recurring prompt with `/every <interval> <name> <prompt>` (interval
+like `30m`/`1h`/`2d`); the bot fires it as a normal turn on that cadence and the result
+streams into the chat. `/schedules` lists them, `/unschedule`/`/pause`/`/resume` manage
+them, and `/runnow <name>` fires one immediately. Schedules need `CLAUDE_STATE_FILE` so
+they persist; on restart they re-arm from *now* (a fire missed while the bot was down is
+**not** replayed — no thundering herd on wake). It's on by default but does nothing until
+you create a schedule (`SCHEDULER_ENABLED=false` disables it entirely).
+
+**A scheduled turn runs with no one watching — so it forces the gate ON.** This is the
+load-bearing safety property: a proactive (unattended) turn runs through the **same**
+approval gate as a typed turn, but with the gate **forced on** — it ignores a standing
+`/yolo` and any allow-session grant, so an unattended fire can **never** inherit allow-all.
+A safe read/search tool still auto-runs (so a read-only check completes unattended), but a
+**risky** tool (`Write`/`Edit`/`Bash`/…) has no one there to approve it, so it **holds and
+the answer-backstop auto-denies it** — the scheduled turn can't silently do anything risky.
+A task that genuinely needs to write or run shell is your cue to **be present**: use
+`/runnow` and tap *Allow*, or run it as a normal turn. Every fire (and every skip) is
+recorded body-free in the [audit log](#commands) (`/audit`), the schedule's prompt is never
+displayed or logged, and the allowlist (SB1) is re-checked **at fire time** — a chat removed
+from `TELEGRAM_ALLOWED_CHAT_IDS` can no longer receive fires. See
+[ADR-008](docs/adr/ADR-008-proactive-scheduler.md) for the full design.
 
 ## Voice notes (streaming mode)
 
@@ -324,6 +357,9 @@ its default; only the first two are required.
 | `AUDIT_LOG_MAX_BYTES` | | `5242880` (5 MB) | *(streaming)* Size the audit log may reach before a 1-keep rotation to `<file>.1` (disk bounded to ~2×). Positive integer; else fails loud. |
 | `BASH_POLICY_MODE` | | `flag` | *(streaming)* Bash command-policy mode (P13): `flag` \| `deny` \| `off`. `flag` (default) escalates the approval prompt for a matched dangerous command (⚠️, no *Allow for session*, re-prompts even under a grant/`/yolo`); `deny` auto-denies it; `off` is byte-for-byte the pre-P13 gate. Invalid value → fails loud at startup. |
 | `BASH_POLICY_EXTRA_PATTERNS` | | empty | *(streaming)* Extra Bash-policy denylist regexes, **additive** to the built-ins (built-ins can't be removed via config). Newline- or semicolon-separated (commas are not separators). A regex that won't compile → fails loud at startup. |
+| `SCHEDULER_ENABLED` | | `true` | *(streaming)* Whether the [proactive scheduler](#proactive-scheduler-streaming-mode) loop runs (P14). **On by default but zero-risk** — the loop runs but nothing fires until you create a schedule with `/every`. Set `false` to disable proactive firing entirely. |
+| `SCHEDULE_MAX_TASKS_PER_CHAT` | | `20` | *(streaming)* Per-chat cap on the number of schedules (a DoS-by-schedule bound). A `/every` over the cap is refused with a clean message. Positive integer; else fails loud at startup. |
+| `SCHEDULE_MIN_INTERVAL_SECONDS` | | `60` | *(streaming)* Floor (seconds) on a `/every` interval, so a typo like `/every 1s` can't schedule a host-hammering cadence. A shorter interval is rejected at create time. Positive integer; else fails loud at startup. |
 
 The `*(streaming)*` variables are only consulted when `ENGINE_MODE=streaming`.
 
@@ -363,7 +399,8 @@ The `*(streaming)*` variables are only consulted when `ENGINE_MODE=streaming`.
   [004 multi-project](docs/adr/ADR-004-multi-project-sessions.md) ·
   [005 concurrency](docs/adr/ADR-005-concurrency-correlation.md) ·
   [006 known limitations](docs/adr/ADR-006-known-limitations.md) ·
-  [007 trust layer](docs/adr/ADR-007-trust-layer.md).
+  [007 trust layer](docs/adr/ADR-007-trust-layer.md) ·
+  [008 proactive scheduler](docs/adr/ADR-008-proactive-scheduler.md).
 - Security: [P6 audit findings + remediation](docs/features/p6-security-audit/findings.md).
 - Keep-alive: [`deploy/README.md`](deploy/README.md).
 - Per-feature specs live under [`docs/features/`](docs/features/).

@@ -79,6 +79,7 @@ from .engine.types import (
     ThinkingEvent,
     ToolUseEvent,
 )
+from .scheduler import format_interval
 from .tg_html import strip_telegram_html, to_telegram_html
 from .util import TELEGRAM_MAX, split_message
 
@@ -1386,6 +1387,106 @@ def sessions_keyboard(
 
 
 # ---------------------------------------------------------------------------
+# /schedules listing (P14 T-SCHED) — proactive schedules, BODY-FREE-SAFE
+# ---------------------------------------------------------------------------
+#
+# `/schedules` lists THIS chat's proactive schedules. Pure render logic (no I/O): the bot
+# supplies the chat's list[Schedule] + an injected `now` and sends the string. Each row shows
+# the (SB4-validated) name, the interval, a relative next-run, a ⏸ paused marker, the pinned
+# project (if any), and a TRUNCATED + HTML-escaped prompt PREVIEW.
+#
+# SB3 — the prompt is the operator's OWN turn text (the same thing /macros previews), not a
+# transcript body / tool output / secret. It is still TRUNCATED (so a long prompt can't flood
+# the message) AND HTML-escaped (so a stray `<`/`&` can't break the HTML or inject markup) —
+# the same posture /macros uses for a macro body. The name + project are SB4-validated upstream
+# (^[A-Za-z0-9_-]{1,32}$), so safe to interpolate, but escaped uniformly for defense-in-depth.
+
+#: The /schedules header + the empty-list notice (the bot sends the latter when the chat has
+#: no schedules — a clean hint, never an error).
+SCHEDULES_EMPTY_NOTICE: Final = (
+    "⏰ No schedules yet. Create one with /every &lt;interval&gt; &lt;name&gt; &lt;prompt…&gt; "
+    "(e.g. <code>/every 1h ci run the tests and tell me if anything is red</code>)."
+)
+
+
+def _relative_next_run(next_run: object, *, now: float) -> str:
+    """A compact relative ``next run`` like ``"due now"`` / ``"in 5m"`` / ``"in 2h"`` (``/schedules``).
+
+    ``next_run`` is epoch seconds; ``now`` is injected (wall seconds) so the render is
+    deterministic in tests. Shows the single most-significant unit (seconds→minutes→hours→
+    days). A value at/in the past (or a missing/odd value) reads ``"due now"`` rather than a
+    negative duration (RB1) — a re-armed schedule is always in the future, so "due now" only
+    shows transiently right at/after a fire. Pure; the future-facing mirror of
+    :func:`relative_age`.
+    """
+    if not isinstance(next_run, (int, float)):
+        return "due now"
+    delta = float(next_run) - now
+    if delta <= 0:
+        return "due now"
+    if delta < 60:
+        return "in <1m"
+    minutes = int(delta // 60)
+    if minutes < 60:
+        return f"in {minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"in {hours}h"
+    days = hours // 24
+    return f"in {days}d"
+
+
+def schedule_listing(schedules: Iterable[object], *, now: float) -> str:
+    """Render a chat's proactive schedules as a BODY-FREE HTML listing (P14 ``/schedules``).
+
+    Each :class:`~claude_tg.scheduler.Schedule` row shows ONLY: a ``⏸``/``⏰`` marker (paused vs
+    armed), the **name** (bold), the interval (``every <Nh>`` via
+    :func:`~claude_tg.scheduler.format_interval`), the relative **next run**
+    (:func:`_relative_next_run`; a paused schedule shows ``paused`` instead of a next-run), and
+    the pinned **project** if any. ⭐ The schedule's PROMPT text is **NOT** displayed (SB3 /
+    Codex-QA: a truncated prompt is still prompt text — a body); the prompt stays persisted
+    (needed to fire) but is never rendered. The operator manages by the NAME they chose. ``now``
+    is injected so the render is deterministic in tests.
+
+    Returns :data:`SCHEDULES_EMPTY_NOTICE` for an empty list (the bot sends it as the clean
+    "no schedules" reply). Pure (no I/O). Defensive (RB1): a malformed schedule object missing
+    an attribute is skipped rather than crashing the listing. The result is an HTML message
+    (``parse_mode="HTML"``) — every interpolated value is escaped.
+    """
+    rows: list[str] = []
+    for schedule in schedules:
+        name = getattr(schedule, "name", None)
+        interval = getattr(schedule, "interval_seconds", None)
+        if not isinstance(name, str) or not isinstance(interval, int):
+            continue  # a malformed entry can't be rendered — skip (RB1)
+        paused = bool(getattr(schedule, "paused", False))
+        marker = "⏸️" if paused else "⏰"
+        every = html.escape(format_interval(interval), quote=False)
+        if paused:
+            when = "paused"
+        else:
+            when = html.escape(_relative_next_run(getattr(schedule, "next_run", None), now=now), quote=False)
+        project = getattr(schedule, "project", None)
+        project_html = (
+            f" · <code>{html.escape(str(project), quote=False)}</code>"
+            if isinstance(project, str) and project
+            else ""
+        )
+        # ⭐ SB3 / Codex-QA BLOCKER: the listing is BODY-FREE — name, interval, relative
+        # next-run, paused marker, and pinned project ONLY. The schedule's PROMPT text is NOT
+        # displayed (a truncated prompt is still prompt text — a body); it stays persisted
+        # (needed to fire) but is never rendered here. The operator manages by the NAME they
+        # chose; a detail view is a future fast-follow.
+        rows.append(
+            f"{marker} <b>{html.escape(name, quote=False)}</b> — "
+            f"every {every} ({when}){project_html}"
+        )
+    if not rows:
+        return SCHEDULES_EMPTY_NOTICE
+    return "\n".join(["⏰ <b>Schedules</b>:", *rows])
+
+
+# ---------------------------------------------------------------------------
 # Event -> RenderAction (the verbatim-vs-one-liner split)
 # ---------------------------------------------------------------------------
 
@@ -2409,6 +2510,9 @@ __all__ = [
     "relative_age",
     "SESSIONS_EMPTY_NOTICE",
     "SESSIONS_LIST_LIMIT",
+    # /schedules listing (P14 T-SCHED)
+    "schedule_listing",
+    "SCHEDULES_EMPTY_NOTICE",
     # coalesce / throttle
     "Coalescer",
     "FlushResult",

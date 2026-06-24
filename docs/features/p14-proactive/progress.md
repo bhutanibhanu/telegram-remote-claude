@@ -1,0 +1,29 @@
+# Progress: p14-proactive
+
+_From design.md · roadmap-v2 P14 "proactive / integrated" (LAST feature phase before P15 release) · supervised build. Baseline 1438 tests. Scope = an operator-managed PROACTIVE SCHEDULER (interval prompts fired as gated turns). MCP + dedicated-git + webhooks DEFERRED (triggers in design §). Owner-decisions accepted: O1 default-on-but-empty, O2 interval-only, O3 gate-only + force-gate-on (no unattended pre-auth)._
+
+## Task list
+- [x] T-SCHED — Scheduler core + persistence + config + CRUD commands (`0166381`) — dormant-data-only, no firing.
+- [x] T-FIRE — Firing runtime + the force-gate security core (`8064e85` + blocker-fix `d156589`).
+- [x] T-VERIFY — Codex QA SHIP + live phone-verify PASS + ADR-008 + README + merge. **DONE:**
+  - **Codex QA:** round-1 NO_SHIP (2 blockers — `/schedules` prompt-text display; SB1 not re-checked at fire time) → fixed → **Codex re-check SHIP** (both CLOSED). Independent reviewer: **FORCE-GATE + unattended-fail-safe + RB1 all AGREE**, mutation-probed (invert the force-gate → 3 proactive-gating tests fail; normal yolo turn still auto-allows = regression guard).
+  - **Live phone-verify PASS:** `/every 5m schedtest …` created (persisted) → `/schedules` body-free (no prompt text) → **`/runnow` fired a proactive turn → Claude replied `SCHEDULEFIRED`** + a body-free `proactive_fire (schedtest)` audit record (schedule name only). **⭐ Force-gate confirmed:** with `/yolo` ON, `/runnow risktest` (a risky Bash command) **STILL hit the permission gate** ("🔐 Permission needed … Allow/Deny") — an unattended fire does NOT inherit allow-all — denied → no file written.
+  - ADR-008 + README (+ docs index) written; stale "dormant/nothing-fires-yet" code comments corrected. 1577 tests; ruff/mypy/secret_scan clean.
+
+Legend: `[ ]` todo · `[>]` in progress · `[x]` done (sha) · `[!]` blocked
+
+## Tasks
+
+### T-SCHED — scheduler model + store + config + CRUD (no firing)
+- **Files:** new `claude_tg/scheduler.py` (pure `Schedule` dataclass + interval parse `1h`/`30m`/`2d` + `due`/`next_run` math, injected clock); `claude_tg/session_store.py` (persist schedules — atomic 0600; on load **re-arm `next_run` from now**, never replay missed fires — flood-safe RB3); `claude_tg/config.py` (`SCHEDULER_ENABLED` default true, max-schedules knob, fail-loud parse); `claude_tg/bot.py` (`/every <interval> <name> <prompt>`, `/schedules`, `/unschedule <name>`, `/pause <name>`, `/resume <name>` — SB1 via `_ok`; register + COMMAND_MENU + HELP lock-step, HELP balanced).
+- **Accept:** `/every 1h ci "run tests"` (SB1) creates a per-chat schedule (interval parsed; bad interval → clean usage, RB1); `/schedules` lists them (body-free — name/interval/next-run/paused, prompt truncated+escaped SB3); `/unschedule`/`/pause`/`/resume` manage by name; schedules persist (atomic 0600) + survive restart with `next_run` recomputed from now (no replay); a task is bound to its creating chat. Default-on-but-empty (no schedules = no behavior change → 1438 floor + existing behavior unchanged).
+- **Tests:** interval parse (valid/invalid); `due`/`next_run` math (injected clock); CRUD per-chat; persistence round-trip + **restart re-arms from now (no missed-fire replay)**; SB1 + body-free `/schedules` + menu/HELP lock-step; empty/default = unchanged.
+
+### T-FIRE — firing runtime + the force-gate security core
+- **Files:** new scheduler-driver (asyncio task) wired in `claude_tg/bot.py` `post_init`/`post_shutdown` (injected clock/interval, like the mirror/`StreamingSession` patterns); `claude_tg/stream_session.py` (`handle_message(..., proactive=True)` — thread a `proactive` flag that **forces the permission gate ON for that turn** regardless of the project's `/yolo` or session-grants; reuse the send-gate/concurrency/busy-guard); `claude_tg/audit.py` tie-in (`proactive_fire`/`proactive_skip`); `/runnow <name>` in `bot.py`.
+- **⭐ Security (the core):** a proactive turn runs through the SAME `on_tool_request` gate — but with **yolo/grant FORCED OFF for that turn** so an unattended fire can NEVER inherit allow-all (the proactive analogue of P13's flagged-Bash-beats-yolo). A risky tool in an unattended turn HOLDS → the answer-backstop auto-DENIES (RB4) → fail-safe; proactive is NOT a bypass. Every fire + its tool decisions are audited (body-free). The driver respects the concurrency cap + per-chat send gate (no flood); a fire while that chat/project is busy queues or skips-with-audit (don't stack).
+- **Accept:** the driver fires a due task as a turn into its chat + notifies (body-free); the turn's risky tools are gated EVEN IF `/yolo` is on for that project (mutation-probe: force yolo on → a proactive fire's risky tool STILL hits the gate); an unattended risky tool auto-denies at backstop (no hang, RB4); `proactive_fire`/`proactive_skip` audited; `/runnow` fires immediately; the loop survives a fire that errors (RB1, one bad task never kills the scheduler or the bot). Cancelled cleanly on shutdown.
+- **Tests:** driver fires due/skips not-due (injected clock); **force-gate — a proactive turn's risky tool is gated despite `/yolo`** (mutation-probe: drop the force → the test fails = an unattended yolo bypass); unattended risky → backstop deny (RB4); fire-into-busy-chat queues/skips (no overlap); audit records; a raising task doesn't kill the loop (RB1); shutdown cancels.
+
+### T-VERIFY — QA + live-verify + docs + merge
+Cross-model Codex QA (iterate to SHIP; the unattended-action security model is the focus) → live phone-verify (`/every 1m …` fires + notifies + audited; `/runnow`; **`/yolo` does NOT leak into a proactive fire** — a risky tool still prompts; an unattended risky tool auto-denies) → ADR-008 (proactive scheduler + the unattended-action security model + the deferred MCP/git) + README → 4 gates → merge to `main`. Then **P15 = 🛑 HARD STOP** (do NOT cross).

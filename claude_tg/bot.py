@@ -10,6 +10,7 @@ import os
 import shutil
 import tempfile
 import time
+from typing import Any
 
 from telegram import BotCommand, InputFile, Update
 from telegram.constants import ChatAction
@@ -42,13 +43,23 @@ from .render import (
     project_status_label,
     quick_reply_dismiss,
     quick_reply_keyboard,
+    schedule_listing,
     sessions_keyboard,
     sessions_listing,
     yolo_banner,
 )
+from .scheduler import (
+    InvalidInterval,
+    InvalidScheduleName,
+    Schedule,
+    format_interval,
+    parse_interval,
+)
+from .scheduler_driver import Scheduler
 from .session_store import (
     DuplicateProject,
     InvalidProjectName,
+    MaxSchedulesExceeded,
     UnknownProject,
     validate_project_name,
 )
@@ -107,6 +118,14 @@ HELP_TEXT = (
     "/run <name> [args…] — run a saved macro (expands `$1` `$2` … and `$*` = all args)\n"
     "/macros — list your saved macros\n"
     "/unsave <name> — remove a saved macro\n"
+    "/every <interval> <name> <prompt…> — schedule a recurring prompt (interval like "
+    "30m·1h·2d·90s); it runs through the SAME approval gate, so an unattended risky tool "
+    "holds then auto-denies — it never silently does anything risky (streaming mode)\n"
+    "/schedules — list your proactive schedules (name, interval, next run, paused?) (streaming mode)\n"
+    "/unschedule <name> — remove a schedule (streaming mode)\n"
+    "/pause <name> — pause a schedule without deleting it (streaming mode)\n"
+    "/resume <name> — resume a paused schedule (streaming mode)\n"
+    "/runnow <name> — fire a schedule right now (through the same gate; streaming mode)\n"
     "\nAny *other* slash-command (e.g. /grill, /pipeline, /scaffold) is forwarded "
     "verbatim and runs as a skill in the Claude session.\n"
 )
@@ -149,6 +168,12 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("run", "Run a saved macro: /run <name> [args…]"),
     ("macros", "List your saved macros"),
     ("unsave", "Remove a saved macro: /unsave <name>"),
+    ("every", "Schedule a recurring prompt: /every <interval> <name> <prompt…>"),
+    ("schedules", "List your proactive schedules"),
+    ("unschedule", "Remove a schedule: /unschedule <name>"),
+    ("pause", "Pause a schedule without deleting it: /pause <name>"),
+    ("resume", "Resume a paused schedule: /resume <name>"),
+    ("runnow", "Fire a schedule right now: /runnow <name>"),
 )
 
 
@@ -322,6 +347,12 @@ class TelegramClaudeBot:
         # harmless and the registry's per-chat shape is project-scoped, not a natural home for
         # a UX seen-flag); persisting it is a possible later refinement.
         self._welcomed: set[int] = set()
+        # P14 T-FIRE: the proactive-scheduler firing driver — the single asyncio task that
+        # fires due schedules. Constructed + started in ``_post_init`` (it needs the running
+        # loop + ``app.bot`` for the per-chat send closures) and cancelled in ``_post_shutdown``.
+        # ``None`` until then, and never built in one-shot mode (no streaming session, nowhere
+        # safe for a proactive turn to land — design §3.2). Held so shutdown can cancel it.
+        self._scheduler: Scheduler | None = None
 
     # ---- auth ---------------------------------------------------------------
     def _authorized(self, update: Update) -> bool:
@@ -1646,6 +1677,325 @@ class TelegramClaudeBot:
         # path. A PLAIN typed message keeps the flag False and still answers a pending prompt.
         await self._run_turn(update, ctx, chat_id, expanded, command_initiated=True)
 
+    # ---- proactive schedules (P14 T-SCHED; streaming mode only) -------------
+    #
+    # The CRUD surface for the proactive scheduler: /every (create), /schedules (list),
+    # /unschedule, /pause, /resume. Each is SB1-gated (the _ok recheck) and STREAMING-ONLY
+    # (proactive needs the per-chat send gate + the permission-hold path — one-shot has
+    # neither, so it replies a clean notice, exactly like /projects / /yolo). A created schedule
+    # is persisted with a next_run; the asyncio firing driver (T-FIRE) then fires it on its
+    # interval (and /runnow fires it immediately).
+
+    async def _require_scheduling(self, update: Update) -> bool:
+        """Reply the scheduling-needs-streaming notice and return False in one-shot mode.
+
+        The proactive scheduler is a streaming-engine concept (it fires a turn through the
+        streaming permission gate + per-chat send gate — one-shot has neither). Callers have
+        already done the ``_ok`` recheck; this is the second guard (mirrors
+        :meth:`_require_streaming`'s one-shot notice). ``update.message`` is non-None here.
+        """
+        if self.streaming is None:
+            await update.message.reply_text(
+                "Scheduling applies to streaming mode only — one-shot mode has no "
+                "per-tool gate or background turn path for a proactive task to run through."
+            )
+            return False
+        return True
+
+    def _schedule_store(self):
+        """The session store schedules are persisted in, or ``None`` (P14 T-SCHED).
+
+        Schedules are a streaming-mode surface (they fire through the streaming engine), so
+        the store is the streaming session's. ``None`` when there is no streaming session OR
+        no ``CLAUDE_STATE_FILE`` (RB1: the commands then reply a clean "needs persistence"
+        notice instead of crashing — mirroring :meth:`_macro_store`). ``getattr`` so a
+        lightweight test stand-in without a ``store`` degrades to None.
+        """
+        if self.streaming is None:
+            return None
+        return getattr(self.streaming, "store", None)
+
+    async def cmd_every(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/every <interval> <name> <prompt…>`` — create/replace a proactive schedule (P14).
+
+        SB1 (``_ok``) + streaming-only (``_require_scheduling``) first. Then, fail-fast:
+
+        1. parse the args — ``<interval>`` (``30m``/``1h``/``2d``/``90s``), ``<name>`` (SB4),
+           ``<prompt…>`` (the rest, the turn text). Missing parts → usage (RB1).
+        2. ``parse_interval`` validates the interval against the configured floor
+           (``SCHEDULE_MIN_INTERVAL_SECONDS``) — a bad/zero/too-small interval (RB1) replies
+           the error.
+        3. build the :class:`~claude_tg.scheduler.Schedule` (its constructor validates the SB4
+           name; an invalid name → a clean, HTML-escaped reply since it is pre-validation
+           operator input) with ``next_run = now + interval`` and the chat's active project
+           pinned (so a later ``/switch`` doesn't retarget it).
+        4. ``store.add_schedule`` with the per-chat cap (``SCHEDULE_MAX_TASKS_PER_CHAT``) —
+           over the cap → :class:`~claude_tg.session_store.MaxSchedulesExceeded` → a clean
+           "you've hit the limit" reply (fail-closed); a same-name schedule is overwritten.
+
+        **This creates the schedule; it does not fire it inline** — the schedule is persisted
+        with a ``next_run`` and the firing driver (T-FIRE) fires it on its interval (``/runnow``
+        fires it immediately). The prompt is operator-authored and stored verbatim (SB4: fired
+        as a normal turn, never a shell command).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_scheduling(update):
+            return
+        store = self._schedule_store()
+        if store is None:
+            await update.message.reply_text(
+                "Schedules need persistence — set CLAUDE_STATE_FILE to create one."
+            )
+            return
+        chat_id = update.effective_chat.id
+        args = list(ctx.args) if ctx.args else []
+        if len(args) < 3:
+            await update.message.reply_text(
+                "Usage: /every <interval> <name> <prompt…>\n"
+                "e.g. /every 1h ci run the tests and tell me if anything is red"
+            )
+            return
+        interval_raw, name = args[0], args[1]
+        prompt = " ".join(args[2:]).strip()
+        if not prompt:
+            await update.message.reply_text("Usage: /every <interval> <name> <prompt…>")
+            return
+        # Validate the interval against the configured floor (a typo /every 1s can't hammer
+        # the host). interval_raw is pre-validation operator input — escape it in the error.
+        try:
+            interval_seconds = parse_interval(
+                interval_raw, minimum_seconds=self.config.schedule_min_interval_seconds
+            )
+        except InvalidInterval as exc:
+            await update.message.reply_text(
+                f"❌ {html.escape(str(exc), quote=False)}", parse_mode="HTML"
+            )
+            return
+        # The pinned target project = the chat's active project at creation (None if none yet;
+        # T-FIRE resolves None to the active project at fire time). Read-only.
+        project = store.get_active(chat_id)
+        now = time.time()
+        try:
+            schedule = Schedule(
+                name=name,
+                interval_seconds=interval_seconds,
+                prompt=prompt,
+                chat_id=chat_id,
+                next_run=now + interval_seconds,
+                project=project,
+                created_at=now,
+            )
+        except InvalidScheduleName:
+            # PRE-validation operator input (the name was just rejected by SB4) — HTML-escape it.
+            await update.message.reply_text(
+                f"❌ Invalid schedule name <b>{html.escape(name, quote=False)}</b> — "
+                "use letters, digits, _ or - (≤32 chars).",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            store.add_schedule(
+                schedule, max_per_chat=self.config.schedule_max_tasks_per_chat
+            )
+        except MaxSchedulesExceeded:
+            await update.message.reply_text(
+                f"❌ You've hit the schedule limit "
+                f"({self.config.schedule_max_tasks_per_chat} per chat). "
+                "Remove one with /unschedule <name> first."
+            )
+            return
+        # Confirm body-free: the name (SB4, escaped uniformly), the interval, and how to see or
+        # fire it (it fires on its interval; /runnow fires it now — both through the approval
+        # gate). The prompt is NOT echoed (it is the operator's own text; the listing previews it).
+        await update.message.reply_text(
+            f"⏰ Saved schedule <b>{html.escape(name, quote=False)}</b> — "
+            f"every {html.escape(format_interval(interval_seconds), quote=False)}. "
+            "See it with /schedules, fire it now with /runnow. "
+            "It runs through the same approval gate, so an unattended risky tool holds then "
+            "auto-denies — it never silently does anything risky.",
+            parse_mode="HTML",
+        )
+
+    async def cmd_schedules(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/schedules`` — list THIS chat's proactive schedules, BODY-FREE (P14). SB1; streaming.
+
+        Mirrors :meth:`cmd_macros` (the read-only template): the ``_ok`` recheck → the
+        streaming-only guard → read the chat's schedules from the store → render them via the
+        pure :func:`~claude_tg.render.schedule_listing` (name, interval, relative next-run,
+        ``⏸`` paused marker, pinned project, TRUNCATED + HTML-escaped prompt preview — SB3).
+        Empty → the clean "no schedules" notice. RB1: read-only, never crashes on a sparse/odd
+        record (the listing skips a malformed one).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_scheduling(update):
+            return
+        store = self._schedule_store()
+        schedules = store.list_schedules(update.effective_chat.id) if store is not None else []
+        await update.message.reply_text(
+            schedule_listing(schedules, now=time.time()), parse_mode="HTML"
+        )
+
+    async def cmd_unschedule(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/unschedule <name>`` — remove a proactive schedule (P14). SB1; streaming; RB1 clean."""
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_scheduling(update):
+            return
+        store = self._schedule_store()
+        if store is None:
+            await update.message.reply_text("No schedules to remove.")
+            return
+        name = " ".join(ctx.args).strip() if ctx.args else ""
+        if not name:
+            await update.message.reply_text("Usage: /unschedule <name>")
+            return
+        removed = store.remove_schedule(update.effective_chat.id, name)
+        if removed:
+            await update.message.reply_text(
+                f"🗑️ Removed schedule <b>{html.escape(name, quote=False)}</b>.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ No schedule named <b>{html.escape(name, quote=False)}</b>. "
+                "List them with /schedules.",
+                parse_mode="HTML",
+            )
+
+    async def _set_schedule_paused(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, paused: bool
+    ) -> None:
+        """Shared body for ``/pause`` · ``/resume`` (P14; streaming mode only).
+
+        SB1 (the caller did ``_ok``) + the streaming-only guard, then flip the named
+        schedule's persisted ``paused`` flag (``next_run`` untouched, so the cadence resumes
+        where it left off). Unknown name → a clean "no such schedule" reply (RB1/RB2). The
+        verb word in the confirmation/usage is derived from ``paused``.
+        """
+        if not await self._require_scheduling(update):
+            return
+        verb = "pause" if paused else "resume"
+        store = self._schedule_store()
+        if store is None:
+            await update.message.reply_text("No schedules to " + verb + ".")
+            return
+        name = " ".join(ctx.args).strip() if ctx.args else ""
+        if not name:
+            await update.message.reply_text(f"Usage: /{verb} <name>")
+            return
+        found = store.set_schedule_paused(update.effective_chat.id, name, paused)
+        if not found:
+            await update.message.reply_text(
+                f"❌ No schedule named <b>{html.escape(name, quote=False)}</b>. "
+                "List them with /schedules.",
+                parse_mode="HTML",
+            )
+            return
+        if paused:
+            await update.message.reply_text(
+                f"⏸️ Paused schedule <b>{html.escape(name, quote=False)}</b> — "
+                "it won't run until you /resume it.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                f"▶️ Resumed schedule <b>{html.escape(name, quote=False)}</b>.",
+                parse_mode="HTML",
+            )
+
+    async def cmd_pause(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/pause <name>`` — pause a proactive schedule without deleting it (P14). SB1; streaming."""
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._set_schedule_paused(update, ctx, paused=True)
+
+    async def cmd_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/resume <name>`` — resume a paused proactive schedule (P14). SB1; streaming."""
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._set_schedule_paused(update, ctx, paused=False)
+
+    async def cmd_runnow(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/runnow <name>`` — fire a proactive schedule IMMEDIATELY (P14 T-FIRE ⭐). SB1; streaming.
+
+        The manual proactive trigger (design §3.1): fire the named task NOW through the SAME
+        gated proactive path the scheduler uses — ``proactive=True`` so the gate is FORCED ON
+        (``/yolo`` + grants treated as off; a risky tool HOLDS for approval; with the operator
+        present they can tap Allow). It does **NOT** change the task's ``next_run`` (it is an
+        out-of-band fire, not a reschedule — the recurring cadence is untouched).
+
+        SB1 (``_ok``) + streaming-only (``_require_scheduling``) first; then resolve the schedule
+        by name (case-insensitive) → an unknown name replies a clean "no such schedule" (RB1).
+        On a hit, build this chat's send/edit/delete closures over ``ctx.bot`` and delegate to
+        :meth:`~claude_tg.stream_session.StreamingSession.fire_schedule` (which sends the
+        ``⏰ <name> (scheduled)…`` header, audits ``proactive_fire``, drives the gated turn, and
+        is RB1-total — a busy project / a fire error becomes a body-free skip, never a crash).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_scheduling(update):
+            return
+        store = self._schedule_store()
+        if store is None:
+            await update.message.reply_text(
+                "Schedules need persistence — set CLAUDE_STATE_FILE to create one."
+            )
+            return
+        name = (ctx.args[0] if ctx.args else "").strip()
+        if not name:
+            await update.message.reply_text("Usage: /runnow <name>")
+            return
+        chat_id = update.effective_chat.id
+        schedule = store.get_schedule(chat_id, name)
+        if schedule is None:
+            await update.message.reply_text(
+                f"❌ No schedule named <b>{html.escape(name, quote=False)}</b>. "
+                "List them with /schedules.",
+                parse_mode="HTML",
+            )
+            return
+        assert self.streaming is not None  # _require_scheduling guaranteed it
+        send, edit, delete = self._make_chat_io(ctx.bot, chat_id)
+        # fire_schedule sends the header, audits, drives the gated turn, and is RB1-total
+        # (a busy project / fire error is a clean body-free skip — never propagates here).
+        await self.streaming.fire_schedule(schedule, send=send, edit=edit, delete=delete)
+
+    def _make_chat_io(self, bot, chat_id: int):
+        """Build ``(send, edit, delete)`` Telegram closures over ``bot`` for ``chat_id`` (P14 T-FIRE).
+
+        The proactive firing path (the scheduler driver + ``/runnow``) has no incoming
+        ``update``/``ctx`` to build the per-chat send/edit/delete closures from (a scheduled
+        fire is machine-initiated), so it builds the IDENTICAL closures the message path builds
+        (:meth:`on_message`) over the persistent :class:`~telegram.Bot` captured at startup
+        (PTB hands the ``Application`` — and thus ``app.bot`` — to ``post_init``). The closures
+        are byte-for-byte the same shape the render layer + per-chat send gate expect, so a
+        proactive turn renders exactly like a typed one. Pure factory (no I/O here).
+        """
+
+        async def send(
+            *, text: str, reply_markup=None, parse_mode=None, link_preview_options=None
+        ) -> int | None:
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                link_preview_options=link_preview_options,
+            )
+            return getattr(msg, "message_id", None)
+
+        async def edit(*, message_id: int, text: str, parse_mode=None) -> None:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text, parse_mode=parse_mode
+            )
+
+        async def delete(*, message_id: int) -> None:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+
+        return send, edit, delete
+
     # ---- messages -----------------------------------------------------------
     @staticmethod
     def _reply_to_id(update: Update) -> int | None:
@@ -2345,7 +2695,12 @@ class TelegramClaudeBot:
             # handle_message with the EXACT pre-P10 signature — every existing FakeStreaming
             # (whose handle_message has no ``images`` kwarg) keeps working verbatim. The image
             # path supplies the kwarg to the real StreamingSession (which accepts it).
-            extra = {"images": images} if images else {}
+            # P10 T1 / P14: pass ``images`` ONLY when present (the additive-kwarg discipline),
+            # so a pure TEXT turn calls handle_message WITHOUT it — every existing FakeStreaming
+            # whose handle_message has no ``images`` kwarg keeps working verbatim. ``extra`` is
+            # typed ``dict[str, Any]`` so the ``**`` unpack type-checks cleanly against the
+            # (now larger) keyword set (mirrors _drive_turn's ``send_kwargs`` discipline).
+            extra: dict[str, Any] = {"images": images} if images else {}
             captured_free_text = await self.streaming.handle_message(
                 chat_id, text, send=send, edit=edit, delete=delete,
                 reply_to_message_id=reply_to_message_id,
@@ -2501,6 +2856,47 @@ class TelegramClaudeBot:
         except Exception:
             log.warning("failed to register the bot command menu (set_my_commands)", exc_info=True)
 
+        # P14 T-FIRE: start the proactive-scheduler firing driver — the single asyncio task
+        # that fires due schedules through the gated proactive path. Started HERE (post_init
+        # runs inside app.run_polling's loop, so the task lives on that loop, and app.bot is
+        # available for the per-chat send closures). STREAMING ONLY (a proactive turn needs the
+        # per-chat send gate + the hold path — one-shot has neither, design §3.2) AND only when
+        # SCHEDULER_ENABLED (default ON; the empty scheduler is zero-risk). Best-effort (RB1): a
+        # failure to start the driver must NEVER block the bot from polling — it just means no
+        # proactive fires until restart. ``Scheduler.start`` re-arms persisted schedules (no
+        # missed-fire replay) then launches the loop, which is itself RB1-total.
+        if (
+            self.streaming is not None
+            and self.streaming.store is not None
+            and getattr(self.config, "scheduler_enabled", True)
+        ):
+            try:
+                self._scheduler = Scheduler(
+                    store=self.streaming.store,
+                    fire=lambda schedule: self._fire_schedule(app.bot, schedule),
+                )
+                self._scheduler.start()
+            except Exception:
+                log.warning("failed to start the proactive scheduler (ignored)", exc_info=True)
+
+    async def _fire_schedule(self, bot, schedule: Schedule) -> bool:
+        """Drive ONE due schedule as a gated proactive turn (the driver's fire seam; P14 T-FIRE).
+
+        The ``fire`` callback the :class:`~claude_tg.scheduler_driver.Scheduler` invokes each
+        time a schedule comes due: build this chat's send/edit/delete closures over the
+        persistent ``bot`` (a fired turn has no incoming ``update``/``ctx``) and delegate to
+        :meth:`~claude_tg.stream_session.StreamingSession.fire_schedule` (force-gate ON; RB1-
+        total — a busy project / fire error is a clean body-free skip, never a crash). Returns
+        whether the turn was driven. Defensive: with no streaming session (shouldn't happen —
+        the driver is only started when one exists) it is a no-op skip.
+        """
+        if self.streaming is None:
+            return False
+        send, edit, delete = self._make_chat_io(bot, schedule.chat_id)
+        return await self.streaming.fire_schedule(
+            schedule, send=send, edit=edit, delete=delete
+        )
+
     async def _post_shutdown(self, _app: Application) -> None:
         """Clean shutdown: stop every engine + cancel every live-mirror watch (P11 T3).
 
@@ -2510,6 +2906,16 @@ class TelegramClaudeBot:
         started engine. Best-effort (RB1): a failure here must never block the shutdown — a
         crash on exit is logged, not raised. No-op in one-shot mode (no streaming session).
         """
+        # P14 T-FIRE: cancel the proactive-scheduler firing loop FIRST so no fire is dispatched
+        # while engines are being torn down (and no driver task outlives the bot). Best-effort
+        # (RB1): a cancel error never blocks the rest of shutdown. ``Scheduler.stop`` is
+        # idempotent + safe when never started.
+        if self._scheduler is not None:
+            try:
+                await self._scheduler.stop()
+            except Exception:
+                log.warning("error stopping the proactive scheduler", exc_info=True)
+            self._scheduler = None
         if self.streaming is None:
             return
         try:
@@ -2608,6 +3014,20 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("run", self.cmd_run, filters=allowed))
         app.add_handler(CommandHandler("macros", self.cmd_macros, filters=allowed))
         app.add_handler(CommandHandler("unsave", self.cmd_unsave, filters=allowed))
+        # P14 T-SCHED: the proactive-scheduler CRUD — /every (create), /schedules (list),
+        # /unschedule, /pause, /resume. Each SB1-gated (the `allowed` filter + the _ok
+        # recheck) + streaming-only (a clean notice in one-shot), registered BEFORE the
+        # on_skill_command passthrough so first-match-wins makes them real commands. (These are
+        # the CRUD surface; the firing driver + /runnow [T-FIRE] are registered just below.)
+        app.add_handler(CommandHandler("every", self.cmd_every, filters=allowed))
+        app.add_handler(CommandHandler("schedules", self.cmd_schedules, filters=allowed))
+        app.add_handler(CommandHandler("unschedule", self.cmd_unschedule, filters=allowed))
+        app.add_handler(CommandHandler("pause", self.cmd_pause, filters=allowed))
+        app.add_handler(CommandHandler("resume", self.cmd_resume, filters=allowed))
+        # P14 T-FIRE: /runnow fires a schedule immediately through the SAME gated proactive
+        # path the driver uses (force-gate ON). SB1 + streaming-only; registered BEFORE the
+        # skill passthrough so first-match-wins makes it a real command.
+        app.add_handler(CommandHandler("runnow", self.cmd_runnow, filters=allowed))
         # P13 T-AUDIT: /audit — body-free tail of the durable decision trail. Read-only,
         # SB1-gated (the `allowed` filter + the _ok recheck), registered BEFORE the
         # on_skill_command passthrough so first-match-wins makes it a real command (not

@@ -449,6 +449,73 @@ def parse_bash_policy_extra_patterns(raw: str | None) -> tuple[str, ...]:
     return patterns
 
 
+#: P14 T-SCHED — proactive scheduler defaults. The scheduler is **default ON** (design O1):
+#: the loop runs but does NOTHING until the owner creates a task (no schedules exist on a
+#: fresh install), so default-on is zero-risk and non-breaking — requiring a flag to use the
+#: headline feature would be needless friction. The per-task pause + the empty default keep it
+#: quiet; ``SCHEDULER_ENABLED=false`` opts out entirely. The asyncio firing driver is live, so
+#: a created schedule fires on its interval (and ``/runnow`` fires it immediately) — default-on
+#: still changes no observable behavior on a fresh install (no schedules exist there to fire).
+DEFAULT_SCHEDULER_ENABLED = True
+
+#: P14 T-SCHED — the per-CHAT cap on the number of proactive schedules (a DoS-by-schedule
+#: bound). 20 is generous for a single operator while bounding a runaway/accidental create
+#: loop; the store refuses a create that would exceed it (fail-closed, MaxSchedulesExceeded).
+#: Configurable via ``SCHEDULE_MAX_TASKS_PER_CHAT``.
+DEFAULT_SCHEDULE_MAX_TASKS_PER_CHAT = 20
+
+#: P14 T-SCHED — the minimum interval (seconds) ``/every`` accepts. A floor so a typo
+#: ``/every 1s …`` can't schedule a host-hammering cadence; the interval parser
+#: (:func:`~claude_tg.scheduler.parse_interval`) rejects anything below it. 60 s (one minute)
+#: is the smallest sensible proactive cadence. Configurable via ``SCHEDULE_MIN_INTERVAL_SECONDS``.
+DEFAULT_SCHEDULE_MIN_INTERVAL_SECONDS = 60
+
+
+def parse_schedule_max_tasks_per_chat(raw: str | None) -> int:
+    """Parse + validate SCHEDULE_MAX_TASKS_PER_CHAT (default 20; P14 T-SCHED).
+
+    The per-chat cap on proactive schedules (a DoS-by-schedule guard the store enforces
+    fail-closed). Parsing mirrors :func:`parse_image_max_bytes`: empty/unset → the default;
+    must be a **positive** integer (a ``0``/negative cap would refuse every schedule — so it
+    is a configuration error and fails loud at startup rather than silently disabling
+    scheduling). So ``""``/unset → 20; ``"5"`` → 5; ``"0"``/``"-1"``/``"x"`` → raise.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_SCHEDULE_MAX_TASKS_PER_CHAT
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"SCHEDULE_MAX_TASKS_PER_CHAT must be an integer, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError("SCHEDULE_MAX_TASKS_PER_CHAT must be positive")
+    return value
+
+
+def parse_schedule_min_interval_seconds(raw: str | None) -> int:
+    """Parse + validate SCHEDULE_MIN_INTERVAL_SECONDS (default 60; P14 T-SCHED).
+
+    The floor (seconds) on ``/every``'s interval — a typo ``/every 1s`` can't schedule a
+    host-hammering cadence; the interval parser rejects anything below it. Parsing mirrors
+    :func:`parse_schedule_max_tasks_per_chat`: empty/unset → the default; must be a
+    **positive** integer (a ``0``/negative floor would let a sub-second interval through —
+    defeating the guardrail — so it is a configuration error and fails loud at startup). So
+    ``""``/unset → 60; ``"30"`` → 30; ``"0"``/``"-1"``/``"x"`` → raise.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_SCHEDULE_MIN_INTERVAL_SECONDS
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"SCHEDULE_MIN_INTERVAL_SECONDS must be an integer, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError("SCHEDULE_MIN_INTERVAL_SECONDS must be positive")
+    return value
+
+
 def resolve_audit_log_file(raw: str | None, *, state_file: Path | None) -> Path | None:
     """Resolve the audit-log path (P13 T-AUDIT design §1.2) — default-on but non-breaking.
 
@@ -602,6 +669,19 @@ class Config:
     # in BASH_POLICY_EXTRA_PATTERNS (comma is NOT a separator — a regex may contain commas).
     # Empty by default. A pattern that fails to compile is dropped at match time (fail-safe).
     bash_policy_extra_patterns: tuple[str, ...] = ()
+    # P14 T-SCHED: the proactive scheduler. ``scheduler_enabled`` is default ON (design O1) —
+    # the loop runs but has nothing to fire until a task is created (no schedules on a fresh
+    # install), so default-on is non-breaking; SCHEDULER_ENABLED=false opts out. The asyncio
+    # firing driver is live: a created schedule fires on its interval (and /runnow fires it
+    # immediately), so default-on still changes no observable behavior on a fresh install (no
+    # schedules to fire). ``schedule_max_tasks_
+    # per_chat`` is the per-chat DoS-by-schedule cap the store enforces fail-closed (default 20).
+    # ``schedule_min_interval_seconds`` is the floor /every accepts (default 60 s) so a typo
+    # ``/every 1s`` can't schedule a host-hammering cadence. Unset → defaults; a bad max/floor
+    # fails loud (parse_schedule_*). Only consulted in streaming mode (proactive is streaming-only).
+    scheduler_enabled: bool = DEFAULT_SCHEDULER_ENABLED
+    schedule_max_tasks_per_chat: int = DEFAULT_SCHEDULE_MAX_TASKS_PER_CHAT
+    schedule_min_interval_seconds: int = DEFAULT_SCHEDULE_MIN_INTERVAL_SECONDS
 
     @classmethod
     def from_env(cls, dotenv_path: str | os.PathLike[str] | None = ".env") -> "Config":
@@ -685,6 +765,18 @@ class Config:
             os.environ.get("BASH_POLICY_EXTRA_PATTERNS")
         )
 
+        # P14 T-SCHED: the proactive scheduler knobs. Default ON (design O1) but with nothing
+        # to fire until a task exists (firing IS live via the asyncio driver), so non-breaking;
+        # the per-chat cap + interval floor fail loud on a bad value (a typo must not silently
+        # disable the DoS/host-hammer guardrails).
+        scheduler_enabled = _env_bool("SCHEDULER_ENABLED", DEFAULT_SCHEDULER_ENABLED)
+        schedule_max_tasks_per_chat = parse_schedule_max_tasks_per_chat(
+            os.environ.get("SCHEDULE_MAX_TASKS_PER_CHAT")
+        )
+        schedule_min_interval_seconds = parse_schedule_min_interval_seconds(
+            os.environ.get("SCHEDULE_MIN_INTERVAL_SECONDS")
+        )
+
         # SB2 /cd confinement. Default the allow-list to the workdir so an unset
         # ALLOWED_ROOTS still confines /cd (ON by default); ALLOW_ANY_PATH=true is the
         # explicit owner opt-out. workdir is already expanduser()'d above; resolve it so
@@ -720,4 +812,7 @@ class Config:
             audit_log_max_bytes=audit_log_max_bytes,
             bash_policy_mode=bash_policy_mode,
             bash_policy_extra_patterns=bash_policy_extra_patterns,
+            scheduler_enabled=scheduler_enabled,
+            schedule_max_tasks_per_chat=schedule_max_tasks_per_chat,
+            schedule_min_interval_seconds=schedule_min_interval_seconds,
         )

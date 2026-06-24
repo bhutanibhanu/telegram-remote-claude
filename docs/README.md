@@ -25,6 +25,13 @@ Each ADR captures one load-bearing decision, its context, and its consequences.
 - [ADR-006 — Known limitations accepted as-is](adr/ADR-006-known-limitations.md): two
   deliberately-deferred trade-offs (the unpruned `notify_last` throttle; the
   `_is_resume_failure` text heuristic) — why each is intentional and where it lives.
+- [ADR-007 — Trust layer](adr/ADR-007-trust-layer.md): the durable, body-free, `0600` JSONL
+  audit log and the conservative Bash command policy (`flag`/`deny`/`off`) — both hooked at
+  the gate chokepoint, both fail-closed.
+- [ADR-008 — Proactive scheduler](adr/ADR-008-proactive-scheduler.md): operator-managed
+  interval schedules fired as normal **gated** turns by an asyncio driver, with a per-turn
+  force-gate so an unattended fire can never inherit `/yolo` / session-grants (a risky tool
+  holds then auto-denies). Proactive is **not** a gate bypass.
 
 ## Feature specs
 

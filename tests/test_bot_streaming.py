@@ -118,6 +118,9 @@ class FakeStreaming:
         self.shutdown_calls = []
         self.command_initiated_calls = []
         self.images_calls = []
+        # P14 T-FIRE: records (schedule) each /runnow (or driver) fire delegated here, so the
+        # bot-wiring test asserts /runnow → fire_schedule. Returns True (fired) by default.
+        self.fire_schedule_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
         self._busy = busy
         # P5/T7: cmd_reset now reads streaming.store.get_active to scope its busy-guard to
@@ -144,6 +147,13 @@ class FakeStreaming:
         # bot dismisses the quick-reply chips on True). This stand-in drives normal turns →
         # False; the free-text-capture behavior is covered against a REAL session.
         return False
+
+    async def fire_schedule(self, schedule, *, send, edit, delete=None):
+        # P14 T-FIRE: /runnow delegates here (the proactive fire path). Record the schedule so
+        # the wiring test asserts delegation; the deep fire behavior is covered against a REAL
+        # session in test_stream_session.
+        self.fire_schedule_calls.append(schedule)
+        return True
 
     def resolve_callback(self, chat_id, data):
         self.resolve_calls.append((chat_id, data))
@@ -5165,3 +5175,335 @@ async def test_reset_records_session_event(tmp_path):
     session.reset(1)
     events = session.audit_log.tail(10)
     assert any(e.kind == KIND_SESSION_EVENT and e.summary == "reset" and e.chat_id == 1 for e in events)
+
+
+# ---------------------------------------------------------------------------
+# P14 T-SCHED — proactive scheduler CRUD commands (/every, /schedules,
+# /unschedule, /pause, /resume). SB1-gated + streaming-only; CRUD persists; the
+# listing is body-free (SB3). This task does NOT fire — a created schedule is
+# dormant data. The menu/HELP lock-step + the unchanged 1438-baseline are pinned
+# elsewhere (test_command_menu_matches_registered_handlers / the full suite count).
+# ---------------------------------------------------------------------------
+
+
+def _sched_bot(tmp_path, *, allowed=(1,)):
+    """A streaming bot wired to a REAL JsonSessionStore (schedules persist there)."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    bot = TelegramClaudeBot(
+        make_config(allowed=allowed, engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    return bot, store
+
+
+async def test_cmd_every_creates_schedule(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/every")
+    await bot.cmd_every(upd, make_cmd_ctx(["1h", "ci", "run", "the", "tests"]))
+    got = store.list_schedules(1)
+    assert len(got) == 1
+    s = got[0]
+    assert s.name == "ci"
+    assert s.interval_seconds == 3600
+    assert s.prompt == "run the tests"
+    assert s.chat_id == 1
+    assert s.next_run > 0  # armed (now + interval)
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "Saved schedule" in reply and "ci" in reply
+
+
+async def test_cmd_every_pins_active_project(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    store.create(1, "proj", "/work/proj", make_active=True)
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["30m", "task", "do", "it"]))
+    assert store.get_schedule(1, "task").project == "proj"  # pinned at create
+
+
+async def test_cmd_every_bad_interval_rejected(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/every")
+    # 1s is below the 60 s floor (the make_config default config carries the 60 s floor).
+    await bot.cmd_every(upd, make_cmd_ctx(["1s", "ci", "go"]))
+    assert store.list_schedules(1) == [], "a sub-floor interval must NOT create a schedule"
+    assert "❌" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_every_garbage_interval_rejected(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/every")
+    await bot.cmd_every(upd, make_cmd_ctx(["abc", "ci", "go"]))
+    assert store.list_schedules(1) == []
+    assert "❌" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_every_invalid_name_rejected_and_escaped(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/every")
+    # A name with a space fails SB4. The arg parsing takes args[1] as the name, so pass an
+    # invalid single-token name (a dot is invalid under ^[A-Za-z0-9_-]{1,32}$).
+    await bot.cmd_every(upd, make_cmd_ctx(["1h", "bad.name", "go"]))
+    assert store.list_schedules(1) == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "Invalid schedule name" in reply
+    # PRE-validation operator input is HTML-escaped (sent with parse_mode=HTML) so a hostile
+    # name renders inert.
+    assert upd.message.reply_text.await_args.kwargs.get("parse_mode") == "HTML"
+
+
+async def test_cmd_every_usage_when_too_few_args(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/every")
+    await bot.cmd_every(upd, make_cmd_ctx(["1h", "ci"]))  # no prompt
+    assert store.list_schedules(1) == []
+    assert upd.message.reply_text.await_args.args[0].startswith("Usage: /every")
+
+
+async def test_cmd_every_overwrites_same_name(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "a"]))
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["2h", "CI", "b"]))  # case-collide
+    got = store.list_schedules(1)
+    assert len(got) == 1, "a re-create of the same name (any case) must not duplicate"
+    assert got[0].interval_seconds == 7200 and got[0].prompt == "b"
+
+
+async def test_cmd_every_cap_fail_closed(tmp_path):
+    # Cap the chat at 2 and try to create a third — fail-closed with a clean reply.
+    store = JsonSessionStore(tmp_path / "state.json")
+    streaming = FakeStreaming()
+    streaming.store = store
+    cfg = make_config(allowed=(1,), engine_mode="streaming")
+    # make_config builds via Config(...); override the cap field on the frozen dataclass copy.
+    import dataclasses
+
+    cfg = dataclasses.replace(cfg, schedule_max_tasks_per_chat=2)
+    bot = TelegramClaudeBot(cfg, FakeRunner(), streaming=streaming)
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "a", "x"]))
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "b", "x"]))
+    upd = make_update(1, "/every")
+    await bot.cmd_every(upd, make_cmd_ctx(["1h", "c", "x"]))
+    assert len(store.list_schedules(1)) == 2, "the over-cap create must be refused"
+    assert "limit" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_every_unauthorized_ignored(tmp_path):
+    # SB1: an un-allowlisted chat is rejected by _ok BEFORE any effect — no schedule, no reply.
+    bot, store = _sched_bot(tmp_path, allowed=(1,))
+    upd = make_update(999, "/every")
+    await bot.cmd_every(upd, make_cmd_ctx(["1h", "ci", "go"]))
+    upd.message.reply_text.assert_not_awaited()
+    assert store.list_schedules(999) == [] and store.list_schedules(1) == []
+
+
+async def test_cmd_every_oneshot_replies_notice():
+    # Streaming-only: one-shot replies a clean notice (mirrors /projects), creates nothing.
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/every")
+    await bot.cmd_every(upd, make_cmd_ctx(["1h", "ci", "go"]))
+    assert "streaming mode only" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_schedules_lists_body_free(tmp_path):
+    # ⭐ SB3 / Codex-QA BLOCKER: /schedules is BODY-FREE — it shows the name + interval + next
+    # run + project, but NEVER the prompt text (a truncated prompt is still prompt text).
+    bot, store = _sched_bot(tmp_path)
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "secret-token-xyz", "deploy"]))
+    upd = make_update(1, "/schedules")
+    await bot.cmd_schedules(upd, make_cmd_ctx([]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "<b>ci</b>" in reply  # the name IS shown
+    assert "every 1h" in reply  # interval shown
+    # The prompt text is ABSENT (not previewed) — the schedule is managed by its name. The
+    # prompt stays persisted (needed to fire) but is never displayed.
+    assert "secret-token-xyz" not in reply
+    assert "deploy" not in reply
+
+
+async def test_cmd_schedules_empty_notice(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/schedules")
+    await bot.cmd_schedules(upd, make_cmd_ctx([]))
+    assert "No schedules yet" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_schedules_prompt_with_markup_not_rendered(tmp_path):
+    # ⭐ SB3: a prompt containing </>& cannot break the HTML or inject markup BECAUSE it is
+    # not rendered at all (body-free). Neither the raw nor an escaped form of the prompt
+    # appears; the only real <b> tag is the schedule NAME.
+    bot, store = _sched_bot(tmp_path)
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "<b>x</b>", "&", "y"]))
+    upd = make_update(1, "/schedules")
+    await bot.cmd_schedules(upd, make_cmd_ctx([]))
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "<b>ci</b>" in reply  # the name (bold) IS shown
+    # The prompt is body-free: neither its raw markup nor an escaped copy appears, so it can
+    # neither inject nor break the HTML. (The only bold spans are the header + the name.)
+    assert "<b>x</b>" not in reply
+    assert "&lt;b&gt;x&lt;/b&gt;" not in reply
+
+
+async def test_cmd_unschedule_removes(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "go"]))
+    upd = make_update(1, "/unschedule")
+    await bot.cmd_unschedule(upd, make_cmd_ctx(["ci"]))
+    assert store.list_schedules(1) == []
+    assert "Removed schedule" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_unschedule_unknown_clean_reply(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/unschedule")
+    await bot.cmd_unschedule(upd, make_cmd_ctx(["nope"]))
+    assert "No schedule named" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_unschedule_usage_when_no_name(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/unschedule")
+    await bot.cmd_unschedule(upd, make_cmd_ctx([]))
+    assert upd.message.reply_text.await_args.args[0].startswith("Usage: /unschedule")
+
+
+async def test_cmd_pause_and_resume(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "go"]))
+    # pause
+    upd = make_update(1, "/pause")
+    await bot.cmd_pause(upd, make_cmd_ctx(["ci"]))
+    assert store.get_schedule(1, "ci").paused is True
+    assert "Paused schedule" in upd.message.reply_text.await_args.args[0]
+    # resume
+    upd2 = make_update(1, "/resume")
+    await bot.cmd_resume(upd2, make_cmd_ctx(["ci"]))
+    assert store.get_schedule(1, "ci").paused is False
+    assert "Resumed schedule" in upd2.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_pause_unknown_clean_reply(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/pause")
+    await bot.cmd_pause(upd, make_cmd_ctx(["nope"]))
+    assert "No schedule named" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_pause_usage_when_no_name(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/pause")
+    await bot.cmd_pause(upd, make_cmd_ctx([]))
+    assert upd.message.reply_text.await_args.args[0] == "Usage: /pause <name>"
+    upd2 = make_update(1, "/resume")
+    await bot.cmd_resume(upd2, make_cmd_ctx([]))
+    assert upd2.message.reply_text.await_args.args[0] == "Usage: /resume <name>"
+
+
+async def test_schedule_commands_unauthorized_ignored(tmp_path):
+    # SB1: every schedule command drops an un-allowlisted chat with NO reply + NO effect.
+    bot, store = _sched_bot(tmp_path, allowed=(1,))
+    for handler, args in (
+        (bot.cmd_schedules, []),
+        (bot.cmd_unschedule, ["ci"]),
+        (bot.cmd_pause, ["ci"]),
+        (bot.cmd_resume, ["ci"]),
+    ):
+        upd = make_update(999, "/x")
+        await handler(upd, make_cmd_ctx(args))
+        upd.message.reply_text.assert_not_awaited()
+
+
+async def test_schedule_commands_oneshot_reply_notice():
+    # Streaming-only: each replies the clean notice in one-shot (no crash, no effect).
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    for handler, args in (
+        (bot.cmd_schedules, []),
+        (bot.cmd_unschedule, ["ci"]),
+        (bot.cmd_pause, ["ci"]),
+        (bot.cmd_resume, ["ci"]),
+    ):
+        upd = make_update(1, "/x")
+        await handler(upd, make_cmd_ctx(args))
+        assert "streaming mode only" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_schedule_commands_need_persistence_notice():
+    # No CLAUDE_STATE_FILE (store=None) → a clean "needs persistence" notice, never a crash.
+    streaming = FakeStreaming()
+    streaming.store = None
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/every")
+    await bot.cmd_every(upd, make_cmd_ctx(["1h", "ci", "go"]))
+    assert "persistence" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_schedule_commands_in_command_menu_and_help():
+    # T7 lock-step: each new command is in BOTH the native menu and the wall-of-text help.
+    from claude_tg.bot import COMMAND_MENU, HELP_TEXT
+
+    menu = {cmd for cmd, _desc in COMMAND_MENU}
+    for cmd in ("every", "schedules", "unschedule", "pause", "resume", "runnow"):
+        assert cmd in menu, f"/{cmd} missing from COMMAND_MENU"
+        assert f"/{cmd}" in HELP_TEXT, f"/{cmd} missing from HELP_TEXT"
+
+
+async def test_creating_schedule_does_not_fire_a_turn(tmp_path):
+    # Creating a schedule must NOT drive a turn (it just persists). Firing is /runnow + the
+    # driver. Assert handle_message was never called by /every.
+    bot, store = _sched_bot(tmp_path)
+    streaming = bot.streaming
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "go"]))
+    assert streaming.handle_message_calls == [], "creating a schedule must not fire a turn"
+
+
+# ---------------------------------------------------------------------------
+# P14 T-FIRE — /runnow fires a schedule IMMEDIATELY via the gated proactive path.
+# ---------------------------------------------------------------------------
+
+
+async def test_cmd_runnow_fires_the_named_schedule_now(tmp_path):
+    """/runnow <name> delegates to streaming.fire_schedule for the named schedule (the gated
+    proactive path), without changing its next_run (an out-of-band fire, not a reschedule)."""
+    bot, store = _sched_bot(tmp_path)
+    await bot.cmd_every(make_update(1, "/every"), make_cmd_ctx(["1h", "ci", "go"]))
+    next_run_before = store.get_schedule(1, "ci").next_run
+
+    upd = make_update(1, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx(["ci"]))
+
+    # The schedule was fired through fire_schedule (the proactive path).
+    assert [s.name for s in bot.streaming.fire_schedule_calls] == ["ci"]
+    # next_run is UNCHANGED — /runnow is out-of-band, it does not reschedule the cadence.
+    assert store.get_schedule(1, "ci").next_run == next_run_before
+
+
+async def test_cmd_runnow_unknown_name_clean_reply_no_fire(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx(["nope"]))
+    assert bot.streaming.fire_schedule_calls == []  # nothing fired
+    assert "No schedule named" in upd.message.reply_text.await_args.args[0]
+
+
+async def test_cmd_runnow_usage_when_no_name(tmp_path):
+    bot, store = _sched_bot(tmp_path)
+    upd = make_update(1, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx([]))
+    assert bot.streaming.fire_schedule_calls == []
+    assert upd.message.reply_text.await_args.args[0] == "Usage: /runnow <name>"
+
+
+async def test_cmd_runnow_unauthorized_ignored(tmp_path):
+    # SB1: an un-allowlisted chat is rejected by _ok BEFORE any effect — no fire, no reply.
+    bot, store = _sched_bot(tmp_path, allowed=(1,))
+    upd = make_update(999, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx(["ci"]))
+    upd.message.reply_text.assert_not_awaited()
+    assert bot.streaming.fire_schedule_calls == []
+
+
+async def test_cmd_runnow_oneshot_replies_notice():
+    # Streaming-only: one-shot replies the clean notice, fires nothing.
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/runnow")
+    await bot.cmd_runnow(upd, make_cmd_ctx(["ci"]))
+    assert "streaming mode only" in upd.message.reply_text.await_args.args[0].lower()

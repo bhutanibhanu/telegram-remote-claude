@@ -1109,3 +1109,200 @@ async def test_engine_dedups_double_plan_path_keeps_only_injected_resolvable():
     assert resolved == [True]
     assert sub.last_decision.allow is False
     assert sub.last_decision.message == "revise it"
+
+
+# ===========================================================================
+# P14 T-FIRE ⭐ — the SECURITY CORE: a proactive turn FORCES the gate ON.
+#
+# A scheduler-fired turn (engine.send(proactive=True)) must treat /yolo AND every
+# allow-session grant as OFF, so a risky tool ALWAYS holds — and, unattended, the
+# backstop auto-DENIES it (RB4 fail-safe). A NORMAL turn under the same /yolo'd policy
+# must still auto-allow (the interactive bypass is unchanged). Safe tools still auto-run.
+# These are the make-or-break invariants; each is a mutation-probe (the comment names
+# what breaks if the force-gate is removed).
+# ===========================================================================
+
+
+def _wire_policy(sub, *, policy, backstop_seconds=100) -> Engine:
+    """Build an Engine over the mock with an explicit policy + backstop, wire the seam."""
+    eng = Engine(sub, permission_policy=policy, backstop_seconds=backstop_seconds)
+    sub.decision_callback = eng.on_tool_request
+    return eng
+
+
+async def test_proactive_risky_tool_holds_even_under_yolo_then_backstop_denies():
+    """⭐ FORCE-GATE mutation-probe: a PROACTIVE risky Bash, fired against a /yolo'd project,
+    is HELD (a PermissionEvent is injected — NOT auto-allowed) and, with no one to tap Allow,
+    the backstop auto-DENIES it. MUTATION-PROBE: drop the ``self._force_gate`` guard in
+    ``Engine._needs_approval`` (let a proactive turn honor ``policy.yolo``) and this flips to an
+    auto-allow with NO PermissionEvent + ``allow is True`` — so this test FAILS, proving the
+    gate is pinned ON for an unattended turn."""
+    from claude_tg.engine.types import TextEvent
+
+    policy = PermissionPolicy()
+    policy.set_yolo(True)  # the operator left this project in allow-all
+
+    sub = HoldingSubstrate(
+        tool_name="Bash",
+        tool_input={"command": "rm -rf /tmp/x"},
+        tool_use_id="tu-proactive-bash",
+        post_factory=lambda d: TextEvent(text="post", session_id="S1"),
+    )
+    # Short backstop so the unattended hold auto-denies with no real wait (RB4).
+    eng = _wire_policy(sub, policy=policy, backstop_seconds=0.05)
+    await eng.start()
+
+    collected = await drain(eng.send("go", proactive=True))
+    await eng.stop()
+
+    # A PermissionEvent reached the stream (it HELD — it was NOT auto-allowed under yolo).
+    perms = [e for e in collected if isinstance(e, PermissionEvent)]
+    assert len(perms) == 1 and perms[0].tool_use_id == "tu-proactive-bash"
+    # And, unattended, the backstop DENIED it (the fail-safe) — never a silent risky run.
+    assert sub.last_decision.allow is False
+    assert "backstop" in (sub.last_decision.message or "")
+    # The persistent policy is UNTOUCHED — the operator's /yolo survives for their typed turns.
+    assert policy.yolo is True
+
+
+async def test_normal_turn_under_yolo_still_auto_allows_risky_unchanged():
+    """The interactive bypass is UNCHANGED: a NORMAL (non-proactive) Bash under a /yolo'd
+    policy auto-allows with NO prompt — exactly as before P14. This is the regression guard
+    that the force-gate only affects proactive turns (don't break the operator's /yolo)."""
+    from claude_tg.engine.types import TextEvent
+
+    policy = PermissionPolicy()
+    policy.set_yolo(True)
+
+    sub = HoldingSubstrate(
+        tool_name="Bash",
+        tool_input={"command": "ls"},
+        tool_use_id="tu-normal-bash",
+        post_factory=lambda d: TextEvent(text="post", session_id="S1"),
+    )
+    eng = _wire_policy(sub, policy=policy, backstop_seconds=0.05)
+    await eng.start()
+
+    collected = await drain(eng.send("go"))  # NOT proactive
+    await eng.stop()
+
+    # No PermissionEvent — yolo auto-allowed it, no hold.
+    assert not [e for e in collected if isinstance(e, PermissionEvent)]
+    assert sub.last_decision.allow is True
+
+
+async def test_proactive_safe_tool_still_auto_runs():
+    """A SAFE/read tool (Read) on a PROACTIVE turn still auto-runs (no hold) — proactive is
+    useful for read-only checks ("summarize what changed"). The force-gate only gates RISKY
+    tools; it does not gate everything."""
+    from claude_tg.engine.types import TextEvent
+
+    policy = PermissionPolicy()  # yolo OFF — a safe tool auto-runs regardless
+
+    sub = HoldingSubstrate(
+        tool_name="Read",
+        tool_input={"file_path": "/work/README.md"},
+        tool_use_id="tu-proactive-read",
+        post_factory=lambda d: TextEvent(text="post", session_id="S1"),
+    )
+    eng = _wire_policy(sub, policy=policy, backstop_seconds=0.05)
+    await eng.start()
+
+    collected = await drain(eng.send("go", proactive=True))
+    await eng.stop()
+
+    assert not [e for e in collected if isinstance(e, PermissionEvent)]  # no hold
+    assert sub.last_decision.allow is True  # auto-allowed
+
+
+async def test_proactive_ignores_allow_session_grant_and_holds():
+    """A live allow-session GRANT for the tool is treated as OFF on a proactive turn — a risky
+    tool still HOLDS even though a normal turn would auto-allow it. MUTATION-PROBE companion:
+    the same drop of the force-gate guard would let the grant short-circuit, auto-allowing the
+    tool — so the hold here proves grants are pinned off for an unattended turn too (design §5.2)."""
+    policy = PermissionPolicy()
+    policy.grant_session("Bash")  # a prior [Allow for session] tap
+
+    sub = HoldingSubstrate(
+        tool_name="Bash",
+        tool_input={"command": "echo hi"},
+        tool_use_id="tu-grant-bash",
+        post_factory=None,
+    )
+    eng = _wire_policy(sub, policy=policy, backstop_seconds=0.05)
+    await eng.start()
+
+    collected = await drain(eng.send("go", proactive=True))
+    await eng.stop()
+
+    # Held despite the grant; backstop-denied unattended.
+    assert [e for e in collected if isinstance(e, PermissionEvent)]
+    assert sub.last_decision.allow is False
+    # The grant itself is untouched (still live for the operator's own typed turns).
+    assert policy.is_granted("Bash") is True
+
+
+async def test_proactive_hold_allows_when_operator_taps_allow():
+    """A proactive risky tool is GATED, not auto-denied: with the operator present (e.g. via
+    /runnow) tapping Allow lets it run. Proves the force-gate produces a real, resolvable hold
+    (the §5.1 "be present and tap Allow" path), not a blanket deny."""
+    from claude_tg.engine.types import TextEvent
+
+    policy = PermissionPolicy()
+    policy.set_yolo(True)  # even under yolo it gates — and an explicit allow still works
+
+    sub = HoldingSubstrate(
+        tool_name="Bash",
+        tool_input={"command": "pytest"},
+        tool_use_id="tu-allow-bash",
+        post_factory=lambda d: TextEvent(text=f"allow={d.allow}", session_id="S1"),
+    )
+    eng = _wire_policy(sub, policy=policy, backstop_seconds=100)  # long: operator wins
+    await eng.start()
+
+    async def operator():
+        for _ in range(1000):
+            if eng._pending.has_pending("tu-allow-bash"):
+                break
+            await asyncio.sleep(0)
+        eng.resolve("tu-allow-bash", PermissionDecision(verdict="allow_once"))
+
+    op = asyncio.create_task(operator())
+    collected = await asyncio.wait_for(drain(eng.send("go", proactive=True)), timeout=5)
+    await op
+    await eng.stop()
+
+    assert sub.last_decision.allow is True  # the explicit Allow ran the tool
+    assert any("allow=True" in getattr(e, "text", "") for e in collected)
+
+
+async def test_force_gate_resets_after_turn_so_next_normal_turn_honors_yolo():
+    """The force-gate is TURN-SCOPED: after a proactive turn ends on a (reused) engine, the
+    NEXT normal turn honors /yolo again (auto-allows). Proves the flag is reset in send()'s
+    finally and never leaks across turns (the engine is reused per project)."""
+    from claude_tg.engine.types import TextEvent
+
+    policy = PermissionPolicy()
+    policy.set_yolo(True)
+
+    # First: a proactive turn that holds+denies a risky tool.
+    sub1 = HoldingSubstrate(
+        tool_name="Bash", tool_input={"command": "rm x"}, tool_use_id="tu-1",
+        post_factory=lambda d: TextEvent(text="p1", session_id="S1"),
+    )
+    eng = _wire_policy(sub1, policy=policy, backstop_seconds=0.05)
+    await eng.start()
+    await drain(eng.send("go", proactive=True))
+    assert sub1.last_decision.allow is False  # proactive held + denied
+
+    # Then a NORMAL turn on the SAME engine: yolo is honored again (auto-allow, no leak).
+    sub2 = HoldingSubstrate(
+        tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="tu-2",
+        post_factory=lambda d: TextEvent(text="p2", session_id="S1"),
+    )
+    # Re-point the engine's substrate seam at sub2 (the engine drives whatever its substrate
+    # yields; we swap the substrate the callback runs against to exercise a 2nd turn cleanly).
+    eng._substrate = sub2
+    sub2.decision_callback = eng.on_tool_request
+    await drain(eng.send("go2"))  # NOT proactive
+    assert sub2.last_decision.allow is True  # yolo auto-allowed again — flag reset

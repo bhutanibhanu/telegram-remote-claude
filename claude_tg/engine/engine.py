@@ -62,7 +62,7 @@ from ..audit import (
     audit_safe_summary,
 )
 from ..bash_policy import BashPolicyMatch, classify_bash
-from ..permissions import PermissionPolicy, path_needs_approval
+from ..permissions import PermissionPolicy, is_risky, path_needs_approval
 from ..util import _now_iso, _redact_sid
 from .pending import DEFAULT_BACKSTOP_SECONDS, PendingRegistry
 from .substrate import Substrate
@@ -164,6 +164,20 @@ class Engine:
         # decision callback and the backstop notify push injected events onto it; the
         # substrate stream is drained onto it by send()'s producer task.
         self._out_queue: Optional[asyncio.Queue[Any]] = None
+        # P14 T-FIRE ⭐ THE SECURITY CORE — the per-turn FORCE-GATE flag. False for every
+        # normal (operator-typed) turn (so the interactive ``/yolo`` + allow-session grants
+        # behave EXACTLY as before — zero behavior change). Set to True for the duration of a
+        # PROACTIVE (scheduler-fired) turn by :meth:`send` (``proactive=True``) and reset in
+        # its ``finally`` — turn-scoped, like ``_out_queue``. When set, :meth:`on_tool_request`
+        # treats ``policy.yolo`` AND every allow-session grant as OFF for that turn, so a risky
+        # tool ALWAYS holds for approval (and, unattended, the 60-min backstop auto-DENIES it —
+        # RB4 fail-safe). It is NEVER persisted and NEVER mutates the policy object: the
+        # operator's interactive ``/yolo``/grants survive untouched for their own later typed
+        # turns. The per-project turn lock means a proactive and a normal turn never run on the
+        # SAME engine at once, so this single per-engine flag has no cross-turn race (mirrors
+        # ``_out_queue``'s single-in-flight-turn invariant). The make-or-break invariant: an
+        # unattended fire can NEVER inherit allow-all.
+        self._force_gate: bool = False
 
     # -- audit hook (P13 T-AUDIT — body-free, best-effort, no-op when unset) --
 
@@ -340,6 +354,13 @@ class Engine:
         if tool_name in (ASK_TOOL, PLAN_TOOL) and tool_use_id is not None:
             return await self._answer_hold(tool_name, tool_input, tool_use_id)
 
+        # P14 T-FIRE ⭐ the FORCE-GATE for this turn. ``yolo_active`` is the policy's ``/yolo``
+        # bit UNLESS this is a proactive turn (``_force_gate``), in which case it is forced
+        # OFF — an unattended fire must never inherit allow-all. Everything below that consulted
+        # ``self._policy.yolo`` directly now reads ``yolo_active`` so the proactive inversion is
+        # honored in ONE place (the out-of-root bypass AND the Bash-policy/name-gate ordering).
+        yolo_active = self._policy.yolo and not self._force_gate
+
         # --- P13 T-BASH: the Bash command policy (ADDITIVE, checked FIRST so it can override
         # grant/yolo for a MATCHED dangerous command — the C2-residual closure). It runs ONLY
         # for Bash and ONLY when the mode is not ``off`` (so a non-Bash tool, or any tool with
@@ -414,16 +435,18 @@ class Engine:
         #      short-circuit and is disabled by ALLOW_ANY_PATH=true (the other opt-out) and
         #      when no cwd is wired (the path layer is then a no-op — see __init__).
         #   3. otherwise the P2 name-only verdict: safe→auto, risky→grant-or-prompt.
-        if not self._policy.yolo and self._path_out_of_root(tool_name, tool_input):
+        if not yolo_active and self._path_out_of_root(tool_name, tool_input):
             # Out-of-root + not yolo → hold for approval regardless of name/grant. A risky
             # tool with no tool_use_id still can't open a resolvable hold (fail closed →
             # deny, below); an out-of-root SAFE tool with no id would be vanishingly rare on
-            # the live path but is handled the same fail-closed way.
+            # the live path but is handled the same fail-closed way. (Proactive: yolo_active
+            # is forced False, so an out-of-root tool always re-prompts under a proactive turn
+            # even if the project is /yolo'd — the §5.1 out-of-root fail-safe.)
             log.debug(
                 "tool %s target is outside allowed_roots — requiring approval (C2/SB2)",
                 tool_name,
             )
-        elif not self._policy.needs_approval(tool_name, tool_input):
+        elif not self._needs_approval(tool_name, tool_input):
             log.debug("policy allows tool %s without prompt", tool_name)
             # P13 T-AUDIT: record the AUTO-ALLOW (safe tool / live grant / /yolo) at the
             # chokepoint — this branch never reaches the bot, so the engine is the only
@@ -452,6 +475,33 @@ class Engine:
             )
 
         return await self._permission_hold(tool_name, tool_input, tool_use_id)
+
+    def _needs_approval(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
+        """Whether this tool must HOLD for approval — force-gate-aware (P14 T-FIRE ⭐).
+
+        For a NORMAL turn this is exactly ``self._policy.needs_approval(...)`` — the
+        unchanged P2 gate (``/yolo`` on → never; safe tool → never; live allow-session grant
+        → never; else hold). For a PROACTIVE turn (``self._force_gate`` set) it treats BOTH
+        ``/yolo`` AND every allow-session grant as OFF: a tool holds **iff it is risky**
+        (:func:`~claude_tg.permissions.is_risky`), regardless of any stale bypass on the
+        project's policy. So a risky tool fired unattended ALWAYS gates (and the 60-min
+        backstop then auto-DENIES it — RB4), while a SAFE/read tool still auto-runs (proactive
+        is useful for read-only checks).
+
+        Crucially this does **not** mutate the persistent :class:`~claude_tg.permissions.
+        PermissionPolicy` — the operator's interactive ``/yolo`` / grants are untouched and
+        apply to their own later typed turns. The inversion is purely per-turn (it reads the
+        turn-scoped ``_force_gate`` flag), so the make-or-break invariant holds: an unattended
+        fire can never inherit allow-all.
+
+        **Mutation-probe:** drop the ``self._force_gate`` guard (let a proactive turn fall
+        through to ``self._policy.needs_approval``) and the force-gate test flips — a risky
+        tool auto-allows under a yolo'd project — so the test FAILS, proving the gate is pinned.
+        """
+        if self._force_gate:
+            # Proactive turn: ignore yolo + grants entirely. Risk is the ONLY criterion.
+            return is_risky(tool_name, tool_input)
+        return self._policy.needs_approval(tool_name, tool_input)
 
     def _path_out_of_root(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
         """Return ``True`` iff this tool's target path is outside ``allowed_roots`` (C2/SB2).
@@ -664,6 +714,7 @@ class Engine:
         *,
         timeout: Optional[float] = None,
         images: Optional[Sequence[ImageInput]] = None,
+        proactive: bool = False,
     ) -> AsyncIterator[Event]:
         """Send one operator turn; async-yield normalized events out.
 
@@ -671,6 +722,18 @@ class Engine:
         when supplied it is threaded straight through to the substrate's ``send`` so the
         turn is multimodal (prompt + pixels). The merge/inject/decision machinery below is
         identical for both — only the substrate's ``query`` argument differs.
+
+        **P14 T-FIRE ⭐ — ``proactive`` FORCES THE GATE ON for this turn (the security core).**
+        Defaults to ``False`` (every operator-typed turn — unchanged; ``/yolo`` + allow-session
+        grants behave exactly as before). When ``True`` (a scheduler-fired turn — no human
+        present), the per-turn :attr:`_force_gate` flag is set for the duration of this ``send``
+        and reset in its ``finally``, so :meth:`on_tool_request` treats ``policy.yolo`` AND
+        every allow-session grant as OFF: a risky tool ALWAYS holds (and, unattended, the 60-min
+        backstop auto-DENIES it — RB4 fail-safe), while a safe/read tool still auto-runs. It is
+        turn-scoped and NEVER mutates the policy (the operator's interactive bypass is untouched
+        for their own later typed turns). The per-project turn lock guarantees a proactive turn
+        and a normal turn never overlap on the SAME engine, so this single per-engine flag is
+        race-free (same single-in-flight-turn invariant as ``_out_queue``).
 
         Merges TWO sources onto one stream so the operator sees everything in order and
         nothing deadlocks:
@@ -687,8 +750,20 @@ class Engine:
         the turn continue. The consumer ends once the substrate producer signals done
         AND the queue is drained.
         """
+        # P14 T-FIRE (Codex-QA, defensive): one turn at a time per Engine. The per-turn state
+        # below (``_out_queue`` + the ``_force_gate`` flag) is single-flight — it is set here and
+        # reset in the ``finally``, so a turn must fully end before the next starts. Production
+        # guarantees this via ``StreamingSession``'s per-project turn lock (a proactive and a
+        # normal turn never overlap on one engine), but assert it locally so a future caller that
+        # tried to drive two concurrent turns on ONE engine fails LOUD here rather than silently
+        # corrupting the force-gate / stream merge. (``_out_queue is None`` between turns.)
+        assert self._out_queue is None, "Engine.send is single-flight: a turn is already in flight"
         queue: asyncio.Queue[Any] = asyncio.Queue()
         self._out_queue = queue
+        # P14 T-FIRE ⭐ arm the per-turn FORCE-GATE for a proactive turn (reset in the
+        # finally). Set BEFORE the producer task starts so the decision callback (which fires
+        # mid-``send`` from the substrate's can_use_tool) always observes it.
+        self._force_gate = proactive
         producer = asyncio.create_task(
             self._drain_substrate(prompt, timeout or self._send_timeout, queue, images=images),
             name="substrate-drain",
@@ -713,6 +788,9 @@ class Engine:
             if not producer.done():
                 producer.cancel()
             self._out_queue = None
+            # P14 T-FIRE: disarm the force-gate so a later turn on this (reused) engine is a
+            # normal gated turn unless it too is proactive. Turn-scoped, like _out_queue.
+            self._force_gate = False
 
     async def _drain_substrate(
         self,

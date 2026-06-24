@@ -796,3 +796,164 @@ def test_get_fork_pending_unknown_project_is_false(tmp_path):
     assert store.get_fork_pending(1, "nope") is False
     store.create(1, "p", "/w", make_active=True)
     assert store.get_fork_pending(2, "p") is False  # wrong chat
+
+
+# ---- proactive schedules (P14 T2) ------------------------------------------
+#
+# Schedule DEFINITIONS persist alongside macros/projects (atomic + 0600). The key
+# RB3/RB6 property: rearm_all_schedules re-arms next_run from NOW (no missed-fire replay).
+
+from claude_tg.scheduler import Schedule  # noqa: E402
+from claude_tg.session_store import MaxSchedulesExceeded  # noqa: E402
+
+
+def _sched(name="ci", **kw) -> Schedule:
+    base = dict(
+        name=name,
+        interval_seconds=3600,
+        prompt="run tests",
+        chat_id=7,
+        next_run=1000.0,
+        project="proj",
+        created_at=500.0,
+    )
+    base.update(kw)
+    return Schedule(**base)
+
+
+def test_schedule_round_trip(tmp_path):
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.add_schedule(_sched())
+    got = store.list_schedules(7)
+    assert len(got) == 1
+    s = got[0]
+    # The stored next_run round-trips faithfully (the runtime re-arms it; the store doesn't).
+    assert (s.name, s.interval_seconds, s.prompt, s.chat_id, s.next_run, s.project, s.paused, s.created_at) == (
+        "ci", 3600, "run tests", 7, 1000.0, "proj", False, 500.0,
+    )
+
+
+def test_schedule_persisted_with_0600_perms(tmp_path):
+    import os
+    import stat
+
+    p = tmp_path / "s.json"
+    store = JsonSessionStore(p)
+    store.add_schedule(_sched())
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+
+
+def test_schedule_get_and_remove_case_insensitive(tmp_path):
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.add_schedule(_sched(name="CI"))
+    assert store.get_schedule(7, "ci").interval_seconds == 3600  # case-insensitive
+    assert store.remove_schedule(7, "ci") is True
+    assert store.list_schedules(7) == []
+    # Removing a now-absent schedule is a clean False (RB1), never a raise.
+    assert store.remove_schedule(7, "ci") is False
+
+
+def test_schedule_overwrite_keeps_one_entry(tmp_path):
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.add_schedule(_sched(name="Work", interval_seconds=3600))
+    store.add_schedule(_sched(name="work", interval_seconds=7200))  # case-collide → overwrite
+    got = store.list_schedules(7)
+    assert len(got) == 1, "a re-create under a different case must not fork a duplicate"
+    assert got[0].interval_seconds == 7200
+
+
+def test_schedule_pause_resume_preserves_next_run(tmp_path):
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.add_schedule(_sched(next_run=1234.0))
+    assert store.set_schedule_paused(7, "ci", True) is True
+    s = store.get_schedule(7, "ci")
+    assert s.paused is True and s.next_run == 1234.0  # next_run untouched by pause
+    assert store.set_schedule_paused(7, "ci", False) is True
+    assert store.get_schedule(7, "ci").paused is False
+    # Pausing an unknown schedule is a clean False (RB1).
+    assert store.set_schedule_paused(7, "nope", True) is False
+
+
+def test_schedule_rearm_from_now_no_missed_fire_replay(tmp_path):
+    # The KEY RB3/RB6 test: a schedule whose stored next_run is far in the PAST (the bot was
+    # down past its fire window) must, on re-arm, be set to now + interval — NOT replayed.
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.add_schedule(_sched(interval_seconds=3600, next_run=1.0, paused=False))
+    store.add_schedule(_sched(name="nightly", interval_seconds=86400, next_run=2.0, paused=True))
+    store.rearm_all_schedules(now=10_000.0)
+    a = store.get_schedule(7, "ci")
+    assert a.next_run == 10_000.0 + 3600, "next_run must be re-armed to now + interval"
+    b = store.get_schedule(7, "nightly")
+    # Paused schedules are re-armed too (so a later /resume resumes on a fresh cadence) and the
+    # paused flag is preserved.
+    assert b.next_run == 10_000.0 + 86400
+    assert b.paused is True
+
+
+def test_schedule_rearm_persists_across_reload(tmp_path):
+    # Re-arm + a FRESH store over the same file: the re-armed next_run is durable (RB6).
+    p = tmp_path / "s.json"
+    store = JsonSessionStore(p)
+    store.add_schedule(_sched(interval_seconds=3600, next_run=1.0))
+    store.rearm_all_schedules(now=50_000.0)
+    reloaded = JsonSessionStore(p)
+    assert reloaded.get_schedule(7, "ci").next_run == 50_000.0 + 3600
+
+
+def test_schedule_max_per_chat_fail_closed(tmp_path):
+    store = JsonSessionStore(tmp_path / "s.json")
+    for i in range(3):
+        store.add_schedule(_sched(name=f"s{i}"), max_per_chat=3)
+    with pytest.raises(MaxSchedulesExceeded):
+        store.add_schedule(_sched(name="s3"), max_per_chat=3)
+    assert len(store.list_schedules(7)) == 3, "the over-cap create must NOT have been stored"
+
+
+def test_schedule_overwrite_does_not_trip_cap(tmp_path):
+    store = JsonSessionStore(tmp_path / "s.json")
+    for i in range(3):
+        store.add_schedule(_sched(name=f"s{i}"), max_per_chat=3)
+    # Overwriting an EXISTING name (case-insensitive) does not grow the count → allowed at cap.
+    store.add_schedule(_sched(name="S0", interval_seconds=120), max_per_chat=3)
+    assert len(store.list_schedules(7)) == 3
+    assert store.get_schedule(7, "s0").interval_seconds == 120
+
+
+def test_schedule_missing_store_reads_empty_never_raises(tmp_path):
+    store = JsonSessionStore(tmp_path / "absent.json")
+    assert store.list_schedules(1) == []
+    assert store.get_schedule(1, "x") is None
+    assert store.remove_schedule(1, "x") is False
+    assert store.set_schedule_paused(1, "x", True) is False
+    store.rearm_all_schedules(now=0.0)  # no-op, no raise
+
+
+def test_schedule_corrupt_record_skipped(tmp_path):
+    p = tmp_path / "s.json"
+    store = JsonSessionStore(p)
+    store.add_schedule(_sched(name="good"))
+    raw = json.loads(p.read_text())
+    # A hand-edited record with no interval_seconds is unrenderable → skipped by list (RB1).
+    raw["chats"]["7"]["schedules"]["bad"] = {"prompt": "x"}
+    p.write_text(json.dumps(raw))
+    names = [s.name for s in store.list_schedules(7)]
+    assert "good" in names and "bad" not in names
+
+
+def test_schedules_are_per_chat(tmp_path):
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.add_schedule(_sched(name="a", chat_id=7))
+    store.add_schedule(_sched(name="b", chat_id=8))
+    assert [s.name for s in store.list_schedules(7)] == ["a"]
+    assert [s.name for s in store.list_schedules(8)] == ["b"]
+
+
+def test_schedules_coexist_with_macros_and_projects(tmp_path):
+    # A schedule write must not disturb the chat's macros/projects (separate namespaces).
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.create(7, "proj", "/work", make_active=True)
+    store.save_macro(7, "m", "body")
+    store.add_schedule(_sched(name="ci", chat_id=7))
+    assert store.get_active(7) == "proj"
+    assert store.get_macro(7, "m") == "body"
+    assert [s.name for s in store.list_schedules(7)] == ["ci"]
