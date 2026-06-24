@@ -26,6 +26,7 @@ is unit-testable against constructed/fake SDK objects with no live session.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from typing import Any, AsyncIterator, Optional, Sequence
 
@@ -43,6 +44,8 @@ from .types import (
     ThinkingEvent,
     ToolUseEvent,
 )
+
+log = logging.getLogger(__name__)
 
 # StreamEvent.event["type"] values that are genuine incremental model output
 # (everything else — message_start/content_block_start/stop — is framing, not text).
@@ -128,6 +131,81 @@ def _session_id_of(msg: Any) -> Optional[str]:
         return str(data["session_id"])
     sid = getattr(msg, "session_id", None)
     return str(sid) if sid else None
+
+
+def _field(obj: Any, key: str) -> Any:
+    """Read ``key`` from ``obj`` whether it is a dict or an attribute object (defensive).
+
+    The SDK's ``usage`` / ``get_context_usage()`` shapes are TypedDicts at the type level but
+    may surface as plain dicts OR attribute objects at runtime depending on the build; this
+    reads either uniformly. Returns ``None`` when absent. Pure; never raises (STATUSLINE ctx-%).
+    """
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    """Coerce a numeric token/percentage value to ``int``, or ``None`` (defensive, RB1)."""
+    if isinstance(value, bool):  # bool is an int subclass — never a token count.
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _usage_tokens(usage: Any) -> Optional[int]:
+    """Sum the context-relevant token fields of a ``ResultMessage.usage`` (ctx-% fallback §2.1).
+
+    ``input_tokens + cache_read_input_tokens + cache_creation_input_tokens`` — the last turn's
+    INPUT side ≈ the current context size (design §2.1; output tokens are NOT part of the
+    context the next turn carries). Missing fields read as 0. Returns ``None`` only when the
+    whole ``usage`` is absent/odd (so the caller leaves the cached value untouched). Pure;
+    never raises.
+    """
+    if usage is None:
+        return None
+    total = 0
+    seen = False
+    for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        n = _coerce_int(_field(usage, key))
+        if n is not None:
+            total += n
+            seen = True
+    return total if seen else None
+
+
+def _context_window_of(model_usage: Any) -> Optional[int]:
+    """The per-model ``contextWindow`` from a ``ResultMessage.model_usage`` (ctx-% fallback).
+
+    ``model_usage`` maps ``model_id -> {…, contextWindow: int, …}`` (design §2.1). One model
+    runs per turn, so the FIRST entry carrying a positive ``contextWindow`` is taken (no
+    model-id→window table is hard-coded — the SDK reports the model's true window, and a ``1M``
+    beta tracks automatically). Returns ``None`` when absent/odd. Pure; never raises.
+    """
+    if not isinstance(model_usage, dict):
+        return None
+    for entry in model_usage.values():
+        window = _coerce_int(_field(entry, "contextWindow"))
+        if window is not None and window > 0:
+            return window
+    return None
+
+
+def _percentage_of(resp: Any) -> Optional[int]:
+    """``round(resp["percentage"])`` from a live ``ContextUsageResponse``, or ``None`` (§2.1).
+
+    The spike-proven primary ctx source: the SDK's ``percentage`` (0–100, the same figure the
+    CLI ``/context`` shows). Reads the value defensively (dict or attribute object), ROUNDS
+    (``6.4`` → ``6``, ``6.6`` → ``7`` — design §2.1 says ``round(percentage)``, never truncate),
+    and clamps to ``[0, 100]`` (a number outside that range is an unexpected shape → bounded,
+    never shown raw). ``None`` when the field is absent/non-numeric (the caller then uses the
+    usage fallback). Pure; never raises.
+    """
+    raw = _field(resp, "percentage")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return max(0, min(100, round(raw)))
 
 
 def normalize(msg: Any) -> Optional[Event]:
@@ -395,6 +473,17 @@ class SdkSubstrate:
         # concurrent hold without a premature un-suspend. Single asyncio task per the
         # substrate contract, so no lock is needed.
         self._hold_depth = 0
+        # STATUSLINE T-SL-CORE: the honest ctx-% usage fallback (design §2.1/§5 T5). The live
+        # ``get_context_usage()`` is the primary source (``context_percentage()`` below); when
+        # it is unavailable/raises, the bot can still compute an honest % from the LAST turn's
+        # usage — the last ``ResultMessage`` carries ``usage`` (input + cache_read +
+        # cache_creation tokens ≈ the current context size) and ``model_usage[…].contextWindow``
+        # (the model's window). We stash those two numbers as each ResultMessage drains
+        # (``_capture_usage``), so a None from the live call has a derived figure to fall back to.
+        # Both default None → no fallback before the first turn completes (→ ``ctx —``, never a
+        # fabricated 0%). In-memory only (RB3); reset on stop. Single asyncio task → no lock.
+        self._last_usage_tokens: Optional[int] = None
+        self._last_context_window: Optional[int] = None
 
     # -- options -------------------------------------------------------------
 
@@ -581,6 +670,7 @@ class SdkSubstrate:
                 except StopAsyncIteration:
                     break
                 self._capture_session_id(msg)
+                self._capture_usage(msg)
                 for ev in self._events_from(msg):
                     yield ev
         except asyncio.TimeoutError:
@@ -686,6 +776,78 @@ class SdkSubstrate:
         if sid and not self.session_id:
             self.session_id = sid
 
+    def _capture_usage(self, msg: Any) -> None:
+        """Stash the last ``ResultMessage``'s token usage + context window (ctx-% fallback).
+
+        STATUSLINE T-SL-CORE (design §2.1/§5 T5). Only a terminal ``ResultMessage`` carries
+        ``usage`` + ``model_usage``; for one we record the honest fallback inputs so a None
+        from the live ``get_context_usage()`` can still produce a % (:meth:`context_percentage`):
+
+        * ``tokens`` = ``input_tokens + cache_read_input_tokens + cache_creation_input_tokens``
+          from ``msg.usage`` — the LAST turn's input ≈ the current context size (design §2.1).
+        * ``window`` = the per-model ``contextWindow`` from ``msg.model_usage[<model>]`` (the SDK
+          reports the model's raw window; no model-id→window table is hard-coded — a ``1M`` beta
+          tracks automatically). We take the FIRST model entry's window (one model per turn).
+
+        **Best-effort + fully defensive (RB1):** any missing key / odd shape / exception leaves
+        the stored values UNCHANGED (we never overwrite a good figure with a broken one, and we
+        never raise on the hot receive path). ``usage`` may be a dict or an attribute object, so
+        both are probed. A non-positive/absent window is ignored (a 0 window would divide-by-zero
+        downstream). Pure-ish: only mutates the two cached ints; no I/O.
+        """
+        from claude_agent_sdk import ResultMessage  # lazy
+
+        if not isinstance(msg, ResultMessage):
+            return
+        try:
+            usage = getattr(msg, "usage", None)
+            tokens = _usage_tokens(usage)
+            window = _context_window_of(getattr(msg, "model_usage", None))
+            if tokens is not None:
+                self._last_usage_tokens = tokens
+            if window is not None and window > 0:
+                self._last_context_window = window
+        except Exception:  # pragma: no cover - defensive; never break the receive loop (RB1)
+            log.debug("usage capture failed (ignored)", exc_info=True)
+
+    def context_percentage(self) -> Optional[int]:
+        """Best-effort % of the context window currently used — the honest ctx figure (§2.1).
+
+        **Primary path:** call the LIVE client's ``get_context_usage()`` and return
+        ``round(resp["percentage"])`` — the same number the CLI ``/context`` shows (spike-proven,
+        design §2.1). **Fallback:** if there is no live client, the method is absent, or it
+        raises, derive ``round(100 * tokens / window)`` from the LAST ``ResultMessage``'s usage
+        captured by :meth:`_capture_usage` (an honest ratio, not a fabricated number). If neither
+        is available (no client AND no completed turn yet) → ``None`` (the caller shows ``ctx —``,
+        NEVER a fake 0%).
+
+        Fully best-effort (RB1): this is an observer off the turn's critical path — it NEVER
+        raises. A synchronous read (no ``await``): the spike-confirmed ``get_context_usage()`` on
+        the installed SDK returns the dict synchronously; should a build expose an awaitable
+        instead, that non-dict return is treated as unavailable and the usage fallback is used.
+        """
+        client = self._client
+        if client is not None:
+            try:
+                getter = getattr(client, "get_context_usage", None)
+                if getter is not None:
+                    resp = getter()
+                    pct = _percentage_of(resp)
+                    if pct is not None:
+                        return pct
+            except Exception:
+                # The live call is best-effort; fall through to the usage-derived fallback.
+                log.debug("get_context_usage() failed; using usage fallback", exc_info=True)
+        # Fallback: the honest ratio from the last completed turn's usage (§2.1).
+        tokens = self._last_usage_tokens
+        window = self._last_context_window
+        if tokens is not None and window is not None and window > 0:
+            try:
+                return round(100 * tokens / window)
+            except Exception:  # pragma: no cover - arithmetic guard (RB1)
+                return None
+        return None
+
     async def stop(self) -> None:
         if self._client is None:
             return
@@ -693,6 +855,11 @@ class SdkSubstrate:
             await self._client.disconnect()
         finally:
             self._client = None
+            # STATUSLINE T-SL-CORE: drop the ctx-% fallback cache with the session — it
+            # described THAT session's context; a fresh session starts with no figure (→ ctx —
+            # until its first turn completes), never a stale carryover. RB3 (in-memory only).
+            self._last_usage_tokens = None
+            self._last_context_window = None
 
 
 __all__ = [

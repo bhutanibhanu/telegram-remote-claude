@@ -1253,3 +1253,180 @@ def test_adapter_does_not_import_sdk_at_module_top_level():
         name == "claude_agent_sdk" or name.startswith("claude_agent_sdk.")
         for name in top_level_imports
     ), f"SDK must be imported lazily; found top-level import in {top_level_imports}"
+
+
+# ---------------------------------------------------------------------------
+# STATUSLINE T-SL-CORE — the ctx-% source (live get_context_usage() + the honest
+# usage-derived fallback). The live call is the primary path; the fallback derives an
+# honest ratio from the LAST ResultMessage.usage. A None is NEVER a fabricated number.
+# ---------------------------------------------------------------------------
+
+
+class _FakeUsageClient:
+    """A fake ClaudeSDKClient exposing only get_context_usage (the ctx-% spike shape)."""
+
+    def __init__(self, resp):
+        self._resp = resp
+
+    def get_context_usage(self):
+        return self._resp
+
+
+class _BoomUsageClient:
+    def get_context_usage(self):
+        raise RuntimeError("get_context_usage unavailable")
+
+
+def test_context_percentage_live_client_returns_rounded_percentage():
+    # Primary path: a connected client's get_context_usage()['percentage'] → round(%).
+    sub = SdkSubstrate()
+    sub._client = _FakeUsageClient(
+        {"percentage": 6, "maxTokens": 200000, "totalTokens": 12998, "model": "claude-opus-4-6"}
+    )
+    assert sub.context_percentage() == 6
+
+
+def test_context_percentage_rounds_a_float_percentage():
+    # design §2.1: round(percentage) — 6.6 → 7, not truncated to 6.
+    sub = SdkSubstrate()
+    sub._client = _FakeUsageClient({"percentage": 6.6})
+    assert sub.context_percentage() == 7
+    sub._client = _FakeUsageClient({"percentage": 6.4})
+    assert sub.context_percentage() == 6
+
+
+def test_context_percentage_no_client_no_usage_is_none():
+    # No live client AND no completed turn → None (the caller shows "ctx —", never a fake 0%).
+    sub = SdkSubstrate()
+    assert sub.context_percentage() is None
+
+
+def test_context_percentage_raising_client_falls_back_to_none_without_usage():
+    # The live call raises and there is no usage yet → None (NOT a fabricated number).
+    sub = SdkSubstrate()
+    sub._client = _BoomUsageClient()
+    assert sub.context_percentage() is None
+
+
+def test_context_percentage_usage_fallback_math():
+    # The honest fallback: round(100 * tokens / window) from the last turn's usage.
+    sub = SdkSubstrate()
+    sub._last_usage_tokens = 12998
+    sub._last_context_window = 200000
+    # No client → fallback used directly.
+    assert sub.context_percentage() == round(100 * 12998 / 200000)  # == 6
+
+
+def test_context_percentage_raising_client_uses_usage_fallback():
+    # The live call raises BUT a last-turn usage is present → the fallback % (not None).
+    sub = SdkSubstrate()
+    sub._client = _BoomUsageClient()
+    sub._last_usage_tokens = 100000
+    sub._last_context_window = 200000
+    assert sub.context_percentage() == 50
+
+
+def test_capture_usage_records_tokens_and_window_from_result_message():
+    # _capture_usage carries the fallback inputs off a real ResultMessage (usage + model_usage).
+    sub = SdkSubstrate()
+    msg = sdk.ResultMessage(
+        subtype="success",
+        duration_ms=10,
+        duration_api_ms=8,
+        is_error=False,
+        num_turns=1,
+        session_id="S1",
+        total_cost_usd=0.01,
+        result="ok",
+        usage={
+            "input_tokens": 3,
+            "cache_creation_input_tokens": 12995,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 5,
+        },
+        model_usage={
+            "claude-opus-4-6": {
+                "inputTokens": 3,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 12995,
+                "contextWindow": 200000,
+                "maxOutputTokens": 64000,
+            }
+        },
+    )
+    sub._capture_usage(msg)
+    assert sub._last_usage_tokens == 12998  # 3 + 12995 + 0
+    assert sub._last_context_window == 200000
+    # With no live client, context_percentage now derives from the captured usage.
+    assert sub.context_percentage() == 6
+
+
+def test_capture_usage_ignores_non_result_message():
+    # A non-terminal message never touches the fallback cache.
+    sub = SdkSubstrate()
+    sub._capture_usage(object())
+    assert sub._last_usage_tokens is None
+    assert sub._last_context_window is None
+
+
+def test_capture_usage_never_overwrites_good_with_broken():
+    # A ResultMessage with no usage/window leaves a previously-captured good figure intact (RB1).
+    sub = SdkSubstrate()
+    sub._last_usage_tokens = 12998
+    sub._last_context_window = 200000
+    msg = sdk.ResultMessage(
+        subtype="success",
+        duration_ms=10,
+        duration_api_ms=8,
+        is_error=False,
+        num_turns=1,
+        session_id="S1",
+        result="ok",
+        usage=None,
+        model_usage=None,
+    )
+    sub._capture_usage(msg)
+    assert sub._last_usage_tokens == 12998
+    assert sub._last_context_window == 200000
+
+
+def test_stop_clears_ctx_usage_cache():
+    # The fallback cache describes THIS session; stop() drops it (RB3 — no stale carryover).
+    sub = SdkSubstrate()
+    sub._last_usage_tokens = 12998
+    sub._last_context_window = 200000
+
+    class _FakeClient:
+        async def disconnect(self):
+            return None
+
+    sub._client = _FakeClient()
+    asyncio.run(sub.stop())
+    assert sub._last_usage_tokens is None
+    assert sub._last_context_window is None
+
+
+def test_engine_context_percentage_delegates_to_substrate():
+    # Engine.context_percentage() delegates to the substrate's method.
+    class _Sub(FakeSubstrate):
+        def context_percentage(self):
+            return 42
+
+    eng = Engine(_Sub())
+    assert eng.context_percentage() == 42
+
+
+def test_engine_context_percentage_none_when_substrate_lacks_method():
+    # A substrate predating the method (additive seam) → None, never an error.
+    eng = Engine(FakeSubstrate())
+    assert eng.context_percentage() is None
+
+
+def test_engine_context_percentage_swallows_substrate_error():
+    # A raising substrate method → None (RB1; an observer off the critical path never raises).
+    class _Sub(FakeSubstrate):
+        def context_percentage(self):
+            raise RuntimeError("boom")
+
+    eng = Engine(_Sub())
+    assert eng.context_percentage() is None

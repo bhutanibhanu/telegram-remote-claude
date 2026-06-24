@@ -58,7 +58,9 @@ from claude_tg.render import (
     encode_attach_callback,
     encode_callback,
     encode_switch_callback,
+    format_statusline,
     free_text_prompt,
+    model_short_label,
     notify_attention,
     notify_done,
     notify_error,
@@ -2079,3 +2081,166 @@ def test_schedule_listing_skips_malformed_entry():
 def test_schedule_listing_due_now_when_past():
     out = schedule_listing([_sch(next_run=5.0)], now=10_000.0)
     assert "due now" in out
+
+
+# ---------------------------------------------------------------------------
+# STATUSLINE T-SL-CORE — the pure formatter + the model_short_label helper.
+# The format is owner-LOCKED:
+#   📁 <worktree> · 🤖 <model>·<effort> · 🧠 ctx <X%> · 🔒 <mode>
+# (with a leading "⚙️ " when working). The pieces under test are PURE (no I/O), so they
+# are exercised directly. SB3 is the binding constraint: every field is escaped once, and a
+# path-shaped name is wrapped in <code> so no /segment fake-link can appear.
+# ---------------------------------------------------------------------------
+
+
+def test_format_statusline_full_set_exact_format():
+    # The complete, owner-locked line for a working turn: worktree · model·effort · ctx% · mode.
+    line = format_statusline(
+        worktree="claude-telegram-bot",
+        model_label="opus",
+        effort="max",
+        ctx_pct=6,
+        mode="gate",
+        working=True,
+    )
+    assert line == "⚙️ 📁 claude-telegram-bot · 🤖 opus·max · 🧠 ctx 6% · 🔒 gate"
+
+
+def test_format_statusline_idle_has_no_working_marker():
+    # working=False → NO leading ⚙️ (the marker is present iff a turn is running).
+    line = format_statusline(
+        worktree="proj", model_label="sonnet", effort="high", ctx_pct=42, mode="yolo", working=False
+    )
+    assert line == "📁 proj · 🤖 sonnet·high · 🧠 ctx 42% · 🔒 yolo"
+    assert not line.startswith("⚙️")
+
+
+def test_format_statusline_effort_none_shows_model_only():
+    # effort=None → just the model (🤖 opus), never an invented ·<effort>.
+    line = format_statusline(
+        worktree="proj", model_label="opus", effort=None, ctx_pct=10, mode="gate", working=False
+    )
+    assert "🤖 opus ·" in line
+    assert "opus·" not in line  # no dot-effort suffix at all
+
+
+def test_format_statusline_ctx_none_is_em_dash_never_zero():
+    # ctx_pct=None → "🧠 ctx —" (em dash). NEVER a fabricated "0%" (design §2.1).
+    line = format_statusline(
+        worktree="proj", model_label="opus", effort=None, ctx_pct=None, mode="gate", working=False
+    )
+    assert "🧠 ctx —" in line
+    assert "0%" not in line
+    assert "ctx —%" not in line  # the dash replaces the WHOLE figure, not just the number
+
+
+def test_format_statusline_ctx_zero_is_a_real_zero_not_a_dash():
+    # A genuine 0 (an int) is shown as 0% — only None becomes the dash. (0 is a real reading,
+    # the dash means "unknown".)
+    line = format_statusline(
+        worktree="proj", model_label="opus", effort=None, ctx_pct=0, mode="gate", working=False
+    )
+    assert "🧠 ctx 0%" in line
+    assert "—" not in line
+
+
+def test_format_statusline_working_marker_on_off():
+    on = format_statusline(
+        worktree="p", model_label="opus", effort=None, ctx_pct=None, mode="gate", working=True
+    )
+    off = format_statusline(
+        worktree="p", model_label="opus", effort=None, ctx_pct=None, mode="gate", working=False
+    )
+    assert on.startswith("⚙️ 📁")
+    assert off.startswith("📁")
+    # The only difference is the leading marker.
+    assert on == "⚙️ " + off
+
+
+def test_format_statusline_all_three_modes():
+    for mode in ("gate", "yolo", "plan"):
+        line = format_statusline(
+            worktree="p", model_label="opus", effort=None, ctx_pct=None, mode=mode, working=False
+        )
+        assert f"🔒 {mode}" in line
+
+
+# --- SB3 (the binding constraint): escape-once + no path-as-fake-link --------
+
+
+def test_format_statusline_escapes_angle_and_amp_in_name():
+    # SB3: a name carrying < / > / & is HTML-escaped exactly once so it can't break the HTML
+    # message or inject a tag. (The SB4 charset forbids these, but escape-once is the insurance.)
+    line = format_statusline(
+        worktree="a<b>&c", model_label="opus", effort=None, ctx_pct=None, mode="gate", working=False
+    )
+    assert "&lt;" in line and "&gt;" in line and "&amp;" in line
+    # The raw, unescaped sequence must NOT appear (no tag injection).
+    assert "<b>" not in line
+
+
+def test_format_statusline_path_shaped_name_wrapped_in_code_no_fake_link():
+    # SB3 / P8: a path-shaped value (one containing "/") is wrapped in <code>…</code> so
+    # Telegram renders it as inert monospace — its /segment runs CANNOT linkify into fake
+    # command-links. (Defensive: the validated name has no "/", but if one ever leaks through
+    # it is rendered safely, never as a bare path.)
+    line = format_statusline(
+        worktree="/tmp/secret/proj", model_label="opus", effort=None, ctx_pct=None, mode="gate", working=False
+    )
+    assert "<code>/tmp/secret/proj</code>" in line
+    # The path is NOT emitted bare (which Telegram would linkify each /segment of).
+    assert "📁 /tmp/secret/proj " not in line
+
+
+def test_format_statusline_path_with_special_chars_escaped_inside_code():
+    # A path-shaped name containing HTML metacharacters is escaped INSIDE the <code> wrap
+    # (code_path escapes exactly once) — valid HTML, no injection.
+    line = format_statusline(
+        worktree="/x/<a>&/y", model_label="opus", effort=None, ctx_pct=None, mode="gate", working=False
+    )
+    assert "<code>/x/&lt;a&gt;&amp;/y</code>" in line
+
+
+def test_format_statusline_escapes_odd_effort_and_mode_defensively():
+    # effort/mode are fixed words in practice, but the formatter escapes every interpolated
+    # field once — a stray < in any of them can never break the message (defense in depth).
+    line = format_statusline(
+        worktree="p", model_label="m<x", effort="e&y", ctx_pct=None, mode="z>w", working=False
+    )
+    assert "m&lt;x" in line and "e&amp;y" in line and "z&gt;w" in line
+
+
+# --- model_short_label mapping (regex/contains → family; unknown → raw id) ----
+
+
+def test_model_short_label_known_families():
+    assert model_short_label("claude-opus-4-8") == "opus"
+    assert model_short_label("claude-sonnet-4-5") == "sonnet"
+    assert model_short_label("claude-haiku-4-5") == "haiku"
+
+
+def test_model_short_label_case_insensitive():
+    assert model_short_label("CLAUDE-OPUS-4-8") == "opus"
+    assert model_short_label("Claude-Haiku-4-5") == "haiku"
+
+
+def test_model_short_label_unknown_returns_raw_id():
+    # RB1: an id matching no known family is shown VERBATIM (never mislabelled / crashed).
+    assert model_short_label("some-future-model-x9") == "some-future-model-x9"
+    assert model_short_label("gpt-4o") == "gpt-4o"
+
+
+def test_model_short_label_none_and_blank_are_empty():
+    assert model_short_label(None) == ""
+    assert model_short_label("") == ""
+    assert model_short_label("   ") == ""
+
+
+def test_statusline_carries_no_dollar_or_secret():
+    # SB3 structural: the line is bot-derived STATE — no dollar amount, no body. The fields are
+    # a name, a model word, an effort word, a number, a mode word. Nothing here can carry a
+    # secret (proven by construction; this guards a regression that adds a body field).
+    line = format_statusline(
+        worktree="proj", model_label="opus", effort="max", ctx_pct=6, mode="yolo", working=True
+    )
+    assert "$" not in line

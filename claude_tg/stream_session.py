@@ -112,6 +112,8 @@ from .render import (
     code_path,
     decode_callback,
     error_is_raw_external,
+    format_statusline,
+    model_short_label,
     notify_attention,
     notify_done,
     notify_error,
@@ -146,6 +148,14 @@ EditFn = Callable[..., Awaitable[None]]
 #: A coroutine that deletes a message by id (best-effort; used to clear the transient
 #: "💭 Claude is thinking…" status line at the end of a turn so it does not linger).
 DeleteFn = Callable[..., Awaitable[None]]
+#: A coroutine that PINS a message by id (STATUSLINE T-SL-CORE). The bot's closure forwards
+#: to ``Bot.pin_chat_message`` with ``disable_notification=True`` (a silent pin — design §3.1).
+#: Best-effort: a failure is swallowed (RB1) and never breaks a turn.
+PinFn = Callable[..., Awaitable[None]]
+#: A coroutine that UNPINS a message by id (STATUSLINE T-SL-CORE). Used on orphan-recovery to
+#: best-effort drop the stale pin before re-pinning the fresh one (the "one pinned message"
+#: invariant; Telegram's current pin is the newest, so the bar self-corrects). Best-effort (RB1).
+UnpinFn = Callable[..., Awaitable[None]]
 
 #: The three operator verdicts the engine understands (mirrors PermissionDecision.verdict).
 PermissionVerdictName = Literal["allow_once", "allow_session", "deny"]
@@ -694,6 +704,16 @@ class _ChatState:
     # wins — the name-echoed prompt said which). Bumped by :meth:`_next_armed_seq`; never
     # reset (strictly increasing within the process is all the ordering needs).
     armed_seq: int = 0
+    # STATUSLINE T-SL-CORE (design §3.1 / §4 RB3) — the ONE pinned statusline message per chat.
+    # ``statusline_message_id`` is the Telegram id of the pinned line (None before the first
+    # update / after an orphan-recovery clears it); ``statusline_text`` is the last body shown,
+    # for the identical-text skip (no-op edits raise "message is not modified" AND waste a send
+    # slot — mirrors the transient status line's ``status_text``). EXACTLY ONE id is ever held
+    # (we only edit it; on recovery we re-point it). Transient/in-memory only (RB3): a restart
+    # drops the reference (the bot re-creates the line on the first post-restart update) — like
+    # ``send_gate``/``status_message_id``, the live pin id is never persisted.
+    statusline_message_id: Optional[int] = None
+    statusline_text: Optional[str] = None
 
 
 class StreamingBusy(Exception):
@@ -4078,6 +4098,180 @@ class StreamingSession:
             )
             rt.status_message_id = mid
             rt.status_text = body
+
+    # -- the pinned mobile statusline (STATUSLINE T-SL-CORE, design §3.1/§4) --
+
+    def _statusline_text(self, chat_id: int) -> Optional[str]:
+        """Build the CURRENT statusline body for ``chat_id``'s foreground project (pure read).
+
+        Reads the chat's ACTIVE (foreground) project's live state — the worktree NAME, the
+        effective model + effort, the permission mode, the working/idle marker, and the ctx %
+        — and renders it through :func:`~claude_tg.render.format_statusline`. Foreground-only
+        (design §3.1): a background project's turn never rewrites the line, so the single pinned
+        line always describes "what you're looking at".
+
+        **Read-only / fail-safe (RB1):** resolves the active runtime with ``create_default=
+        False`` so a statusline refresh NEVER creates a project as a side effect; with no active
+        project (nothing run yet) returns ``None`` (nothing to show). Each field read is
+        defensive — a missing store / odd record / ctx call that raises degrades to a safe
+        default (``ctx —``, ``gate``) rather than raising. Returns the formatted body, or
+        ``None`` when there is no foreground project to describe. No I/O beyond the best-effort
+        ctx read (which itself never raises).
+
+        * ``worktree`` — the active project NAME (SB4-validated charset, so inert — SB3).
+        * ``model`` — :meth:`_resolve_project_model` reduced by :func:`model_short_label`.
+        * ``effort`` — :meth:`_resolve_project_effort` (``None`` → model-only).
+        * ``mode`` — ``yolo`` if the project's policy is allow-all, else ``plan`` if a ``/plan``
+          is armed for the next turn, else ``gate`` (the fail-closed default).
+        * ``working`` — the per-project status enum is a working state (``running`` /
+          ``awaiting_*`` / ``queued``) vs ``idle``.
+        * ``ctx_pct`` — the live engine's :meth:`~claude_tg.engine.engine.Engine.context_percentage`
+          (``None`` → ``ctx —``, never a fabricated number).
+        """
+        name, rt = self._active_runtime(chat_id, create_default=False)
+        if name is None or rt is None:
+            return None
+        worktree = name  # the SB4-validated project name (no path; SB3-inert).
+        model_label = model_short_label(self._resolve_project_model(chat_id, name))
+        effort = self._resolve_project_effort(chat_id, name)
+        # mode: yolo (allow-all) wins; else an armed /plan; else the fail-closed gate.
+        if bool(getattr(rt.policy, "yolo", False)):
+            mode = "yolo"
+        elif bool(getattr(rt, "plan_next", False)):
+            mode = "plan"
+        else:
+            mode = "gate"
+        working = rt.status in ("running", "awaiting_approval", "awaiting_answer", "awaiting_plan", "queued")
+        ctx_pct: Optional[int] = None
+        engine = rt.engine
+        if engine is not None:
+            try:
+                ctx_pct = engine.context_percentage()
+            except Exception:  # pragma: no cover - the engine call is already best-effort (RB1)
+                ctx_pct = None
+        return format_statusline(
+            worktree=worktree,
+            model_label=model_label,
+            effort=effort,
+            ctx_pct=ctx_pct,
+            mode=mode,
+            working=working,
+        )
+
+    async def _update_statusline(
+        self,
+        chat_id: int,
+        *,
+        send: SendFn,
+        edit: EditFn,
+        pin: PinFn,
+        unpin: UnpinFn,
+    ) -> None:
+        """Refresh the chat's ONE pinned statusline — send+pin on first use, edit thereafter.
+
+        STATUSLINE T-SL-CORE (design §3.1/§4). Builds the current foreground statusline body
+        (:meth:`_statusline_text`) and reconciles it with the chat's pinned line:
+
+        * **identical text** → skip entirely (no I/O — a no-op edit raises "message is not
+          modified" AND wastes a send slot; mirrors :meth:`_edit_status`).
+        * **first update** (no id held) → SEND the body then PIN it with the notification
+          DISABLED (a silent pin — design §3.1); store the id + text.
+        * **subsequent update** → EDIT in place only (no re-pin, no re-send; a pinned message
+          edited in place stays pinned and silent).
+        * **edit FAILURE** (the operator unpinned/deleted it → "message to edit not found", an
+          API hiccup, too old) → ORPHAN RECOVERY: clear the stored id, best-effort UNPIN the
+          stale one (the "one pinned message" invariant — Telegram's current pin is the newest,
+          so the bar self-corrects), then re-SEND + re-PIN a fresh line (mirrors the orphaned
+          status-line recovery in :meth:`_edit_status`).
+
+        **⭐ RB1 — a pin/edit/send failure NEVER breaks or wedges a turn.** This is an observer
+        OFF the turn's critical path: the WHOLE body is wrapped so ANY exception (a raising
+        ``send``/``edit``/``pin``/``unpin``, a build error) is logged at debug and swallowed —
+        the caller (the turn loop / a command) is unaffected. **RB5** — every send/edit funnels
+        through the per-chat gate as the **non-verbatim** kind (:meth:`_gated_send`/
+        :meth:`_gated_edit`), so the statusline can never flood and never starves a real
+        answer/prompt. **One id invariant** — exactly one ``statusline_message_id`` is ever held
+        per chat; we only ever edit it, and on recovery re-point it.
+
+        ``send``/``edit``/``pin``/``unpin`` are injected by ``bot.py`` (the same pattern as the
+        existing send/edit/delete closures) targeting THIS chat — so the line is SB1-confined to
+        the operator's allowlisted chat (no new outbound surface).
+        """
+        try:
+            body = self._statusline_text(chat_id)
+            if not body:
+                return  # no foreground project to describe — nothing to pin/edit.
+            state = self._chat(chat_id)
+            if body == state.statusline_text:
+                # Identical to what's pinned — skip BEFORE the gate so an unchanged refresh
+                # never consumes a send slot and never triggers a no-op "not modified" edit.
+                return
+            if state.statusline_message_id is None:
+                await self._statusline_send_and_pin(state, body, send=send, pin=pin)
+                return
+            try:
+                await self._gated_edit(
+                    state, edit,
+                    message_id=state.statusline_message_id, text=body, parse_mode="HTML",
+                )
+                state.statusline_text = body
+            except Exception:
+                # Orphan recovery (design §4 RB1): the pinned line is gone (unpinned/deleted by
+                # the operator) / too old / an API hiccup. Clear the dead id, best-effort UNPIN
+                # the stale one (one-pin invariant), then re-send + re-pin a fresh line. The
+                # turn is unaffected either way (this whole method is best-effort).
+                log.debug("statusline edit failed for chat; re-sending + re-pinning", exc_info=True)
+                stale_id = state.statusline_message_id
+                state.statusline_message_id = None
+                state.statusline_text = None
+                try:
+                    await unpin(message_id=stale_id)
+                except Exception:
+                    log.debug("stale statusline unpin failed (ignored)", exc_info=True)
+                await self._statusline_send_and_pin(state, body, send=send, pin=pin)
+        except Exception:
+            # ⭐ The make-or-break swallow (RB1): NOTHING the statusline does may escape to the
+            # turn. A build/gate/closure failure is logged at debug and dropped — the next state
+            # change re-creates the line.
+            log.debug("statusline update failed for chat (ignored)", exc_info=True)
+
+    async def _statusline_send_and_pin(
+        self,
+        state: _ChatState,
+        body: str,
+        *,
+        send: SendFn,
+        pin: PinFn,
+    ) -> None:
+        """Send the statusline body (gated, non-verbatim) then PIN it silently (design §3.1).
+
+        The first-use + orphan-recovery primitive: a single gated send followed by a
+        best-effort silent pin (``disable_notification=True`` — a pin must never re-ping the
+        operator). The id/text are stored on the chat ONLY when the send returns an id (so a
+        send that yields ``None`` does not leave a half-set state). A PIN failure is swallowed
+        (RB1) — the line is still sent + tracked, and a later edit keeps it current; only the
+        bar placement is lost, never the turn. Called from :meth:`_update_statusline` inside its
+        best-effort guard, so it does not re-wrap (a raising ``send`` propagates to that guard's
+        swallow); the pin is wrapped here because the send must still be tracked even if pinning
+        fails.
+        """
+        mid = await self._gated_send(
+            state, send, verbatim=False,
+            text=body, reply_markup=None, parse_mode="HTML",
+        )
+        if mid is None:
+            # The send produced no id (a closure that returns None) — don't store a half state;
+            # the next update will try a fresh send.
+            return
+        state.statusline_message_id = mid
+        state.statusline_text = body
+        try:
+            await pin(message_id=mid, disable_notification=True)
+        except Exception:
+            # A failed pin must never break the turn (RB1): the line is sent + tracked, edits
+            # keep it current; only the pinned-bar placement is lost. Mirrors the status-line
+            # best-effort discipline.
+            log.debug("statusline pin failed (ignored)", exc_info=True)
 
     # -- the callback resolve path (LOCK-FREE: SB1 enforced at the bot) ------
 

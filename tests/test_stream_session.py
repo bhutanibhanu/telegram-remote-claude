@@ -90,9 +90,12 @@ HOLD = object()  # sentinel in a script: park send() here until a resolve/cancel
 
 
 class FakeEngine:
-    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True):
+    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True, ctx_pct=None):
         self._script = script
         self.session_id = session_id
+        # STATUSLINE T-SL-CORE: the ctx % the statusline reads via engine.context_percentage().
+        # Default None (→ "ctx —"); a test sets it to assert the figure flows into the line.
+        self._ctx_pct = ctx_pct
         self.resolve_calls: list[tuple[str, object]] = []
         self.cancel_calls: list = []
         # P14 T-FIRE: records the ``proactive`` flag passed to each send() (the force-gate
@@ -139,6 +142,10 @@ class FakeEngine:
         self.cancel_calls.append(tool_use_id)
         self._gate.set()
         return 1
+
+    def context_percentage(self):
+        # STATUSLINE T-SL-CORE: the best-effort ctx % the statusline reads (None → "ctx —").
+        return self._ctx_pct
 
 
 class Recorder:
@@ -7283,3 +7290,307 @@ async def test_fire_schedule_busy_skip_sends_only_skip_notice_not_header(tmp_pat
 
     engine.cancel()
     await asyncio.wait_for(first, timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# STATUSLINE T-SL-CORE — the pinned statusline pin/edit lifecycle.
+#
+# _update_statusline builds the foreground statusline body from CURRENT state and reconciles
+# it with the chat's ONE pinned line: first use SENDS + PINS (silently); a changed state EDITS
+# in place; an identical state is a no-op; an edit FAILURE clears the id + re-sends + re-pins
+# (orphan recovery); and a pin/edit/send raising is SWALLOWED (RB1 — never breaks a turn). All
+# I/O funnels through the per-chat gate as the non-verbatim kind (RB5). Only ONE id is held.
+#
+# These exercise the machinery directly with fake send/edit/pin/unpin closures (T-SL-WIRE will
+# call _update_statusline from the live turn path; this unit is machinery-only).
+# ---------------------------------------------------------------------------
+
+
+class StatuslineRecorder:
+    """Captures the send/edit/pin/unpin calls _update_statusline performs (with fault injection).
+
+    ``fail_edit`` makes the FIRST edit raise (the orphan-recovery trigger — the operator
+    unpinned/deleted the line). ``fail_pin`` / ``fail_send`` make pin / send raise (the RB1
+    swallow probe). Each call is recorded so the sequence + the silent-pin flag are assertable.
+    """
+
+    def __init__(self, *, fail_edit=False, fail_pin=False, fail_send=False):
+        self.sends: list[dict] = []
+        self.edits: list[dict] = []
+        self.pins: list[dict] = []
+        self.unpins: list[dict] = []
+        self._next_id = 500
+        self._fail_edit_first = fail_edit
+        self._fail_pin = fail_pin
+        self._fail_send = fail_send
+
+    async def send(self, *, text, reply_markup=None, parse_mode=None, **kwargs) -> int:
+        self.sends.append({"text": text, "parse_mode": parse_mode})
+        if self._fail_send:
+            raise RuntimeError("Telegram error: send failed")
+        self._next_id += 1
+        return self._next_id
+
+    async def edit(self, *, message_id, text, parse_mode=None) -> None:
+        if self._fail_edit_first:
+            self._fail_edit_first = False
+            raise RuntimeError("Telegram BadRequest: message to edit not found")
+        self.edits.append({"message_id": message_id, "text": text, "parse_mode": parse_mode})
+
+    async def pin(self, *, message_id, disable_notification=None) -> None:
+        self.pins.append({"message_id": message_id, "disable_notification": disable_notification})
+        if self._fail_pin:
+            raise RuntimeError("Telegram error: pin failed")
+
+    async def unpin(self, *, message_id) -> None:
+        self.unpins.append({"message_id": message_id})
+
+
+def _prime_statusline_project(session, *, chat_id=1, engine=None, status="running"):
+    """Resolve the chat's active project + give its runtime an engine + status (statusline read).
+
+    _update_statusline reads the FOREGROUND project's live state. With no store this auto-creates
+    the implicit ``default`` runtime; we attach a (fake) engine for the ctx-% read and set the
+    status enum (working vs idle). Returns the (name, runtime).
+    """
+    name, rt = session._active_runtime(chat_id, create_default=True)
+    if engine is not None:
+        rt.engine = engine
+    rt.status = status
+    return name, rt
+
+
+async def test_update_statusline_first_use_sends_then_pins_silently():
+    # First update for a chat: SEND the body, then PIN it with the notification disabled.
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6)
+    name, _rt = _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    assert len(rec.sends) == 1, f"first use must SEND exactly once, sends={rec.sends!r}"
+    assert len(rec.pins) == 1, f"first use must PIN exactly once, pins={rec.pins!r}"
+    # The pin is SILENT (disable_notification=True) — design §3.1 (no re-ping).
+    assert rec.pins[0]["disable_notification"] is True
+    # The pinned id is the just-sent id (501 — the recorder hands out 501, 502, …).
+    assert rec.pins[0]["message_id"] == 501
+    # No edit on first use.
+    assert rec.edits == []
+    # The body is the locked format (working marker on, the project name, the ctx %, the gate).
+    body = rec.sends[0]["text"]
+    assert body.startswith("⚙️ 📁 ")
+    assert "🧠 ctx 6%" in body
+    assert "🔒 gate" in body
+    assert rec.sends[0]["parse_mode"] == "HTML"
+    # The id + text are tracked on the chat (the one-pin invariant).
+    state = session._chat(1)
+    assert state.statusline_message_id == 501
+    assert state.statusline_text == body
+
+
+async def test_update_statusline_second_changed_edits_in_place_no_repin():
+    # A SUBSEQUENT update with changed state EDITS in place — no re-pin, no re-send.
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    # First update → send + pin.
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    # Change state (turn ends → idle; ctx grows to 7) and update again.
+    rt = active_rt(session)
+    rt.status = "idle"
+    eng._ctx_pct = 7
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    assert len(rec.sends) == 1, "the second update must NOT re-send (edit in place)"
+    assert len(rec.pins) == 1, "the second update must NOT re-pin"
+    assert len(rec.edits) == 1, f"the second update must EDIT once, edits={rec.edits!r}"
+    edited = rec.edits[0]
+    assert edited["message_id"] == 501  # the SAME pinned message is edited
+    assert "🧠 ctx 7%" in edited["text"]
+    assert not edited["text"].startswith("⚙️")  # idle → no working marker
+    assert edited["parse_mode"] == "HTML"
+    # The tracked text is the new body.
+    assert session._chat(1).statusline_text == edited["text"]
+
+
+async def test_update_statusline_identical_state_is_no_io():
+    # Identical text → skip entirely (no send, no edit — a no-op edit raises "not modified" and
+    # wastes a send slot).
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    # Nothing changed — a second update must be a pure no-op.
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    assert len(rec.sends) == 1, "an identical state must not re-send"
+    assert rec.edits == [], "an identical state must not edit (no-op skip)"
+    assert len(rec.pins) == 1
+
+
+async def test_update_statusline_edit_failure_resends_and_repins_orphan_recovery():
+    # The operator unpinned/deleted the line → the in-place edit raises "message to edit not
+    # found". Recovery: clear the dead id, best-effort UNPIN the stale one, re-SEND + re-PIN.
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder(fail_edit=True)  # the first edit will raise
+    # First update → send (id 501) + pin.
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    assert session._chat(1).statusline_message_id == 501
+    # Change state → an EDIT is attempted; it fails → recovery re-sends (id 502) + re-pins.
+    active_rt(session).status = "idle"
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    assert len(rec.sends) == 2, f"recovery must re-SEND a fresh line, sends={rec.sends!r}"
+    assert len(rec.pins) == 2, f"recovery must re-PIN the fresh line, pins={rec.pins!r}"
+    # The stale id (501) was best-effort UNPINNED before re-pinning (one-pin invariant).
+    assert {u["message_id"] for u in rec.unpins} == {501}
+    # The chat now holds the NEW id (502), and only one.
+    assert session._chat(1).statusline_message_id == 502
+    assert rec.pins[-1]["message_id"] == 502
+    assert rec.pins[-1]["disable_notification"] is True
+
+
+async def test_update_statusline_pin_failure_is_swallowed_turn_unaffected():
+    # ⭐ RB1: a PIN that raises must NEVER escape — _update_statusline returns normally, the
+    # line is still sent + tracked (only the bar placement is lost).
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder(fail_pin=True)
+    # Must NOT raise.
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    assert len(rec.sends) == 1  # the line was still sent
+    assert len(rec.pins) == 1  # the pin was attempted (and raised, swallowed)
+    # The id is still tracked (the send succeeded), so the next update edits in place.
+    assert session._chat(1).statusline_message_id == 501
+
+
+async def test_update_statusline_send_failure_is_swallowed_turn_unaffected():
+    # ⭐ RB1: a SEND that raises must NEVER escape — _update_statusline returns normally and no
+    # id is left half-set.
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder(fail_send=True)
+    # Must NOT raise.
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    # The send raised before any id was returned → nothing pinned, nothing tracked.
+    assert rec.pins == []
+    assert session._chat(1).statusline_message_id is None
+    assert session._chat(1).statusline_text is None
+
+
+async def test_update_statusline_only_one_id_ever_held_across_many_updates():
+    # The one-pin invariant: across many state changes, exactly one id is held and only edits
+    # happen after the first pin.
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=1)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    for pct in (1, 2, 3, 4, 5):
+        eng._ctx_pct = pct
+        await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    assert len(rec.sends) == 1, "only the FIRST update sends; the rest edit"
+    assert len(rec.pins) == 1, "only ONE pin ever"
+    assert len(rec.edits) == 4, "the 4 changed updates each edit in place"
+    # All edits target the single held id.
+    assert {e["message_id"] for e in rec.edits} == {501}
+    assert session._chat(1).statusline_message_id == 501
+
+
+async def test_update_statusline_no_foreground_project_is_noop(tmp_path):
+    # With no active project (read-only resolve, create_default=False) there is nothing to
+    # describe → no I/O, no created runtime.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    assert store.get_active(1) is None  # nothing active yet
+    session = make_session(FakeEngine([]), store=store)
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    assert rec.sends == [] and rec.pins == [] and rec.edits == []
+    # The read-only resolve must NOT have created a runtime.
+    assert store.get_active(1) is None
+
+
+async def test_update_statusline_yolo_mode_shows_in_line():
+    # The mode field reflects the project's posture: a yolo (allow-all) policy → "🔒 yolo".
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6)
+    _name, rt = _prime_statusline_project(session, engine=eng, status="running")
+    rt.policy.yolo = True
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    assert "🔒 yolo" in rec.sends[0]["text"]
+
+
+async def test_update_statusline_plan_armed_shows_in_line():
+    # An armed /plan (plan_next) → "🔒 plan" (when not yolo).
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6)
+    _name, rt = _prime_statusline_project(session, engine=eng, status="idle")
+    rt.plan_next = True
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    assert "🔒 plan" in rec.sends[0]["text"]
+
+
+async def test_update_statusline_ctx_none_when_no_engine_shows_em_dash():
+    # No live engine on the runtime → ctx is unknown → "🧠 ctx —" (never a fabricated 0%).
+    session = make_session(FakeEngine([]))
+    _prime_statusline_project(session, engine=None, status="idle")
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    assert "🧠 ctx —" in rec.sends[0]["text"]
+    assert "0%" not in rec.sends[0]["text"]
+
+
+async def test_update_statusline_engine_ctx_raises_is_swallowed_shows_dash():
+    # ⭐ RB1: a context_percentage() that raises is swallowed (the line still renders, ctx —).
+    class _BoomCtxEngine(FakeEngine):
+        def context_percentage(self):
+            raise RuntimeError("ctx boom")
+
+    session = make_session(FakeEngine([]))
+    _prime_statusline_project(session, engine=_BoomCtxEngine([]), status="running")
+    rec = StatuslineRecorder()
+    # Must NOT raise.
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+    assert len(rec.sends) == 1
+    assert "🧠 ctx —" in rec.sends[0]["text"]
+
+
+async def test_update_statusline_edit_and_resend_both_raise_still_swallowed():
+    # ⭐ The make-or-break RB1 mutation probe: the in-place edit raises AND the recovery re-send
+    # ALSO raises (the chat is fully wedged at the Telegram layer). _update_statusline must STILL
+    # return normally — the outermost best-effort guard swallows everything; the turn is
+    # unaffected. (Proves no exception can escape via the recovery path either.)
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6)
+    _prime_statusline_project(session, engine=eng, status="running")
+
+    # First update with a working send/pin to establish the pinned id.
+    good = StatuslineRecorder()
+    await session._update_statusline(1, send=good.send, edit=good.edit, pin=good.pin, unpin=good.unpin)
+    assert session._chat(1).statusline_message_id == 501
+
+    # Now: the edit raises (orphan trigger) AND the re-send raises too.
+    async def boom_edit(*, message_id, text, parse_mode=None):
+        raise RuntimeError("edit not found")
+
+    async def boom_send(*, text, reply_markup=None, parse_mode=None, **kwargs):
+        raise RuntimeError("send failed too")
+
+    async def boom_unpin(*, message_id):
+        raise RuntimeError("unpin failed too")
+
+    active_rt(session).status = "idle"  # change state → an edit is attempted
+    # Must NOT raise despite every closure failing.
+    await session._update_statusline(1, send=boom_send, edit=boom_edit, pin=good.pin, unpin=boom_unpin)
+    # The dead id was cleared on the failed-edit path (recovery couldn't re-establish one).
+    assert session._chat(1).statusline_message_id is None

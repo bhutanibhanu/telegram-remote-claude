@@ -319,6 +319,30 @@ class Engine:
         """The current Claude session id (None before the substrate reports one)."""
         return self._substrate.session_id
 
+    # -- ctx % for the statusline (STATUSLINE T-SL-CORE) ---------------------
+
+    def context_percentage(self) -> Optional[int]:
+        """Best-effort % of the context window currently used, or ``None`` (design §2.1/§5 T5).
+
+        Delegates to the substrate's ``context_percentage`` (live ``get_context_usage()`` →
+        honest usage-derived fallback). The statusline shows ``🧠 ctx <X>%`` when this is an
+        int and ``🧠 ctx —`` when it is ``None`` — NEVER a fabricated number. Read defensively
+        via ``getattr`` so a substrate that predates this method (or a fake in a test) simply
+        yields ``None`` (the additive-seam discipline, mirroring the optional ``fork`` keyword);
+        the call is fully best-effort and NEVER raises — it is an observer off the turn's
+        critical path (RB1). Synchronous (no ``await``): the spike-confirmed live call returns
+        synchronously.
+        """
+        getter = getattr(self._substrate, "context_percentage", None)
+        if getter is None:
+            return None
+        try:
+            value = getter()
+        except Exception:  # pragma: no cover - the substrate is already best-effort
+            log.debug("context_percentage() failed (ignored)", exc_info=True)
+            return None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
     # -- the decision seam (the async answer-hold) ---------------------------
 
     async def on_tool_request(
