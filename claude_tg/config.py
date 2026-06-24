@@ -149,6 +149,16 @@ DEFAULT_STREAM_MESSAGE_TIMEOUT_SECONDS = 300.0
 #: Configurable via ``IMAGE_MAX_BYTES``. Only consulted in streaming mode.
 DEFAULT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
+#: Default max file size (P10 T3, file send/receive): 20 MB — both directions. An inbound
+#: non-image ``Document`` is saved (path-confined) into the active project's cwd, and
+#: ``/get <path>`` uploads an in-root file back to the chat; a file larger than this is
+#: REFUSED with a clean message (never written to disk inbound, never uploaded outbound).
+#: The cap bounds host disk/memory + the Telegram upload budget (Telegram's own bot upload
+#: ceiling is ~50 MB, so 20 MB is a comfortable, conservative default that covers ordinary
+#: code/log/patch attachments). Configurable via ``FILE_MAX_BYTES``. Only consulted in
+#: streaming mode (the inbound save + ``/get`` are streaming-mode surfaces — see bot.py).
+DEFAULT_FILE_MAX_BYTES = 20 * 1024 * 1024
+
 
 def parse_answer_backstop_seconds(raw: str | None) -> int:
     """Parse + validate ANSWER_BACKSTOP_SECONDS (default 3600 = 60 min).
@@ -277,6 +287,29 @@ def parse_image_max_bytes(raw: str | None) -> int:
     return value
 
 
+def parse_file_max_bytes(raw: str | None) -> int:
+    """Parse + validate FILE_MAX_BYTES (default 20 MB; P10 T3, file send/receive).
+
+    The max size (in BYTES) of a file the bot will accept inbound (a non-image ``Document``
+    saved into the active project's cwd) OR upload outbound (``/get <path>``); a larger file
+    is refused with a clean message (inbound: never written to disk; outbound: never
+    uploaded). Parsing mirrors :func:`parse_image_max_bytes`: empty/unset → the default;
+    must be a **positive** integer (a ``0``/negative cap would reject every file — so it is a
+    configuration error and fails loud at startup rather than silently disabling file
+    transfer). So ``""``/unset → 20 MB; ``"1048576"`` → 1 MB; ``"0"``/``"-1"``/``"x"`` →
+    raise.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_FILE_MAX_BYTES
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"FILE_MAX_BYTES must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError("FILE_MAX_BYTES must be positive")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -346,6 +379,14 @@ class Config:
     # 0/negative/non-integer → fail loud (parse_image_max_bytes). Only consulted in
     # streaming mode (the multimodal turn path is streaming-only — see bot.py).
     image_max_bytes: int = DEFAULT_IMAGE_MAX_BYTES
+    # P10 T3 (file send/receive): the max size in BYTES of a file the bot accepts inbound
+    # (a non-image Document saved, path-confined, into the active project's cwd) OR uploads
+    # outbound (/get <path>). A file larger than this is refused with a clean message —
+    # inbound it is never written to disk, outbound it is never uploaded. It bounds host
+    # disk/memory + the Telegram upload budget. Default 20 MB; unset → default;
+    # 0/negative/non-integer → fail loud (parse_file_max_bytes). Only consulted in streaming
+    # mode (the inbound save + /get are streaming-mode surfaces — see bot.py).
+    file_max_bytes: int = DEFAULT_FILE_MAX_BYTES
 
     @classmethod
     def from_env(cls, dotenv_path: str | os.PathLike[str] | None = ".env") -> "Config":
@@ -401,6 +442,7 @@ class Config:
             os.environ.get("STREAM_MESSAGE_TIMEOUT_SECONDS")
         )
         image_max_bytes = parse_image_max_bytes(os.environ.get("IMAGE_MAX_BYTES"))
+        file_max_bytes = parse_file_max_bytes(os.environ.get("FILE_MAX_BYTES"))
 
         # SB2 /cd confinement. Default the allow-list to the workdir so an unset
         # ALLOWED_ROOTS still confines /cd (ON by default); ALLOW_ANY_PATH=true is the
@@ -430,4 +472,5 @@ class Config:
             allowed_roots=allowed_roots,
             allow_any_path=allow_any_path,
             image_max_bytes=image_max_bytes,
+            file_max_bytes=file_max_bytes,
         )

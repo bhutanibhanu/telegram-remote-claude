@@ -33,6 +33,7 @@ def make_config(
     max_concurrent_runs=3,
     render_chat_send_interval_seconds=0.0,
     image_max_bytes=5 * 1024 * 1024,
+    file_max_bytes=20 * 1024 * 1024,
 ):
     # P5/T8: default the per-chat send-gate interval to 0.0 in tests so the gate never
     # introduces a real ``asyncio.sleep`` under the frozen test clock (these tests assert
@@ -54,6 +55,7 @@ def make_config(
         allowed_roots=allowed_roots,
         allow_any_path=allow_any_path,
         image_max_bytes=image_max_bytes,
+        file_max_bytes=file_max_bytes,
     )
 
 
@@ -79,7 +81,10 @@ class FakeRunner:
 class FakeStreaming:
     """Stands in for StreamingSession at the bot boundary."""
 
-    def __init__(self, outcome=None, busy=False):
+    def __init__(self, outcome=None, busy=False, cwd="/work"):
+        # P10 T3: the active project's cwd the on_document save / cmd_get resolve against.
+        # Default "/work" (the pre-T3 fixed value); the file tests point it at a tmp dir.
+        self._cwd = cwd
         self.handle_message_calls = []
         self.resolve_calls = []
         self.cancel_calls = []
@@ -154,7 +159,8 @@ class FakeStreaming:
 
     def get_cwd(self, chat_id):
         # P9/T1: the first-run welcome reads the active cwd via this accessor.
-        return "/work"
+        # P10/T3: on_document saves into — and /get resolves against — this cwd.
+        return self._cwd
 
     def get_yolo(self, chat_id):
         # P9/T2: /status reads the active project's yolo posture (read-only).
@@ -3231,3 +3237,377 @@ def test_build_application_registers_photo_handler():
         if isinstance(h, MessageHandler) and h.callback == bot.on_photo
     ]
     assert len(photo_handlers) == 1
+
+
+# ===========================================================================
+# P10 T3 — file send (out: /get) + receive (in: on_document)
+# ===========================================================================
+
+
+def make_document_update(
+    chat_id=1, *, caption=None, raw=b"print('hi')\n", file_size=None,
+    file_name="note.py", mime_type="text/x-python",
+):
+    """A fake Update carrying a NON-image ``Document`` (the on_document inbound path).
+
+    ``get_file().download_as_bytearray()`` returns ``raw`` (the fake file bytes);
+    ``file_size`` is the Telegram-declared size for the pre-download cap (defaults to
+    len(raw)). ``file_name`` is the Telegram-supplied name (may be hostile — ``../`` etc).
+    """
+    upd = MagicMock()
+    upd.effective_chat.id = chat_id
+    upd.message.text = None
+    upd.message.caption = caption
+    upd.message.reply_text = AsyncMock()
+    upd.message.reply_to_message = None
+    upd.effective_message = upd.message
+    size = file_size if file_size is not None else len(raw)
+
+    tg_file = MagicMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(raw))
+
+    document = MagicMock()
+    document.file_size = size
+    document.file_name = file_name
+    document.mime_type = mime_type
+    document.get_file = AsyncMock(return_value=tg_file)
+
+    upd.message.photo = []
+    upd.message.document = document
+    return upd
+
+
+def _file_bot(tmp_path, *, allowed=(1,), file_max_bytes=20 * 1024 * 1024, cwd=None):
+    """A streaming bot whose active-project cwd + ALLOWED_ROOTS are ``tmp_path`` (T3)."""
+    cwd = cwd if cwd is not None else str(tmp_path)
+    streaming = FakeStreaming(cwd=cwd)
+    bot = TelegramClaudeBot(
+        make_config(
+            allowed=allowed, engine_mode="streaming",
+            allowed_roots=(tmp_path,), file_max_bytes=file_max_bytes,
+        ),
+        FakeRunner(), streaming=streaming,
+    )
+    bot._welcomed.add(1)
+    return bot, streaming
+
+
+# ---- inbound: on_document saves into the project, path-confined --------------
+
+
+async def test_on_document_saves_into_project_cwd_and_offers_to_claude(tmp_path):
+    bot, streaming = _file_bot(tmp_path)
+    raw = b"def f():\n    return 42\n"
+    upd = make_document_update(1, caption="review this", raw=raw, file_name="snippet.py")
+    await bot.on_document(upd, make_ctx())
+
+    # The file landed INSIDE the project cwd with the sanitized name + exact bytes.
+    saved = tmp_path / "snippet.py"
+    assert saved.is_file()
+    assert saved.read_bytes() == raw
+    # A normal turn was fired offering the file to Claude (caption as the instruction).
+    assert len(streaming.handle_message_calls) == 1
+    _chat, prompt, _rt = streaming.handle_message_calls[0]
+    assert str(saved) in prompt
+    assert "review this" in prompt
+    # No image was threaded — this is the file path, not the multimodal path.
+    assert streaming.images_calls[0] is None
+
+
+async def test_on_document_no_caption_uses_default_instruction(tmp_path):
+    bot, streaming = _file_bot(tmp_path)
+    upd = make_document_update(1, caption=None, file_name="a.log")
+    await bot.on_document(upd, make_ctx())
+    _chat, prompt, _rt = streaming.handle_message_calls[0]
+    assert "I've added the file" in prompt
+    assert (tmp_path / "a.log").is_file()
+
+
+async def test_on_document_dotdot_filename_confined_to_cwd(tmp_path):
+    # SB2: a ``../`` traversal in the file_name CANNOT escape the project cwd. The name is
+    # sanitized to a basename AND re-confined by resolve_within_roots — the file lands
+    # INSIDE tmp_path, never in the parent.
+    bot, streaming = _file_bot(tmp_path)
+    upd = make_document_update(1, raw=b"x", file_name="../../escape.txt")
+    await bot.on_document(upd, make_ctx())
+
+    # Nothing was written above the root; the basename landed inside the cwd.
+    parent_escape = tmp_path.parent / "escape.txt"
+    assert not parent_escape.exists()
+    assert (tmp_path / "escape.txt").is_file()
+    assert len(streaming.handle_message_calls) == 1
+
+
+async def test_on_document_absolute_filename_confined_to_cwd(tmp_path):
+    # SB2: an ABSOLUTE file_name is stripped to its basename and saved inside the cwd —
+    # it never writes to the absolute location.
+    bot, streaming = _file_bot(tmp_path)
+    upd = make_document_update(1, raw=b"y", file_name="/etc/cron.d/evil")
+    await bot.on_document(upd, make_ctx())
+    assert not Path("/etc/cron.d/evil").exists()  # never touched
+    assert (tmp_path / "evil").is_file()
+
+
+async def test_on_document_oversized_refused_before_download(tmp_path):
+    # RB2: a declared size over the cap is refused with a clean message — NO download, NO
+    # write, NO turn.
+    bot, streaming = _file_bot(tmp_path, file_max_bytes=1024)
+    upd = make_document_update(1, raw=b"x" * 10, file_size=5000, file_name="big.bin")
+    await bot.on_document(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    upd.message.document.get_file.assert_not_awaited()
+    assert not (tmp_path / "big.bin").exists()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_on_document_oversized_refused_after_download_when_underreported(tmp_path):
+    # Defense-in-depth: declared size None (no pre-check) but the downloaded bytes exceed
+    # the cap → refused post-download; never written, never offered.
+    bot, streaming = _file_bot(tmp_path, file_max_bytes=10)
+    upd = make_document_update(1, raw=b"x" * 100, file_size=None, file_name="sneaky.bin")
+    await bot.on_document(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert not (tmp_path / "sneaky.bin").exists()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_on_document_sb1_unauthorized_chat_no_download_no_write(tmp_path):
+    # SB1: a document from a NON-allowlisted chat is dropped — no download, no write, no turn.
+    bot, streaming = _file_bot(tmp_path, allowed=(1,))
+    upd = make_document_update(chat_id=999, raw=b"z", file_name="x.py")
+    await bot.on_document(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    upd.message.document.get_file.assert_not_awaited()
+    assert not (tmp_path / "x.py").exists()
+
+
+async def test_on_document_oneshot_mode_refuses_needs_streaming(tmp_path):
+    # One-shot mode has no per-project cwd → clean refusal; never silently drops the file.
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="oneshot"), runner)
+    assert bot.streaming is None
+    bot._welcomed.add(1)
+    upd = make_document_update(1, file_name="x.py")
+    await bot.on_document(upd, make_ctx())
+    assert runner.run_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "streaming" in reply.lower()
+
+
+async def test_on_document_download_failure_clean_message(tmp_path):
+    # RB1: a download exception → a clean message, no crash, no write, no turn.
+    bot, streaming = _file_bot(tmp_path)
+    upd = make_document_update(1, file_name="x.py")
+    upd.message.document.get_file = AsyncMock(side_effect=RuntimeError("boom"))
+    await bot.on_document(upd, make_ctx())
+    assert streaming.handle_message_calls == []
+    assert not (tmp_path / "x.py").exists()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "couldn't download" in reply.lower()
+
+
+async def test_on_document_never_logs_file_bytes_sb3(tmp_path, caplog):
+    import logging
+
+    bot, streaming = _file_bot(tmp_path)
+    secret = b"SECRET-FILE-PAYLOAD-DO-NOT-LOG-9876543210"
+    with caplog.at_level(logging.DEBUG):
+        upd = make_document_update(1, raw=secret, file_name="secret.bin")
+        await bot.on_document(upd, make_ctx())
+    full_log = "\n".join(r.getMessage() for r in caplog.records)
+    assert "SECRET-FILE-PAYLOAD" not in full_log
+    # But a size SUMMARY (name + KB) is logged.
+    assert "received a file" in full_log
+
+
+async def test_on_document_does_not_collide_with_image_document(tmp_path):
+    # An IMAGE document must route to on_photo (T1's multimodal path), NOT to on_document.
+    # The registration filters are disjoint: on_photo = PHOTO | Document.IMAGE; on_document =
+    # Document.ALL & ~Document.IMAGE. Prove an image-document message is NOT matched by the
+    # on_document handler's filter, while a non-image document IS.
+    from telegram.ext import MessageHandler
+
+    bot, _streaming = _file_bot(tmp_path)
+    app = bot.build_application()
+    doc_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, MessageHandler) and h.callback == bot.on_document
+    ]
+    assert len(doc_handlers) == 1
+    photo_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, MessageHandler) and h.callback == bot.on_photo
+    ]
+    assert len(photo_handlers) == 1
+
+
+# ---- outbound: /get <path> ---------------------------------------------------
+
+
+async def test_cmd_get_in_root_file_sends_document(tmp_path):
+    bot, _streaming = _file_bot(tmp_path)
+    f = tmp_path / "out.txt"
+    f.write_bytes(b"hello file")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["out.txt"]  # relative to the active cwd
+    upd = make_update(1, text="/get out.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_awaited_once()
+    kwargs = ctx.bot.send_document.await_args.kwargs
+    assert kwargs["chat_id"] == 1
+    assert kwargs["document"] is not None
+
+
+async def test_cmd_get_absolute_in_root_path_sends(tmp_path):
+    bot, _streaming = _file_bot(tmp_path)
+    f = tmp_path / "abs.txt"
+    f.write_bytes(b"data")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = [str(f)]  # absolute, but inside the root
+    upd = make_update(1, text=f"/get {f}")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_awaited_once()
+
+
+async def test_cmd_get_out_of_root_refused(tmp_path):
+    # SB2: an absolute path OUTSIDE the allowed root is refused — never read/uploaded.
+    bot, _streaming = _file_bot(tmp_path)
+    outside = tmp_path.parent / "secret.txt"
+    outside.write_bytes(b"top secret")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = [str(outside)]
+    upd = make_update(1, text="/get ...")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "outside the permitted roots" in reply.lower()
+
+
+async def test_cmd_get_dotdot_traversal_refused(tmp_path):
+    # SB2: a ``../`` relative traversal that escapes the root is refused.
+    bot, _streaming = _file_bot(tmp_path)
+    (tmp_path.parent / "escape.txt").write_bytes(b"x")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["../escape.txt"]
+    upd = make_update(1, text="/get ../escape.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "outside the permitted roots" in reply.lower()
+
+
+async def test_cmd_get_missing_file_refused(tmp_path):
+    bot, _streaming = _file_bot(tmp_path)
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["nope.txt"]
+    upd = make_update(1, text="/get nope.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "no such file" in reply.lower()
+
+
+async def test_cmd_get_directory_refused(tmp_path):
+    # A directory (in-root) is not a regular file → refused (RB2).
+    bot, _streaming = _file_bot(tmp_path)
+    (tmp_path / "subdir").mkdir()
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["subdir"]
+    upd = make_update(1, text="/get subdir")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "no such file" in reply.lower()
+
+
+async def test_cmd_get_oversized_refused(tmp_path):
+    # RB2: an in-root file over the cap is refused — never uploaded.
+    bot, _streaming = _file_bot(tmp_path, file_max_bytes=10)
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 100)
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["big.bin"]
+    upd = make_update(1, text="/get big.bin")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_cmd_get_no_arg_usage(tmp_path):
+    bot, _streaming = _file_bot(tmp_path)
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = []
+    upd = make_update(1, text="/get")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    assert "usage" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_get_sb1_unauthorized_no_send(tmp_path):
+    # SB1: a /get from a NON-allowlisted chat does nothing.
+    bot, _streaming = _file_bot(tmp_path, allowed=(1,))
+    (tmp_path / "f.txt").write_bytes(b"x")
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["f.txt"]
+    upd = make_update(chat_id=999, text="/get f.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    upd.message.reply_text.assert_not_awaited()
+
+
+async def test_cmd_get_oneshot_mode_refuses(tmp_path):
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="oneshot"), runner)
+    assert bot.streaming is None
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["x.txt"]
+    upd = make_update(1, text="/get x.txt")
+    await bot.cmd_get(upd, ctx)
+    ctx.bot.send_document.assert_not_awaited()
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+def test_build_application_registers_get_command_and_document_handler(tmp_path):
+    from telegram.ext import CommandHandler, MessageHandler
+
+    bot, _streaming = _file_bot(tmp_path)
+    app = bot.build_application()
+    get_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, CommandHandler) and "get" in {c.lower() for c in h.commands}
+    ]
+    assert len(get_handlers) == 1
+    doc_handlers = [
+        h
+        for group in sorted(app.handlers)
+        for h in app.handlers[group]
+        if isinstance(h, MessageHandler) and h.callback == bot.on_document
+    ]
+    assert len(doc_handlers) == 1
+
+
+def test_get_in_command_menu_and_help():
+    # T3: /get must be in the native menu AND documented in HELP_TEXT (the lock-step guards).
+    from claude_tg.bot import COMMAND_MENU, HELP_TEXT
+
+    assert "get" in {cmd for cmd, _desc in COMMAND_MENU}
+    assert "/get" in HELP_TEXT

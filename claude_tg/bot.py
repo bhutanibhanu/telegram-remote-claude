@@ -6,9 +6,10 @@ import asyncio
 import base64
 import html
 import logging
+import os
 import time
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, InputFile, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -46,7 +47,9 @@ log = logging.getLogger(__name__)
 
 HELP_TEXT = (
     "🤖 *Claude Code remote*\n\n"
-    "Just send me a message and I'll run it through Claude Code on the Mac and reply.\n\n"
+    "Just send me a message and I'll run it through Claude Code on the Mac and reply.\n"
+    "Send a photo and Claude sees it; send a file and it's saved into the project for "
+    "Claude to read (streaming mode); pull a file back with /get.\n\n"
     "Commands:\n"
     "/help — this help\n"
     "/status — health: uptime, mode, gate, runs, per-project status + cost\n"
@@ -66,6 +69,8 @@ HELP_TEXT = (
     "/switch <name> — switch the active project; the next message resumes it (streaming mode)\n"
     "/rm <name> — drop a project from the registry, leaving its transcript on disk (streaming mode)\n"
     "/pwd — show the active project's working directory\n"
+    "/get <path> — send a file from the project back to you (path-confined to the "
+    "permitted roots; relative to the active project, or an absolute path)\n"
     "/cd <path> — change the working directory (one-shot mode only; in streaming mode "
     "the cwd is fixed per project — use /new to work elsewhere)\n"
     "/save <name> <text> — save a reusable prompt template (macro)\n"
@@ -101,6 +106,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("switch", "Switch the active project"),
     ("rm", "Drop a project from the registry"),
     ("pwd", "Show the active project's working directory"),
+    ("get", "Send a file from the project back to you: /get <path>"),
     ("cd", "Change the working directory (one-shot mode only)"),
     ("save", "Save a reusable prompt template: /save <name> <text>"),
     ("run", "Run a saved macro: /run <name> [args…]"),
@@ -133,6 +139,42 @@ def _format_uptime(seconds: float) -> str:
 #: The caption is normally the turn's prompt; with none we give Claude a sensible
 #: look-at-this instruction so a bare screenshot still does something useful.
 DEFAULT_IMAGE_PROMPT = "Look at this image and tell me what you see / help me with it."
+
+#: P10 T3 (file receive): a safe fallback filename when a Telegram ``Document`` carries no
+#: usable ``file_name`` (or one that sanitizes to nothing). Saved into the active project's
+#: cwd so Claude can Read it; never executed.
+DEFAULT_INBOUND_FILENAME = "upload.bin"
+
+
+def _safe_filename(name: str | None) -> str:
+    """Reduce a Telegram-supplied ``file_name`` to a SINGLE, inert basename (P10 T3 / SB2).
+
+    The destination is built by joining this name onto the active project's cwd and then
+    re-confined through :func:`~claude_tg.paths.resolve_within_roots` — but we ALSO strip the
+    name to a bare basename here so a hostile ``../../etc/passwd`` or an absolute
+    ``/etc/cron.d/x`` can never even *form* a traversal before confinement runs (defense in
+    depth; the SB2 resolve is the authoritative boundary, this is the belt). Steps, pure (no
+    I/O):
+
+    * take only the final path component (``os.path.basename`` after normalizing both
+      separators) — drops every directory part, so ``../`` and a leading ``/`` are gone;
+    * reject the special ``.`` / ``..`` components and any empty result;
+    * strip control chars / NULs that could confuse the filesystem.
+
+    Returns a clean basename, or :data:`DEFAULT_INBOUND_FILENAME` when nothing usable
+    remains. The caller STILL runs the confinement resolve on the joined path — this only
+    guarantees the join starts from a single inert component.
+    """
+    raw = (name or "").strip()
+    # Normalize Windows separators too, then take the final component only. This discards
+    # any directory portion (../, leading /, nested dirs) regardless of OS.
+    raw = raw.replace("\\", "/")
+    base = os.path.basename(raw)
+    # Strip NUL / control characters (defensive — a filename should be printable text).
+    base = "".join(ch for ch in base if ch.isprintable()).strip()
+    if not base or base in (".", ".."):
+        return DEFAULT_INBOUND_FILENAME
+    return base
 
 #: P10 T1: map a Telegram mime-type / file extension to an Anthropic image ``media_type``.
 #: Telegram compresses inbound *photos* to JPEG (no mime on a PhotoSize), so a photo with
@@ -1257,6 +1299,209 @@ class TelegramClaudeBot:
             images=[image],
         )
 
+    async def on_document(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """P10 T3 — a NON-image ``Document`` → saved (path-confined) into the project (SB1/SB2).
+
+        **Registration boundary (no collision with T1's image-Document handler).** Registered
+        as ``MessageHandler(allowed & filters.Document.ALL & ~filters.Document.IMAGE, …)`` —
+        the EXACT complement of T1's ``filters.PHOTO | filters.Document.IMAGE``: an image
+        document (``image/*``) routes to :meth:`on_photo` (the multimodal path) and a
+        non-image document (a ``.py`` / ``.log`` / ``.pdf`` / ``.zip`` …) routes HERE. The two
+        document filters are disjoint, so neither steals the other's messages.
+
+        **SB1 security boundary.** The ``allowed`` chat filter on the registration AND this
+        explicit :meth:`_ok` recheck — same allowlist gate as every handler (defense in
+        depth). A non-allowlisted chat never reaches the download / disk write.
+
+        **Streaming-only.** Saving a file requires the active project's cwd (a per-project
+        streaming concept) + the "offer it to Claude" turn; one-shot mode has no per-project
+        cwd, so it replies a clean "needs streaming mode" message rather than dropping the
+        file silently.
+
+        Flow: **size-cap** (refuse > ``config.file_max_bytes`` BEFORE download — never pull an
+        oversized file onto disk), **sanitize** the Telegram ``file_name`` to a single inert
+        basename, **SB2-confine** the destination by resolving ``cwd / basename`` through
+        :func:`~claude_tg.paths.resolve_within_roots` (a ``../`` / absolute filename can never
+        escape the permitted roots — the SAME resolver ``/cd`` · ``/new`` use), download +
+        write the bytes atomically, then fire a normal turn ("I've added <file> …") so Claude
+        can Read it. **Never auto-executed.** RB1: any download/write failure → a clean message,
+        never a crash. SB3: only a size SUMMARY is logged — never the file bytes.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        await self._maybe_welcome(update)
+        msg = update.message
+        document = msg.document
+        if document is None:  # RB1: the filter guarantees a document, but be defensive.
+            return
+        chat_id = update.effective_chat.id
+        # Streaming-only: the inbound save needs the active project's cwd. One-shot mode has
+        # no per-project cwd → a clean refusal (never silently drop the file).
+        if self.streaming is None:
+            await msg.reply_text(
+                "📎 Receiving a file needs streaming mode (ENGINE_MODE=streaming). "
+                "In one-shot mode I can't save attachments into a project yet."
+            )
+            return
+        # Size-cap BEFORE download (RB2): Telegram reports file_size on a Document. A
+        # missing/odd size (defensive) falls through to download + a post-download cap so an
+        # over-cap file can never land on disk either way.
+        cap = self.config.file_max_bytes
+        declared = getattr(document, "file_size", None)
+        if isinstance(declared, int) and declared > cap:
+            await msg.reply_text(
+                f"📎 That file is too large ({declared // 1024} KB) — "
+                f"the limit is {cap // 1024} KB."
+            )
+            return
+        # SB2: build the destination from the active project's cwd + a SANITIZED basename,
+        # then re-confine through resolve_within_roots. A ``../`` / absolute file_name is
+        # stripped to a basename above AND cannot escape the roots here (the authoritative
+        # boundary). allow_any_path=true is the explicit opt-out, identical to /cd · /new.
+        cwd = self.streaming.get_cwd(chat_id)
+        filename = _safe_filename(getattr(document, "file_name", None))
+        try:
+            dest = resolve_within_roots(
+                filename,
+                cwd=cwd,
+                allowed_roots=self.config.allowed_roots,
+                allow_any=self.config.allow_any_path,
+            )
+        except PathNotAllowed:
+            # An escaping name that survived sanitization (belt-and-braces) — refuse cleanly.
+            await msg.reply_text(
+                f"📎 Can't save that file — its name resolves outside the permitted "
+                f"roots: {code_path(filename)}",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            tg_file = await document.get_file()
+            raw = await tg_file.download_as_bytearray()
+        except Exception:
+            # RB1: a transient download failure must never crash the handler — clean message.
+            log.debug("file download failed for chat %s", chat_id, exc_info=True)
+            await msg.reply_text("⚠️ Couldn't download that file — please try sending it again.")
+            return
+        # Post-download cap (defense-in-depth: a missing/under-reported declared size). Never
+        # write an over-cap file to disk.
+        if len(raw) > cap:
+            await msg.reply_text(
+                f"📎 That file is too large ({len(raw) // 1024} KB) — "
+                f"the limit is {cap // 1024} KB."
+            )
+            return
+        try:
+            # Write atomically (tmp + replace) so a partial download never leaves a truncated
+            # file in the project. The destination is the SB2-confined path.
+            tmp = dest.with_name(dest.name + ".part")
+            tmp.write_bytes(bytes(raw))
+            tmp.replace(dest)
+        except OSError:
+            # RB1: a write failure (permissions / no space / the path is a directory) → a
+            # clean message, never a crash. SB3: no file content in the log.
+            log.debug("file save failed for chat %s", chat_id, exc_info=True)
+            await msg.reply_text(
+                f"⚠️ Couldn't save {code_path(filename)} into the project — check the bot logs.",
+                parse_mode="HTML",
+            )
+            return
+        # SB3: log a SIZE SUMMARY only (name + KB) — never the file bytes.
+        log.info("chat %s received a file %r (%d KB)", chat_id, dest.name, len(raw) // 1024)
+        # Offer it to Claude as a NORMAL turn (never auto-executed): the caption is the
+        # operator's instruction, with a sensible default. The path is wrapped in <code> so
+        # it renders inert (R6), but the turn text Claude receives is plain so it can Read it.
+        caption = (msg.caption or "").strip()
+        instruction = caption or "Read it and tell me what it is, or help me with it."
+        prompt = f"I've added the file {dest} to the project — {instruction}"
+        await self._run_turn(
+            update, ctx, chat_id, prompt,
+            reply_to_message_id=self._reply_to_id(update),
+        )
+
+    async def cmd_get(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """P10 T3 — ``/get <path>`` uploads an in-root file back to the chat (SB1/SB2/RB2).
+
+        SB1: allowlist-gated (the ``_ok`` recheck). **Streaming-only:** ``<path>`` resolves
+        relative to the active project's cwd, a per-project streaming concept; one-shot mode
+        replies a clean notice. Order, fail-fast + secure:
+
+        1. ``_ok`` + streaming check + a usage message for a missing arg.
+        2. **SB2 confinement** — resolve ``<path>`` (relative to the active cwd, or absolute)
+           through :func:`~claude_tg.paths.resolve_within_roots`. An out-of-root target
+           (``../`` / absolute / a symlink that points outside) is REFUSED ("outside the
+           permitted roots") and nothing is read (the SAME resolver ``/cd`` · ``/new`` use).
+        3. Missing / not-a-regular-file → refuse cleanly (RB2).
+        4. **Size-cap** — a file over ``config.file_max_bytes`` is refused (never uploaded).
+        5. Else ``bot.send_document`` it to the chat. RB1: a send failure → a clean message.
+
+        The shown path is wrapped in ``<code>`` (P8/R6) so it renders inert. SB3: only a size
+        summary is logged — never the file bytes.
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if self.streaming is None:
+            await update.message.reply_text(
+                "📎 /get applies to streaming mode only — it sends a file from the active "
+                "project, and one-shot mode has no per-project working directory."
+            )
+            return
+        chat_id = update.effective_chat.id
+        arg = " ".join(ctx.args).strip() if ctx.args else ""
+        if not arg:
+            await update.message.reply_text("Usage: /get <path>")
+            return
+        cwd = self.streaming.get_cwd(chat_id)
+        # SB2: canonicalize (resolves symlinks AND ..) and confine to ALLOWED_ROOTS. A path
+        # that escapes the permitted roots is refused here and never read/uploaded.
+        try:
+            target = resolve_within_roots(
+                arg,
+                cwd=cwd,
+                allowed_roots=self.config.allowed_roots,
+                allow_any=self.config.allow_any_path,
+            )
+        except PathNotAllowed:
+            await update.message.reply_text(
+                f"❌ Path not allowed (outside the permitted roots): {code_path(arg)}",
+                parse_mode="HTML",
+            )
+            return
+        # Must be an existing REGULAR file (not a directory / device / missing). RB2.
+        if not target.is_file():
+            await update.message.reply_text(
+                f"❌ No such file: {code_path(arg)}", parse_mode="HTML"
+            )
+            return
+        cap = self.config.file_max_bytes
+        try:
+            size = target.stat().st_size
+        except OSError:
+            await update.message.reply_text(
+                f"❌ Couldn't read {code_path(arg)}.", parse_mode="HTML"
+            )
+            return
+        if size > cap:
+            await update.message.reply_text(
+                f"❌ That file is too large to send ({size // 1024} KB) — "
+                f"the limit is {cap // 1024} KB."
+            )
+            return
+        # SB3: log a size SUMMARY only — never the file bytes.
+        log.info("chat %s requested /get %r (%d KB)", chat_id, target.name, size // 1024)
+        try:
+            await ctx.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(target.open("rb"), filename=target.name),
+            )
+        except Exception:
+            # RB1: a transient upload failure must never crash the handler — clean message.
+            log.debug("send_document failed for chat %s", chat_id, exc_info=True)
+            await update.message.reply_text(
+                f"⚠️ Couldn't send {code_path(target.name)} — please try again.",
+                parse_mode="HTML",
+            )
+
     async def on_skill_command(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward any *unregistered* slash-command verbatim to the active session (P3, D1).
 
@@ -1626,6 +1871,11 @@ class TelegramClaudeBot:
         app.add_handler(CommandHandler("deep", self.cmd_deep, filters=allowed))
         app.add_handler(CommandHandler(["auto", "model"], self.cmd_auto, filters=allowed))
         app.add_handler(CommandHandler("pwd", self.cmd_pwd, filters=allowed))
+        # P10 T3: /get <path> uploads an in-root file back to the chat (streaming mode only;
+        # one-shot replies a notice). Same `allowed` chat filter (SB1) + registered BEFORE
+        # the on_skill_command COMMAND passthrough so first-match-wins consumes it here
+        # rather than forwarding /get to the session as a skill.
+        app.add_handler(CommandHandler("get", self.cmd_get, filters=allowed))
         app.add_handler(CommandHandler("cd", self.cmd_cd, filters=allowed))
         # P4 multi-project navigation (streaming mode only; the handlers reply a
         # streaming-only notice in one-shot). Registered as specific CommandHandlers with
@@ -1659,6 +1909,20 @@ class TelegramClaudeBot:
         # overlaps a TEXT/COMMAND message, so handler ordering is unaffected.
         app.add_handler(
             MessageHandler(allowed & (filters.PHOTO | filters.Document.IMAGE), self.on_photo)
+        )
+        # P10 T3 (file receive): a NON-image Document → on_document (saved, path-confined, into
+        # the active project's cwd). SB1: the SAME `allowed` chat filter as every other handler
+        # (the `_ok` recheck inside on_document is defense in depth). The filter is the EXACT
+        # COMPLEMENT of on_photo's image-document filter — ``filters.Document.ALL &
+        # ~filters.Document.IMAGE`` — so an image document still routes to on_photo (T1's
+        # multimodal path) and only a non-image document (.py/.log/.pdf/.zip …) reaches here.
+        # The two are disjoint; neither steals the other's messages. Registered BEFORE the
+        # COMMAND passthrough; a Document message is neither TEXT nor COMMAND, so handler
+        # ordering is unaffected.
+        app.add_handler(
+            MessageHandler(
+                allowed & filters.Document.ALL & ~filters.Document.IMAGE, self.on_document
+            )
         )
         # P3 skill-launch passthrough (D1): forward any *unregistered* slash-command verbatim
         # to the session. Registered AFTER the specific CommandHandlers above so PTB's
