@@ -929,6 +929,167 @@ async def test_timeout_branch_guard_targets_pending_done_directly():
 
 
 # ---------------------------------------------------------------------------
+# P6 H2/RB2 — SEQUENTIAL holds in one turn (the P12 plan-mode live symptom).
+#
+# A /plan turn approves ExitPlanMode, execution resumes, Claude calls Write and
+# the operator DENIES it, then Claude goes SILENT. This opens TWO holds in one
+# turn — an APPROVE then a DENY — and is the exact sequence a live P12 run wedged
+# on for 9+ minutes. The invariant under test: ``_hold_depth`` must return to 0
+# after the LAST hold resolves (balanced across the sequence AND across BOTH
+# allow and deny resolutions), so the per-message liveness bound RE-ARMS and a
+# subsequently-silent Claude is caught by a clean ``driver_error`` — the turn can
+# never wedge with the bound stuck suspended (RB2).
+#
+# Drives the real ``SdkSubstrate`` (its real ``_make_can_use_tool`` increments/
+# decrements ``_hold_depth``; its real ``_next_message`` reads it) behind a fake
+# SDK client that fires ``can_use_tool`` twice — once per hold — between yields,
+# faithful to the real SDK control protocol (can_use_tool is awaited with no
+# fail_after and no further message is delivered until the verdict returns).
+# Deterministic: the only wait is the tiny liveness bound the silent tail trips.
+# ---------------------------------------------------------------------------
+
+
+class _PlanApproveThenWriteDenyClient:
+    """Fake SDK client mirroring the P12 live sequence: ExitPlanMode hold, then a
+    yielded assistant message (execution resumed), then a Write hold, then SILENCE.
+
+    Each ``yield`` is a separate ``__anext__`` -> a separate ``_next_message`` call,
+    and each ``can_use_tool`` await happens between yields — exactly the live shape
+    (a plan approval, resumed work, then a denied Write). After the second hold the
+    generator never yields the terminal ``ResultMessage`` (Claude went silent), so
+    the re-armed liveness bound is the ONLY thing that can end the turn.
+
+    ``hold_delay`` (default 0) optionally sleeps inside each ``can_use_tool`` await to
+    simulate the operator taking longer than the liveness bound to decide BOTH holds —
+    proving the bound is suspended *during* each hold yet restored *between/after* them.
+    """
+
+    def __init__(self, can_use_tool, *, silent_tail=3600.0, hold_delay=0.0):
+        self._can_use_tool = can_use_tool
+        self._silent_tail = silent_tail
+        self._hold_delay = hold_delay
+
+    async def connect(self):
+        pass
+
+    async def query(self, prompt):
+        pass
+
+    def receive_response(self):
+        async def _gen():
+            # --- hold #1: ExitPlanMode (operator APPROVES) ---
+            ctx1 = type("Ctx", (), {"tool_use_id": "tu-plan-1"})()
+            await self._can_use_tool("ExitPlanMode", {"plan": "do the thing"}, ctx1)
+            # execution resumes -> an assistant text message is delivered
+            yield sdk.AssistantMessage(
+                content=[sdk.TextBlock(text="resuming after plan approval")],
+                model="m",
+            )
+            # --- hold #2: Write (operator DENIES) ---
+            ctx2 = type("Ctx", (), {"tool_use_id": "tu-write-2"})()
+            await self._can_use_tool(
+                "Write", {"file_path": "/tmp/x", "content": "y"}, ctx2
+            )
+            # --- then Claude goes SILENT: NO terminal ResultMessage ever arrives ---
+            await asyncio.sleep(self._silent_tail)
+            yield  # pragma: no cover
+
+        return _gen()
+
+    async def disconnect(self):
+        pass
+
+
+async def _approve_plan_deny_write(tool_name, tool_input, tool_use_id):
+    """Engine-shaped decision callback: APPROVE ExitPlanMode, DENY Write.
+
+    Returns the substrate decision the engine's ``decision_to_substrate`` would
+    produce for a PlanVerdict(approve=True) and a PermissionDecision('deny').
+    """
+    if tool_name == "ExitPlanMode":
+        return SubstrateDecision(allow=True, updated_input=dict(tool_input))  # approve
+    return SubstrateDecision(allow=False, updated_input=None, message="denied")  # deny
+
+
+async def test_liveness_rearms_after_approve_then_deny_sequence_then_silence():
+    """The P12 plan-mode wedge guard: approve -> resume -> deny -> SILENCE must NOT wedge.
+
+    Two holds open in one turn (ExitPlanMode approved, then Write denied). After the
+    DENY resolves there is no further message. ``_hold_depth`` must be back to 0 so the
+    re-armed liveness bound fires a clean ``driver_error`` rather than hanging forever.
+    Wrapped in an outer ``wait_for`` so a regression (depth stuck > 0 -> swallow every
+    tick forever) FAILS as a timeout instead of hanging the suite.
+    """
+    sub = SdkSubstrate(decision_callback=_approve_plan_deny_write)
+    sub._client = _PlanApproveThenWriteDenyClient(sub._make_can_use_tool())
+
+    # Tiny liveness bound; the silent tail vastly outlives it, so the re-armed bound
+    # must trip within ~0.05s of the deny resolving. The outer 10s is a wedge tripwire.
+    out = await asyncio.wait_for(drain(sub.send("go", timeout=0.05)), timeout=10.0)
+
+    # Both holds were resolved and the depth is balanced back to 0 (the invariant).
+    assert sub._hold_depth == 0, f"hold depth must return to 0 after the sequence; got {sub._hold_depth}"
+    # The re-armed bound fired: a clean driver_error ended the turn (RB2 — no wedge).
+    assert any(
+        isinstance(e, ErrorEvent) and e.kind_of_error == "driver_error" for e in out
+    ), f"the liveness bound must re-arm after the last hold and fire on silence; got {out}"
+    # The mid-sequence assistant text streamed (the approve let execution resume).
+    assert any(isinstance(e, TextEvent) for e in out), out
+
+
+async def test_liveness_rearms_after_long_approve_then_long_deny_then_silence():
+    """Same sequence, but each hold OUTLIVES the bound (operator slow on BOTH).
+
+    Proves the bound is genuinely SUSPENDED *during* each hold (a >bound approve and a
+    >bound deny do not themselves trip a driver_error) AND restored *after* the last
+    one (the silent tail still trips it). Guards against an implementation that only
+    suspends/restores correctly for the FIRST hold.
+    """
+    sub = SdkSubstrate(decision_callback=_approve_plan_deny_write)
+    sub._client = _PlanApproveThenWriteDenyClient(
+        sub._make_can_use_tool(), hold_delay=0.2  # > 0.05 bound, per hold
+    )
+
+    out = await asyncio.wait_for(drain(sub.send("go", timeout=0.05)), timeout=10.0)
+
+    assert sub._hold_depth == 0, f"hold depth must return to 0; got {sub._hold_depth}"
+    # Exactly ONE driver_error, from the silent tail — neither slow hold produced one.
+    driver_errors = [
+        e for e in out if isinstance(e, ErrorEvent) and e.kind_of_error == "driver_error"
+    ]
+    assert len(driver_errors) == 1, f"only the silent tail may driver_error; got {out}"
+
+
+async def test_hold_depth_increment_decrement_paired_for_allow_and_deny():
+    """Mutation probe anchor: the depth is incremented BEFORE and decremented AFTER
+
+    each callback, for BOTH an allow and a deny. After invoking the substrate's real
+    ``can_use_tool`` once for an allow and once for a deny, the depth is back to 0 each
+    time. Breaking the balance — e.g. dropping the ``finally`` decrement, or skipping it
+    on the deny branch — leaves the depth at 1 here and wedges the sequence tests above.
+    """
+    seen_depths = []
+
+    async def _cb(tool_name, tool_input, tool_use_id):
+        # Inside the hold the depth is exactly 1 (incremented before the await).
+        seen_depths.append(sub._hold_depth)
+        if tool_name == "ExitPlanMode":
+            return SubstrateDecision(allow=True, updated_input=dict(tool_input))
+        return SubstrateDecision(allow=False, updated_input=None, message="denied")
+
+    sub = SdkSubstrate(decision_callback=_cb)
+    can_use_tool = sub._make_can_use_tool()
+    ctx = type("Ctx", (), {"tool_use_id": "tu-1"})()
+
+    assert sub._hold_depth == 0
+    await can_use_tool("ExitPlanMode", {"plan": "p"}, ctx)  # allow path
+    assert sub._hold_depth == 0, "depth must return to 0 after an ALLOW"
+    await can_use_tool("Write", {"file_path": "/x"}, ctx)  # deny path
+    assert sub._hold_depth == 0, "depth must return to 0 after a DENY"
+    assert seen_depths == [1, 1], "depth must be exactly 1 while each hold is open"
+
+
+# ---------------------------------------------------------------------------
 # ENGINE_MODE config parsing / validation
 # ---------------------------------------------------------------------------
 
