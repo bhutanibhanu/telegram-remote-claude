@@ -1089,12 +1089,53 @@ def _render_error(event: ErrorEvent) -> RenderAction:
     return RenderAction(op="new", chunks=_chunk(body), verbatim=True)
 
 
+def done_footer_suffix(event: ResultEvent) -> str:
+    """The ``· N turns · $X.XX`` usage suffix for a done message (T3 / P9), or ``""``.
+
+    Surfaces the SDK-provided usage the engine already carries on a
+    :class:`~claude_tg.engine.types.ResultEvent` — ``num_turns`` + ``total_cost_usd`` —
+    which the per-turn done render previously dropped whenever there was ``result_text``.
+    Each field is included only WHEN the SDK provided it (``None`` → omitted gracefully —
+    oneshot / a partial result may carry neither), so:
+
+    * both present → ``" · 3 turns · $0.01"``
+    * only turns   → ``" · 3 turns"``
+    * neither      → ``""`` (no suffix at all — never a dangling separator).
+
+    The leading ``" · "`` lets a caller append it straight onto a done line / the last
+    prose chunk. The cost is rendered to cents (``$X.XX``) per the design; **no secret is
+    in this line** (SB3 — it is two numbers the SDK reported, never tool input/output).
+    Pure string; no I/O.
+    """
+    bits: list[str] = []
+    if event.num_turns is not None:
+        # Pluralize: "1 turn" (singular) vs "N turns" — never the ungrammatical "1 turns".
+        unit = "turn" if event.num_turns == 1 else "turns"
+        bits.append(f"{event.num_turns} {unit}")
+    if event.total_cost_usd is not None:
+        bits.append(f"${event.total_cost_usd:.2f}")
+    if not bits:
+        return ""
+    return " · " + " · ".join(bits)
+
+
 def _render_result(event: ResultEvent) -> RenderAction:
     # Terminal per-turn frame. The result_text (if any) is the final answer — it is
     # Claude-authored CommonMark, so render it as Telegram HTML (with a raw fallback);
     # otherwise a compact, bot-generated status footer stays plain text.
+    #
+    # T3 (P9): surface the SDK-provided usage (num_turns + total_cost_usd) the done frame
+    # used to drop whenever there was result_text. The ``· N turns · $X.XX`` suffix
+    # (done_footer_suffix; "" when the SDK gave neither — oneshot may not) is appended to
+    # the LAST prose chunk so the answer ends with a compact, secret-free usage line. The
+    # suffix is plain bot scaffolding (digits + glyph) so it is HTML-safe to append onto the
+    # converted HTML chunk; the parallel plain fallback gets it too (positionally parallel).
     if event.result_text:
         html_chunks, plain = _html_chunks(event.result_text)
+        suffix = done_footer_suffix(event)
+        if suffix and html_chunks:
+            html_chunks = (*html_chunks[:-1], html_chunks[-1] + suffix)
+            plain = (*plain[:-1], plain[-1] + suffix)
         return RenderAction(
             op="new",
             chunks=html_chunks,
@@ -1102,12 +1143,7 @@ def _render_result(event: ResultEvent) -> RenderAction:
             parse_mode="HTML",
             verbatim=True,
         )
-    bits = [f"✅ done ({event.subtype})"]
-    if event.num_turns is not None:
-        bits.append(f"{event.num_turns} turns")
-    if event.total_cost_usd is not None:
-        bits.append(f"${event.total_cost_usd:.4f}")
-    body = " · ".join(bits)
+    body = f"✅ done ({event.subtype})" + done_footer_suffix(event)
     return RenderAction(op="new", chunks=_chunk(body), verbatim=True)
 
 

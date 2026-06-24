@@ -1011,6 +1011,27 @@ class StreamingSession:
         if rt is not None:
             rt.policy.set_yolo(on)
 
+    def get_yolo(self, chat_id: int) -> bool:
+        """Whether the chat's ACTIVE project is in ``/yolo`` allow-all mode (T2 /status).
+
+        Read-only (RB1): never creates a project or runtime — a chat with no active project
+        (or no runtime yet) reports ``False`` (the fail-closed default; the gate is ON). The
+        bypass is per-project + transient (a fresh process / ``/reset`` clears it), so this
+        reflects the live posture of whichever project is currently active.
+        """
+        _name, rt = self._active_runtime(chat_id, create_default=False)
+        return bool(rt.policy.yolo) if rt is not None else False
+
+    def active_run_count(self) -> int:
+        """The number of turns currently RUNNING across the whole process (T2 /status).
+
+        Mirrors the concurrency counter the queue/cap logic (D6) maintains — read-only. The
+        cap is :attr:`config.max_concurrent_runs`; this is the live numerator the operator
+        sees as ``N active / M max``. Process-global (the cap is per-deployment), matching how
+        the queue admission is accounted.
+        """
+        return self._running
+
     # -- engine lifecycle ----------------------------------------------------
 
     async def _ensure_engine(
@@ -1981,6 +2002,21 @@ class StreamingSession:
                             session_id=event.session_id or engine.session_id,
                             name=turn_name,
                         )
+                        # T3 (P9): accumulate this turn's SDK-reported cost into the
+                        # project's durable cumulative total (shown by /status). Only when
+                        # the SDK gave a cost (oneshot / a partial result may not) and a
+                        # store + named project exist; swallowed like _persist (RB1 — never
+                        # crash a turn over a write). Persisted to THIS turn's CAPTURED
+                        # project (turn_name), same per-project discipline as the session_id.
+                        if event.total_cost_usd is not None and self.store is not None:
+                            try:
+                                self.store.add_cost(
+                                    chat_id, turn_name, event.total_cost_usd
+                                )
+                            except Exception:
+                                log.exception(
+                                    "failed to accumulate project cost for chat %s", chat_id
+                                )
                 # ADR-005 D4: the inline-vs-notify send-decision. Re-read foreground PER
                 # EVENT — /switch is free (T7), so the foreground can change mid-turn; an
                 # event for the foreground project renders inline (as P4), an event for a

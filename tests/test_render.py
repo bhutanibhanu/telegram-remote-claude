@@ -49,6 +49,7 @@ from claude_tg.render import (
     coalesce_stream,
     code_path,
     decode_callback,
+    done_footer_suffix,
     encode_callback,
     free_text_prompt,
     notify_attention,
@@ -1413,3 +1414,82 @@ def test_chat_send_gate_zero_interval_never_waits():
 def test_chat_send_gate_rejects_negative_interval():
     with pytest.raises(ValueError):
         ChatSendGate(now=FakeClock(), interval=-1.0)
+
+
+# ===========================================================================
+# P9 / T3 — cost + usage surfacing on the done message (num_turns + cost).
+#
+# ResultEvent already carries total_cost_usd + num_turns; the per-turn done render
+# used to drop them whenever there was result_text. done_footer_suffix builds the
+# "· N turns · $X.XX" suffix (only the fields the SDK provided), and _render_result
+# appends it onto the prose's last chunk (and the bare footer).
+# ===========================================================================
+
+
+def test_done_footer_suffix_both_present():
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success", num_turns=3, total_cost_usd=0.012
+    )
+    assert done_footer_suffix(res) == " · 3 turns · $0.01"
+
+
+def test_done_footer_suffix_only_turns():
+    res = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=5)
+    assert done_footer_suffix(res) == " · 5 turns"
+
+
+def test_done_footer_suffix_only_cost():
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success", total_cost_usd=1.5
+    )
+    assert done_footer_suffix(res) == " · $1.50"
+
+
+def test_done_footer_suffix_absent_is_empty():
+    # oneshot / a partial result may carry neither — omit gracefully (no dangling separator).
+    res = ResultEvent(session_id="s", is_error=False, subtype="success")
+    assert done_footer_suffix(res) == ""
+
+
+def test_result_with_text_appends_turns_and_cost():
+    # T3: the turns+cost are surfaced on the done message even WHEN there is result_text
+    # (previously dropped). The suffix lands on the last chunk; the plain fallback gets it
+    # too (positionally parallel).
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success",
+        num_turns=2, total_cost_usd=0.0734, result_text="All done — see **above**.",
+    )
+    action = render_event(res)
+    assert action.text.endswith(" · 2 turns · $0.07")
+    assert "above" in action.text
+    assert action.plain_chunks[-1].endswith(" · 2 turns · $0.07")
+
+
+def test_result_with_text_omits_suffix_when_sdk_absent():
+    # No num_turns + no cost (oneshot-shaped) → the prose is sent UNCHANGED, no suffix.
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success", result_text="Just the answer.",
+    )
+    action = render_event(res)
+    assert action.text == "Just the answer."
+    assert action.plain_chunks == ("Just the answer.",)
+
+
+def test_done_footer_suffix_carries_no_secret():
+    # SB3: the suffix is two SDK-reported numbers — never tool input/output or a path.
+    res = ResultEvent(
+        session_id="s", is_error=False, subtype="success", num_turns=1, total_cost_usd=0.01
+    )
+    suffix = done_footer_suffix(res)
+    assert suffix == " · 1 turn · $0.01"  # only digits + the $ glyph (singular: "1 turn")
+
+
+def test_done_footer_suffix_pluralizes_turn():
+    # Cosmetic (UX): "1 turn" (singular) but "N turns" for N != 1 — never the ungrammatical
+    # "1 turns". Cover the singular, the plural, and the zero-edge (also plural: "0 turns").
+    one = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=1)
+    assert done_footer_suffix(one) == " · 1 turn"
+    many = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=2)
+    assert done_footer_suffix(many) == " · 2 turns"
+    zero = ResultEvent(session_id="s", is_error=False, subtype="success", num_turns=0)
+    assert done_footer_suffix(zero) == " · 0 turns"

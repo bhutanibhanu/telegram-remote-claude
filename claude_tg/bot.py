@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import time
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -63,6 +64,50 @@ HELP_TEXT = (
     "verbatim and runs as a skill in the Claude session.\n"
 )
 
+#: T1 (P9): the native Telegram ``/`` command menu — ``set_my_commands`` is called with
+#: this list at startup so the commands are discoverable without the wall-of-text /help.
+#: Each entry is ``(command, one-line description)``. **Invariant (tested):** this list
+#: MUST stay in lock-step with the CommandHandlers registered in :meth:`build_application`
+#: — no documented-but-unregistered command, no registered command missing here. The
+#: ``start`` alias of ``/help`` is intentionally NOT listed (Telegram treats /start
+#: specially and a duplicate menu row is noise). Descriptions are concise (Telegram
+#: truncates long ones) and secret-free.
+COMMAND_MENU: tuple[tuple[str, str], ...] = (
+    ("help", "Show the help text"),
+    ("status", "Health: uptime, mode, runs, per-project status + cost"),
+    ("reset", "Start a fresh Claude session (forget context)"),
+    ("cancel", "Abort the in-flight run (active / a name / all)"),
+    ("to", "Send a free-text answer to a named project's prompt"),
+    ("yolo", "Run every tool with NO approval prompt this session"),
+    ("unyolo", "Restore the per-tool permission gate"),
+    ("projects", "List your projects and which one is active"),
+    ("new", "Create a project at a path and switch to it"),
+    ("switch", "Switch the active project"),
+    ("rm", "Drop a project from the registry"),
+    ("pwd", "Show the active project's working directory"),
+    ("cd", "Change the working directory (one-shot mode only)"),
+)
+
+
+def _format_uptime(seconds: float) -> str:
+    """A compact human uptime like ``3d 4h 5m`` / ``5m 12s`` / ``8s`` (T2 /status).
+
+    Pure + defensive (RB1): a negative/odd value floors at ``0s``. Shows the two most
+    significant non-zero units (days→hours→minutes→seconds) so the line stays short; under
+    a minute it shows whole seconds. No I/O.
+    """
+    total = int(seconds) if seconds and seconds > 0 else 0
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
 
 class TelegramClaudeBot:
     def __init__(
@@ -79,6 +124,16 @@ class TelegramClaudeBot:
         # exactly as before — the live one-shot bot is untouched until the owner flips
         # the flag. Streaming-mode methods delegate to this driver.
         self.streaming = streaming if config.engine_mode == "streaming" else None
+        # T2 (P9): process start time for the /status uptime line (monotonic-independent
+        # wall reference; uptime is a human-facing duration so wall time is fine here).
+        self._start_time = time.time()
+        # T1 (P9): one-time first-run onboarding. A chat whose first-ever message fires the
+        # welcome once; the chat id is recorded here so subsequent messages do NOT re-welcome.
+        # CAVEAT: in-memory only (not persisted in the session store) — the welcome re-fires
+        # once after a bot restart. That is an accepted trade-off (a single extra welcome is
+        # harmless and the registry's per-chat shape is project-scoped, not a natural home for
+        # a UX seen-flag); persisting it is a possible later refinement.
+        self._welcomed: set[int] = set()
 
     # ---- auth ---------------------------------------------------------------
     def _authorized(self, update: Update) -> bool:
@@ -97,6 +152,102 @@ class TelegramClaudeBot:
         if not await self._ok(update) or update.message is None:
             return
         await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+    async def _maybe_welcome(self, update: Update) -> None:
+        """T1 (P9): send the one-time first-run welcome for a chat's FIRST-ever message.
+
+        Gated on :meth:`_authorized` by the caller (a non-allowlisted chat never reaches
+        here — SB1), this fires AT MOST ONCE per chat per process: the chat id is recorded
+        in :attr:`_welcomed` so every subsequent message is a no-op. The welcome names the
+        current ``ENGINE_MODE`` + active cwd and points at the ``/`` menu (a hint, not the
+        wall-of-text /help). Best-effort (RB1): a failed send must never break the turn that
+        follows it — the message is dispatched regardless. CAVEAT: the seen-set is in-memory,
+        so the welcome re-fires once after a restart (accepted — see ``__init__``).
+        """
+        chat = update.effective_chat
+        if chat is None or chat.id in self._welcomed:
+            return
+        # Mark BEFORE sending so a send failure (or a racing second message under
+        # concurrent_updates) cannot double-welcome — at-most-once wins over at-least-once.
+        self._welcomed.add(chat.id)
+        if update.message is None:
+            return
+        try:
+            # The active cwd: the streaming session / runner both expose get_cwd (read-only;
+            # never creates a project). Wrapped in <code> (R6) so its /segments are inert.
+            cwd = (
+                self.streaming.get_cwd(chat.id)
+                if self.streaming is not None
+                else self.runner.get_cwd(chat.id)
+            )
+            mode = html.escape(self.config.engine_mode, quote=False)
+            await update.message.reply_text(
+                f"👋 <b>Claude Code remote</b> — engine mode <b>{mode}</b>\n"
+                f"Working in {code_path(cwd)}\n\n"
+                "Send a message, or tap a command — try /projects or /status.",
+                parse_mode="HTML",
+            )
+        except Exception:  # RB1: a failed welcome must never break the message dispatch.
+            log.debug("first-run welcome send failed for chat %s", chat.id, exc_info=True)
+
+    async def cmd_status(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """T2 (P9): an at-a-glance health view — uptime, mode, gate/yolo, runs, projects.
+
+        SB1: allowlist-gated like every command (the ``_ok`` recheck). **Body-free (SB3):**
+        the reply carries only bot-derived health values — uptime, ``ENGINE_MODE``, the
+        permission-gate posture, active-vs-cap run counts, and a per-project line (name +
+        :data:`~claude_tg.render.ProjectStatus` label + cwd in ``<code>`` + cumulative
+        cost) — never tool input/output or file content. Every interpolated value is
+        HTML-escaped (or a fixed/numeric bot value); paths are ``code_path``-wrapped (R6).
+        Reuses the ``/projects`` internals (``store.list_projects`` / ``get_active`` +
+        ``streaming.project_status``) so it never diverges from that surface. RB1: read-only,
+        never crashes on a sparse/odd record (mirrors ``/projects``).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        chat_id = update.effective_chat.id
+        lines = ["📊 <b>Status</b>", f"Uptime: {html.escape(_format_uptime(time.time() - self._start_time))}"]
+        lines.append(f"Engine mode: <b>{html.escape(self.config.engine_mode, quote=False)}</b>")
+        if self.streaming is not None:
+            # Gate / yolo posture for the ACTIVE project (the policy is per-project; read it
+            # without mutating — get_yolo is read-only). The gate is ON unless yolo bypasses
+            # it; skip_permissions (one-shot bypass) is reported too for completeness.
+            yolo = self.streaming.get_yolo(chat_id)
+            gate = "OFF (/yolo — all tools auto-allowed)" if yolo else "ON (per-tool approval)"
+            lines.append(f"Permission gate: {gate}")
+            active_runs = self.streaming.active_run_count()
+            cap = self.config.max_concurrent_runs
+            lines.append(f"Runs: {active_runs} active / {cap} max concurrent")
+            projects = self.streaming.store.list_projects(chat_id) if self.streaming.store else {}
+            active = self.streaming.store.get_active(chat_id) if self.streaming.store else None
+            if projects:
+                lines.append("Projects:")
+                for name, record in projects.items():
+                    rec = record if isinstance(record, dict) else {}
+                    marker = "→" if name == active else "  "
+                    cwd = rec.get("cwd")
+                    cwd_html = code_path(cwd) if cwd else "(no path)"
+                    status = project_status_label(self.streaming.project_status(chat_id, name))
+                    # T4 hook: a per-project model override would surface here (left for T4).
+                    cost = self.streaming.store.get_cost(chat_id, name) if self.streaming.store else 0.0
+                    cost_html = f" · ${cost:.2f}" if cost > 0 else ""
+                    lines.append(
+                        f"{marker} <b>{html.escape(str(name), quote=False)}</b> — "
+                        f"{cwd_html} ({status}){cost_html}"
+                    )
+            else:
+                lines.append("Projects: none yet — /new &lt;name&gt; &lt;path&gt;")
+        else:
+            # One-shot mode: the gate posture is the skip_permissions opt-out; no per-project
+            # registry / concurrency (each message runs to completion against one session).
+            gate = (
+                "OFF (CLAUDE_SKIP_PERMISSIONS — all tools auto-allowed)"
+                if self.config.skip_permissions
+                else "ON (CLI approval prompt)"
+            )
+            lines.append(f"Permission gate: {gate}")
+            lines.append(f"Working dir: {code_path(self.runner.get_cwd(chat_id))}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def cmd_reset(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ok(update) or update.message is None:
@@ -663,6 +814,10 @@ class TelegramClaudeBot:
         text = (update.message.text or "").strip()
         if not text:
             return
+        # T1: first-ever message for this chat → one-time welcome (SB1: only reached for an
+        # authorized chat). At-most-once; subsequent messages are a no-op. Sent before the
+        # turn runs so the welcome appears first.
+        await self._maybe_welcome(update)
         await self._run_turn(
             update, ctx, update.effective_chat.id, text,
             reply_to_message_id=self._reply_to_id(update),
@@ -691,6 +846,9 @@ class TelegramClaudeBot:
         text = (update.message.text or "").strip()
         if not text:
             return
+        # T1: a skill-launch slash-command can also be a chat's first-ever message — welcome
+        # once here too (at-most-once shared with on_message via the same seen-set).
+        await self._maybe_welcome(update)
         await self._run_turn(update, ctx, update.effective_chat.id, text)
 
     async def _run_turn(
@@ -899,6 +1057,23 @@ class TelegramClaudeBot:
         except Exception:
             pass
 
+    # ---- startup ------------------------------------------------------------
+    async def _post_init(self, app: Application) -> None:
+        """T1 (P9): register the bot's ``/`` command menu once at startup (set_my_commands).
+
+        PTB calls this after the application is initialized. It pushes :data:`COMMAND_MENU`
+        (the registered commands + concise descriptions) so Telegram shows the native menu.
+        Best-effort (RB1): a Telegram API hiccup is logged but never blocks startup — the bot
+        runs fine without a menu. The menu is global (Telegram has no per-chat allowlist
+        scope at the bot-command layer; SB1 still gates every actual command at dispatch).
+        """
+        try:
+            await app.bot.set_my_commands(
+                [BotCommand(cmd, desc) for cmd, desc in COMMAND_MENU]
+            )
+        except Exception:
+            log.warning("failed to register the bot command menu (set_my_commands)", exc_info=True)
+
     # ---- wiring -------------------------------------------------------------
     def build_application(self) -> Application:
         # concurrent_updates(True) is REQUIRED by the answer-hold design: a streaming turn
@@ -909,9 +1084,20 @@ class TelegramClaudeBot:
         # return). Concurrent dispatch lets the callback handler run while the turn is held
         # (resolve_callback is intentionally lock-free for exactly this). One turn per chat
         # is still enforced by the StreamingBusy guard.
-        app = ApplicationBuilder().token(self.config.bot_token).concurrent_updates(True).build()
+        # T1 (P9): register the native /-menu at startup via post_init. set_my_commands makes
+        # every registered command discoverable in Telegram's UI (derived from COMMAND_MENU,
+        # which the test pins to the registered CommandHandlers below). Best-effort (RB1): a
+        # failed API call must not block the bot from starting — it just means no menu.
+        app = (
+            ApplicationBuilder()
+            .token(self.config.bot_token)
+            .concurrent_updates(True)
+            .post_init(self._post_init)
+            .build()
+        )
         allowed = filters.Chat(chat_id=list(self.config.allowed_chat_ids))
         app.add_handler(CommandHandler(["start", "help"], self.cmd_help, filters=allowed))
+        app.add_handler(CommandHandler("status", self.cmd_status, filters=allowed))
         app.add_handler(CommandHandler("reset", self.cmd_reset, filters=allowed))
         app.add_handler(CommandHandler("cancel", self.cmd_cancel, filters=allowed))
         app.add_handler(CommandHandler("yolo", self.cmd_yolo, filters=allowed))

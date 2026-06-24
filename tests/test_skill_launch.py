@@ -112,6 +112,8 @@ async def test_skill_command_forwards_verbatim_oneshot():
     """A non-bot command forwards the VERBATIM text (cmd + args, leading /) to runner.run."""
     runner = FakeRunner(ClaudeResult(ok=True, text="launched"))
     bot = TelegramClaudeBot(make_config(), runner)
+    # P9/T1: pre-mark welcomed so the first-run welcome doesn't perturb the assert-once.
+    bot._welcomed.add(1)
     upd = make_update(1, "/grill do X")
     await bot.on_skill_command(upd, make_ctx())
     assert runner.run_calls == [(1, "/grill do X")]  # verbatim — / and args intact

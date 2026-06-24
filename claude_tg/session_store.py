@@ -372,6 +372,60 @@ class JsonSessionStore:
         record["last_active"] = _now()
         self._save_raw(raw)
 
+    def add_cost(self, chat_id: int, name: str, cost_usd: float) -> float:
+        """Add ``cost_usd`` to the **named** project's cumulative cost; return the new total.
+
+        T3 (P9): each turn's SDK-reported ``total_cost_usd`` is accumulated into a durable
+        per-project ``cost_usd`` field so ``/status`` (T2) can show the project's lifetime
+        spend. Like :meth:`set_session_id` this targets the project the turn ran **on** (the
+        captured name — the active project can move mid-turn now ``/switch`` is free), matched
+        case-insensitively, and is atomic + ``0600`` (RB6) via :meth:`_save_raw`. A
+        non-finite / non-numeric / negative ``cost_usd`` (defensive — the SDK should give a
+        small positive float) is treated as ``0.0`` so a bad value can never corrupt the
+        running total or crash the turn (RB1). Raises :class:`UnknownProject` if no such
+        project exists (the caller only ever passes a project it just ran). Persists; returns
+        the cumulative total after the add (also when the add is 0).
+        """
+        try:
+            delta = float(cost_usd)
+        except (TypeError, ValueError):
+            delta = 0.0
+        if not (delta == delta) or delta in (float("inf"), float("-inf")) or delta < 0:
+            # NaN (delta != delta), ±inf, or negative — ignore the delta (RB1), still return
+            # the current total so the caller's surfacing is unaffected.
+            delta = 0.0
+        raw = self._load_raw()
+        _chat, projects, key = self._resolve(raw, chat_id, name)
+        record = projects[key]
+        if not isinstance(record, dict):
+            raise UnknownProject(name)
+        prior = record.get("cost_usd")
+        try:
+            prior_val = float(prior) if prior is not None else 0.0
+        except (TypeError, ValueError):
+            prior_val = 0.0
+        total = prior_val + delta
+        record["cost_usd"] = total
+        record["last_active"] = _now()
+        self._save_raw(raw)
+        return total
+
+    def get_cost(self, chat_id: int, name: str) -> float:
+        """The named project's cumulative cost in USD (case-insensitive), or ``0.0``.
+
+        Read-only (never raises): an unknown project, a missing/odd ``cost_usd`` field, or a
+        non-numeric stored value all read as ``0.0`` (RB1). Used by ``/status`` (T2) to show
+        a project's lifetime spend.
+        """
+        record = self.get_project(chat_id, name)
+        if not isinstance(record, dict):
+            return 0.0
+        value = record.get("cost_usd")
+        try:
+            return float(value) if value is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     # ---- registry internals -----------------------------------------------
 
     @staticmethod

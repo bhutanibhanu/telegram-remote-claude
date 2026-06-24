@@ -553,3 +553,62 @@ def test_registry_and_flat_view_interoperate(tmp_path):
 
     store.switch(1, "B")  # flat view now follows B
     assert store.load()["1"] == {"cwd": "/b"}  # B has no session yet
+
+
+# ---- P9 / T3 — per-project cumulative cost (add_cost / get_cost) ------------
+
+
+def test_add_cost_accumulates_and_persists_across_reload(tmp_path):
+    """add_cost accumulates per project and survives a store reload (RB6)."""
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    assert store.add_cost(1, "alpha", 0.012) == pytest.approx(0.012)
+    assert store.add_cost(1, "alpha", 0.008) == pytest.approx(0.02)
+    # A fresh store over the same file reads the accumulated total back.
+    reloaded = JsonSessionStore(path)
+    assert reloaded.get_cost(1, "alpha") == pytest.approx(0.02)
+
+
+def test_add_cost_is_case_insensitive(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "Alpha", "/work/alpha", make_active=True)
+    store.add_cost(1, "alpha", 0.5)
+    store.add_cost(1, "ALPHA", 0.25)
+    assert store.get_cost(1, "Alpha") == pytest.approx(0.75)
+
+
+def test_add_cost_ignores_bad_values(tmp_path):
+    """NaN / inf / negative deltas are ignored (RB1) — the running total never corrupts."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.add_cost(1, "alpha", 1.0)
+    assert store.add_cost(1, "alpha", float("nan")) == pytest.approx(1.0)
+    assert store.add_cost(1, "alpha", float("inf")) == pytest.approx(1.0)
+    assert store.add_cost(1, "alpha", -5.0) == pytest.approx(1.0)
+    assert store.get_cost(1, "alpha") == pytest.approx(1.0)
+
+
+def test_add_cost_unknown_project_raises(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    with pytest.raises(UnknownProject):
+        store.add_cost(1, "nope", 1.0)
+
+
+def test_get_cost_unknown_or_unset_is_zero(tmp_path):
+    """get_cost is read-only and never raises — unknown project / unset field → 0.0."""
+    store = JsonSessionStore(tmp_path / "state.json")
+    assert store.get_cost(1, "nope") == 0.0
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    assert store.get_cost(1, "alpha") == 0.0  # never charged yet
+
+
+def test_add_cost_writes_0600(tmp_path):
+    import os
+    import stat
+
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.add_cost(1, "alpha", 0.1)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600

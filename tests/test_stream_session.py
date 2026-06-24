@@ -5697,3 +5697,123 @@ async def test_default_factory_uses_generous_default_stream_message_timeout(tmp_
         permission_policy=PermissionPolicy(),
     )
     assert engine._send_timeout == 300.0, "the live bound must default to the generous 300 s, not 120 s"
+
+
+# ===========================================================================
+# P9 / T3 — the driver accumulates each turn's SDK-reported cost into the
+# project's durable cumulative total (shown by /status). P9 / T2 — get_yolo /
+# active_run_count read-only accessors for the /status health view.
+# ===========================================================================
+
+
+async def test_turn_accumulates_project_cost(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    engine = FakeEngine(
+        [ResultEvent(
+            session_id="s1", is_error=False, subtype="success",
+            num_turns=2, total_cost_usd=0.03, result_text="done",
+        )]
+    )
+    session = make_session(engine, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    # The turn's cost landed on the project it ran on (alpha).
+    assert store.get_cost(1, "alpha") == pytest.approx(0.03)
+
+
+async def test_two_turns_accumulate_cumulative_cost(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    for cost in (0.01, 0.02):
+        engine = FakeEngine(
+            [ResultEvent(
+                session_id="s1", is_error=False, subtype="success",
+                num_turns=1, total_cost_usd=cost, result_text="ok",
+            )]
+        )
+        session = make_session(engine, store=store)
+        rec = Recorder()
+        await asyncio.wait_for(
+            session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+        )
+    # Cumulative across both turns, persisted in the store.
+    assert store.get_cost(1, "alpha") == pytest.approx(0.03)
+
+
+async def test_turn_without_cost_does_not_charge(tmp_path):
+    # A ResultEvent with no total_cost_usd (oneshot-shaped) leaves the cumulative untouched.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    engine = FakeEngine(
+        [ResultEvent(session_id="s1", is_error=False, subtype="success", result_text="ok")]
+    )
+    session = make_session(engine, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert store.get_cost(1, "alpha") == 0.0
+
+
+async def test_get_yolo_reflects_active_policy(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    session = make_session(FakeEngine([]), store=store)
+    assert session.get_yolo(1) is False  # fail-closed default
+    session.set_yolo(1, True)
+    assert session.get_yolo(1) is True
+    session.set_yolo(1, False)
+    assert session.get_yolo(1) is False
+
+
+def test_get_yolo_no_runtime_is_false(tmp_path):
+    # Read-only: a chat with no active project / runtime reports False, creates nothing.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    session = make_session(FakeEngine([]), store=store)
+    assert session.get_yolo(1) is False
+    assert store.get_active(1) is None  # not created by the read-only query
+
+
+def test_active_run_count_starts_zero():
+    session = make_session(FakeEngine([]))
+    assert session.active_run_count() == 0
+
+
+async def test_background_turn_cost_lands_on_captured_project_not_active(tmp_path):
+    # ⭐ The teeth for "cost is accumulated onto the CAPTURED project (turn_name), not the
+    # active one". A BACKGROUND turn runs on alpha while BETA is the active/foreground
+    # project; its ResultEvent carries total_cost_usd → the cost must land on ALPHA (the
+    # project the turn ran ON), and beta (active) must stay at $0.00.
+    #
+    # MUTATION PROBE: if _drive_turn's add_cost were called with the ACTIVE project instead
+    # of turn_name, the cost would land on beta and this test FAILS on BOTH asserts (alpha
+    # would be 0.0, beta would be 0.07). It is the only cost test that distinguishes the
+    # captured-vs-active project — the existing cost tests use a single project that is also
+    # active, so they cannot catch this misrouting.
+    session, store, eng_alpha, _eng_beta = await make_two_project_session(tmp_path, active="beta")
+    eng_alpha._script = [
+        ResultEvent(
+            session_id="alpha-sid", is_error=False, subtype="success",
+            num_turns=2, total_cost_usd=0.07, result_text="bg answer",
+        )
+    ]
+    rt_alpha = session._chat(1).runtimes["alpha"]
+    rec = Recorder()
+    await _drive_project(session, 1, "alpha", rt_alpha, send=rec.send, edit=rec.edit)
+    # Cost landed on the CAPTURED project (alpha, the one that ran) …
+    assert store.get_cost(1, "alpha") == pytest.approx(0.07)
+    # … and NOT on the active/foreground project (beta) — the mutation probe.
+    assert store.get_cost(1, "beta") == 0.0

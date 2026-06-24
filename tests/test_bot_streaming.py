@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -132,6 +133,22 @@ class FakeStreaming:
     def set_yolo(self, chat_id, on):
         self.yolo_calls.append((chat_id, on))
 
+    def get_cwd(self, chat_id):
+        # P9/T1: the first-run welcome reads the active cwd via this accessor.
+        return "/work"
+
+    def get_yolo(self, chat_id):
+        # P9/T2: /status reads the active project's yolo posture (read-only).
+        return False
+
+    def active_run_count(self):
+        # P9/T2: /status reports active-vs-cap run counts.
+        return 0
+
+    def project_status(self, chat_id, name):
+        # P9/T2: /status reuses the per-project status (mirrors /projects).
+        return "idle"
+
 
 def make_update(chat_id=1, text="hello", *, reply_to_message_id=None):
     upd = MagicMock()
@@ -188,6 +205,8 @@ async def test_oneshot_is_default_and_uses_runner():
     # No streaming passed AND default config => oneshot.
     bot = TelegramClaudeBot(make_config(), runner)
     assert bot.streaming is None
+    # P9/T1: pre-mark welcomed so the first-run welcome doesn't perturb the assert-once.
+    bot._welcomed.add(1)
     upd = make_update(1, "do it")
     await bot.on_message(upd, make_ctx())
     assert runner.run_calls == [(1, "do it")]
@@ -2162,3 +2181,208 @@ async def test_cmd_cancel_named_aborts_only_that_run_end_to_end(tmp_path):
 
     eng_a.cancel()
     await asyncio.wait_for(turn_a, timeout=2.0)
+
+
+# ===========================================================================
+# P9 / T1 — command menu (set_my_commands) + first-run onboarding.
+# ===========================================================================
+
+
+def _registered_command_names(bot):
+    """The set of command names actually registered as CommandHandlers (excluding the
+    /start alias of /help — intentionally omitted from the native menu)."""
+    from telegram.ext import CommandHandler
+
+    app = bot.build_application()
+    names: set[str] = set()
+    for group in app.handlers.values():
+        for h in group:
+            if isinstance(h, CommandHandler):
+                names |= {c.lstrip("/").lower() for c in h.commands}
+    names.discard("start")
+    return names
+
+
+def test_command_menu_matches_registered_handlers():
+    # T1: COMMAND_MENU must be in lock-step with the registered CommandHandlers — no
+    # documented-but-unregistered command, and no registered command missing from the menu.
+    from claude_tg.bot import COMMAND_MENU
+
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    menu_names = {cmd for cmd, _desc in COMMAND_MENU}
+    assert menu_names == _registered_command_names(bot)
+    # Every menu entry has a non-empty, concise description.
+    assert all(desc and len(desc) <= 100 for _cmd, desc in COMMAND_MENU)
+    # The new /status command is present.
+    assert "status" in menu_names
+
+
+async def test_post_init_registers_commands_via_set_my_commands():
+    # T1: post_init calls bot.set_my_commands with a BotCommand list matching COMMAND_MENU.
+    from telegram import BotCommand
+
+    from claude_tg.bot import COMMAND_MENU
+
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    app = MagicMock()
+    app.bot.set_my_commands = AsyncMock()
+    await bot._post_init(app)
+    app.bot.set_my_commands.assert_awaited_once()
+    sent = app.bot.set_my_commands.await_args.args[0]
+    assert all(isinstance(c, BotCommand) for c in sent)
+    assert [(c.command, c.description) for c in sent] == list(COMMAND_MENU)
+
+
+async def test_post_init_survives_set_my_commands_failure():
+    # RB1: a Telegram API failure registering the menu must not crash startup.
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    app = MagicMock()
+    app.bot.set_my_commands = AsyncMock(side_effect=RuntimeError("api down"))
+    await bot._post_init(app)  # does not raise
+
+
+async def test_first_message_welcomes_once_then_not_again():
+    # T1: the first-ever message for a chat fires a one-time welcome; subsequent messages
+    # do NOT re-welcome.
+    runner = FakeRunner(ClaudeResult(ok=True, text="ok"))
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    upd1 = make_update(1, "hello")
+    await bot.on_message(upd1, make_ctx())
+    welcome = upd1.message.reply_text.await_args_list[0].args[0]
+    assert welcome.startswith("👋")
+    assert "/status" in welcome and "oneshot" in welcome
+    # Second message: NO welcome (only the turn reply).
+    upd2 = make_update(1, "again")
+    await bot.on_message(upd2, make_ctx())
+    assert not any("👋" in c.args[0] for c in upd2.message.reply_text.await_args_list)
+
+
+async def test_welcome_not_sent_to_unauthorized_chat():
+    # T1/SB1: a non-allowlisted chat never triggers onboarding (and is never marked seen).
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="oneshot"), runner)
+    upd = make_update(999, "hi")
+    await bot.on_message(upd, make_ctx())
+    upd.message.reply_text.assert_not_awaited()
+    assert 999 not in bot._welcomed
+
+
+async def test_welcome_failure_does_not_break_dispatch():
+    # RB1: a welcome send failure must not stop the turn from running.
+    runner = FakeRunner(ClaudeResult(ok=True, text="answer"))
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    upd = make_update(1, "go")
+
+    # First reply (the welcome) raises; later replies (the turn) succeed.
+    upd.message.reply_text = AsyncMock(side_effect=[RuntimeError("boom"), None, None, None])
+    await bot.on_message(upd, make_ctx())
+    assert runner.run_calls == [(1, "go")]  # the turn still ran
+
+
+# ===========================================================================
+# P9 / T2 — /status health command (real StreamingSession + store).
+# ===========================================================================
+
+
+async def test_cmd_status_streaming_fields(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.add_cost(1, "alpha", 0.05)
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert kwargs.get("parse_mode") == "HTML"
+    # Uptime, engine mode, gate posture, run counts, the per-project line + cwd + cost.
+    assert "Uptime" in reply
+    assert "streaming" in reply
+    assert "gate" in reply.lower()
+    assert "active" in reply.lower() and "max concurrent" in reply.lower()
+    assert "alpha" in reply
+    assert "<code>/work/alpha</code>" in reply  # R6: cwd wrapped, not auto-linkified
+    assert "$0.05" in reply  # T3 cumulative cost surfaced in /status
+
+
+async def test_cmd_status_unauthorized_ignored(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(999, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    upd.message.reply_text.assert_not_awaited()  # SB1: dropped, nothing leaked
+
+
+async def test_cmd_status_oneshot_mode():
+    runner = FakeRunner()
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), runner)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "oneshot" in reply
+    assert "Uptime" in reply
+    assert "<code>/work</code>" in reply  # working dir wrapped (R6)
+
+
+async def test_cmd_status_body_free_no_secrets(tmp_path):
+    # SB3: /status carries only health values — never tool input/output or file content. We
+    # plant a "secret"-looking session_id in the store and assert it never appears.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.set_session_id(1, "alpha", "SECRET-SESSION-ID-12345")
+    session, _ = make_streaming(store)
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "SECRET-SESSION-ID-12345" not in reply
+
+
+async def test_cmd_status_multi_project_marker_mixed_cost_and_yolo(tmp_path):
+    # T2: /status with MULTIPLE projects — assert (a) the active-marker placement (→ on the
+    # active project only), (b) a MIXED cost/no-cost rendering (the costed project shows
+    # "$X.XX", the un-costed one shows no cost suffix), and (c) the /yolo-ON gate-disabled
+    # wording shows and stays body-free + HTML-escaped.
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)   # active + costed
+    store.create(1, "beta", "/work/beta", make_active=False)    # inactive + no cost
+    store.add_cost(1, "alpha", 0.12)
+    session, _ = make_streaming(store)
+    # Flip the active project into /yolo so the gate-disabled posture renders.
+    session.set_yolo(1, True)
+    assert session.get_yolo(1) is True
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=session)
+    upd = make_update(1, "/status")
+    await bot.cmd_status(upd, make_cmd_ctx())
+    reply = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert kwargs.get("parse_mode") == "HTML"
+
+    lines = reply.splitlines()
+    alpha_line = next(line for line in lines if "alpha" in line)
+    beta_line = next(line for line in lines if "beta" in line)
+    # (a) active marker: the → arrow leads the ACTIVE project's line only.
+    assert "→" in alpha_line and "<b>alpha</b>" in alpha_line
+    assert "→" not in beta_line and "<b>beta</b>" in beta_line
+    # (b) mixed cost: alpha shows its cumulative cost, beta (uncharged) shows none.
+    assert "$0.12" in alpha_line
+    assert "$" not in beta_line
+    # (c) /yolo gate-disabled wording is present, loud, and names the toggle.
+    gate_line = next(line for line in lines if line.startswith("Permission gate:"))
+    assert "OFF" in gate_line and "/yolo" in gate_line
+    # Body-free + HTML-escaped: the only "<...>" runs are the bot's own <b>/<code> tags (no
+    # stray angle brackets), and no raw '&' leaks unescaped (every literal & is an entity).
+    assert set(re.findall(r"</?(\w+)", reply)) <= {"b", "code"}
+    for amp in re.findall(r"&\S*", reply):
+        assert amp.startswith(("&amp;", "&lt;", "&gt;")), amp
+
+
+def test_format_uptime():
+    from claude_tg.bot import _format_uptime
+
+    assert _format_uptime(8) == "8s"
+    assert _format_uptime(72) == "1m 12s"
+    assert _format_uptime(3661) == "1h 1m"
+    assert _format_uptime(90061) == "1d 1h 1m"
+    assert _format_uptime(-5) == "0s"  # RB1: defensive floor
