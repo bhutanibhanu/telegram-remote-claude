@@ -3,12 +3,14 @@
 _From design.md · 6 quick-win features · supervised build. Baseline 875 tests._
 
 ## Task list
-- [ ] T1 — Command menu (`setMyCommands`) + first-run onboarding
-- [ ] T2 — `/status` health command
-- [ ] T3 — Cost/usage surfacing (done-footer + per-project total + `/status`)
-- [ ] T4 — Model routing `/fast`·`/deep` (per-project override)
-- [ ] T5 — Macros `/save`·`/run`·`/macros`·`/unsave` (persisted prompt templates)
-- [ ] T6 — Notification polish (no link preview, switch button, queue counter) + smart-reply chips
+- [x] T1 — Command menu (`setMyCommands`) + first-run onboarding (b09cc8a)
+- [x] T2 — `/status` health command (b09cc8a; per-project yolo added in fix round)
+- [x] T3 — Cost/usage surfacing (done-footer + per-project total + `/status`) (b09cc8a)
+- [x] T4 — Model routing `/fast`·`/deep`·`/auto` (per-project override) (f30d649)
+- [x] T5 — Macros `/save`·`/run`·`/macros`·`/unsave` (persisted prompt templates) (f30d649; case-collision + /run-prompt-consume bugs fixed in QA round)
+- [x] T6 — Notification polish (no link preview, [Open] switch button SB1+cwd-revalidated, queue counter) + smart-reply chips (4e7816c)
+
+_QA: per-batch reviewers (AGREE) + whole-bot UX/bug audit (1 P0 + 4 P1, all fixed) + cross-model Codex (NO_SHIP → fixed /run-consumes-prompt blocker → re-QA). 1001 tests. Fix round: see below._
 
 Legend: `[ ]` todo · `[x]` done (sha) · `[!]` blocked
 
