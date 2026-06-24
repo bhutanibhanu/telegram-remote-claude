@@ -128,6 +128,7 @@ from .session_mirror import (
     transcript_path,
 )
 from .session_store import (
+    _EFFORT_LEVELS,
     DEFAULT_PROJECT,
     DuplicateProject,
     InvalidProjectName,
@@ -227,6 +228,7 @@ def _default_engine_factory(
     model: Optional[str] = None,
     permission_mode: str = "default",
     thinking: bool = False,
+    effort: Optional[str] = None,
     audit_sink: Optional[AuditSink] = None,
     bash_policy_mode: str = "off",
     bash_policy_extra_patterns: tuple[str, ...] = (),
@@ -284,6 +286,17 @@ def _default_engine_factory(
     Off by default (cost + flood posture); toggled per project by ``/thinking`` (transient,
     RB3). SB3: the reasoning TEXT is shown; the opaque signature is dropped in ``normalize``.
 
+    **T-EFFORT (STATUSLINE):** ``effort`` is the per-project reasoning-EFFORT override
+    (``/effort low…max``) baked into the substrate's ``ClaudeAgentOptions(effort=…)`` at
+    session-creation time (mirrors ``model`` — a session-creation knob, distinct from the P12
+    ``thinking`` VISIBILITY toggle). ``None`` (the default here, and what a bare ``/effort``
+    clears to) omits ``effort`` entirely so behavior is byte-for-byte unchanged when no
+    override is set and the SDK's own default effort (``high``) applies. There is NO
+    ``CLAUDE_*`` global default for effort: the session resolves the per-project override (else
+    ``None``) and passes it via ``_bound_factory`` at each ``_ensure_engine`` build, so an
+    ``/effort`` change takes effect on the NEXT fresh session for that project (never hot-swapped
+    mid-session).
+
     **P13 T-AUDIT:** ``audit_sink`` is the optional, BODY-FREE audit sink the engine records
     every gate decision to (a :class:`~claude_tg.audit.ChatBoundSink` over the process
     :class:`~claude_tg.audit.AuditLog`, bound per chat by ``StreamingSession._build_engine``).
@@ -312,6 +325,7 @@ def _default_engine_factory(
         decision_callback=decision_callback,
         model=model,
         thinking=thinking,
+        effort=effort,
     )
     engine = Engine(
         substrate,
@@ -451,6 +465,17 @@ class _ProjectRuntime:
     # (off→on streams from the next turn; on→off stops the wire traffic from the next turn).
     # Transient (RB3); a restart rebuilds in the default OFF.
     engine_thinking: bool = False
+    # T-EFFORT (STATUSLINE): the reasoning-EFFORT level the CURRENT live engine was built with
+    # (the resolved per-project override, else ``None`` = SDK default). ``_ensure_engine``
+    # records it at build time and the warm fast-path reuses the engine ONLY when it matches the
+    # turn's requested effort — so changing ``/effort`` rebuilds the session on the NEXT turn
+    # (effort is a session-creation knob baked into ``ClaudeAgentOptions``; it can't be
+    # hot-switched), in either direction. UNLIKE ``engine_thinking`` the override itself is
+    # PERSISTED (on the project, like the model override) — only this built-with marker is
+    # transient (RB3): a restart resolves the persisted effort fresh and rebuilds. ``None`` (no
+    # override) matches ``None`` → a back-to-back no-effort turn reuses the warm engine
+    # byte-for-byte (the default-turn path is unchanged).
+    engine_effort: Optional[str] = None
     # P11 T2 (attach-fork): True iff this project was ADOPTED from an external session that
     # was LIVE in another process at attach time, so its NEXT resume MUST fork (resume into a
     # fresh id, transcript copied) rather than continue the live id — two writers on one
@@ -780,6 +805,7 @@ class StreamingSession:
                 model: Optional[str] = None,
                 permission_mode: str = "default",
                 thinking: bool = False,
+                effort: Optional[str] = None,
                 audit_sink: Optional[AuditSink] = None,
             ) -> Engine:
                 return _default_engine_factory(
@@ -792,6 +818,7 @@ class StreamingSession:
                     model=model,
                     permission_mode=permission_mode,
                     thinking=thinking,
+                    effort=effort,
                     audit_sink=audit_sink,
                     # P13 T-BASH: bind the live config's Bash policy (default flag) into the
                     # production engine — consulted ADDITIVELY for Bash in on_tool_request. A
@@ -1442,6 +1469,43 @@ class StreamingSession:
                 log.exception("failed to persist model override for chat %s", chat_id)
         return normalized
 
+    def set_effort(self, chat_id: int, level: Optional[str]) -> Optional[str]:
+        """Set (or clear) the ACTIVE project's per-project reasoning-EFFORT override (T-EFFORT).
+
+        ``/effort <low|medium|high|xhigh|max>`` stores the level; a bare ``/effort`` (or
+        ``/effort default``) clears it (``None``) back to the SDK default (``high``). Exactly
+        parallel to :meth:`set_model`: persisted on the active project via the store (atomic +
+        ``0600``, RB6) so it survives a restart and a store reload; with no store it is a no-op
+        (a single implicit project, no persistence) — returns the NORMALIZED level regardless so
+        the bot can confirm. Auto-creates ``default`` if there is no active project (consistent
+        with ``set_model`` / ``set_yolo`` / ``arm_plan``).
+
+        The store VALIDATES the level against ``{low, medium, high, xhigh, max}`` and normalizes
+        anything else to ``None`` (a cleared override) — but the bot's ``cmd_effort`` rejects a
+        bad level with a clean error *before* calling this, so a stored garbage level can't arise
+        from the command path; this method simply returns what was persisted. **Applies on the
+        NEXT fresh session, never mid-turn** (effort is a session-creation param baked into
+        ``ClaudeAgentOptions``; a turn in flight keeps its current effort, and the warm fast-path
+        rebuilds on the next turn because ``engine_effort`` no longer matches). Returns the
+        normalized override that was stored (``None`` for a clear).
+        """
+        normalized = (
+            level.strip().lower()
+            if isinstance(level, str) and level.strip().lower() in _EFFORT_LEVELS
+            else None
+        )
+        # Resolve (and if needed auto-create) the active project so /effort before any turn works.
+        name, _rt = self._active_runtime(chat_id, create_default=True)
+        if self.store is not None and name is not None:
+            try:
+                self.store.set_effort(chat_id, name, normalized)
+            except Exception:
+                # RB1: never crash the command over a persist failure (e.g. the project was
+                # /rm'd in a race). The override simply isn't recorded; the next turn uses the
+                # SDK default. Mirrors set_model / _persist's swallow-and-log discipline.
+                log.exception("failed to persist effort override for chat %s", chat_id)
+        return normalized
+
     def arm_plan(self, chat_id: int) -> None:
         """Arm the ACTIVE project's NEXT turn as a plan turn (``/plan``; P12 T-PLAN-2).
 
@@ -1521,6 +1585,26 @@ class StreamingSession:
             if override:
                 return override
         return self.config.model
+
+    def _resolve_project_effort(self, chat_id: int, name: str) -> Optional[str]:
+        """The reasoning-EFFORT level to bake into ``name``'s next session (override → ``None``).
+
+        T-EFFORT (STATUSLINE): the per-project override (``/effort low…max``) if set, else
+        ``None`` (omit ``effort`` → the SDK's own default, ``high``). UNLIKE
+        :meth:`_resolve_project_model` there is NO ``CLAUDE_*`` global default for effort — when
+        unset we return ``None`` so the kwarg is omitted entirely. Read-only + fail-safe (RB1):
+        a missing store / project / field (or a garbage stored level — :meth:`get_effort`
+        validates) reads as no override. Called by :meth:`_ensure_engine` for the project it is
+        building.
+        """
+        if self.store is not None:
+            try:
+                override = self.store.get_effort(chat_id, name)
+            except Exception:  # RB1: a bad/odd record never wedges the build
+                override = None
+            if override:
+                return override
+        return None
 
     def active_run_count(self) -> int:
         """The number of turns currently RUNNING across the whole process (T2 /status).
@@ -1620,6 +1704,13 @@ class StreamingSession:
         # fast-path below reuses the engine only when its built-with flag matches, so a toggle
         # rebuilds the session on the next turn (thinking is a session-creation knob).
         thinking = rt.thinking
+        # T-EFFORT (STATUSLINE): resolve THIS project's reasoning-EFFORT override (/effort
+        # low…max), else None (SDK default — no CLAUDE_* global). Like ``model`` it is fixed for
+        # the life of the fresh session built below (a session-creation param); the warm
+        # fast-path reuses the engine only when its built-with level matches, so an /effort
+        # change rebuilds on the next turn (never hot-swapped). Resolved here (not on the
+        # runtime) so the persisted override is read fresh each build (it survives a restart).
+        effort = self._resolve_project_effort(chat_id, name)
         # P5 / ADR-005 D1 (T5): no cross-project stop here. A different project's started
         # engine is left running so N runs can be concurrent (T5 removed P4's
         # _stop_other_started). Only the SAME project's stale/non-started engine is handled
@@ -1640,11 +1731,19 @@ class StreamingSession:
         # not hot-switchable). So /thinking on→off (or off→on) rebuilds the session on the next
         # turn; a back-to-back same-thinking turn still reuses the warm engine byte-for-byte
         # (both False pre-P12 → matched → reuse, so a thinking-OFF project is unchanged).
+        #
+        # T-EFFORT (STATUSLINE): and the built-with reasoning-EFFORT level must match too — for
+        # the SAME reason (effort is a session-creation knob baked into ClaudeAgentOptions, not
+        # hot-switchable). So changing /effort (e.g. high→max, or set→cleared) rebuilds the
+        # session on the next turn; a back-to-back same-effort turn still reuses the warm engine
+        # byte-for-byte (None == None for a no-override project → matched → reuse, so the
+        # default-turn path is unchanged).
         if (
             rt.engine is not None
             and rt.started
             and rt.engine_permission_mode == permission_mode
             and rt.engine_thinking == thinking
+            and rt.engine_effort == effort
         ):
             return rt.engine, False
         # Past the warm fast-path: rt is either fresh (engine None), holds a NON-started
@@ -1686,11 +1785,13 @@ class StreamingSession:
         # mode on the runtime so the warm fast-path reuses this engine only for a same-mode turn
         # and rebuilds back to ``"default"`` after the one-shot plan turn (the mismatch path).
         engine = self._build_engine(
-            chat_id, rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
+            chat_id, rt.cwd, rt.policy, model,
+            permission_mode=permission_mode, thinking=thinking, effort=effort,
         )
         rt.engine = engine
         rt.engine_permission_mode = permission_mode
         rt.engine_thinking = thinking  # P12 T-THINK: track the built-with thinking flag
+        rt.engine_effort = effort  # T-EFFORT: track the built-with reasoning-effort level
         resume_id = self._resume_id(chat_id, name)
         # ⭐ P11 T2 (B2+B3) — the BINDING fork-vs-continue decision, made HERE at the first
         # write from a FRESH liveness re-probe (not frozen at attach time). When this project
@@ -1767,12 +1868,16 @@ class StreamingSession:
                 #     plan mode (the marker was already consumed above; this re-uses the value).
                 #     P12 T-THINK: and the SAME thinking flag — a thinking-ON project whose
                 #     resume failed still starts fresh with live reasoning on (sticky flag).
+                #     T-EFFORT: and the SAME reasoning-effort level (resolved once above) — a
+                #     project with an /effort override starts fresh at that effort too.
                 engine = self._build_engine(
-                    chat_id, rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
+                    chat_id, rt.cwd, rt.policy, model,
+                    permission_mode=permission_mode, thinking=thinking, effort=effort,
                 )
                 rt.engine = engine
                 rt.engine_permission_mode = permission_mode  # P12 T-PLAN: track the fresh mode
                 rt.engine_thinking = thinking  # P12 T-THINK: track the fresh thinking flag
+                rt.engine_effort = effort  # T-EFFORT: track the fresh reasoning-effort level
                 # (d) Start the FRESH engine — a clean fresh session (the dead id is gone).
                 await engine.start()
                 # (e) Signal the caller so handle_message posts the T7 "couldn't resume,
@@ -1882,6 +1987,7 @@ class StreamingSession:
         *,
         permission_mode: str = "default",
         thinking: bool = False,
+        effort: Optional[str] = None,
     ) -> Engine:
         """Call the engine factory, passing the T4 per-project ``model`` only when supported.
 
@@ -1908,6 +2014,12 @@ class StreamingSession:
         configured) makes the engine's hook a no-op. An injected test factory keeps its 3-kwarg
         contract and never receives it, so every existing test factory is unaffected (and the
         no-op default keeps the 1288 floor).
+
+        **T-EFFORT (STATUSLINE):** ``effort`` rides the SAME default-factory-only gate — a level
+        bakes ``ClaudeAgentOptions(effort=…)`` into the FRESH session for a project with an
+        ``/effort`` override, ``None`` (the default) omits it so a no-override turn is
+        byte-for-byte unchanged (the SDK default effort applies). An injected test factory keeps
+        its 3-kwarg contract and never receives it, so every existing test factory is unaffected.
         """
         if self._factory_accepts_model:
             return self._engine_factory(
@@ -1917,6 +2029,7 @@ class StreamingSession:
                 model=model,  # type: ignore[call-arg]  # default factory accepts model (T4)
                 permission_mode=permission_mode,  # default factory accepts it too (P12 T-PLAN-1)
                 thinking=thinking,  # default factory accepts it too (P12 T-THINK)
+                effort=effort,  # default factory accepts it too (T-EFFORT)
                 audit_sink=self._audit_sink_for(chat_id),  # default factory accepts it too (P13)
             )
         return self._engine_factory(

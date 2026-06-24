@@ -51,6 +51,20 @@ DEFAULT_PROJECT = "default"
 #: underscore/hyphen only — no spaces, slashes, dots, ``..``, or unicode.
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
+#: The reasoning-EFFORT levels the SDK accepts (``ClaudeAgentOptions.effort`` —
+#: ``EffortLevel = Literal['low','medium','high','xhigh','max']``), in ascending order
+#: (the canonical ordering for the ``/effort`` usage string + the statusline). The
+#: per-project ``/effort`` override (T-EFFORT) is validated against this; anything else
+#: normalizes to ``None`` (a cleared override → the SDK default), so a garbage value can
+#: never wedge the project on an effort the SDK would reject (RB1). Matched
+#: case-insensitively (the stored value is the lowercased canonical level). Public so the
+#: bot's ``/effort`` command + the streaming session validate against ONE source of truth.
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+#: Set form for O(1) membership tests (validation). Kept in lock-step with
+#: :data:`EFFORT_LEVELS` (the ordered display form).
+_EFFORT_LEVELS = frozenset(EFFORT_LEVELS)
+
 
 # ---- registry errors (raised by the typed CRUD API, T3) --------------------
 
@@ -464,6 +478,57 @@ class JsonSessionStore:
             return None
         value = record.get("model")
         return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def set_effort(self, chat_id: int, name: str, effort: str | None) -> None:
+        """Write the per-project reasoning-EFFORT override to the **named** project (case-insensitive).
+
+        T-EFFORT (STATUSLINE): ``/effort <level>`` stores one of the five SDK levels here;
+        a bare ``/effort`` (or ``/effort default``) clears it (``None``) back to the SDK
+        default. Exactly parallel to :meth:`set_model` (the model override): targets a named
+        project (the active project can move mid-turn now ``/switch`` is free), atomic +
+        ``0600`` (RB6) via :meth:`_save_raw`, and bumps ``last_active``; the project's fixed
+        ``cwd``/``session_id`` are left untouched (effort applies on the NEXT fresh session — it
+        is a session-creation param baked into ``ClaudeAgentOptions``). The value is **validated
+        against** ``{low, medium, high, xhigh, max}`` (case-insensitively) and stored lowercased;
+        a non-string, empty, or unrecognized value normalizes to ``None`` (a cleared override) so
+        a garbage level can never wedge the project on an effort the SDK would reject (RB1) — the
+        turn falls back to the SDK default. Raises :class:`UnknownProject` if no such project
+        exists (the bot only ever passes a project it just resolved/created). Persists.
+        """
+        normalized = (
+            effort.strip().lower()
+            if isinstance(effort, str) and effort.strip().lower() in _EFFORT_LEVELS
+            else None
+        )
+        raw = self._load_raw()
+        _chat, projects, key = self._resolve(raw, chat_id, name)
+        record = projects[key]
+        if not isinstance(record, dict):
+            raise UnknownProject(name)
+        if normalized is None:
+            record.pop("effort", None)
+        else:
+            record["effort"] = normalized
+        record["last_active"] = _now()
+        self._save_raw(raw)
+
+    def get_effort(self, chat_id: int, name: str) -> str | None:
+        """The named project's per-project effort override (case-insensitive), or ``None``.
+
+        Read-only (never raises, RB1): an unknown project, a missing ``effort`` field, or a
+        stored value that is NOT one of ``{low, medium, high, xhigh, max}`` (e.g. a hand-edited
+        garbage level) all read as ``None`` (meaning "no override", so the turn omits the
+        ``effort`` kwarg and the SDK default applies). Matched/returned as the lowercased
+        canonical level. Used by the turn path (thread into ``ClaudeAgentOptions(effort=…)``)
+        and the statusline display.
+        """
+        record = self.get_project(chat_id, name)
+        if not isinstance(record, dict):
+            return None
+        value = record.get("effort")
+        if isinstance(value, str) and value.strip().lower() in _EFFORT_LEVELS:
+            return value.strip().lower()
+        return None
 
     def get_cost(self, chat_id: int, name: str) -> float:
         """The named project's cumulative cost in USD (case-insensitive), or ``0.0``.

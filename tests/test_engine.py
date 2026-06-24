@@ -573,6 +573,42 @@ def test_sdk_build_options_no_model_omits_it():
     assert SdkSubstrate(model="   ")._build_options().model is None
 
 
+# ---- T-EFFORT (STATUSLINE): effort threads into ClaudeAgentOptions(effort=…) ----
+
+
+def test_sdk_build_options_threads_effort():
+    # T-EFFORT: a per-project effort override is carried into ClaudeAgentOptions(effort=…) at
+    # session-creation time (start AND resume paths use _build_options), parallel to `model`.
+    sub = SdkSubstrate(effort="max")
+    assert sub._build_options().effort == "max"
+    # And it rides on the resume path too (the resumed session honors the project's effort).
+    assert sub._build_options(resume="sess-123").effort == "max"
+
+
+def test_sdk_build_options_no_effort_omits_it_byte_for_byte():
+    # The headline invariant: a default (no-effort) turn omits `effort` entirely so the SDK's
+    # own default applies — byte-for-byte the pre-knob baseline. Asserted against the SDK's
+    # ClaudeAgentOptions default for the field (so this can't silently drift if the SDK changes
+    # its default), and an empty/whitespace effort is normalized to None (never an empty value).
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    default_effort = ClaudeAgentOptions().effort
+    assert SdkSubstrate()._build_options().effort == default_effort
+    assert SdkSubstrate(cwd="/work")._build_options().effort == default_effort
+    assert SdkSubstrate(effort="   ")._build_options().effort == default_effort
+
+
+def test_sdk_build_options_effort_is_independent_of_model_and_thinking():
+    # effort is orthogonal: it can be set with or without a model override / thinking, and
+    # setting it never disturbs those fields (guards the three session-creation knobs stay
+    # independent — only the effort kwarg is added when an effort is present).
+    sub = SdkSubstrate(model="claude-haiku-4-5", thinking=True, effort="low")
+    opts = sub._build_options()
+    assert opts.effort == "low"
+    assert opts.model == "claude-haiku-4-5"
+    assert opts.thinking == {"type": "adaptive", "display": "summarized"}
+
+
 def test_sdk_build_options_threads_permission_mode_plan():
     # P12 T-PLAN-1 (mechanism a): an armed plan turn builds the session with
     # permission_mode="plan" baked into ClaudeAgentOptions at session-creation time — on BOTH

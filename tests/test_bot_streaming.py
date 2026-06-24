@@ -110,6 +110,7 @@ class FakeStreaming:
         self.model_calls = []
         self.plan_calls = []
         self.thinking_calls = []
+        self.effort_calls = []
         self.reply_prompt_calls = []
         self.to_calls = []
         self.attach_calls = []
@@ -227,6 +228,13 @@ class FakeStreaming:
         # Record the (chat_id, on) and echo the new state back (mirrors the real method).
         self.thinking_calls.append((chat_id, on))
         return on
+
+    def set_effort(self, chat_id, level):
+        # T-EFFORT (STATUSLINE): /effort <level> sets (or clears, on None) the active project's
+        # reasoning-EFFORT override. Record the (chat_id, level) and echo it back (the real
+        # method returns the normalized level — None for a clear).
+        self.effort_calls.append((chat_id, level))
+        return level
 
     def get_cwd(self, chat_id):
         # P9/T1: the first-run welcome reads the active cwd via this accessor.
@@ -687,6 +695,93 @@ async def test_cmd_thinking_unauthorized_ignored():
     await bot.cmd_thinking(upd, make_ctx(args=["on"]))
     assert streaming.thinking_calls == []
     upd.message.reply_text.assert_not_awaited()
+
+
+# ---- T-EFFORT (STATUSLINE): /effort <low…max> (SB1, persisted, streaming-only) -------
+
+
+async def test_cmd_effort_valid_level_persists_and_confirms():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/effort max")
+    await bot.cmd_effort(upd, make_ctx(args=["max"]))
+    assert streaming.effort_calls == [(1, "max")]
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "🧠" in reply and "max" in reply.lower()
+
+
+async def test_cmd_effort_is_case_insensitive():
+    # The level is normalized to lowercase before set_effort (matches the store's canonical form).
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/effort MAX")
+    await bot.cmd_effort(upd, make_ctx(args=["MAX"]))
+    assert streaming.effort_calls == [(1, "max")]
+
+
+async def test_cmd_effort_bad_level_clean_error_lists_valid_and_does_not_set():
+    # RB1: an unrecognized level is a clean error listing the valid levels — the override is
+    # NEVER touched (set_effort is not called).
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/effort turbo")
+    await bot.cmd_effort(upd, make_ctx(args=["turbo"]))
+    assert streaming.effort_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "turbo" in reply.lower()
+    # The clean error lists every valid level.
+    for level in ("low", "medium", "high", "xhigh", "max"):
+        assert level in reply.lower()
+
+
+async def test_cmd_effort_bare_clears_to_default():
+    # A bare /effort (no arg) CLEARS the override → SDK default (set_effort called with None).
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/effort")
+    await bot.cmd_effort(upd, make_ctx(args=[]))
+    assert streaming.effort_calls == [(1, None)]
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "default" in reply.lower() and "low" in reply.lower()  # usage lists the levels too
+
+
+async def test_cmd_effort_default_keyword_clears():
+    # /effort default is the explicit clear (same as bare).
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/effort default")
+    await bot.cmd_effort(upd, make_ctx(args=["default"]))
+    assert streaming.effort_calls == [(1, None)]
+
+
+async def test_cmd_effort_oneshot_is_explained_not_applied():
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())
+    upd = make_update(1, "/effort max")
+    await bot.cmd_effort(upd, make_ctx(args=["max"]))
+    assert "streaming" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_effort_unauthorized_ignored():
+    # SB1: an un-allowlisted chat is rejected by _ok BEFORE any effect — set_effort is never
+    # called and no reply is sent (mirrors test_cmd_thinking_unauthorized_ignored).
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(
+        make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming
+    )
+    upd = make_update(999, "/effort max")
+    await bot.cmd_effort(upd, make_ctx(args=["max"]))
+    assert streaming.effort_calls == []
+    upd.message.reply_text.assert_not_awaited()
+
+
+def test_effort_in_command_menu_and_help_lockstep():
+    # T-EFFORT: /effort must be in the native menu AND documented in HELP_TEXT (the lock-step
+    # guards in test_command_menu_matches_registered_handlers + the HELP⊇menu test enforce
+    # both globally; this pins the specific command).
+    from claude_tg.bot import COMMAND_MENU, HELP_TEXT
+
+    assert "effort" in {cmd for cmd, _desc in COMMAND_MENU}
+    assert "/effort" in HELP_TEXT
 
 
 async def test_cmd_yolo_unauthorized_ignored():
@@ -4750,7 +4845,7 @@ def _make_plan_recording_session(store):
 
     def factory(
         *, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default",
-        thinking=False, audit_sink=None,
+        thinking=False, effort=None, audit_sink=None,
     ):
         modes.append(permission_mode)
         return HoldEngine(
@@ -4849,7 +4944,7 @@ async def test_plan_turn_rebuild_resumes_persisted_session_for_continuity(tmp_pa
 
     def factory(
         *, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default",
-        thinking=False, audit_sink=None,
+        thinking=False, effort=None, audit_sink=None,
     ):
         eng = HoldEngine(
             [ResultEvent(session_id="sid-keep", is_error=False, subtype="success", result_text="ok")]
@@ -4944,7 +5039,7 @@ async def test_plan_marker_consumed_even_when_sb2_refuses_turn(tmp_path):
 
     def factory(
         *, cwd, backstop_seconds, permission_policy, model=None, permission_mode="default",
-        thinking=False, audit_sink=None,
+        thinking=False, effort=None, audit_sink=None,
     ):
         modes.append(permission_mode)
         return HoldEngine(

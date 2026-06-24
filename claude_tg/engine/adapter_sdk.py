@@ -346,6 +346,7 @@ class SdkSubstrate:
         disallowed_tools: Optional[list[str]] = None,
         model: Optional[str] = None,
         thinking: bool = False,
+        effort: Optional[str] = None,
     ) -> None:
         self._cwd = str(cwd) if cwd is not None else None
         self._permission_mode = permission_mode
@@ -369,6 +370,17 @@ class SdkSubstrate:
         # built, so it applies to THIS session for its whole life — a change takes effect on
         # the NEXT fresh session, never mid-session (the session is rebuilt with new options).
         self._model = str(model).strip() if isinstance(model, str) and str(model).strip() else None
+        # T-EFFORT (STATUSLINE): the per-project reasoning-EFFORT override threaded into
+        # ClaudeAgentOptions(effort=…) at session-creation time (start/resume). None → omit
+        # `effort` entirely so the SDK applies its own default (`high`), exactly as before this
+        # knob. Like `model` it is a session-creation param: baked into the options when the
+        # client is built, so it applies to THIS session for its whole life — a change takes
+        # effect on the NEXT fresh session (the warm engine is rebuilt with new options), never
+        # mid-session. There is NO CLAUDE_* global default for effort (the session resolves the
+        # per-project override → None and lets the SDK default stand). Distinct from `thinking`
+        # (P12), which is a VISIBILITY toggle (display="summarized" + partials); effort is the
+        # DEPTH dial (low→max) and adds no wire traffic.
+        self._effort = str(effort).strip() if isinstance(effort, str) and str(effort).strip() else None
 
         self._client: Any = None  # ClaudeSDKClient | None (lazily typed)
         self.session_id: Optional[str] = None
@@ -412,6 +424,13 @@ class SdkSubstrate:
             # session-creation path (start AND resume) so a resumed session honors the
             # project's current model from the next session onward.
             kwargs["model"] = self._model
+        if self._effort is not None:
+            # T-EFFORT (STATUSLINE): per-project reasoning-EFFORT override (/effort low…max).
+            # Set ONLY when an override is present — a default (no-effort) turn NEVER sets the
+            # kwarg, so its options stay byte-for-byte the pre-knob baseline and the SDK's own
+            # default effort applies. Set on every session-creation path (start AND resume), so
+            # a resumed session honors the project's current effort from the next session onward.
+            kwargs["effort"] = self._effort
         if self._decision_callback is not None:
             kwargs["can_use_tool"] = self._make_can_use_tool()
         if self._allowed_tools is not None:

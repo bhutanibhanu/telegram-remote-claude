@@ -6251,6 +6251,155 @@ def test_injected_factory_never_receives_model_kwarg(tmp_path):
 
 
 # ===========================================================================
+# T-EFFORT (STATUSLINE) — the per-project reasoning-EFFORT knob: the default
+# factory bakes the resolved override into ClaudeAgentOptions(effort=…), the
+# session resolves/persists it, and an /effort change rebuilds the warm engine
+# on the NEXT turn (effort is a session-creation knob, mirroring model/thinking).
+# ===========================================================================
+
+
+def test_default_factory_threads_per_project_effort_into_substrate(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    store.set_effort(1, "alpha", "max")  # an /effort max override on alpha
+
+    session = StreamingSession(
+        _make_config_with_model(tmp_path), session_store=store, clock=lambda: 0.0
+    )
+    # The session resolves alpha's override...
+    assert session._resolve_project_effort(1, "alpha") == "max"
+    # ...and the engine it builds carries it into the substrate's ClaudeAgentOptions.
+    engine = session._build_engine(
+        1, str(tmp_path), PermissionPolicy(), None, effort="max"
+    )
+    assert engine._substrate._effort == "max"
+
+
+def test_resolve_project_effort_no_override_is_none_no_config_default(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    # No override → None (there is NO CLAUDE_* global default for effort — the SDK default
+    # applies, so the kwarg is omitted). Even with a configured model (which DOES default),
+    # effort stays None.
+    session = StreamingSession(
+        _make_config_with_model(tmp_path, model="claude-opus-4-8"),
+        session_store=store,
+        clock=lambda: 0.0,
+    )
+    assert session._resolve_project_effort(1, "alpha") is None
+    # And the engine then builds with effort=None (SDK default), never an empty value.
+    assert (
+        session._build_engine(1, str(tmp_path), PermissionPolicy(), None, effort=None)
+        ._substrate._effort
+        is None
+    )
+
+
+def test_set_effort_persists_on_active_project_and_resolves_it(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    session = StreamingSession(
+        _make_config_with_model(tmp_path), session_store=store, clock=lambda: 0.0
+    )
+    # /effort max sets the override on the active project + persists.
+    assert session.set_effort(1, "max") == "max"
+    assert store.get_effort(1, "alpha") == "max"
+    assert session._resolve_project_effort(1, "alpha") == "max"
+    # bare /effort (None) clears it → resolve falls back to None (SDK default).
+    assert session.set_effort(1, None) is None
+    assert store.get_effort(1, "alpha") is None
+    assert session._resolve_project_effort(1, "alpha") is None
+
+
+def test_set_effort_bad_value_is_safe_clears(tmp_path):
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    session = StreamingSession(
+        _make_config_with_model(tmp_path), session_store=store, clock=lambda: 0.0
+    )
+    # An unrecognized/garbage level normalizes to a clear (no override) — never a bad id.
+    assert session.set_effort(1, "turbo") is None
+    assert store.get_effort(1, "alpha") is None
+    assert session._resolve_project_effort(1, "alpha") is None
+
+
+def test_injected_factory_never_receives_effort_kwarg(tmp_path):
+    # An injected (test) factory keeps the 3-kwarg contract; _build_engine must NOT pass
+    # `effort` to it (it would TypeError). The fixed-3-kwarg lambda below would raise on an
+    # unexpected `effort=` — its clean return proves the gate (_factory_accepts_model) works.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    store.set_effort(1, "alpha", "max")  # override present, but must not be passed
+    sentinel = object()
+    session = StreamingSession(
+        _make_config_with_model(tmp_path),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: sentinel,
+        clock=lambda: 0.0,
+    )
+    assert session._factory_accepts_model is False
+    effort = session._resolve_project_effort(1, "alpha")
+    assert effort == "max"
+    # Builds via the 3-kwarg injected factory WITHOUT effort (the gate strips it).
+    assert (
+        session._build_engine(1, str(tmp_path), PermissionPolicy(), None, effort=effort)
+        is sentinel
+    )
+
+
+async def test_ensure_engine_rebuilds_on_effort_change_next_turn(tmp_path):
+    # T-EFFORT: changing /effort must rebuild the session on the NEXT turn (effort is a
+    # session-creation knob baked into ClaudeAgentOptions — not hot-switchable). A back-to-back
+    # SAME-effort turn reuses the warm engine (the match-key includes engine_effort); an effort
+    # change drops the warm engine and builds a fresh one. Mirrors the warm-reuse regression
+    # test but proves the INVERSE (a change forces the rebuild).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "api", str(tmp_path), make_active=True)
+
+    eng1 = FakeEngine(
+        [ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")],
+        session_id="s",
+    )
+    eng2 = FakeEngine(
+        [ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")],
+        session_id="s",
+    )
+    session = make_sequential_session({str(tmp_path): [eng1, eng2]}, store=store)
+
+    # Turn 1: builds eng1 with the current effort (None — no override yet).
+    e1, _ = await session._ensure_engine(1)
+    assert e1 is eng1 and eng1.started is True
+    rt = session._chat(1).runtimes["api"]
+    assert rt.engine_effort is None
+
+    # A same-effort second call reuses the warm engine (no rebuild, no second pop).
+    e1b, _ = await session._ensure_engine(1)
+    assert e1b is eng1, "a warm engine at the same effort must be reused"
+    assert eng1.stopped is False
+
+    # Now change /effort → the persisted override no longer matches engine_effort.
+    assert session.set_effort(1, "max") == "max"
+    # Next turn rebuilds: the warm eng1 is discarded (best-effort stop) and eng2 is built fresh
+    # with the new effort baked in.
+    e2, _ = await session._ensure_engine(1)
+    assert e2 is eng2, "an effort change must rebuild the session on the next turn"
+    assert eng1.stopped is True, "the stale-effort engine is torn down before the rebuild"
+    assert rt.engine_effort == "max"
+
+
+# ===========================================================================
 # T6 (P9) — notification polish + chips (SESSION level, mock-only).
 #   1. no link previews on background pings
 #   2. [Open <project>] switch button on attention + done pings; SB1-gated switch routing

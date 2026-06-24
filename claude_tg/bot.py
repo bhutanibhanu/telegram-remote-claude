@@ -57,6 +57,7 @@ from .scheduler import (
 )
 from .scheduler_driver import Scheduler
 from .session_store import (
+    EFFORT_LEVELS,
     DuplicateProject,
     InvalidProjectName,
     MaxSchedulesExceeded,
@@ -92,6 +93,9 @@ HELP_TEXT = (
     "/plan — run your next message in plan mode: Claude proposes a plan and you Approve "
     "(it executes, still per-tool gated) or Reject with feedback (it revises) (streaming mode)\n"
     "/thinking on|off — stream Claude's reasoning as a 🧠 line while it works; off by default "
+    "(streaming mode)\n"
+    "/effort low|medium|high|xhigh|max — set how hard Claude reasons for this project (depth, "
+    "not visibility); persisted, applies to your next turn; bare /effort clears to the default "
     "(streaming mode)\n"
     "/fast — use the fast model (Haiku) for this project's next turn (streaming mode)\n"
     "/deep — use the deep model (Opus) for this project's next turn (streaming mode)\n"
@@ -149,6 +153,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("unyolo", "Restore the per-tool permission gate"),
     ("plan", "Run the next message in plan mode (approve the plan first)"),
     ("thinking", "Toggle the live reasoning stream: /thinking on|off (default off)"),
+    ("effort", "Set reasoning effort: /effort low|medium|high|xhigh|max"),
     ("fast", "Use the fast model (Haiku) for this project's next turn"),
     ("deep", "Use the deep model (Opus) for this project's next turn"),
     ("auto", "Clear the model override (back to the default)"),
@@ -689,6 +694,63 @@ class TelegramClaudeBot:
                 "🧠 Live thinking OFF — Claude's reasoning won't be shown. "
                 "Applies to your next message."
             )
+
+    async def cmd_effort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/effort <low|medium|high|xhigh|max>`` — set the per-project reasoning EFFORT (T-EFFORT).
+
+        Sets the active project's reasoning-EFFORT level (how hard Claude thinks: ``low`` =
+        fastest/minimal … ``max`` = maximum effort). Distinct from ``/thinking`` (which only
+        makes the reasoning VISIBLE as the 🧠 line); ``/effort`` dials the DEPTH and costs no
+        extra wire traffic. Per-project + **persisted** (survives a restart, like the ``/fast``
+        model override). A bare ``/effort`` (or ``/effort default``) CLEARS the override back to
+        the SDK default. **Applies on the NEXT fresh session**, never mid-turn (it's a
+        session-creation knob, like ``/fast``·``/deep``).
+
+        Streaming mode only — effort is baked into the streaming engine's ``ClaudeAgentOptions``
+        (one-shot has no per-project session knob), so one-shot replies a clear notice rather
+        than half-working (mirrors :meth:`cmd_thinking` / :meth:`cmd_fast`). SB1: ``_ok``
+        allowlist recheck first, exactly like every command (an unauthorized chat does nothing).
+        An unrecognized level shows a clean error listing the valid levels (RB1 — never a crash);
+        ``xhigh`` is documented as Opus-4.7-only (the SDK falls back to ``high`` elsewhere).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if self.streaming is None:
+            await update.message.reply_text(
+                "Reasoning effort (/effort) applies to streaming mode only — one-shot mode "
+                "has no per-project session knob."
+            )
+            return
+        levels = " · ".join(EFFORT_LEVELS)
+        arg = (ctx.args[0].strip().lower() if ctx.args else "")
+        # Bare /effort (or /effort default) CLEARS the override → SDK default. A bare invocation
+        # also shows the usage so the operator sees the valid levels (mirrors /thinking's bare
+        # usage), but it DOES clear (the documented "/effort default" UX), so it is not a no-op.
+        if arg in ("", "default"):
+            self.streaming.set_effort(update.effective_chat.id, None)
+            await update.message.reply_text(
+                f"🧠 Effort cleared — your next turn uses the default reasoning effort. "
+                f"(Applies to the next session; a turn in flight keeps its current effort.)\n"
+                f"Usage: /effort <{levels}>",
+            )
+            return
+        if arg not in EFFORT_LEVELS:
+            # RB1: an unrecognized level is a clean error listing the valid levels — never a
+            # crash, and the override is NOT touched (we don't guess a level).
+            await update.message.reply_text(
+                f"Unknown effort level {arg!r}. Valid levels: {levels}.\n"
+                f"Usage: /effort <{levels}>  —  or  /effort default to clear "
+                f"(xhigh is Opus-4.7-only; it falls back to high on other models)."
+            )
+            return
+        chosen = self.streaming.set_effort(update.effective_chat.id, arg)
+        # ``chosen`` is one of the five fixed SDK literals (validated above), never user input —
+        # safe to interpolate, but escape defensively for HTML (mirrors _set_model).
+        await update.message.reply_text(
+            f"🧠 Effort set to <b>{html.escape(chosen or arg, quote=False)}</b> — applies to "
+            "your next turn. A turn in flight keeps its current effort.",
+            parse_mode="HTML",
+        )
 
     async def _set_model(
         self, update: Update, label: str, model: str | None
@@ -2960,6 +3022,11 @@ class TelegramClaudeBot:
         # P12 T-THINK: /thinking on|off toggles the per-project live reasoning stream
         # (streaming mode only; default OFF — the explicit opt-in, transient RB3).
         app.add_handler(CommandHandler("thinking", self.cmd_thinking, filters=allowed))
+        # T-EFFORT (STATUSLINE): /effort <low…max> sets the per-project reasoning-EFFORT level
+        # (streaming mode only; persisted, applies on the next session). Same `allowed` chat
+        # filter (SB1) + registered BEFORE the on_skill_command COMMAND passthrough so it is
+        # consumed here, not forwarded to the session as a skill.
+        app.add_handler(CommandHandler("effort", self.cmd_effort, filters=allowed))
         # T4 (P9): per-project model routing (streaming mode only; the handlers reply a
         # streaming-only notice in one-shot). /model is the alias of /auto (so /model default
         # clears the override); both names route to cmd_auto. Registered with the SAME
