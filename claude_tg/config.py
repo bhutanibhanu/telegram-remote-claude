@@ -424,10 +424,14 @@ def parse_bash_policy_extra_patterns(raw: str | None) -> tuple[str, ...]:
     can NOT be removed via config — dropping a safety pattern must be a code change,
     fail-safe). The value is split on **newlines** and **semicolons** (a regex legitimately
     contains commas, so — unlike :func:`parse_chat_ids` — comma is NOT a separator), each
-    entry stripped, blanks dropped. Empty/unset → an empty tuple (built-ins only). A pattern
-    that fails to compile is dropped at match time by :func:`~claude_tg.bash_policy.classify_bash`
-    (fail-safe — one bad entry can't wedge the policy), so this parser does not validate the
-    regex (kept I/O- and import-light; the policy module owns compilation).
+    entry stripped, blanks dropped. Empty/unset → an empty tuple (built-ins only).
+
+    **Fail-LOUD on a malformed regex (Codex BLOCKER 2).** Each pattern is COMPILED here, at
+    config load, via :func:`~claude_tg.bash_policy.validate_extra_patterns`; an invalid regex
+    raises :class:`~claude_tg.bash_policy.InvalidBashPattern` so the owner learns at STARTUP
+    (consistent with the other fail-loud knobs like :func:`parse_bash_policy_mode`). Silently
+    dropping it would be fail-OPEN — the owner's rule meant to catch a dangerous command would
+    be lost, and that command would then auto-allow under a grant/``/yolo``.
     """
     if raw is None or not raw.strip():
         return ()
@@ -436,7 +440,13 @@ def parse_bash_policy_extra_patterns(raw: str | None) -> tuple[str, ...]:
         entry = chunk.strip()
         if entry:
             parts.append(entry)
-    return tuple(parts)
+    patterns = tuple(parts)
+    # Fail loud on a malformed regex (the policy module owns compilation). Imported here
+    # (not at module top) to keep config.py import-light and the import local to this knob.
+    from .bash_policy import validate_extra_patterns
+
+    validate_extra_patterns(patterns)
+    return patterns
 
 
 def resolve_audit_log_file(raw: str | None, *, state_file: Path | None) -> Path | None:

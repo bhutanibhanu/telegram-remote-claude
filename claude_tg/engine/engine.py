@@ -59,6 +59,7 @@ from ..audit import (
     KIND_TOOL_DECISION,
     AuditEvent,
     AuditSink,
+    audit_safe_summary,
 )
 from ..bash_policy import BashPolicyMatch, classify_bash
 from ..permissions import PermissionPolicy, path_needs_approval
@@ -178,11 +179,13 @@ class Engine:
         — auto-allow (safe / live grant / ``/yolo``), the out-of-root and risky holds'
         resolved verdicts, and the fail-closed no-id deny — so a tool that auto-runs under
         ``/yolo`` (and never reaches the bot) is still audited. The summary is
-        :func:`safe_input_summary` (the SAME body-free string the prompt shows — lengths /
-        truncated idents, never a body); the session tag is :func:`_redact_sid` (never the
-        raw resumable id). When no sink is wired this is a no-op (the 1288 floor holds).
-        Best-effort: the sink swallows its own failures (RB1) — an audit write never breaks
-        a turn.
+        :func:`audit_safe_summary` — the STRONGLY body-free audit renderer that collapses
+        BOTH body fields AND idents (``command`` / ``path`` / ``url`` / ``pattern``) to a
+        length/shape, so a secret early in a Bash command is **never persisted to the durable
+        log** (stricter than the ephemeral prompt's ``safe_input_summary``; BLOCKER 1). The
+        session tag is :func:`_redact_sid` (never the raw resumable id). When no sink is wired
+        this is a no-op (the floor holds). Best-effort: the sink swallows its own failures
+        (RB1) — an audit write never breaks a turn.
         """
         sink = self._audit_sink
         if sink is None:
@@ -193,7 +196,7 @@ class Engine:
                     ts=_now_iso(),
                     kind=KIND_TOOL_DECISION,
                     tool=tool_name,
-                    summary=safe_input_summary(tool_name, tool_input),
+                    summary=audit_safe_summary(tool_name, tool_input),
                     decision=decision,
                     session_tag=_redact_sid(self.session_id),
                 )
@@ -224,29 +227,33 @@ class Engine:
         except Exception:  # pragma: no cover - the sink is already best-effort
             log.debug("audit record (plan) failed (ignored)", exc_info=True)
 
-    def _record_policy(self, action: str, tool_name: str, tool_input: dict[str, Any]) -> None:
+    def _record_policy(self, action: str, tool_name: str, *, label: str | None = None) -> None:
         """Record a body-free ``policy_event`` for a Bash-policy outcome (P13 T-BASH).
 
         ``action`` is ``bash_policy_flag`` (flag mode escalated the prompt) or
-        ``bash_policy_block`` (deny mode auto-denied). The ``summary`` is the SAME body-free
-        :func:`safe_input_summary` string the prompt/tool_decision shows (the matched command,
-        truncated to 160 chars — NOT the raw command beyond that, and NOT the matched-pattern
-        label, which is UX-only) and ``tool`` is the tool name, so a reviewer sees *which*
-        command tripped the policy without any body. No-op when no sink is wired; best-effort
-        otherwise (RB1) — a policy-audit write never breaks a turn. Reuses the T-AUDIT sink /
-        ``policy_event`` schema (the bot already records ``/yolo`` the same way).
+        ``bash_policy_block`` (deny mode auto-denied). **Clean semantics (Codex QA non-block):**
+        ``summary`` carries the action token PLUS the body-free matched-pattern ``label`` (e.g.
+        ``"bash_policy_block (chmod-777-recursive)"``) — so ``/audit`` reads "a chmod-777 Bash
+        command was denied" WITHOUT the command text — and ``decision`` carries the verdict
+        token (``deny`` for both modes: flag denies on the no-id edge / on operator deny, deny
+        mode auto-denies). The matched command's body-free summary is recorded SEPARATELY by
+        the paired ``_record_tool`` call (the ``tool_decision``), via the STRICT
+        :func:`audit_safe_summary` — so NO command text (raw or 160-char) is persisted on EITHER
+        record (BLOCKER 1). No-op when no sink is wired; best-effort otherwise (RB1) — a
+        policy-audit write never breaks a turn.
         """
         sink = self._audit_sink
         if sink is None:
             return
+        summary = f"{action} ({label})" if label else action
         try:
             sink.record(
                 AuditEvent(
                     ts=_now_iso(),
                     kind=KIND_POLICY_EVENT,
                     tool=tool_name,
-                    summary=action,
-                    decision=safe_input_summary(tool_name, tool_input),
+                    summary=summary,
+                    decision="deny",
                     session_tag=_redact_sid(self.session_id),
                 )
             )
@@ -358,7 +365,7 @@ class Engine:
                         tool_name,
                         bash_match.pattern,
                     )
-                    self._record_policy("bash_policy_block", tool_name, tool_input)
+                    self._record_policy("bash_policy_block", tool_name, label=bash_match.label)
                     self._record_tool(tool_name, tool_input, "deny")
                     return decision_to_substrate(
                         PermissionVerdict(behavior="deny", message=DENIED_MESSAGE),
@@ -375,7 +382,7 @@ class Engine:
                         "approval — failing closed (deny)",
                         bash_match.pattern,
                     )
-                    self._record_policy("bash_policy_flag", tool_name, tool_input)
+                    self._record_policy("bash_policy_flag", tool_name, label=bash_match.label)
                     self._record_tool(tool_name, tool_input, "deny")
                     return decision_to_substrate(
                         PermissionVerdict(behavior="deny", message=DENIED_MESSAGE),
@@ -387,7 +394,7 @@ class Engine:
                     tool_name,
                     bash_match.pattern,
                 )
-                self._record_policy("bash_policy_flag", tool_name, tool_input)
+                self._record_policy("bash_policy_flag", tool_name, label=bash_match.label)
                 return await self._permission_hold(
                     tool_name,
                     tool_input,

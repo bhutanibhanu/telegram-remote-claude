@@ -215,15 +215,49 @@ _BUILTIN_RULES: list[tuple[str, str, BashSeverity, re.Pattern[str]]] = [
 ]
 
 
+class InvalidBashPattern(ValueError):
+    """An owner-supplied ``BASH_POLICY_EXTRA_PATTERNS`` regex failed to compile (P13 T-BASH).
+
+    Raised by :func:`validate_extra_patterns` at CONFIG LOAD so a malformed custom guardrail
+    is surfaced LOUDLY at startup — never silently dropped (which would be fail-OPEN: the
+    owner's rule meant to catch a dangerous command would be lost and that command would then
+    auto-allow under grant/yolo). Mirrors the other fail-loud config parsers (Codex BLOCKER 2).
+    """
+
+
+def validate_extra_patterns(extra_patterns: Sequence[str]) -> None:
+    """Compile every owner extra pattern, raising :class:`InvalidBashPattern` on a bad one.
+
+    **Fail-LOUD (BLOCKER 2).** The owner's ``BASH_POLICY_EXTRA_PATTERNS`` are SAFETY rules; a
+    pattern that does not compile must NOT be silently dropped — that would lose the guardrail
+    and let the very command it was meant to catch auto-allow under a grant/``/yolo`` (fail
+    OPEN). So this validates each (non-empty, stripped) pattern at config load and raises a
+    clear error naming the offending pattern + the regex error, so the owner fixes it at
+    startup. Built-in rules are unaffected (they are code, always valid). Pure; raises only
+    :class:`InvalidBashPattern`.
+    """
+    for raw in extra_patterns:
+        pat = raw.strip()
+        if not pat:
+            continue
+        try:
+            re.compile(pat, re.IGNORECASE)
+        except re.error as exc:
+            raise InvalidBashPattern(
+                f"BASH_POLICY_EXTRA_PATTERNS contains an invalid regex {pat!r}: {exc}"
+            ) from exc
+
+
 def _compile_extra(extra_patterns: Sequence[str]) -> list[tuple[str, str, BashSeverity, re.Pattern[str]]]:
-    """Compile owner-supplied extra denylist patterns into rules (best-effort, additive).
+    """Compile owner-supplied extra denylist patterns into rules (additive to the built-ins).
 
     Each non-empty, stripped string in ``extra_patterns`` becomes an additional rule with
     a generic ``"custom"`` pattern id + label and ``medium`` severity, ADDITIVE to the
     built-ins (the built-ins cannot be removed via config — removing a safety pattern must
-    be a code change, fail-safe). A pattern that fails to compile is **skipped** (logged by
-    the caller via the value error it would otherwise raise — here we simply drop it so one
-    bad env entry can't wedge the whole policy); an empty sequence yields no extra rules.
+    be a code change, fail-safe). The patterns are now VALIDATED fail-loud at config load
+    (:func:`validate_extra_patterns`), so by the time the gate calls this they are known to
+    compile; a pattern that still somehow fails here is skipped defensively (RB1 — the gate
+    must never crash mid-turn), but the owner already learned of a bad pattern at startup.
     The pattern is matched case-insensitively, consistent with the built-ins.
     """
     rules: list[tuple[str, str, BashSeverity, re.Pattern[str]]] = []
@@ -234,8 +268,8 @@ def _compile_extra(extra_patterns: Sequence[str]) -> list[tuple[str, str, BashSe
         try:
             compiled = re.compile(pat, re.IGNORECASE)
         except re.error:
-            # A malformed custom pattern is dropped (fail-safe — never crash the gate). The
-            # built-in rules still apply; the owner sees nothing run for this bad entry.
+            # Defensive only (RB1): config load already validated these fail-loud, so this is
+            # unreachable on the live path; never crash the gate mid-turn if it somehow isn't.
             continue
         rules.append(("custom", "matched a custom denylist pattern", "medium", compiled))
     return rules
@@ -281,6 +315,8 @@ def builtin_pattern_ids() -> tuple[str, ...]:
 __all__ = [
     "BashSeverity",
     "BashPolicyMatch",
+    "InvalidBashPattern",
     "classify_bash",
+    "validate_extra_patterns",
     "builtin_pattern_ids",
 ]

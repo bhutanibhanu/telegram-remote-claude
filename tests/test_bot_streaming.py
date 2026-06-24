@@ -5108,13 +5108,13 @@ async def test_cmd_audit_oneshot_mode_clean_notice():
 async def test_cmd_audit_records_no_body_even_with_secret_summary(tmp_path):
     """SB3 at the /audit surface: a record built from a secret-laden summary renders body-free.
 
-    The summary stored is what safe_input_summary produces for a Write-with-secret (the body
-    collapsed to <N chars>); /audit shows exactly that — never the secret.
+    The summary stored is what the STRICT audit_safe_summary produces for a Bash-with-secret
+    (the command collapsed to argv0 + length); /audit shows exactly that — never the secret.
     """
-    from claude_tg.engine.types import safe_input_summary
+    from claude_tg.audit import audit_safe_summary
 
     fake_secret = "fake-sample-not-real-zzzz0000111122223333"  # placeholder (secret_scan-safe)
-    summary = safe_input_summary("Write", {"file_path": "/x", "content": fake_secret})
+    summary = audit_safe_summary("Bash", {"command": "curl -d " + fake_secret + " x"})
     session = _streaming_with_audit(tmp_path)
     session.audit_log.append(AuditEvent(ts="t", kind=KIND_TOOL_DECISION, tool="Write", summary=summary, decision="deny", chat_id=1))
     bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=session)
@@ -5122,7 +5122,7 @@ async def test_cmd_audit_records_no_body_even_with_secret_summary(tmp_path):
     await bot.cmd_audit(upd, make_cmd_ctx())
     reply = upd.message.reply_text.await_args.args[0]
     assert fake_secret not in reply  # the secret is never surfaced
-    assert "content=&lt;" in reply  # collapsed to a length (HTML-escaped < )
+    assert "command=&lt;" in reply  # collapsed to a length/shape (HTML-escaped < )
 
 
 # ===========================================================================

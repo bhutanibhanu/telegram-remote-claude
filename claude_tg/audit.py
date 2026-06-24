@@ -56,11 +56,14 @@ class AuditEvent:
     is deliberately **no** field that could carry a raw body — no file content, no
     command output, no prompt / plan text, no plan feedback, no raw session id, no
     secret. The ONLY free-ish string is :attr:`summary`, and the contract is that the
-    caller passes a value that is *already* body-free (a
-    :func:`~claude_tg.engine.types.safe_input_summary` output, which collapses bodies to
-    ``<N chars>`` and truncates idents). Because the writer's only input is this type, a
-    body cannot reach the log even by mistake — a leak is impossible by construction (the
-    SB3 gate-blocking bar).
+    caller passes a value built by :func:`audit_safe_summary` — the audit-specific,
+    STRONGLY body-free renderer that collapses BOTH free-text body fields AND ident fields
+    (``command`` / ``path`` / ``url`` / ``pattern``) to a length/shape, so even a secret
+    early in a Bash command is never persisted (this is STRICTER than the ephemeral prompt's
+    ``safe_input_summary``, which keeps 160 raw chars of an ident — correct for the prompt,
+    a leak for the durable log). Because the writer's only input is this type and the only
+    summary source is the strict renderer, a body cannot reach the log even by mistake — a
+    leak is impossible by construction (the SB3 gate-blocking bar).
 
     Fields:
 
@@ -69,9 +72,10 @@ class AuditEvent:
       ``session_event`` / ``policy_event``.
     * ``tool`` — the tool NAME for a ``tool_decision`` (e.g. ``"Bash"``), else ``None``.
       A name only — never the tool input.
-    * ``summary`` — for a ``tool_decision`` the body-free
-      :func:`~claude_tg.engine.types.safe_input_summary` string the prompt shows; for the
-      other kinds a short action token (e.g. ``"attach"`` / ``"yolo_on"``). NEVER a body.
+    * ``summary`` — for a ``tool_decision`` the STRONGLY body-free
+      :func:`audit_safe_summary` string (idents collapsed to length/shape, not raw); for the
+      other kinds a short action token (e.g. ``"attach"`` / ``"yolo_on"`` /
+      ``"bash_policy_flag"``) optionally with a body-free pattern label. NEVER a body.
     * ``decision`` — the outcome: a verdict (``auto_allow`` / ``allow_once`` /
       ``allow_session`` / ``deny`` / ``backstop_deny`` / ``cancel``) or an action verdict
       (``approve`` / ``reject``), or ``None`` where not applicable.
@@ -133,6 +137,92 @@ KIND_TOOL_DECISION = "tool_decision"
 KIND_PLAN_DECISION = "plan_decision"
 KIND_SESSION_EVENT = "session_event"
 KIND_POLICY_EVENT = "policy_event"
+
+
+# ---------------------------------------------------------------------------
+# Audit-specific summary — STRICTER than the prompt's (the durable-log SB3 bar)
+# ---------------------------------------------------------------------------
+#
+# The live permission PROMPT uses ``engine.types.safe_input_summary``, which keeps the
+# first 160 RAW chars of an IDENT field (``command`` / ``path`` / ``url`` / ``pattern``) —
+# correct there, because the operator must SEE the command to approve it, and the prompt is
+# EPHEMERAL (it scrolls off the chat). The DURABLE audit log is different: persisting 160 raw
+# chars of a Bash command would write a secret early in the command to disk. So the audit log
+# uses THIS stricter summary, which collapses IDENT fields to a length/shape too — never raw
+# text. (BLOCKER 1, Codex QA: the durable log must be STRONGLY body-free.)
+
+#: IDENT fields the PROMPT shows verbatim (truncated) but the AUDIT log must NOT — a command
+#: / path / url / regex can carry a secret or sensitive target. Collapsed to length/shape.
+_AUDIT_IDENT_FIELDS = frozenset({"file_path", "path", "command", "pattern", "url"})
+
+#: Free-text body fields — collapsed to a length in BOTH the prompt and the audit summary.
+_AUDIT_BODY_FIELDS = frozenset({"content", "new_string", "old_string"})
+
+#: Per-tool argv[0]-bearing field, and the max chars of it the audit summary may keep. For a
+#: ``Bash`` command we surface ONLY the first whitespace-delimited token (the binary name,
+#: e.g. ``rm`` / ``git`` / ``curl``) — useful for review ("a curl command was denied") and
+#: low-risk (argv[0] is the program, not its secret-bearing arguments) — then the LENGTH of
+#: the whole command. Capped so even a pathological no-space "token" can't dump the command.
+_AUDIT_ARGV0_MAX = 16
+
+
+def _audit_ident_value(field: str, value: str) -> str:
+    """Collapse an IDENT field to a length/shape for the AUDIT log — never raw text (SB3).
+
+    * ``command`` → ``<bin> …<N chars>`` where ``<bin>`` is ONLY argv[0] (the first
+      whitespace-delimited token, capped at :data:`_AUDIT_ARGV0_MAX`, dropped if it looks
+      non-trivial) and ``N`` is the FULL command length. argv[0] is the program name (e.g.
+      ``rm`` / ``git`` / ``curl``), not a secret-bearing argument, so it is review-useful and
+      low-risk; everything after it is replaced by a length. If argv[0] is suspiciously long
+      / non-word-ish (could be an inline assignment like ``SECRET=…`` or a data blob), it is
+      dropped and only the length is shown.
+    * ``path`` / ``file_path`` / ``url`` / ``pattern`` → ``<N chars>`` (length only — a path
+      or url can encode a token or a sensitive location; a regex is the owner's, not a body,
+      but length-only keeps the rule uniform + the log strongly body-free).
+    """
+    if field == "command":
+        token = value.split(maxsplit=1)[0] if value.split(maxsplit=1) else ""
+        # Keep argv[0] only when it is a short, plausible program name (word-ish chars +
+        # path separators / dots / hyphens) — NOT an inline ``VAR=value`` assignment or a
+        # long blob, which could carry a secret. Otherwise show length only.
+        if token and len(token) <= _AUDIT_ARGV0_MAX and "=" not in token and all(
+            ch.isalnum() or ch in "._-/" for ch in token
+        ):
+            return f"<{token} …{len(value)} chars>"
+        return f"<{len(value)} chars>"
+    return f"<{len(value)} chars>"
+
+
+def audit_safe_summary(tool_name: str, tool_input: "dict[str, object] | None") -> str:
+    """Render a tool's input for the DURABLE audit log — STRONGLY body-free (SB3).
+
+    Stricter than :func:`~claude_tg.engine.types.safe_input_summary` (the ephemeral prompt's
+    renderer): in ADDITION to collapsing free-text BODY fields (``content`` / ``new_string``
+    / ``old_string``) to ``<N chars>``, this also collapses IDENT fields (``command`` /
+    ``path`` / ``file_path`` / ``url`` / ``pattern``) to a length/shape via
+    :func:`_audit_ident_value` — so a secret early in a Bash command, or a token-bearing url
+    / path, is **never persisted to disk** (only its length + argv[0] binary name). Every
+    other field is truncated to 40 chars (a short scalar like a flag is harmless and keeps the
+    line review-useful). Pure; SDK-free (the audit module stays isolated).
+
+    A Write's ``content`` shows ``content=<500 chars>``; a Bash ``rm -rf /etc … <secret>``
+    shows ``command=<rm …40 chars>`` — the verb, then the length, never the body.
+    """
+    if not isinstance(tool_input, dict):
+        return f"{tool_name}(<{len(str(tool_input))} chars>)"
+    parts: list[str] = []
+    for k, v in tool_input.items():
+        sv = str(v)
+        if k in _AUDIT_BODY_FIELDS:
+            parts.append(f"{k}=<{len(sv)} chars>")
+        elif k in _AUDIT_IDENT_FIELDS:
+            parts.append(f"{k}={_audit_ident_value(k, sv)}")
+        else:
+            parts.append(f"{k}={sv[:40]}")
+    return f"{tool_name}({', '.join(parts)})"
+
+
+
 
 #: Default size bound (bytes) before a 1-keep rotation: 5 MB. Bounds disk to ~2x this
 #: (the live file + the single ``.1`` keep). Configurable via ``AUDIT_LOG_MAX_BYTES``.
@@ -350,6 +440,7 @@ __all__ = [
     "FileAuditSink",
     "ChatBoundSink",
     "DEFAULT_AUDIT_LOG_MAX_BYTES",
+    "audit_safe_summary",
     "KIND_TOOL_DECISION",
     "KIND_PLAN_DECISION",
     "KIND_SESSION_EVENT",

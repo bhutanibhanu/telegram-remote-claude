@@ -298,10 +298,17 @@ async def test_flag_mode_escalates_a_matched_command_to_a_one_time_prompt():
     # It HELD then allowed-once on the tap (never auto-allowed).
     assert sub.decisions[0].allow is True
     assert any(getattr(e, "text", "") == "tu1:allow" for e in out)
-    # The audit shows the policy flag + the resolved allow_once (both body-free).
-    kinds = [(e.kind, e.summary if e.kind == KIND_POLICY_EVENT else e.decision) for e in sink.events]
-    assert (KIND_POLICY_EVENT, "bash_policy_flag") in kinds
-    assert (KIND_TOOL_DECISION, "allow_once") in kinds
+    # The audit shows the policy flag + the resolved allow_once (both body-free). The policy
+    # event's summary is the action token + the body-free pattern label ("bash_policy_flag
+    # (root-rm)"); its decision is the verdict token "deny" (clean semantics — no command in
+    # decision). Match on the action-token PREFIX so the label is allowed but pinned present.
+    policy_events = [e for e in sink.events if e.kind == KIND_POLICY_EVENT]
+    assert any((e.summary or "").startswith("bash_policy_flag") for e in policy_events)
+    assert any("force-delete" in (e.summary or "") for e in policy_events)  # body-free pattern label
+    assert all(e.decision == "deny" for e in policy_events)  # verdict token in decision
+    assert (KIND_TOOL_DECISION, "allow_once") in [
+        (e.kind, e.decision) for e in sink.events
+    ]
 
 
 async def test_flag_mode_re_prompts_under_active_session_grant():
@@ -403,8 +410,11 @@ async def test_deny_mode_auto_denies_a_matched_command_and_audits():
     await eng.stop()
     assert sub.decisions[0].allow is False
     assert any(getattr(e, "text", "") == "tu1:deny" for e in out)
-    summaries = [(e.kind, e.summary) for e in sink.events]
-    assert (KIND_POLICY_EVENT, "bash_policy_block") in summaries
+    # policy_event summary = "bash_policy_block (<label>)"; decision = "deny" (clean semantics).
+    policy_events = [e for e in sink.events if e.kind == KIND_POLICY_EVENT]
+    assert any((e.summary or "").startswith("bash_policy_block") for e in policy_events)
+    assert any("force-delete" in (e.summary or "") for e in policy_events)
+    assert all(e.decision == "deny" for e in policy_events)
     assert any(e.kind == KIND_TOOL_DECISION and e.decision == "deny" for e in sink.events)
 
 
@@ -534,27 +544,39 @@ async def test_fail_closed_flagged_command_without_tool_use_id_denies():
 # --- audit body-free guard --------------------------------------------------------------
 
 
-async def test_policy_audit_record_is_body_free():
-    """The bash_policy_flag policy_event summary is the body-free safe_input_summary (the
-    160-char-truncated command), NOT a secret beyond it; the matched LABEL is never recorded
-    in a way that carries the raw command."""
+async def test_policy_audit_record_is_strongly_body_free():
+    """SB3 (BLOCKER 1): a secret EARLY in a flagged Bash command appears in NO audit record.
+
+    A flagged command produces a policy_event AND a tool_decision. The policy_event carries
+    only the action token + the body-free pattern LABEL (no command); the tool_decision's
+    summary is the STRICT ``audit_safe_summary`` (the command collapsed to argv[0] + a length,
+    NOT raw text). So a planted fake secret placed EARLY in the command (within the first 160
+    chars — where the OLD prompt summary would have leaked it) must be in NEITHER record's
+    summary NOR decision. Mutation-probe: if ``_record_tool`` reverts to the prompt's
+    ``safe_input_summary`` (raw 160 chars), this fails.
+    """
     from claude_tg.engine.types import PermissionDecision
 
     sink = _ListSink()
-    secret = "rm -rf / # token=" + "z" * 200  # a long command with a fake token tail
-    sub = _ScriptedSubstrate(requests=[("Bash", {"command": secret}, "tu1")])
+    # The secret is placed EARLY (right after the matched `rm -rf /`), well within 160 chars —
+    # the exact spot the prompt summary would persist. Marked `fake` for secret_scan.
+    fake_secret = "fake-sample-not-real-tok-abcdef0123456789abcdef"
+    command = "rm -rf / && export TOKEN=" + fake_secret
+    assert len(command) < 160  # the secret is in the range the prompt summary would keep
+    sub = _ScriptedSubstrate(requests=[("Bash", {"command": command}, "tu1")])
     eng = _engine(sub, mode="flag", sink=sink)
     await eng.start()
     op = asyncio.create_task(_resolve_when_pending(eng, "tu1", PermissionDecision("allow_once")))
     await asyncio.wait_for(_drain(eng.send("go")), timeout=5)
     assert await op is True
     await eng.stop()
-    policy_events = [e for e in sink.events if e.kind == KIND_POLICY_EVENT]
-    assert policy_events
-    for e in policy_events:
-        # The decision field carries the safe summary (truncated at 160), not the full tail.
-        assert "z" * 200 not in (e.decision or "")
-        assert "z" * 200 not in (e.summary or "")
+    assert sink.events  # both a policy_event and a tool_decision were recorded
+    for e in sink.events:
+        assert fake_secret not in (e.summary or ""), f"secret leaked into {e.kind}.summary"
+        assert fake_secret not in (e.decision or ""), f"secret leaked into {e.kind}.decision"
+    # The tool_decision DOES record a body-free shape (argv[0] + length), proving it's useful.
+    tool_decisions = [e for e in sink.events if e.kind == KIND_TOOL_DECISION]
+    assert tool_decisions and "command=<" in (tool_decisions[0].summary or "")
 
 
 # ===========================================================================
@@ -669,6 +691,39 @@ def test_parse_bash_policy_extra_patterns():
     assert parse_bash_policy_extra_patterns("foo\nbar;baz") == ("foo", "bar", "baz")
     assert parse_bash_policy_extra_patterns(r"a{1,3}") == (r"a{1,3}",)  # comma kept inside one
     assert parse_bash_policy_extra_patterns("  spaced  \n\n  next  ") == ("spaced", "next")
+
+
+def test_parse_bash_policy_extra_patterns_bad_regex_fails_loud():
+    """BLOCKER 2: a malformed extra-pattern regex FAILS LOUD at config parse (not silent-drop).
+
+    Silently dropping it would be fail-OPEN — the owner's guardrail would be lost and the
+    command it was meant to catch would auto-allow under grant/yolo. Valid patterns alongside
+    must still parse + compile. The raised error names the offending pattern."""
+    from claude_tg.bash_policy import InvalidBashPattern
+    from claude_tg.config import parse_bash_policy_extra_patterns
+
+    # An unbalanced paren is an invalid regex → must raise (fail loud), not drop.
+    with pytest.raises((ValueError, InvalidBashPattern)) as exc:
+        parse_bash_policy_extra_patterns(r"\bvalid\b" + "\n" + "(unclosed")
+    assert "(unclosed" in str(exc.value)  # the error names the bad pattern
+    # A set of all-valid patterns still parses + compiles fine.
+    assert parse_bash_policy_extra_patterns(r"\bshutdown\b;\breboot\b") == (
+        r"\bshutdown\b",
+        r"\breboot\b",
+    )
+
+
+def test_config_from_env_fails_loud_on_bad_extra_pattern(monkeypatch):
+    """BLOCKER 2 end-to-end: a malformed BASH_POLICY_EXTRA_PATTERNS makes Config.from_env raise
+    at STARTUP, so the owner learns immediately instead of silently losing the guardrail."""
+    from claude_tg.bash_policy import InvalidBashPattern
+    from claude_tg.config import Config
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:fake-sample-token-for-tests")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "42")
+    monkeypatch.setenv("BASH_POLICY_EXTRA_PATTERNS", "(unclosed-group")
+    with pytest.raises((ValueError, InvalidBashPattern)):
+        Config.from_env(dotenv_path=None)
 
 
 def test_config_from_env_threads_bash_policy(monkeypatch):

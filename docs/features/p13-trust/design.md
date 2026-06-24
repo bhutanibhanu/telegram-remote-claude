@@ -1,9 +1,11 @@
 # P13 — Trust Layer for Power (design)
 
 _Roadmap-v2 phase 5 ("Trust layer for power"). A **delta** on the shipped, security-audited
-P0–P12 tree (`main` @ `f7c1cda`); worktree `feat/p13-trust`. Investigation + design only — this
-doc is the deliverable; no feature code, no commit. Pins **ADR-003** (permission gating) and the
-**P6/C2** "Bash documented-unconfined" finding ([`docs/features/p6-security-audit/findings.md`](../p6-security-audit/findings.md))._
+P0–P12 tree (`main` @ `f7c1cda`); worktree `feat/p13-trust`. **Built** — T-AUDIT (`0640130`) +
+T-BASH (`7fb92cd`); in cross-model QA (Codex round-1 NO_SHIP → 2 blockers fixed: the durable
+audit log now uses a STRICTER body-free summary that collapses idents too, and a malformed
+`BASH_POLICY_EXTRA_PATTERNS` regex now fails loud at config load). Pins **ADR-003** (permission
+gating) and the **P6/C2** "Bash documented-unconfined" finding ([`docs/features/p6-security-audit/findings.md`](../p6-security-audit/findings.md))._
 
 ---
 
