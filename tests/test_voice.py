@@ -155,6 +155,13 @@ async def test_transcribe_nonzero_exit_raises_error_body_free(tmp_path, caplog):
     # The raised message is bot-authored (exit code), NOT the raw stderr path.
     assert "/secret/path" not in str(ei.value)
     assert "exit 3" in str(ei.value)
+    # Codex B2 (SB3): the raw stderr can carry partial transcripts / paths / secrets — it must
+    # NOT be logged either. We log only a body-free summary (exit code), never the stderr body.
+    full_log = "\n".join(r.getMessage() for r in caplog.records)
+    assert "/secret/path" not in full_log
+    assert "no such model" not in full_log
+    # But a body-free summary IS logged (so an operator sees the transcriber failed).
+    assert "exited 3" in full_log or "exit 3" in full_log
 
 
 async def test_transcribe_empty_output_raises(tmp_path):
@@ -246,3 +253,45 @@ async def test_transcribe_real_subprocess_timeout(tmp_path):
             work_dir=str(tmp_path), timeout=0.3,
         )
     assert "timed out" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# VOICE_SETUP_MESSAGE — Markdown-safety guard (P10 BUG A, same class as the P9
+# `/help $*` break). The graceful-off message contains the literal token
+# ``TRANSCRIBE_CMD``; the underscore-free copy below is fine, BUT the message must
+# never be sent through a Markdown parser with an UNBALANCED special token (a bare
+# ``_`` / ``*`` / `` ` ``) or Telegram throws ``BadRequest: can't parse entities``
+# and the user gets NOTHING. We pin the message to a payload that is safe to send.
+# ---------------------------------------------------------------------------
+
+
+def _strip_code_spans(text: str) -> str:
+    """Remove `` `...` `` code spans — a special char inside a code span is literal."""
+    import re
+
+    return re.sub(r"`[^`]*`", "", text)
+
+
+def test_voice_setup_message_markdown_markers_balanced() -> None:
+    """Every Markdown emphasis marker in VOICE_SETUP_MESSAGE (outside code spans) is balanced.
+
+    Regression (BUG A): the message embeds ``TRANSCRIBE_CMD`` — its underscore, if read as
+    Markdown, opens an italic span that is never closed → Telegram rejects the whole send and
+    the operator gets no reply at all (the common no-transcriber-configured case). The fix
+    sends the message as PLAIN TEXT, so this guard simply requires that, whatever the copy is,
+    no emphasis marker is left dangling (belt: if anyone re-introduces a Markdown send, the
+    payload must still be balanced).
+    """
+    from claude_tg.bot import VOICE_SETUP_MESSAGE
+
+    body = _strip_code_spans(VOICE_SETUP_MESSAGE)
+    for marker in ("_", "*", "`"):
+        count = body.count(marker)
+        assert count % 2 == 0, (
+            f"VOICE_SETUP_MESSAGE has an ODD number of {marker!r} markers ({count}) outside "
+            "code spans — a Markdown send would be rejected by Telegram. Send it as plain "
+            f"text or code-span the special token (e.g. wrap TRANSCRIBE_CMD in backticks)."
+        )
+    # The load-bearing token that triggered the bug must be present (we still tell the
+    # operator which env var to set) AND must not sit as a bare Markdown italic delimiter.
+    assert "TRANSCRIBE_CMD" in VOICE_SETUP_MESSAGE

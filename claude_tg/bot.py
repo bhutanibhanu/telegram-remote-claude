@@ -153,10 +153,17 @@ DEFAULT_INBOUND_FILENAME = "upload.bin"
 #: P10 T2 (voice): the graceful-off message when no ``TRANSCRIBE_CMD`` is configured. Voice
 #: transcription is operator-provided infra (no hard dependency); with none set up, a voice
 #: note gets this clean, actionable setup message instead of a crash (RB2).
+#:
+#: BUG A: this is sent as PLAIN TEXT (the ``on_voice`` send-sites pass no ``parse_mode``). The
+#: ``TRANSCRIBE_CMD`` token + the backtick spans below would, under ``parse_mode="Markdown"``,
+#: leave an unterminated italic / code span and make Telegram REJECT the entire send (the user
+#: then gets nothing — the common no-transcriber case). The backticks here render literally as
+#: plain text. The ``_strip_code_spans`` guard in ``tests/test_voice.py`` additionally pins the
+#: emphasis markers balanced so a future Markdown send can't silently re-break it.
 VOICE_SETUP_MESSAGE = (
     "🎙️ Voice transcription isn't set up. Install a transcriber "
-    "(e.g. `brew install whisper-cpp` + a model) and set TRANSCRIBE_CMD — "
-    "or just type your message."
+    "(e.g. `brew install whisper-cpp` + a model) and set the `TRANSCRIBE_CMD` "
+    "environment variable — or just type your message."
 )
 
 
@@ -1406,11 +1413,31 @@ class TelegramClaudeBot:
             )
             return
         try:
-            # Write atomically (tmp + replace) so a partial download never leaves a truncated
-            # file in the project. The destination is the SB2-confined path.
-            tmp = dest.with_name(dest.name + ".part")
-            tmp.write_bytes(bytes(raw))
-            tmp.replace(dest)
+            # Write atomically (random tmp + os.replace) so a partial download never leaves a
+            # truncated file in the project. The destination is the SB2-confined path.
+            #
+            # BUG B (Codex B1 — symlink-escape on save): we MUST NOT open a *predictable*-named
+            # temp like ``<dest.name>.part`` for write — an attacker could pre-place an in-root
+            # symlink of that exact name pointing OUT of the allowed roots, and open-for-write
+            # would FOLLOW it and clobber the out-of-root target (a confinement escape). Instead
+            # create a RANDOM temp name in the SAME (confined) parent dir via mkstemp — a random
+            # name cannot have been pre-placed as a symlink — write to its fd, then os.replace()
+            # it onto ``dest``. os.replace() swaps the directory entry: if ``dest`` itself is a
+            # symlink, replace overwrites the LINK (it does not write through it the way an
+            # open-for-write would). Both moves stay inside ``dest.parent`` (the confined dir).
+            fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=".tg-", suffix=".part")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(bytes(raw))
+                os.replace(tmp_name, dest)
+            except BaseException:
+                # Best-effort cleanup of the temp on any failure (it's a random in-root name,
+                # never a symlink) so a failed save can't leave a stray ``.tg-…part`` behind.
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
         except OSError:
             # RB1: a write failure (permissions / no space / the path is a directory) → a
             # clean message, never a crash. SB3: no file content in the log.
@@ -1474,9 +1501,12 @@ class TelegramClaudeBot:
         if attachment is None:
             return
         # Graceful-off FIRST: with no transcriber configured we never download — just point the
-        # operator at the setup (RB2). The Markdown is balanced (a single backtick span).
+        # operator at the setup (RB2). Sent as PLAIN TEXT (no parse_mode): the copy names the
+        # literal env var TRANSCRIBE_CMD, whose underscore would open an unterminated Markdown
+        # italic span and make Telegram REJECT the whole send (BUG A — same class as the P9
+        # `/help $*` break, where the user then gets nothing). Plain text can't be misparsed.
         if not (self.config.transcribe_cmd or "").strip():
-            await msg.reply_text(VOICE_SETUP_MESSAGE, parse_mode="Markdown")
+            await msg.reply_text(VOICE_SETUP_MESSAGE)
             return
         # Streaming-only: the transcript runs as a turn (a per-project streaming concept). In
         # one-shot mode reply a clean notice rather than transcribing into nothing.
@@ -1484,6 +1514,18 @@ class TelegramClaudeBot:
             await msg.reply_text(
                 "🎙️ Voice notes need streaming mode (ENGINE_MODE=streaming) — the transcript "
                 "runs as a turn against a project. In one-shot mode, please type your message."
+            )
+            return
+        # Size-cap BEFORE download (Codex B3 / RB2): Telegram reports file_size on a Voice /
+        # Audio. A declared size over the cap is refused cleanly — never pull oversized audio
+        # into memory. A missing/odd size (defensive) falls through to the post-download cap
+        # below so an over-cap (or under-reported) file can never be transcribed either way.
+        cap = self.config.file_max_bytes
+        declared = getattr(attachment, "file_size", None)
+        if isinstance(declared, int) and declared > cap:
+            await msg.reply_text(
+                f"🎙️ That voice note is too large ({declared // 1024} KB) — "
+                f"the limit is {cap // 1024} KB."
             )
             return
         # Download + transcribe under a per-turn temp dir, cleaned in finally (RB1). The audio
@@ -1504,6 +1546,15 @@ class TelegramClaudeBot:
                 return
             # SB3: log a SIZE SUMMARY only — never the audio bytes.
             log.info("chat %s received a voice note (%d KB)", chat_id, len(raw) // 1024)
+            # Post-download cap (Codex B3 / defense-in-depth): a missing/under-reported declared
+            # size means the pre-check above passed — re-check the ACTUAL bytes and never write /
+            # transcribe an over-cap file.
+            if len(raw) > cap:
+                await msg.reply_text(
+                    f"🎙️ That voice note is too large ({len(raw) // 1024} KB) — "
+                    f"the limit is {cap // 1024} KB."
+                )
+                return
             try:
                 with open(audio_path, "wb") as fh:
                     fh.write(bytes(raw))
@@ -1521,7 +1572,8 @@ class TelegramClaudeBot:
             except TranscriptionUnavailable:
                 # Defensive: the cmd was set at handler entry but normalizes to empty here —
                 # treat as graceful-off (RB2). (The entry guard above normally catches this.)
-                await msg.reply_text(VOICE_SETUP_MESSAGE, parse_mode="Markdown")
+                # Plain text, same as the entry-guard send — never Markdown (BUG A).
+                await msg.reply_text(VOICE_SETUP_MESSAGE)
                 return
             except TranscriptionError as exc:
                 # A real transcriber failure — bot-authored, body-free message (SB3); the raw
@@ -1619,10 +1671,14 @@ class TelegramClaudeBot:
         # SB3: log a size SUMMARY only — never the file bytes.
         log.info("chat %s requested /get %r (%d KB)", chat_id, target.name, size // 1024)
         try:
-            await ctx.bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(target.open("rb"), filename=target.name),
-            )
+            # Codex NB: open the file inside a context manager so its descriptor is ALWAYS
+            # closed (no fd leak) — PTB reads InputFile's stream into the outgoing request
+            # before this await resolves, so closing on the way out is safe.
+            with open(target, "rb") as fh:
+                await ctx.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(fh, filename=target.name),
+                )
         except Exception:
             # RB1: a transient upload failure must never crash the handler — clean message.
             log.debug("send_document failed for chat %s", chat_id, exc_info=True)

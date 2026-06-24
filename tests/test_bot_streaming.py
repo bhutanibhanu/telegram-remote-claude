@@ -3352,6 +3352,60 @@ async def test_on_document_absolute_filename_confined_to_cwd(tmp_path):
     assert (tmp_path / "evil").is_file()
 
 
+async def test_on_document_part_symlink_escape_not_written_through(tmp_path):
+    # BUG B (Codex B1): the atomic save wrote ``<dest.name>.part`` then renamed it over dest.
+    # If an attacker had pre-placed an IN-ROOT symlink named ``<name>.part`` pointing OUT of the
+    # allowed roots, opening that fixed-name temp for write would FOLLOW the symlink and clobber
+    # the out-of-root target (an escape). The fix writes to a RANDOM temp name (mkstemp) in the
+    # confined parent and os.replace()s it into place — a random name can't be a pre-placed
+    # symlink, and the out-of-root target is never touched.
+    outside = tmp_path.parent / "victim_outside_root.txt"
+    outside.write_bytes(b"ORIGINAL-OUT-OF-ROOT-CONTENT")
+    # Pre-place the malicious in-root symlink the OLD code would have opened for write.
+    booby = tmp_path / "note.py.part"
+    booby.symlink_to(outside)
+    assert booby.is_symlink()
+
+    bot, streaming = _file_bot(tmp_path)
+    raw = b"def f():\n    return 7\n"
+    upd = make_document_update(1, caption="save it", raw=raw, file_name="note.py")
+    await bot.on_document(upd, make_ctx())
+
+    # The out-of-root target was NEVER written through the symlink — its bytes are untouched.
+    assert outside.read_bytes() == b"ORIGINAL-OUT-OF-ROOT-CONTENT"
+    # The real file landed INSIDE the project cwd with the exact bytes (the save still works).
+    saved = tmp_path / "note.py"
+    assert saved.is_file() and not saved.is_symlink()
+    assert saved.read_bytes() == raw
+    # And the turn was offered as normal.
+    assert len(streaming.handle_message_calls) == 1
+
+
+async def test_on_document_dest_is_symlink_out_of_root_refused_not_followed(tmp_path):
+    # Companion to BUG B: if the DESTINATION name itself is a pre-placed in-root symlink that
+    # resolves OUT of the roots, the SB2 resolve (resolve_within_roots canonicalizes symlinks)
+    # REFUSES it up front — so the save never even reaches the write, and the out-of-root target
+    # is untouched. (This is the authoritative SB2 boundary; the .part-name fix above closes the
+    # remaining temp-name write-through. Together: no path writes through an escaping symlink.)
+    outside = tmp_path.parent / "dest_victim_outside.txt"
+    outside.write_bytes(b"DEST-OUT-OF-ROOT-ORIGINAL")
+    dest_link = tmp_path / "note.py"
+    dest_link.symlink_to(outside)
+    assert dest_link.is_symlink()
+
+    bot, streaming = _file_bot(tmp_path)
+    raw = b"replaced-bytes\n"
+    upd = make_document_update(1, raw=raw, file_name="note.py")
+    await bot.on_document(upd, make_ctx())
+
+    # The out-of-root target is NEVER written through the symlink — refused at the SB2 boundary.
+    assert outside.read_bytes() == b"DEST-OUT-OF-ROOT-ORIGINAL"
+    # No turn fired; a clean "resolves outside the permitted roots" refusal was sent.
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "outside the permitted roots" in reply.lower()
+
+
 async def test_on_document_oversized_refused_before_download(tmp_path):
     # RB2: a declared size over the cap is refused with a clean message — NO download, NO
     # write, NO turn.
@@ -3467,6 +3521,37 @@ async def test_cmd_get_in_root_file_sends_document(tmp_path):
     kwargs = ctx.bot.send_document.await_args.kwargs
     assert kwargs["chat_id"] == 1
     assert kwargs["document"] is not None
+
+
+async def test_cmd_get_closes_file_handle_no_fd_leak(tmp_path, monkeypatch):
+    # Codex NB: /get must open the file inside a context manager so its descriptor is closed
+    # after the send (no fd leak). We capture every file the handler opens and assert each is
+    # closed once cmd_get returns.
+    import builtins
+
+    bot, _streaming = _file_bot(tmp_path)
+    f = tmp_path / "out.txt"
+    f.write_bytes(b"hello file")
+
+    opened = []
+    real_open = builtins.open
+
+    def tracking_open(file, mode="r", *a, **k):
+        fh = real_open(file, mode, *a, **k)
+        # Only track the binary read the handler does on the target file.
+        if "b" in mode and "r" in mode and str(file) == str(f):
+            opened.append(fh)
+        return fh
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    ctx = make_ctx()
+    ctx.bot.send_document = AsyncMock()
+    ctx.args = ["out.txt"]
+    upd = make_update(1, text="/get out.txt")
+    await bot.cmd_get(upd, ctx)
+
+    assert opened, "cmd_get should have opened the target file for reading"
+    assert all(fh.closed for fh in opened), "the /get file handle leaked (was not closed)"
 
 
 async def test_cmd_get_absolute_in_root_path_sends(tmp_path):
@@ -3693,6 +3778,49 @@ async def test_on_voice_graceful_off_whitespace_cmd():
     assert upd.message.reply_text.await_args.args[0] == VOICE_SETUP_MESSAGE
 
 
+async def test_on_voice_graceful_off_message_sent_without_markdown_parse_mode():
+    # BUG A regression (same class as the P9 `/help $*` break): VOICE_SETUP_MESSAGE embeds the
+    # literal token TRANSCRIBE_CMD. Sent with parse_mode="Markdown", the underscore opens an
+    # unterminated italic span → Telegram raises BadRequest and the operator gets NOTHING (the
+    # common no-transcriber case). The fix sends it as PLAIN TEXT (no parse_mode), so a Markdown
+    # parser is never invoked on the message.
+    bot, _streaming = _voice_bot(transcribe_cmd="")
+    upd = make_voice_update(1)
+    await bot.on_voice(upd, make_ctx())
+    kwargs = upd.message.reply_text.await_args.kwargs
+    pm = kwargs.get("parse_mode")
+    assert pm is None or str(pm).lower() != "markdown", (
+        "VOICE_SETUP_MESSAGE must NOT be sent with parse_mode=Markdown — its TRANSCRIBE_CMD "
+        "underscore is an unterminated italic → Telegram rejects the send."
+    )
+
+
+async def test_on_voice_graceful_off_via_transcription_unavailable_no_markdown():
+    # The SECOND VOICE_SETUP_MESSAGE send-site: TRANSCRIBE_CMD was set at handler entry but the
+    # transcriber raises TranscriptionUnavailable (it normalized to empty). Same Markdown-safety
+    # requirement applies to this fallback path.
+    from claude_tg.voice import TranscriptionUnavailable
+
+    bot, _streaming = _voice_bot()
+
+    async def unavailable(*, template, audio_path, work_dir, timeout):
+        raise TranscriptionUnavailable()
+
+    import claude_tg.bot as _botmod
+
+    _orig = _botmod.transcribe
+    _botmod.transcribe = unavailable
+    try:
+        upd = make_voice_update(1)
+        await bot.on_voice(upd, make_ctx())
+    finally:
+        _botmod.transcribe = _orig
+    sent = upd.message.reply_text.await_args
+    assert sent.args[0] == VOICE_SETUP_MESSAGE
+    pm = sent.kwargs.get("parse_mode")
+    assert pm is None or str(pm).lower() != "markdown"
+
+
 # ---- happy path: transcript echoed + turn fired -----------------------------
 
 
@@ -3793,6 +3921,57 @@ async def test_on_voice_sb1_unauthorized_chat_no_download_no_turn(monkeypatch):
     assert called["n"] == 0
     upd.message.voice.get_file.assert_not_awaited()
     upd.message.reply_text.assert_not_awaited()
+
+
+# ---- size caps (Codex B3): oversized audio refused cleanly, no download ------
+
+
+async def test_on_voice_oversized_refused_before_download(monkeypatch):
+    # Codex B3 (RB2): a voice note whose DECLARED file_size exceeds the cap is refused with a
+    # clean message BEFORE any download — never pull oversized audio into memory, never
+    # transcribe, never fire a turn.
+    bot, streaming = _voice_bot()
+    bot.config = make_config(allowed=(1,), engine_mode="streaming",
+                             transcribe_cmd="stt -f {audio}", file_max_bytes=1024)
+    called = {"transcribe": 0}
+
+    async def spy_transcribe(*a, **k):
+        called["transcribe"] += 1
+        return "should not run"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", spy_transcribe)
+    upd = make_voice_update(1, raw=b"x" * 10)
+    upd.message.voice.file_size = 5000  # declared over the 1024 cap
+    await bot.on_voice(upd, make_ctx())
+
+    upd.message.voice.get_file.assert_not_awaited()  # no download
+    assert called["transcribe"] == 0
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
+
+
+async def test_on_voice_oversized_refused_after_download_when_underreported(monkeypatch):
+    # Defense-in-depth: a missing/under-reported declared size (no pre-check) but the downloaded
+    # bytes exceed the cap → refused post-download; never transcribed, never offered as a turn.
+    bot, streaming = _voice_bot()
+    bot.config = make_config(allowed=(1,), engine_mode="streaming",
+                             transcribe_cmd="stt -f {audio}", file_max_bytes=10)
+    called = {"transcribe": 0}
+
+    async def spy_transcribe(*a, **k):
+        called["transcribe"] += 1
+        return "should not run"
+
+    monkeypatch.setattr("claude_tg.bot.transcribe", spy_transcribe)
+    upd = make_voice_update(1, raw=b"x" * 100)
+    upd.message.voice.file_size = None  # no declared size → falls through to post-download cap
+    await bot.on_voice(upd, make_ctx())
+
+    assert called["transcribe"] == 0
+    assert streaming.handle_message_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "too large" in reply.lower()
 
 
 # ---- oneshot mode → clean "needs streaming" notice --------------------------

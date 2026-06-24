@@ -141,8 +141,10 @@ async def transcribe(
     Reads the transcript from the produced ``<out>.txt`` when the template references
     ``{out}`` (the whisper.cpp convention), else from the command's stdout. The ``{out}``
     basename is placed inside ``work_dir`` (the bot's per-turn temp dir), so any ``.txt`` the
-    transcriber writes is cleaned with the audio (RB1). SB3: the raw stderr is logged at DEBUG
-    only (never echoed to the chat) and the audio/transcript bytes are never logged here.
+    transcriber writes is cleaned with the audio (RB1). SB3 (Codex B2): the raw stderr is NEVER
+    logged (it can carry partial transcripts / paths / secrets) — only a body-free summary (the
+    exit code + stderr length) goes to DEBUG; stderr is never echoed to the chat, and the
+    audio/transcript bytes are never logged here.
     """
     if not template or not template.strip():
         raise TranscriptionUnavailable()
@@ -161,12 +163,11 @@ async def transcribe(
         raise TranscriptionError(f"couldn't run the transcriber: {exc}") from exc
 
     if rc != 0:
-        # SB3: the raw stderr can carry file paths — log it body-free at DEBUG, never echo it.
-        log.debug(
-            "transcriber exited %d; stderr=%r",
-            rc,
-            stderr.decode("utf-8", "replace")[:500],
-        )
+        # SB3 (Codex B2): the raw stderr can carry partial transcripts / file paths / secrets,
+        # so we log a BODY-FREE summary only — the exit code and the stderr LENGTH, never the
+        # bytes themselves — and never echo stderr to the chat. (Previously the first 500 bytes
+        # of stderr were logged at DEBUG, which leaked exactly that sensitive content.)
+        log.debug("transcriber exited %d (stderr %d bytes, not logged)", rc, len(stderr))
         raise TranscriptionError(f"the transcriber failed (exit {rc})")
 
     if template_uses_out(template):
