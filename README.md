@@ -244,24 +244,30 @@ voice note with nothing configured and the bot replies with a one-line "install 
 and set `TRANSCRIBE_CMD`" message (it never crashes, and you can always just type). To enable
 it, point `TRANSCRIBE_CMD` at any local or API transcriber:
 
-1. Install a transcriber + a model, e.g. [whisper.cpp](https://github.com/ggml-org/whisper.cpp):
+1. Install a local transcriber + a model, e.g. [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
+   (free, runs on your Mac — the audio never leaves the machine):
 
    ```sh
-   brew install whisper-cpp
-   # download a model (e.g. ggml-base.en.bin) per the whisper.cpp README
+   brew install ffmpeg whisper-cpp
+   mkdir -p ~/.cache/whisper-models
+   curl -fsSL -o ~/.cache/whisper-models/ggml-base.en.bin \
+     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
    ```
 
-2. Set `TRANSCRIBE_CMD` (and `ENGINE_MODE=streaming`) in `.env`. It is a command **template**
-   with two placeholders — `{audio}` (the input audio path) and `{out}` (an optional output
-   basename):
+2. Set `TRANSCRIBE_CMD` (and `ENGINE_MODE=streaming`) in `.env`. **The bot passes the raw
+   downloaded audio (Telegram opus `.ogg`) as `{audio}`** — whisper.cpp needs 16 kHz WAV, so use
+   the **bundled helper** (`deploy/transcribe-whisper.sh`), which converts with ffmpeg and runs
+   whisper.cpp for you. It's a command **template** with `{audio}` (input audio) and `{out}`
+   (output basename):
 
    ```sh
-   # whisper.cpp writes <out>.txt; the bot reads it:
-   TRANSCRIBE_CMD=whisper-cli -m /Users/you/models/ggml-base.en.bin -f {audio} -otxt -of {out}
+   # RECOMMENDED — the bundled helper (handles .ogg→wav conversion). Use the ABSOLUTE path:
+   TRANSCRIBE_CMD=bash /Users/you/dev/claude-telegram-bot/deploy/transcribe-whisper.sh {audio} {out}
 
-   # an STT CLI that prints the transcript to stdout (no {out}):
+   # …or any STT CLI that ACCEPTS the raw audio and prints the transcript to stdout (no {out}):
    TRANSCRIBE_CMD=my-stt --file {audio}
    ```
+   (Override the model with `WHISPER_MODEL` if you put `ggml-base.en.bin` elsewhere.)
 
 If the template mentions `{out}` the transcript is read from `<out>.txt`; otherwise it's read
 from the command's **stdout**. When a voice note arrives the bot downloads it to a temp file,
