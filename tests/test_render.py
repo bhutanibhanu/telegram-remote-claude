@@ -38,6 +38,7 @@ from claude_tg.engine.types import (
 from claude_tg.render import (
     BODY_FREE_ERROR_LINE,
     CALLBACK_LIMIT,
+    KIND_ATTACH,
     KIND_PERMISSION,
     KIND_SWITCH,
     ChatSendGate,
@@ -51,6 +52,7 @@ from claude_tg.render import (
     code_path,
     decode_callback,
     done_footer_suffix,
+    encode_attach_callback,
     encode_callback,
     encode_switch_callback,
     free_text_prompt,
@@ -1565,6 +1567,87 @@ def test_open_project_keyboard_carries_switch_callback():
     assert len(buttons) == 1
     assert buttons[0].text == "📂 Open beta"
     assert decode_callback(buttons[0].callback_data).switch_to == "beta"
+
+
+# ---- P11 T2: the attach callback codec + the /sessions attach keyboard -----
+
+
+def test_attach_callback_round_trips():
+    # P11 T2: encode_attach_callback -> decode_callback recovers kind="attach" + the session id.
+    sid = "f47ac10b-58cc-4372-a567-0e02b2c3d479"  # a real UUID-shaped id
+    data = encode_attach_callback(sid)
+    assert data == f"{KIND_ATTACH}|{sid}|x"
+    cb = decode_callback(data)
+    assert cb is not None
+    assert cb.kind == "attach"
+    assert cb.attach_session_id == sid
+
+
+def test_attach_callback_within_byte_budget_for_uuid():
+    # A 36-char UUID id stays well under Telegram's 64-byte callback limit.
+    sid = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    data = encode_attach_callback(sid)
+    assert len(data.encode("utf-8")) <= CALLBACK_LIMIT
+    assert decode_callback(data).attach_session_id == sid
+
+
+def test_attach_callback_does_not_collide_with_other_kinds():
+    # P11 T2: the attach kind char 't' is distinct from ask/other/plan/permission/switch, so
+    # an attach callback never decodes to any of them (and vice versa) — collision-free.
+    assert decode_callback(encode_attach_callback("sess-1")).kind == "attach"
+    assert decode_callback(encode_switch_callback("alpha")).kind == "switch"
+    assert decode_callback(encode_callback("a", REAL_TOOL_USE_ID, question_index=0, option_index=0)).kind == "ask"
+    assert decode_callback(encode_callback("p", REAL_TOOL_USE_ID, plan_action="a")).kind == "plan"
+    assert decode_callback(encode_callback(KIND_PERMISSION, REAL_TOOL_USE_ID, payload="o")).kind == "permission"
+
+
+def test_decode_rejects_forged_attach_id_and_payload():
+    # SB1 trust boundary: an attach callback with a non-session-shaped id (illegal chars / too
+    # long) or a wrong payload char is forged/stale -> decode returns None (adopts nothing).
+    assert decode_callback("t|bad id|x") is None        # space is not in the id charset
+    assert decode_callback("t|" + "a" * 49 + "|x") is None  # over the 48-char bound
+    assert decode_callback("t|sess-1|s") is None         # wrong payload char ('s' is switch)
+    assert decode_callback("t||x") is None               # empty id
+
+
+def test_encode_attach_callback_rejects_pipe_in_id():
+    # Defensive: a '|' in the id would break the 3-field scheme -> ValueError at build.
+    with pytest.raises(ValueError):
+        encode_attach_callback("a|b")
+    with pytest.raises(ValueError):
+        encode_attach_callback("")
+
+
+def test_sessions_keyboard_one_attach_button_per_session():
+    from claude_tg.render import sessions_keyboard
+
+    class _S:
+        def __init__(self, sid):
+            self.session_id = sid
+
+    kb = sessions_keyboard([_S("aaaa1111-2222-3333-4444-555566667777"), _S("bbbb")])
+    assert isinstance(kb, InlineKeyboardMarkup)
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    assert len(buttons) == 2
+    # Each button text shows the SHORT id; the callback_data carries the FULL id.
+    assert buttons[0].text.startswith("📎 Attach aaaa1111")
+    assert decode_callback(buttons[0].callback_data).attach_session_id == "aaaa1111-2222-3333-4444-555566667777"
+    assert decode_callback(buttons[1].callback_data).attach_session_id == "bbbb"
+
+
+def test_sessions_keyboard_empty_is_none_and_caps():
+    from claude_tg.render import sessions_keyboard
+
+    class _S:
+        def __init__(self, sid):
+            self.session_id = sid
+
+    assert sessions_keyboard([]) is None  # no sessions → no keyboard (listing sent alone)
+    # The button count is capped; an id-less session is skipped (no button, no crash).
+    many = [_S(f"sess-{i}") for i in range(20)] + [_S(None)]
+    kb = sessions_keyboard(many, cap=5)
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    assert len(buttons) == 5  # honored the cap
 
 
 def test_queued_suffix():

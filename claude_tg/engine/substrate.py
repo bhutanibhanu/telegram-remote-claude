@@ -70,12 +70,19 @@ class Substrate(Protocol):
         """Establish a fresh persistent session (host CLI auth; no API key)."""
         ...
 
-    async def resume(self, session_id: str) -> None:
+    async def resume(self, session_id: str, *, fork: bool = False) -> None:
         """Re-attach to an existing session by id.
 
         Per ADR-001 / C6 the id is **cwd/project-scoped** — the engine must resume
         only from the original cwd (it owns the ``(session_id, cwd)`` coupling and
         the double-attach guard; the substrate does not enforce either).
+
+        **P11 T2 — ``fork``.** ``fork=False`` (the default) CONTINUES the same id (every
+        pre-P11 resume). ``fork=True`` resumes into a NEW id with the transcript copied,
+        never writing to the resumed id — the engine sets this when adopting a session that
+        is LIVE in another process, so the two never share one ``(id, cwd)`` transcript. The
+        seam shape only GROWS an optional keyword, so a fake substrate that ignores it still
+        satisfies the Protocol.
         """
         ...
 
@@ -152,7 +159,7 @@ class SubstrateBAdapter:
     async def start(self) -> None:  # pragma: no cover - slot
         raise NotImplementedError
 
-    async def resume(self, session_id: str) -> None:  # pragma: no cover - slot
+    async def resume(self, session_id: str, *, fork: bool = False) -> None:  # pragma: no cover - slot
         raise NotImplementedError
 
     def send(  # pragma: no cover - slot

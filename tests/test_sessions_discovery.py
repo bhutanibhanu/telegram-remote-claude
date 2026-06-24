@@ -15,10 +15,12 @@ fake session lister, a fake ``ps`` snapshot, a fake process registry, a frozen c
 
 from __future__ import annotations
 
+import unittest.mock as mock
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
+import claude_tg.sessions_discovery as disc_mod
 from claude_tg.sessions_discovery import (
     LIVE_MTIME_WINDOW_SECONDS,
     DiscoveredSession,
@@ -150,6 +152,25 @@ def test_transcript_mtime_reads_sanitized_path(tmp_path):
     # Missing file / missing cwd → None (no signal), never an exception.
     assert transcript_mtime("nope", cwd, home=home) is None
     assert transcript_mtime("sid123", None, home=home) is None
+
+
+def test_transcript_mtime_degraded_sink_distinguishes_missing_from_errored(tmp_path):
+    """P11 T2: a MISSING transcript is a confident no-signal (degraded sink untouched); a
+    NON-not-found stat error (PermissionError) flags the sink (we couldn't read the signal)."""
+    home = tmp_path / ".claude"
+    cwd = "/work/x"
+    # 1. Missing transcript → None, and the degraded sink is NOT touched (confident no-signal).
+    sink: list[bool] = []
+    assert transcript_mtime("gone", cwd, home=home, degraded=sink) is None
+    assert sink == []
+    # 2. A PermissionError on stat → None AND the sink is flagged (uncertain).
+    def deny(self, *a, **k):
+        raise PermissionError("denied")
+
+    sink2: list[bool] = []
+    with mock.patch.object(disc_mod.Path, "stat", deny):
+        assert transcript_mtime("sid", cwd, home=home, degraded=sink2) is None
+    assert sink2 == [True]
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +310,9 @@ def test_discover_marks_running_idle_from_injected_seams(tmp_path):
     out = disc.discover()
     assert [(s.session_id, s.running) for s in out] == [("run", True), ("idle", False)]
     assert all(isinstance(s, DiscoveredSession) for s in out)
+    # P11 T2: a CLEAN run (every signal executed, no error) is CONFIDENT — not degraded —
+    # even for the idle session. A clean negative is a confident continue, not "couldn't tell".
+    assert all(s.liveness_degraded is False for s in out)
 
 
 def test_discover_total_when_lister_raises(tmp_path):
@@ -308,6 +332,50 @@ def test_discover_total_when_proc_and_registry_raise(tmp_path):
     out = disc.discover()
     # The session is still listed; with both liveness scans down it just reads idle.
     assert [(s.session_id, s.running) for s in out] == [("s", False)]
+    # P11 T2: but the negative is NOT confident — the scans ERRORED, so liveness is degraded.
+    # A write/adopt action reads this and forks on doubt (never co-drives a possibly-live id).
+    assert out[0].liveness_degraded is True
+
+
+def test_discover_scan_failure_with_stale_mtime_is_degraded(tmp_path):
+    """P11 T2 (fork-on-doubt): proc_scan + registry both raise and the mtime is stale/absent →
+    the session reads idle (running=False) but UNCERTAIN (liveness_degraded=True). This is the
+    exact shape attach_session must fork on, distinguished from a clean confident idle."""
+    sessions = [_raw(session_id="s", cwd="/nope-no-transcript")]
+
+    def boom():
+        raise OSError("scan failed")
+
+    disc = SessionDiscovery(
+        lister=lambda: sessions, proc_scan=boom, registry=boom,
+        clock=lambda: 1e12, home=tmp_path,  # no transcript under home → mtime absent → idle
+    )
+    out = disc.discover()
+    assert out[0].running is False
+    assert out[0].liveness_degraded is True
+
+
+def test_discover_mtime_permission_error_is_degraded(tmp_path):
+    """P11 T2: a NON-not-found transcript stat error (a PermissionError) degrades the per-
+    session liveness even when the scans are clean — we could not read the mtime signal. A
+    MISSING transcript (FileNotFoundError) would NOT degrade (a confident no-signal)."""
+    sessions = [_raw(session_id="s", cwd="/c")]
+    # Build the transcript path the probe will stat, then make stat raise PermissionError.
+    real_stat = disc_mod.Path.stat
+
+    def deny_stat(self, *a, **k):
+        if self.name == "s.jsonl":
+            raise PermissionError("denied")
+        return real_stat(self, *a, **k)
+
+    disc = SessionDiscovery(
+        lister=lambda: sessions, proc_scan=lambda: [], registry=lambda: [],
+        clock=lambda: 1e12, home=tmp_path,
+    )
+    with mock.patch.object(disc_mod.Path, "stat", deny_stat):
+        out = disc.discover()
+    assert out[0].running is False
+    assert out[0].liveness_degraded is True  # the stat ERRORED (not not-found) → uncertain
 
 
 def test_discover_empty_when_no_sessions():

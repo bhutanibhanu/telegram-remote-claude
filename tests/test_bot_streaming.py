@@ -20,7 +20,12 @@ from claude_tg.claude_runner import ClaudeResult, ClaudeRunner
 from claude_tg.config import Config
 from claude_tg.engine.types import AskEvent, ResultEvent
 from claude_tg.session_store import JsonSessionStore
-from claude_tg.stream_session import CallbackOutcome, StreamingBusy, StreamingSession
+from claude_tg.stream_session import (
+    AttachOutcome,
+    CallbackOutcome,
+    StreamingBusy,
+    StreamingSession,
+)
 
 
 def make_config(
@@ -97,6 +102,7 @@ class FakeStreaming:
         self.model_calls = []
         self.reply_prompt_calls = []
         self.to_calls = []
+        self.attach_calls = []
         self.command_initiated_calls = []
         self.images_calls = []
         self._outcome = outcome or CallbackOutcome(handled=True, note="ok")
@@ -149,6 +155,15 @@ class FakeStreaming:
         # P5/T9: the /to <name> <text> escape hatch (D5). Return a confirmation string.
         self.to_calls.append((chat_id, name, text))
         return f"✅ Sent your reply to {name}."
+
+    def attach_session(self, chat_id, session_id):
+        # P11/T2: /attach + the [Attach] tap delegate here. Record the call and return a
+        # styled AttachOutcome so the bot-wiring tests assert delegation + the reply send.
+        self.attach_calls.append((chat_id, session_id))
+        return AttachOutcome(
+            ok=True, message=f"✅ Attached {session_id}.", parse_mode="HTML",
+            project_name="adopted", forked=False,
+        )
 
     def reset(self, chat_id):
         self.reset_calls.append(chat_id)
@@ -4235,3 +4250,118 @@ def test_sessions_in_command_menu_and_help_lockstep():
 
     assert "sessions" in {cmd for cmd, _desc in COMMAND_MENU}
     assert "/sessions" in HELP_TEXT
+
+
+# ===========================================================================
+# P11 / T2 — /attach + [Attach] callback: adopt + drive any discovered session.
+# The bot is a pure renderer of StreamingSession.attach_session's AttachOutcome (the session
+# owns the SB2 + fork-vs-continue policy); here we assert the BOT wiring: SB1, the streaming-
+# only notice, delegation, the reply send, the callback route, and the /sessions keyboard.
+# ===========================================================================
+
+
+async def test_cmd_attach_delegates_and_replies(monkeypatch):
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/attach abc-123")
+    await bot.cmd_attach(upd, make_cmd_ctx(args=["abc-123"]))
+    # Delegated to the session with the parsed id…
+    assert streaming.attach_calls == [(1, "abc-123")]
+    # …and the outcome message was sent with its parse_mode.
+    text = upd.message.reply_text.await_args.args[0]
+    kwargs = upd.message.reply_text.await_args.kwargs
+    assert "Attached abc-123" in text
+    assert kwargs.get("parse_mode") == "HTML"
+
+
+async def test_cmd_attach_usage_when_no_id():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/attach")
+    await bot.cmd_attach(upd, make_cmd_ctx(args=[]))
+    assert "Usage: /attach" in upd.message.reply_text.await_args.args[0]
+    assert streaming.attach_calls == []  # never delegated on a usage error
+
+
+async def test_cmd_attach_oneshot_replies_streaming_only_notice():
+    # /attach is a streaming-mode concept (project registry) — one-shot replies the notice.
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())  # streaming=None
+    upd = make_update(1, "/attach abc-123")
+    await bot.cmd_attach(upd, make_cmd_ctx(args=["abc-123"]))
+    assert "streaming mode only" in upd.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_attach_unauthorized_replies_nothing():
+    streaming = FakeStreaming()
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(999, "/attach abc-123")  # NOT allowlisted
+    await bot.cmd_attach(upd, make_cmd_ctx(args=["abc-123"]))
+    upd.message.reply_text.assert_not_awaited()  # SB1: nothing sent
+    assert streaming.attach_calls == []  # and never delegated
+
+
+async def test_attach_callback_authorized_routes_to_attach_session():
+    # An [Attach] tap from an allowlisted chat routes the decoded session id to attach_session.
+    streaming = FakeStreaming(
+        outcome=CallbackOutcome(handled=True, note="Attaching…", attach_session_id="sess-zz")
+    )
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    from claude_tg.render import encode_attach_callback
+    upd = make_callback_update(1, data=encode_attach_callback("sess-zz"))
+    await bot.on_callback(upd, make_ctx())
+    upd.callback_query.answer.assert_awaited()  # spinner stopped
+    assert streaming.attach_calls == [(1, "sess-zz")]  # adopt performed
+    upd.callback_query.message.reply_text.assert_awaited()  # outcome replied
+
+
+async def test_attach_callback_unauthorized_never_attaches():
+    # SB1 (the security-critical part): a forged/foreign [Attach] tap NEVER adopts a session.
+    streaming = FakeStreaming(
+        outcome=CallbackOutcome(handled=True, note="Attaching…", attach_session_id="sess-zz")
+    )
+    bot = TelegramClaudeBot(make_config(allowed=(1,), engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    from claude_tg.render import encode_attach_callback
+    upd = make_callback_update(999, data=encode_attach_callback("sess-zz"))  # NOT allowlisted
+    await bot.on_callback(upd, make_ctx())
+    upd.callback_query.answer.assert_awaited()  # query answered (spinner stops)
+    assert streaming.attach_calls == []  # but NOTHING adopted (resolve_callback never reached)
+
+
+async def test_cmd_sessions_attaches_keyboard_in_streaming(monkeypatch):
+    # P11 T2: /sessions in streaming mode carries a [📎 Attach <shortid>] button per session.
+    import claude_tg.bot as botmod
+
+    monkeypatch.setattr(
+        botmod, "discover_sessions",
+        lambda: [_disc("aaaaaaaa1111", cwd="/work/a"), _disc("bbbbbbbb2222", cwd="/work/b")],
+    )
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=FakeStreaming())
+    upd = make_update(1, "/sessions")
+    await bot.cmd_sessions(upd, make_cmd_ctx())
+    kb = upd.message.reply_text.await_args.kwargs.get("reply_markup")
+    assert kb is not None  # a keyboard was attached
+    # One attach button per session, each decoding back to its full id.
+    from claude_tg.render import decode_callback
+    datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    decoded = [decode_callback(d) for d in datas]
+    ids = {c.attach_session_id for c in decoded}
+    assert ids == {"aaaaaaaa1111", "bbbbbbbb2222"}
+
+
+async def test_cmd_sessions_no_keyboard_in_oneshot(monkeypatch):
+    # One-shot mode has no registry to attach into → the listing has no attach keyboard.
+    import claude_tg.bot as botmod
+
+    monkeypatch.setattr(botmod, "discover_sessions", lambda: [_disc("solo0001", cwd="/w")])
+    bot = TelegramClaudeBot(make_config(engine_mode="oneshot"), FakeRunner())  # streaming=None
+    upd = make_update(1, "/sessions")
+    await bot.cmd_sessions(upd, make_cmd_ctx())
+    assert upd.message.reply_text.await_args.kwargs.get("reply_markup") is None
+
+
+def test_attach_command_in_menu_and_help():
+    # /attach must be in the native menu (lock-step with the registered handler) AND in HELP.
+    from claude_tg.bot import COMMAND_MENU, HELP_TEXT
+
+    assert "attach" in {cmd for cmd, _desc in COMMAND_MENU}
+    assert "/attach" in HELP_TEXT

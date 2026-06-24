@@ -373,11 +373,27 @@ class Engine:
         # SB3/H1: log a redacted, correlatable tag — never the raw resumable session id.
         log.debug("engine started; %s", _redact_sid(self.session_id))
 
-    async def resume(self, session_id: str) -> None:
-        """Re-attach to an existing session by id (cwd-scoped — engine-owned, C6)."""
-        await self._substrate.resume(session_id)
+    async def resume(self, session_id: str, *, fork: bool = False) -> None:
+        """Re-attach to an existing session by id (cwd-scoped — engine-owned, C6).
+
+        **P11 T2 — ``fork``.** ``fork=False`` (the default) CONTINUES the same session id
+        (every pre-P11 resume). ``fork=True`` resumes into a NEW session id with the
+        transcript copied, NEVER writing to the resumed id — the safety primitive for
+        attaching a session that is LIVE in another process (two writers on one ``(id, cwd)``
+        silently corrupt the transcript). The forked id is reported by the substrate on the
+        first turn (``self.session_id`` updates then), so the caller persists the forked id,
+        not the base one.
+        """
+        # Pass ``fork`` to the substrate ONLY when forking, so a CONTINUE (the default, every
+        # pre-P11 resume) calls ``resume(session_id)`` exactly as before — a substrate that
+        # never needs to fork (and a fake that omits the kwarg) is unaffected; only the new
+        # attach-fork path exercises the grown signature.
+        if fork:
+            await self._substrate.resume(session_id, fork=True)
+        else:
+            await self._substrate.resume(session_id)
         # SB3/H1: redacted tag only (the raw id is a credential — see _redact_sid).
-        log.debug("engine resumed %s", _redact_sid(self.session_id))
+        log.debug("engine resumed %s (fork=%s)", _redact_sid(self.session_id), fork)
 
     async def send(
         self,

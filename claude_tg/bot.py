@@ -35,6 +35,7 @@ from .render import (
     project_status_label,
     quick_reply_dismiss,
     quick_reply_keyboard,
+    sessions_keyboard,
     sessions_listing,
     yolo_banner,
 )
@@ -74,6 +75,9 @@ HELP_TEXT = (
     "/projects — list your projects and which one is active (streaming mode)\n"
     "/sessions — list every Claude Code session on the Mac (running/idle), including the "
     "one running right now, merged with your projects (read-only)\n"
+    "/attach <session-id> — adopt any Mac session (from /sessions) as a project and drive "
+    "it; a session that's live elsewhere is attached as a FORK so it isn't corrupted "
+    "(streaming mode)\n"
     "/new <name> <path> — create a project at <path> and switch to it; <path> must be an "
     "existing directory inside the permitted roots (streaming mode)\n"
     "/switch <name> — switch the active project; the next message resumes it (streaming mode)\n"
@@ -113,6 +117,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("model", "Clear the model override (alias of /auto)"),
     ("projects", "List your projects and which one is active"),
     ("sessions", "List all Claude sessions on the Mac (running/idle)"),
+    ("attach", "Adopt + drive any Mac session: /attach <session-id>"),
     ("new", "Create a project at a path and switch to it"),
     ("switch", "Switch the active project"),
     ("rm", "Drop a project from the registry"),
@@ -792,7 +797,50 @@ class TelegramClaudeBot:
             sessions = []
         marks = self._bot_project_marks(chat_id)
         text = sessions_listing(sessions, marks, now=time.time())
-        await update.message.reply_text(text, parse_mode="HTML")
+        # P11 T2: in STREAMING mode attach a [📎 Attach <shortid>] button per discovered
+        # session so the operator can adopt + drive any of them in one tap (the typed
+        # /attach <id> works too, incl. for sessions past the button cap — the id is on the
+        # row). One-shot mode has no project registry to attach into, so it gets the listing
+        # alone (no keyboard) — discovery there is read-only, exactly as T1. A keyboard is only
+        # attached when there ARE sessions (sessions_keyboard returns None for an empty list,
+        # in which case the empty-listing notice is sent alone). SB1 already gated this above.
+        keyboard = sessions_keyboard(sessions) if self.streaming is not None else None
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+    async def cmd_attach(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Adopt ANY discovered Claude session as a controllable project (``/attach <id>``, P11 T2).
+
+        The "drive any session from your phone" command: ``/attach <session-id>`` (the id is
+        shown on each ``/sessions`` row) looks the session up machine-wide, then adopts its
+        ``(session_id, cwd)`` as a bot project + switches to it, so the NEXT message resumes +
+        drives it through the **normal turn + permission gate** path. Streaming mode only (the
+        project registry is a streaming concept — one-shot replies the streaming-only notice).
+        Order (fail-fast):
+
+        1. ``_ok`` allowlist recheck (SB1) + ``_require_streaming`` one-shot notice.
+        2. Parse the session id (all args joined — an id has no spaces, but be forgiving);
+           missing → usage (RB1).
+        3. Delegate to :meth:`~claude_tg.stream_session.StreamingSession.attach_session`,
+           which does ALL the policy — the SB2 cwd confinement (refuse an out-of-roots cwd),
+           the **fork-if-live** decision (a session live elsewhere is adopted as a FORK, never
+           co-driven), the SB4-named registry write, and the operator-facing reply. The bot is
+           a pure renderer of its :class:`~claude_tg.stream_session.AttachOutcome` (no policy
+           here — same posture as ``/sessions``).
+        """
+        if not await self._ok(update) or update.message is None:
+            return
+        if not await self._require_streaming(update):
+            return
+        assert self.streaming is not None
+        chat_id = update.effective_chat.id
+        # An id carries no spaces; join defensively so a stray paste with a trailing space
+        # still works. Empty → usage.
+        session_id = " ".join(ctx.args).strip() if ctx.args else ""
+        if not session_id:
+            await update.message.reply_text("Usage: /attach <session-id>")
+            return
+        outcome = self.streaming.attach_session(chat_id, session_id)
+        await update.message.reply_text(outcome.message, parse_mode=outcome.parse_mode)
 
     async def cmd_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Switch the chat's active project (streaming mode only).
@@ -2023,6 +2071,21 @@ class TelegramClaudeBot:
             except Exception:
                 log.debug("switch-button reply send failed", exc_info=True)
             return
+        # P11 T2: an [Attach] tap routes by session id. The session decoded + validated the id
+        # (the session-id shape) and returned it on ``attach_session_id``; the bot performs the
+        # actual adopt through ``streaming.attach_session`` — which does ALL the policy (the
+        # SB2 cwd confinement + the fork-if-live decision + the registry write). SB1 is already
+        # enforced above (the _authorized recheck), so a non-allowlisted tap never reaches here.
+        # We answer the query (stop the spinner), do the attach, and reply its outcome; nothing
+        # else (no free-text arm) applies to an attach.
+        if outcome.attach_session_id and self.streaming is not None:
+            await self._answer_callback(query, outcome.note if outcome.handled else None)
+            result = self.streaming.attach_session(chat.id, outcome.attach_session_id)
+            try:
+                await query.message.reply_text(result.message, parse_mode=result.parse_mode)
+            except Exception:
+                log.debug("attach-button reply send failed", exc_info=True)
+            return
         await self._answer_callback(query, outcome.note if outcome.handled else None)
         if outcome.expects_text:
             # D5: name-echo the free-text prompt so the operator knows which project the
@@ -2142,6 +2205,11 @@ class TelegramClaudeBot:
         # the live orchestrator), merged with the bot's own projects. Same `allowed` chat
         # filter (SB1) + registered BEFORE the skill passthrough so it isn't forwarded.
         app.add_handler(CommandHandler("sessions", self.cmd_sessions, filters=allowed))
+        # P11 T2: /attach <session-id> — adopt ANY discovered Claude session as a controllable
+        # project (+ switch to it), forking it if it is live elsewhere. Same `allowed` chat
+        # filter (SB1) + registered BEFORE the skill passthrough so it isn't forwarded as a
+        # skill. Streaming mode only (cmd_attach replies the one-shot notice otherwise).
+        app.add_handler(CommandHandler("attach", self.cmd_attach, filters=allowed))
         # P5 /to <name> <text> (D5 free-text escape hatch): routes a free-text answer to a
         # named project's pending "Other"/reject. Same `allowed` chat filter (SB1) +
         # registered BEFORE the skill passthrough (first-match-wins) — no new callback

@@ -86,6 +86,17 @@ class DiscoveredSession:
     a ``title`` line (custom title / first prompt / summary — operator-authored prompt text,
     truncated + escaped at render time), the ``last_active`` epoch seconds, ``git_branch``
     if known, and the composite ``running`` hint. Frozen + hashable so dedup/merge is cheap.
+
+    **``liveness_degraded`` (the safe-default-on-doubt signal).** ``running`` answers "did any
+    signal say live?" but a clean ``running=False`` is ambiguous between *confidently idle*
+    (every signal executed and none fired) and *couldn't tell* (a probe sub-step — the ``ps``
+    scan, the registry read, or a transcript stat — RAISED and was swallowed to "no signal").
+    ``liveness_degraded`` distinguishes them: it is ``True`` ONLY when an exception occurred
+    while gathering this session's liveness (never just because the session is quiet). The
+    READ-ONLY ``/sessions`` listing ignores it (a degraded session still shows the idle glyph —
+    display-only). But a WRITE/adopt action (``attach_session``, P11 T2) reads it to choose the
+    SAFE default: confidently-idle → continue the same id; **uncertain → FORK** (never co-drive
+    a possibly-live ``(id, cwd)`` transcript on the strength of a probe that errored).
     """
 
     session_id: str
@@ -94,6 +105,7 @@ class DiscoveredSession:
     last_active: Optional[int]
     running: bool = False
     git_branch: Optional[str] = None
+    liveness_degraded: bool = False
 
 
 @dataclass(frozen=True)
@@ -229,13 +241,27 @@ def claude_home() -> Path:
     return Path.home() / ".claude"
 
 
-def transcript_mtime(session_id: str, cwd: Optional[str], *, home: Optional[Path] = None) -> Optional[float]:
+def transcript_mtime(
+    session_id: str,
+    cwd: Optional[str],
+    *,
+    home: Optional[Path] = None,
+    degraded: Optional[list[bool]] = None,
+) -> Optional[float]:
     """The ``mtime`` (epoch seconds) of ``session_id``'s transcript under ``cwd``, or ``None``.
 
     The transcript lives at ``<home>/projects/<sanitized-cwd>/<session-id>.jsonl`` (the CLI's
     convention; ``<sanitized-cwd>`` replaces every non-alphanumeric char with ``-``). Returns
     the file's mtime if it exists and we can stat it, else ``None`` (no cwd, missing file, or
     an OSError). Never raises (RB1) — a ``None`` simply means "no mtime signal" for liveness.
+
+    **``degraded`` (P11 T2 — fork-on-doubt).** When a mutable ``degraded`` list is passed, a
+    stat error that is **not** a plain not-found (``FileNotFoundError`` / ``NotADirectoryError``)
+    — e.g. a ``PermissionError`` or a genuine I/O failure — appends ``True`` to it: the mtime
+    signal could not be CONFIDENTLY gathered. A MISSING transcript does NOT degrade (it is a
+    confident "no mtime signal" — an idle/gone session), so a clean negative stays a confident
+    continue. Callers that don't care about the distinction pass nothing (default ``None``) and
+    behavior is unchanged.
     """
     if not session_id or not cwd:
         return None
@@ -244,7 +270,14 @@ def transcript_mtime(session_id: str, cwd: Optional[str], *, home: Optional[Path
     path = base / "projects" / sanitized / f"{session_id}.jsonl"
     try:
         return path.stat().st_mtime
+    except (FileNotFoundError, NotADirectoryError):
+        # A missing transcript is a CONFIDENT "no mtime signal" (idle/gone) — never degraded.
+        return None
     except OSError:
+        # A non-not-found stat error (permissions / I/O) — we could not tell. Flag it so a
+        # write/adopt action forks on doubt rather than trusting a possibly-stale negative.
+        if degraded is not None:
+            degraded.append(True)
         return None
 
 
@@ -449,6 +482,7 @@ def probe_liveness(
     registry: Sequence[dict],
     now: float,
     home: Optional[Path] = None,
+    degraded: Optional[list[bool]] = None,
 ) -> bool:
     """Composite "is this session running?" — ``True`` if ANY signal fires (a HINT).
 
@@ -468,13 +502,20 @@ def probe_liveness(
     function over fakes in tests — no real ``ps``, no real ``~/.claude``. Returns a HINT;
     discovery never treats "running" as a lock (this is a read-only listing). Defensive: a
     malformed proc/registry entry is skipped, never fatal (RB1).
+
+    **``degraded`` (P11 T2 — fork-on-doubt).** When a mutable ``degraded`` list is passed, a
+    sub-step that could not be CONFIDENTLY evaluated (today: a non-not-found transcript stat
+    error — see :func:`transcript_mtime`) appends ``True`` to it. The scan-level signal
+    failures (``proc_scan`` / ``registry`` raising) are recorded by :meth:`SessionDiscovery.discover`
+    BEFORE this call (they degrade ALL sessions' signals 2+3 for the call) and OR-ed with this.
+    A clean negative (every signal ran, none fired) leaves it untouched — confidently idle.
     """
     sid = session.session_id
     if not sid:
         return False
 
-    # 1. Transcript mtime within the recent window.
-    mtime = transcript_mtime(sid, session.cwd, home=home)
+    # 1. Transcript mtime within the recent window (a non-not-found stat error → degraded).
+    mtime = transcript_mtime(sid, session.cwd, home=home, degraded=degraded)
     if mtime is not None and (now - mtime) <= LIVE_MTIME_WINDOW_SECONDS:
         return True
 
@@ -556,24 +597,36 @@ class SessionDiscovery:
         except Exception:  # a custom lister that misbehaves must not crash /sessions (RB1)
             log.warning("session lister failed; returning no sessions", exc_info=True)
             return []
+        # P11 T2 (fork-on-doubt): a SCAN failure degrades liveness for EVERY session this call
+        # (signals 2+3 are gathered once, here). Record it so attach forks on doubt rather than
+        # trusting a negative computed with no proc/registry data. /sessions display ignores it.
+        scan_degraded = False
         try:
             procs = self.proc_scan() or []
         except Exception:
             procs = []
+            scan_degraded = True
         try:
             registry = self.registry() or []
         except Exception:
             registry = []
+            scan_degraded = True
         now = _safe_now(self.clock)
 
         out: list[DiscoveredSession] = []
         for rs in raw:
+            # Per-session degradation sink: the mtime sub-step appends to it on a non-not-found
+            # stat error (transcript_mtime), and a whole-probe exception below sets it too. OR
+            # in the call-wide scan failure so a broken ps/registry marks every session uncertain.
+            sink: list[bool] = []
             try:
                 running = probe_liveness(
-                    rs, procs=procs, registry=registry, now=now, home=self.home
+                    rs, procs=procs, registry=registry, now=now, home=self.home, degraded=sink
                 )
-            except Exception:  # a liveness hiccup → assume idle, still list the session (RB1)
+            except Exception:  # a liveness hiccup → assume idle (RB1), but flag it UNCERTAIN so
+                # a write/adopt action forks on doubt; the read-only listing still shows it idle.
                 running = False
+                sink.append(True)
             out.append(
                 DiscoveredSession(
                     session_id=rs.session_id,
@@ -582,6 +635,7 @@ class SessionDiscovery:
                     last_active=rs.last_modified,
                     running=running,
                     git_branch=rs.git_branch,
+                    liveness_degraded=scan_degraded or bool(sink),
                 )
             )
         return out

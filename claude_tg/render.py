@@ -203,6 +203,17 @@ KIND_PERMISSION = "m"
 #: no pending hold and never resolves a decision (so it cannot collide with the
 #: permission/ask/plan/other callback_data — distinct kind char + a name, not an id).
 KIND_SWITCH = "w"
+#: Attach-a-discovered-session kind (P11 T2). A single char ('t' for aTTach; 'a'/'o'/'p'/'m'/
+#: 'w' are taken). Like ``switch`` it does NOT route to a held ``tool_use_id`` — it carries the
+#: TARGET SESSION ID in the middle field and a fixed 'x' payload (``t|<session-id>|x``). A
+#: Claude session id is a 36-char UUID, so ``t|<36>|x`` is ~40 B, well under the 64-byte limit.
+#: The tap is the ``[Attach]`` button on a ``/sessions`` row: it routes through
+#: :func:`decode_callback` → the bot's ``on_callback`` (SB1-gated by ``_authorized`` there) →
+#: ``StreamingSession.attach_session`` (which does the SB2 cwd check + fork-vs-continue). It
+#: touches no pending hold and resolves no decision, so it can't collide with the
+#: ask/plan/permission/other/switch callbacks (distinct kind char + a session id, not a
+#: tool_use_id).
+KIND_ATTACH = "t"
 
 PLAN_APPROVE = "a"
 PLAN_REJECT = "r"
@@ -246,7 +257,7 @@ class Callback:
     (T5 turns ``permission_action`` into the engine's ``PermissionDecision``).
     """
 
-    kind: Literal["ask", "other", "plan", "permission", "switch"]
+    kind: Literal["ask", "other", "plan", "permission", "switch", "attach"]
     tool_use_id: str
     question_index: Optional[int] = None
     option_index: Optional[int] = None
@@ -256,6 +267,10 @@ class Callback:
     #: ``None`` for every other kind (which route by ``tool_use_id``); for a ``switch`` the
     #: ``tool_use_id`` field is unused (set to a sentinel) and this carries the name.
     switch_to: Optional[str] = None
+    #: The TARGET session id of an ``attach`` tap (P11 T2) — the discovered session to adopt.
+    #: ``None`` for every other kind; for an ``attach`` the ``tool_use_id`` field is unused
+    #: (set to a sentinel) and this carries the session id the bot hands to ``attach_session``.
+    attach_session_id: Optional[str] = None
 
 
 def _check_limit(data: str) -> str:
@@ -290,6 +305,34 @@ def encode_switch_callback(name: str) -> str:
     if _SEP in name:
         raise ValueError(f"project name may not contain {_SEP!r}: {name!r}")
     return _check_limit(f"{KIND_SWITCH}{_SEP}{name}{_SEP}{SWITCH_PAYLOAD}")
+
+
+#: Fixed payload char for an ``attach`` callback (the kind + the session id carry the meaning).
+#: 'x' for attach (avoiding 's', which is the switch payload — keeps the two visually distinct).
+ATTACH_PAYLOAD = "x"
+
+#: A discovered session id's lexical shape for the ATTACH callback trust boundary (P11 T2). A
+#: Claude session id is a UUID, but we accept the broader ``[A-Za-z0-9-]{1,48}`` (hex + hyphens,
+#: bounded) so the decode rejects a forged/over-long/separator-bearing id BEFORE it reaches
+#: discovery — without hard-coding the exact UUID grouping (defensive, not a parser). It can
+#: never contain ``|`` (the 3-field split already rejects that); the bound keeps the whole
+#: ``t|<id>|x`` under the 64-byte budget.
+_ATTACH_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,48}$")
+
+
+def encode_attach_callback(session_id: str) -> str:
+    """Encode an ``[Attach]`` tap into <=64-byte ``callback_data`` (P11 T2).
+
+    The attach kind carries the TARGET SESSION ID in the middle field (``t|<session-id>|x``).
+    A Claude session id is a 36-char UUID, so the whole string is ~40 B (well under 64).
+    Round-trips with :func:`decode_callback`. Raises ``ValueError`` on an empty id, one that
+    (defensively) contains the ``|`` separator, or one that overflows the byte budget.
+    """
+    if not session_id:
+        raise ValueError("session id is required for an attach callback")
+    if _SEP in session_id:
+        raise ValueError(f"session id may not contain {_SEP!r}: {session_id!r}")
+    return _check_limit(f"{KIND_ATTACH}{_SEP}{session_id}{_SEP}{ATTACH_PAYLOAD}")
 
 
 def encode_callback(
@@ -409,6 +452,19 @@ def decode_callback(data: object) -> Optional[Callback]:
         # The id field is unused for a switch (the name rides ``switch_to``); keep a sentinel
         # so the dataclass invariant (non-empty ``tool_use_id``) holds.
         return Callback(kind="switch", tool_use_id="-", switch_to=tool_use_id)
+    if kind == KIND_ATTACH:
+        # ``t|<session-id>|x`` — the middle field is the TARGET SESSION ID (not a tool id).
+        # Defensive (P11 T2 / SB1-RB1): the payload must be the fixed attach char and the id
+        # must look like a session id (^[A-Za-z0-9-]{1,48}$) — anything else is a forged/stale
+        # tap → ignorable (None). The 3-field split already rejected a ``|`` in the id. The bot
+        # still applies the SB1 _authorized recheck on the chat before acting on the decode.
+        if payload != ATTACH_PAYLOAD:
+            return None
+        if not _ATTACH_ID_RE.match(tool_use_id):
+            return None
+        # The id field is unused for an attach (the session id rides ``attach_session_id``);
+        # keep a sentinel so the dataclass invariant (non-empty ``tool_use_id``) holds.
+        return Callback(kind="attach", tool_use_id="-", attach_session_id=tool_use_id)
     return None
 
 
@@ -1124,6 +1180,55 @@ def sessions_listing(
 #: machine with no Claude sessions (RB1: ``/sessions`` always replies this clean line rather
 #: than crashing or sending an empty message).
 SESSIONS_EMPTY_NOTICE: Final = "🖥️ No Claude sessions found on this machine."
+
+#: Cap on the number of ``[Attach]`` buttons on a ``/sessions`` listing (P11 T2). Telegram
+#: caps an inline keyboard at 100 buttons, and a phone listing with dozens of one-tap rows is
+#: noise; the first N (in discovery order — most-recent first by the SDK) cover the common
+#: case, and the operator can always ``/attach <id>`` for one past the cap (the id is on the
+#: row). Keeping it small also keeps the message+keyboard well within Telegram's limits.
+_SESSIONS_ATTACH_BUTTON_CAP = 8
+
+
+def sessions_keyboard(
+    sessions: Iterable[object], *, cap: int = _SESSIONS_ATTACH_BUTTON_CAP
+) -> Optional[InlineKeyboardMarkup]:
+    """Build the ``[📎 Attach <shortid>]`` button column for a ``/sessions`` listing (P11 T2).
+
+    One button per discovered session (up to ``cap``), each carrying the compact attach
+    encoding (:func:`encode_attach_callback` → ``t|<session-id>|x``): a tap routes through
+    :func:`decode_callback` → the bot's ``on_callback`` (SB1-gated by ``_authorized`` there) →
+    :meth:`~claude_tg.stream_session.StreamingSession.attach_session` (which does the SB2 cwd
+    check + fork-vs-continue). The button *text* shows the SHORT id (what the row shows) so the
+    operator can match button↔row; the *callback_data* carries the FULL id compactly.
+
+    Returns ``None`` when there are no sessions (the listing then has no keyboard) OR when an id
+    is unusable — a session with a missing/odd id, or one whose id overflows the callback budget
+    (defensive: :func:`encode_attach_callback` raises, which we swallow per-row so one bad id
+    never sinks the whole keyboard, RB1). The bot attaches the returned markup to the listing
+    message; with ``None`` it sends the listing alone (the typed ``/attach <id>`` still works).
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in sessions:
+        if len(rows) >= cap:
+            break
+        sid = getattr(s, "session_id", None)
+        if not sid:
+            continue
+        try:
+            data = encode_attach_callback(str(sid))
+        except ValueError:
+            # An id that won't fit the compact scheme (defensive) — skip its button; the row
+            # still lists the id for a typed /attach. One bad id never drops the keyboard.
+            continue
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"📎 Attach {short_session_id(sid)}",
+                    callback_data=data,
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 # ---------------------------------------------------------------------------
@@ -1996,6 +2101,7 @@ __all__ = [
     "open_project_keyboard",
     "encode_callback",
     "encode_switch_callback",
+    "encode_attach_callback",
     "decode_callback",
     "Callback",
     "answers_from_ask",
@@ -2007,7 +2113,9 @@ __all__ = [
     "KIND_PLAN",
     "KIND_PERMISSION",
     "KIND_SWITCH",
+    "KIND_ATTACH",
     "SWITCH_PAYLOAD",
+    "ATTACH_PAYLOAD",
     "PERMISSION_ONCE",
     "PERMISSION_SESSION",
     "PERMISSION_DENY",
@@ -2030,8 +2138,9 @@ __all__ = [
     # per-project status labels for /projects (D7)
     "ProjectStatus",
     "project_status_label",
-    # /sessions listing (P11 T1)
+    # /sessions listing (P11 T1) + attach keyboard (P11 T2)
     "sessions_listing",
+    "sessions_keyboard",
     "ProjectMark",
     "short_session_id",
     "relative_age",
