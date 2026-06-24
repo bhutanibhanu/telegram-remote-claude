@@ -466,6 +466,49 @@ class JsonSessionStore:
         except (TypeError, ValueError):
             return 0.0
 
+    def set_fork_pending(self, chat_id: int, name: str, pending: bool) -> None:
+        """Set/clear the **persisted** ``fork_pending`` marker on a project (P11 T2 / B2+B3).
+
+        An ADOPTED session (``/attach``) is pinned to a base ``session_id`` it may NOT continue
+        in place if that session is live elsewhere — it must FORK. The fork-vs-continue decision
+        is re-derived from a FRESH liveness probe at the moment of the first write
+        (``StreamingSession._ensure_engine``), and ``fork_pending`` is the DURABLE "this is an
+        adopted-not-yet-resumed session — re-probe before the first resume" marker that survives
+        a restart (the in-memory ``attach_fork`` does not). ``True`` on adopt; **cleared
+        (``False``) after the first successful turn** so subsequent resumes are ordinary
+        continues (never re-fork). A non-bool value is normalized; when clearing, the field is
+        removed entirely (a clean record). Atomic + ``0600`` (RB6). Targets a NAMED project
+        (case-insensitive, like :meth:`set_session_id`) — the active project can move mid-turn.
+        Raises :class:`UnknownProject` if no such project exists. Persists.
+        """
+        raw = self._load_raw()
+        _chat, projects, key = self._resolve(raw, chat_id, name)
+        record = projects[key]
+        if not isinstance(record, dict):
+            raise UnknownProject(name)
+        if pending:
+            record["fork_pending"] = True
+        else:
+            record.pop("fork_pending", None)
+        record["last_active"] = _now()
+        self._save_raw(raw)
+
+    def get_fork_pending(self, chat_id: int, name: str) -> bool:
+        """Whether the named project is an adopted-not-yet-resumed session (P11 T2 / B2+B3).
+
+        Read-only (never raises): an unknown project or a missing/non-truthy ``fork_pending``
+        field reads as ``False`` (RB1 — not an adopted-pending project, so an ordinary
+        continue). ``StreamingSession._ensure_engine`` reads this BEFORE the first resume of an
+        adopted session: when ``True`` it RE-PROBES the base id's current liveness and forks on
+        live-or-uncertain (never co-driving), then clears it after the first successful turn.
+        Survives a restart (it is persisted), so a restart before the first turn re-decides from
+        a fresh probe instead of co-driving a stale-in-memory continue.
+        """
+        record = self.get_project(chat_id, name)
+        if not isinstance(record, dict):
+            return False
+        return bool(record.get("fork_pending"))
+
     # ---- macros (per-chat prompt templates — T5 / P9) ----------------------
 
     def save_macro(self, chat_id: int, name: str, body: str) -> None:

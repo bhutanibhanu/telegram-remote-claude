@@ -760,3 +760,39 @@ def test_macros_independent_of_projects(tmp_path):
     assert store.get_project(1, "alpha") is not None
     assert store.get_macro(1, "alpha") == "a macro named the same as a project"
     assert "alpha" in store.list_projects(1)
+
+
+# ---- fork_pending marker (P11 T2 / B2+B3 — persisted adopt-not-yet-resumed) ----------------
+
+
+def test_fork_pending_set_get_clear_roundtrip(tmp_path):
+    """set_fork_pending persists the marker; get_fork_pending reads it; clearing removes it."""
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.create(1, "adopted", "/work/x", make_active=True)
+    assert store.get_fork_pending(1, "adopted") is False  # default: not pending
+    store.set_fork_pending(1, "adopted", True)
+    assert store.get_fork_pending(1, "adopted") is True
+    # Survives a fresh store instance over the SAME file (persisted — the B2 restart property).
+    assert JsonSessionStore(tmp_path / "s.json").get_fork_pending(1, "adopted") is True
+    store.set_fork_pending(1, "adopted", False)
+    assert store.get_fork_pending(1, "adopted") is False
+    # Cleared field is removed entirely (clean record), not left as False.
+    assert "fork_pending" not in store.get_project(1, "adopted")
+
+
+def test_fork_pending_case_insensitive_and_unknown_raises(tmp_path):
+    """set targets a named project case-insensitively (like set_session_id); unknown → raises."""
+    store = JsonSessionStore(tmp_path / "s.json")
+    store.create(1, "Work", "/work", make_active=True)
+    store.set_fork_pending(1, "work", True)  # case-insensitive match
+    assert store.get_fork_pending(1, "WORK") is True
+    with pytest.raises(UnknownProject):
+        store.set_fork_pending(1, "nope", True)
+
+
+def test_get_fork_pending_unknown_project_is_false(tmp_path):
+    """get_fork_pending on an unknown project / chat reads False (RB1 — ordinary continue)."""
+    store = JsonSessionStore(tmp_path / "s.json")
+    assert store.get_fork_pending(1, "nope") is False
+    store.create(1, "p", "/w", make_active=True)
+    assert store.get_fork_pending(2, "p") is False  # wrong chat

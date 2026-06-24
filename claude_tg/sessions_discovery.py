@@ -317,7 +317,7 @@ _PROC_ID_RE = re.compile(r"--(?:resume|session-id)[=\s]+(\S+)")
 
 
 def scan_claude_processes(
-    *, runner: Optional[Callable[[], str]] = None
+    *, runner: Optional[Callable[[], str]] = None, degraded: Optional[list[bool]] = None
 ) -> list[_ProcInfo]:
     """Return the live ``claude`` processes seen by ``ps`` (RB1 — ``[]`` on any failure).
 
@@ -328,11 +328,21 @@ def scan_claude_processes(
     Claude tooling. The ``lstart`` field is a fixed 5-token date (``Wed Jun 24 06:33:31
     2026``); we split it off the front, the pid off the very front, and treat the remainder
     as the command. **Never raises:** a missing ``ps``, a non-zero exit, or a timeout → ``[]``.
+
+    **``degraded`` (P11 T2 / B1 — fork-on-doubt).** A real ``ps`` failure (missing binary,
+    non-zero exit, timeout, OSError) is swallowed to ``[]`` for the read-only listing, but
+    when a mutable ``degraded`` list is passed it ALSO appends ``True`` so the caller knows the
+    proc signal could not be gathered. Without this, a swallowed ``ps`` failure read as a
+    CONFIDENT "no proc signal", letting an adopt continue a possibly-live session in place.
+    A CLEANLY EMPTY ``ps`` (ran fine, no claude procs) does NOT degrade — that is a confident
+    negative.
     """
     try:
         raw = runner() if runner is not None else _default_ps()
-    except Exception:  # ps missing / timeout / OSError → no proc signal (RB1)
+    except Exception:  # ps missing / nonzero exit / timeout / OSError → no proc signal (RB1)
         log.debug("ps scan for claude processes failed", exc_info=True)
+        if degraded is not None:
+            degraded.append(True)  # B1: a swallowed real failure → liveness uncertain
         return []
 
     procs: list[_ProcInfo] = []
@@ -383,13 +393,21 @@ def _parse_lstart_epoch(started: str) -> Optional[float]:
 
 
 def _default_ps() -> str:
-    """Run the real ``ps`` and return stdout (the injectable boundary's default)."""
+    """Run the real ``ps`` and return stdout (the injectable boundary's default).
+
+    ``check=True`` so a NONZERO ``ps`` exit raises ``CalledProcessError`` (and ``timeout=5``
+    raises ``TimeoutExpired``) — both propagate to :func:`scan_claude_processes`'s ``except``,
+    which flags the liveness probe DEGRADED (B1). Previously ``check=False`` made a nonzero
+    ``ps`` look like a clean empty result, so a swallowed failure read as "confidently no proc
+    signal" — letting an adopt CONTINUE a possibly-live session. A real failure must degrade,
+    never silently read idle.
+    """
     result = subprocess.run(
         ["ps", "-axww", "-o", "pid=,lstart=,command="],
         capture_output=True,
         text=True,
         timeout=5,
-        check=False,
+        check=True,
     )
     return result.stdout or ""
 
@@ -414,7 +432,9 @@ def _is_ignorable_proc(command: str) -> bool:
     return any(marker in command for marker in _IGNORABLE_PROC_MARKERS)
 
 
-def read_process_registry(*, home: Optional[Path] = None) -> list[dict]:
+def read_process_registry(
+    *, home: Optional[Path] = None, degraded: Optional[list[bool]] = None
+) -> list[dict]:
     """Read every ``~/.claude/sessions/<pid>.json`` process-registry entry (RB1 → ``[]``).
 
     The CLI records a JSON file per live session process: ``{pid, sessionId, cwd, procStart,
@@ -423,12 +443,26 @@ def read_process_registry(*, home: Optional[Path] = None) -> list[dict]:
     when its argv has no ``--resume <id>`` (e.g. ``claude --continue``). **Never raises:** a
     missing dir, an unreadable / corrupt file → that entry is skipped; the worst case is
     ``[]``. (Reads metadata only — pid/cwd/sessionId — never transcript content, SB3.)
+
+    **``degraded`` (P11 T2 / B1 — fork-on-doubt).** When a mutable ``degraded`` list is passed,
+    an UNREADABLE/CORRUPT registry entry (a read/parse error) — or a non-not-found glob error —
+    appends ``True``: a live process's registry entry might exist but be unreadable, so the
+    registry signal could not be confidently gathered and an adopt must fork on doubt. A
+    MISSING ``sessions`` dir (``FileNotFoundError``/``NotADirectoryError`` from ``glob``) is a
+    CONFIDENT "no registry" (the common no-running-session case) and does NOT degrade; a
+    CLEANLY EMPTY dir does not either.
     """
     base = (home or claude_home()) / "sessions"
     out: list[dict] = []
     try:
         entries = list(base.glob("*.json"))
+    except (FileNotFoundError, NotADirectoryError):
+        # No registry dir at all — a confident "no registry signal" (never degraded).
+        return []
     except OSError:
+        # A real glob failure (permissions / I/O) — we could not read the registry at all.
+        if degraded is not None:
+            degraded.append(True)
         return []
     import json
 
@@ -436,6 +470,10 @@ def read_process_registry(*, home: Optional[Path] = None) -> list[dict]:
         try:
             data = json.loads(entry.read_text(encoding="utf-8"))
         except Exception:  # corrupt / unreadable single file → skip, keep going (RB1)
+            # B1: a live process's entry could be the unreadable one — flag uncertain so an
+            # adopt forks on doubt rather than trusting the remaining (possibly partial) view.
+            if degraded is not None:
+                degraded.append(True)
             continue
         if not isinstance(data, dict):
             continue
@@ -623,20 +661,30 @@ class SessionDiscovery:
             log.warning("session lister failed; returning no sessions", exc_info=True)
             return []
         # P11 T2 (fork-on-doubt): a SCAN failure degrades liveness for EVERY session this call
-        # (signals 2+3 are gathered once, here). Record it so attach forks on doubt rather than
-        # trusting a negative computed with no proc/registry data. /sessions display ignores it.
-        scan_degraded = False
+        # (signals 2+3 are gathered once, here). Two ways a scan can fail: the callable RAISES
+        # (caught here) OR it swallows a real failure INTERNALLY and signals via the ``degraded``
+        # sink (B1 — ps nonzero/timeout, an unreadable/corrupt registry entry). We OR both so a
+        # swallowed failure no longer reads as a confident negative. /sessions display ignores it.
+        scan_sink: list[bool] = []
         try:
-            procs = self.proc_scan() or []
+            procs = _call_scan(self.proc_scan, scan_sink) or []
         except Exception:
             procs = []
-            scan_degraded = True
+            scan_sink.append(True)
         try:
-            registry = self.registry() or []
+            registry = _call_scan(self.registry, scan_sink) or []
         except Exception:
             registry = []
-            scan_degraded = True
+            scan_sink.append(True)
+        scan_degraded = bool(scan_sink)
         now = _safe_now(self.clock)
+
+        # Dedupe the raw sessions by session_id BEFORE probing (the SDK may return duplicate
+        # ids; the bot-project merge in render dedupes its own overlay but not SDK-internal
+        # dups). Keep the FIRST occurrence (the SDK orders most-recent-first), which is the
+        # most-recent / most-complete; a later dup for the same id is dropped so a session
+        # appears exactly once in the listing AND attach resolves an id to one cwd.
+        raw = _dedupe_by_session_id(raw)
 
         out: list[DiscoveredSession] = []
         for rs in raw:
@@ -664,6 +712,93 @@ class SessionDiscovery:
                 )
             )
         return out
+
+    def probe_one(self, session_id: str, cwd: Optional[str]) -> tuple[bool, bool]:
+        """Re-probe ONE ``(session_id, cwd)``'s CURRENT liveness → ``(running, degraded)`` (P11 T2).
+
+        The single-session probe the adopt path calls at the **first write** (in
+        ``StreamingSession._ensure_engine``) to re-derive the fork-vs-continue decision from a
+        FRESH probe — closing the restart gap (B2: the in-memory intent is gone but a re-probe
+        re-decides) and the attach→first-write race (B3: an idle-at-attach session that has
+        since gone live is caught here). Runs the SAME composite signals as :meth:`discover`
+        (transcript mtime + ``ps`` argv + the validated process registry) against a FRESH
+        ``proc_scan`` / ``registry`` snapshot:
+
+        * ``running`` — ``True`` if any signal fires (the live HINT);
+        * ``degraded`` — ``True`` if a signal could not be CONFIDENTLY gathered (a scan
+          raised OR swallowed a real failure via its sink, or the per-session mtime stat
+          errored, or the whole probe raised). **Never raises (RB1):** any unexpected error
+          degrades to ``(False, True)`` — uncertain — so the caller forks on doubt.
+
+        The caller's rule is identical to attach: **fork on ``running or degraded``; continue
+        only on a confident idle (``not running and not degraded``).**
+        """
+        if not session_id:
+            # No id to probe — can't confirm idle, so report uncertain (caller forks on doubt).
+            return False, True
+        sink: list[bool] = []
+        try:
+            try:
+                procs = _call_scan(self.proc_scan, sink) or []
+            except Exception:
+                procs = []
+                sink.append(True)
+            try:
+                registry = _call_scan(self.registry, sink) or []
+            except Exception:
+                registry = []
+                sink.append(True)
+            now = _safe_now(self.clock)
+            rs = _RawSession(session_id=session_id, cwd=cwd, title=None, last_modified=None)
+            running = probe_liveness(
+                rs, procs=procs, registry=registry, now=now, home=self.home, degraded=sink
+            )
+            return bool(running), bool(sink)
+        except Exception:  # RB1: any unexpected hiccup → uncertain (fork on doubt), never raise.
+            log.debug("probe_one failed for a session; reporting uncertain", exc_info=True)
+            return False, True
+
+
+def _call_scan(seam: Callable[..., list], degraded: list[bool]) -> list:
+    """Call a proc/registry seam, threading the ``degraded`` sink when it accepts one (B1).
+
+    The default seams (:func:`scan_claude_processes` / :func:`read_process_registry`) take a
+    ``degraded`` keyword and signal a SWALLOWED real failure through it; an INJECTED test/legacy
+    seam may be a bare zero-arg callable. We try the keyword first and fall back to a bare call
+    on ``TypeError`` so both shapes work — a seam that can't report degradation simply never
+    does (its only failure mode is raising, which the caller already catches). Never swallows a
+    genuine error from the seam body — only the "unexpected kwarg" ``TypeError`` falls back.
+    """
+    try:
+        return seam(degraded=degraded)
+    except TypeError as exc:
+        # Distinguish "seam doesn't accept degraded=" (fall back) from a TypeError raised
+        # INSIDE the seam (must propagate to the caller's degraded-on-raise handler). The
+        # unexpected-kwarg TypeError names the parameter; anything else re-raises.
+        if "degraded" in str(exc):
+            return seam()
+        raise
+
+
+def _dedupe_by_session_id(raw: list[_RawSession]) -> list[_RawSession]:
+    """Drop duplicate-``session_id`` raw sessions, keeping the FIRST occurrence (P11 dedupe).
+
+    The SDK lister may return more than one record for the same ``session_id`` (an internal
+    duplicate); the render layer's bot-project merge dedupes its own overlay but not these. We
+    keep the first (the SDK orders most-recent-first, so the first is the most-recent / most-
+    complete) and drop later dups, preserving order otherwise. A record with no id is kept as-is
+    (it is already skipped downstream — the listing/probe handle an empty id). Pure; no I/O.
+    """
+    seen: set[str] = set()
+    out: list[_RawSession] = []
+    for rs in raw:
+        sid = rs.session_id
+        if sid:
+            if sid in seen:
+                continue
+            seen.add(sid)
+        out.append(rs)
+    return out
 
 
 def _safe_now(clock: Callable[[], float]) -> float:

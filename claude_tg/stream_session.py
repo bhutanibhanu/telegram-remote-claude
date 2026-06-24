@@ -118,7 +118,7 @@ from .session_store import (
     DuplicateProject,
     InvalidProjectName,
 )
-from .sessions_discovery import DiscoveredSession, discover_sessions
+from .sessions_discovery import DiscoveredSession, SessionDiscovery, discover_sessions
 from .util import _redact_sid, _redact_sid_in_text
 
 log = logging.getLogger(__name__)
@@ -621,6 +621,7 @@ class StreamingSession:
         chat_send_interval: Optional[float] = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         discover: Callable[[], list[DiscoveredSession]] = discover_sessions,
+        probe_one: Optional[Callable[[str, Optional[str]], tuple[bool, bool]]] = None,
     ) -> None:
         self.config = config
         self.store = session_store
@@ -630,6 +631,15 @@ class StreamingSession:
         # (already RB1-total). ``attach_session`` looks the target id up here to learn its cwd
         # (for the SB2 check) and its composite liveness (which gates fork-vs-continue).
         self._discover = discover
+        # P11 T2 (B2+B3): the SINGLE-SESSION liveness re-probe seam, called at the FIRST WRITE
+        # of an adopted (fork_pending) session to re-derive fork-vs-continue from a FRESH probe
+        # → ``(running, degraded)``. Injected so the restart + race tests feed a deterministic
+        # verdict; defaults to a fresh real :meth:`SessionDiscovery.probe_one` (its own ps /
+        # registry / mtime snapshot). _ensure_engine forks on ``running or degraded`` (never
+        # co-driving) and continues only on a confident idle.
+        self._probe_one: Callable[[str, Optional[str]], tuple[bool, bool]] = (
+            probe_one if probe_one is not None else SessionDiscovery().probe_one
+        )
         # P6/C2 (SB2): bind the live config's path-confinement context into the DEFAULT
         # factory so the production engine confines the SDK's file/search tools to
         # allowed_roots (an out-of-root tool call is held for approval — see
@@ -1383,11 +1393,29 @@ class StreamingSession:
         engine = self._build_engine(rt.cwd, rt.policy, model)
         rt.engine = engine
         resume_id = self._resume_id(chat_id, name)
-        # P11 T2 (attach-fork): adopt a LIVE-elsewhere session by FORKING its first resume (a
-        # fresh id, transcript copied) so we never co-write the live ``(id, cwd)`` transcript.
-        # Only the FIRST resume after the attach forks; once it succeeds the runtime owns a
-        # brand-new id and the flag is cleared (every later resume is an ordinary continue).
-        fork = rt.attach_fork
+        # ⭐ P11 T2 (B2+B3) — the BINDING fork-vs-continue decision, made HERE at the first
+        # write from a FRESH liveness re-probe (not frozen at attach time). When this project
+        # is an ADOPTED-not-yet-resumed session (the PERSISTED ``fork_pending`` marker — which
+        # survives a restart, unlike the in-memory runtime), RE-PROBE the base id's CURRENT
+        # liveness and FORK on live-OR-uncertain; CONTINUE only on a confident idle. This
+        # closes:
+        #   * B2 (restart before first turn): the in-memory intent is gone but the persisted
+        #     marker triggers a re-probe, so a restart re-decides instead of co-driving.
+        #   * B3 (attach→first-write race): an idle-at-attach session that has since gone live
+        #     is caught by the re-probe NOW, at the moment of the write — never co-driven.
+        # The fork forks the FIRST resume only; ``fork_pending`` is cleared (persisted) after
+        # the first successful turn (in _drive_turn) and on the resume-failure rebuild below.
+        fork = False
+        fork_pending = bool(resume_id) and self._fork_pending(chat_id, name)
+        if fork_pending:
+            assert resume_id is not None  # guarded by ``bool(resume_id) and`` above
+            running, degraded = self._reprobe_liveness(resume_id, rt.cwd)
+            fork = running or degraded  # fork on doubt — never co-drive a possibly-live session
+            log.info(
+                "attach first-write re-probe for chat %s project %s: running=%s degraded=%s "
+                "→ fork=%s",
+                chat_id, name, running, degraded, fork,
+            )
         resume_failed = False
         if resume_id:
             try:
@@ -1447,20 +1475,24 @@ class StreamingSession:
                 resume_failed = True
                 # P11 T2: the (possibly forked) resume failed and we recovered onto a FRESH
                 # session whose dead id was cleared — there is no longer a base id to fork
-                # from, so clear the fork flag (the next resume of THIS project is a plain
-                # continue of the fresh id).
+                # from, so clear BOTH the in-memory hint AND the PERSISTED fork_pending marker
+                # (the next resume of THIS project is a plain continue of the fresh id). This
+                # matches the existing attach_fork-clearing on the resume-failure rebuild path.
                 rt.attach_fork = False
+                self._clear_fork_pending(chat_id, name)
             else:
                 # Resume CONNECTED. It is not yet CONFIRMED good — a stale/aged/torn
                 # session can connect and then error on the first turn (B3). Mark the
                 # runtime so _drive_turn applies the resume-failure heuristic to this
                 # first turn only (cleared once a turn completes clean — QF3/RB3).
                 rt.resumed_unverified = True
-                # P11 T2: the fork-or-continue resume connected — the runtime now owns its
-                # session (a forked id is brand-new + ours alone; a continued id was idle).
-                # Clear the fork flag so every SUBSEQUENT resume of this project is an
-                # ordinary continue and never re-forks (a fork captures the id on the first
-                # turn's result, which _drive_turn then persists via _persist).
+                # P11 T2: the fork-or-continue resume CONNECTED — clear the in-memory hint so a
+                # subsequent resume WITHIN THIS PROCESS continues. But DO NOT clear the PERSISTED
+                # ``fork_pending`` yet: the turn has not completed, and a restart between connect
+                # and a successful turn must STILL re-probe (a forked id is captured + persisted
+                # only when the first turn's result lands — until then the persisted id is still
+                # the base id). _drive_turn clears the persisted marker after the first
+                # SUCCESSFUL turn (by which point the forked/continued id is persisted + ours).
                 rt.attach_fork = False
         else:
             await engine.start()
@@ -1498,6 +1530,55 @@ class StreamingSession:
         record = self.store.get_project(chat_id, name)
         session_id = (record or {}).get("session_id")
         return session_id if isinstance(session_id, str) and session_id else None
+
+    def _fork_pending(self, chat_id: int, name: str) -> bool:
+        """Whether ``name`` is an adopted-not-yet-resumed session (persisted marker, B2+B3).
+
+        Read-only (RB1): no store, or a missing/false marker → ``False`` (an ordinary
+        continue). ``_ensure_engine`` reads this to decide whether to RE-PROBE the base id's
+        liveness at the first write (forking on doubt). Survives a restart (it is persisted),
+        so a restart before the first turn re-probes instead of co-driving a stale continue.
+        """
+        if self.store is None:
+            return False
+        try:
+            return bool(self.store.get_fork_pending(chat_id, name))
+        except Exception:  # a misbehaving store must not crash the turn (RB1)
+            log.debug("get_fork_pending failed for chat %s project %s", chat_id, name, exc_info=True)
+            return False
+
+    def _clear_fork_pending(self, chat_id: int, name: str) -> None:
+        """Clear the PERSISTED ``fork_pending`` marker (B2+B3); swallow any store error (RB1).
+
+        Called after the first SUCCESSFUL turn of an adopted session (the forked/continued id is
+        then persisted + ours alone, so subsequent resumes are ordinary continues) and on the
+        resume-failure rebuild path (a fresh session, no base to fork). Never crashes the turn
+        over a write — an :class:`~claude_tg.session_store.UnknownProject` (``/rm``'d mid-turn)
+        or any other store error is logged and ignored.
+        """
+        if self.store is None:
+            return
+        try:
+            self.store.set_fork_pending(chat_id, name, False)
+        except Exception:
+            log.debug("clear fork_pending failed for chat %s project %s", chat_id, name, exc_info=True)
+
+    def _reprobe_liveness(self, session_id: str, cwd: Optional[str]) -> tuple[bool, bool]:
+        """Re-probe a base id's CURRENT liveness at the first write → ``(running, degraded)``.
+
+        Delegates to the injected single-session probe seam (``self._probe_one`` →
+        :meth:`SessionDiscovery.probe_one` by default), which runs a FRESH composite liveness
+        check (its own ps / registry / mtime snapshot). **Never raises (RB1):** any unexpected
+        error degrades to ``(False, True)`` — uncertain — so :meth:`_ensure_engine` forks on
+        doubt rather than risk co-driving. The probe itself is already RB1-total; this is the
+        belt-and-braces wrapper at the call boundary.
+        """
+        try:
+            running, degraded = self._probe_one(session_id, cwd)
+            return bool(running), bool(degraded)
+        except Exception:  # RB1: a probe hiccup → uncertain (fork on doubt), never crash the turn
+            log.debug("first-write liveness re-probe failed; treating as uncertain", exc_info=True)
+            return False, True
 
     # -- attach: adopt ANY discovered Claude session as a project (P11 T2) ----
 
@@ -1629,17 +1710,6 @@ class StreamingSession:
         # Derive an SB4-valid, deduped project name from the session's title / cwd basename.
         name = self._attach_project_name(chat_id, discovered, sid)
 
-        # Rule 1 (with the SAFE-DEFAULT-ON-DOUBT hardening): fork iff the target is LIVE
-        # elsewhere OR its liveness could NOT be confidently determined (a probe sub-step
-        # raised — `liveness_degraded`). For a WRITE/adopt action the safe default when we
-        # can't tell is to FORK, never to continue the base id in place (which would
-        # co-drive + corrupt a possibly-live `(id, cwd)` transcript). A CONFIDENTLY-idle
-        # session (every signal ran, none fired, no error) continues the same id — nobody
-        # else is writing it. ``live_elsewhere`` vs ``uncertain`` only changes the wording.
-        live_elsewhere = bool(discovered.running)
-        uncertain = bool(discovered.liveness_degraded)
-        fork = live_elsewhere or uncertain
-
         try:
             self.store.create(chat_id, name, canonical_cwd, make_active=True)
         except (InvalidProjectName, DuplicateProject):
@@ -1656,45 +1726,41 @@ class StreamingSession:
                 )
         # Pin the discovered id onto the new (active) project so the next turn resumes it.
         self.store.set_session_id(chat_id, name, sid)
+        # ⭐ B2+B3: PERSIST the fork-pending marker so the BINDING fork-vs-continue decision is
+        # made at the FIRST WRITE, from a FRESH liveness re-probe — NOT frozen here at attach
+        # time. This survives a restart (the in-memory runtime is lost on restart, but the
+        # persisted base id + this marker are not), so a restart before the first turn re-probes
+        # and re-decides (closing B2's co-drive-after-restart). And because the re-probe runs at
+        # first write, an idle-at-attach session that has since gone live is caught then (B3).
+        # _ensure_engine reads this, re-probes, forks on live-or-uncertain, and clears it
+        # (persisted) after the first successful turn (never re-forking thereafter).
+        self.store.set_fork_pending(chat_id, name, True)
 
-        # Seed the in-memory runtime's fork flag from the liveness so the FIRST resume forks
-        # (rule 1). _runtime caches by name; this is a brand-new name, so it builds a fresh
-        # runtime at the canonical cwd whose attach_fork we set now. _ensure_engine reads it on
-        # the next turn's resume and clears it once the (forked or continued) resume connects.
+        # Build the runtime (fresh — brand-new name) and ALSO mirror the marker in memory so a
+        # turn within THIS process doesn't need a store round-trip; _ensure_engine consults the
+        # persisted marker as the source of truth (the in-memory one is just a fast-path /
+        # restart-survivable mirror). attach_fork stays for the in-process hint; the persisted
+        # fork_pending is authoritative.
         rt = self._runtime(chat_id, name, canonical_cwd)
-        rt.attach_fork = fork
+        rt.attach_fork = True  # adopted-pending; the actual fork-vs-continue is decided at write
 
+        # The attach-time liveness is only a PREVIEW hint for the message — NOT a promise (the
+        # binding decision is the first-write re-probe). Phrase honestly so we never over-promise
+        # an outcome that the re-probe could change between now and the first message.
         name_html = html.escape(name, quote=False)
-        if live_elsewhere:
-            # Rule 1 — TELL the operator we forked (and WHY): the session is active elsewhere,
-            # so we attached a fork rather than co-driving + corrupting the live transcript.
-            message = (
-                f"🔱 Attached <b>{name_html}</b> as a FORK — that session is active elsewhere, "
-                "so I copied its transcript into a fresh session instead of co-driving it (that "
-                "would corrupt the live one). Your next message drives the fork.\n"
-                f"{code_path(canonical_cwd)}"
-            )
-        elif uncertain:
-            # Safe-default-on-doubt: a probe sub-step errored, so we could NOT confirm it's
-            # idle. We fork rather than risk co-driving a possibly-live transcript — and tell
-            # the operator why (the safe, honest default for a write/adopt action).
-            message = (
-                f"🔱 Attached <b>{name_html}</b> as a FORK — I couldn't confirm that session is "
-                "idle (its liveness check failed), so I copied its transcript into a fresh "
-                "session rather than risk co-driving a live one. Your next message drives the "
-                f"fork.\n{code_path(canonical_cwd)}"
-            )
-        else:
-            message = (
-                f"✅ Attached <b>{name_html}</b> — your next message resumes + drives it.\n"
-                f"{code_path(canonical_cwd)}"
-            )
+        message = (
+            f"✅ Attached <b>{name_html}</b>. On your next message I'll resume it — forking "
+            "automatically if it's active elsewhere, so I never corrupt a live session.\n"
+            f"{code_path(canonical_cwd)}"
+        )
         return AttachOutcome(
             ok=True,
             message=message,
             parse_mode="HTML",
             project_name=name,
-            forked=fork,
+            # ``forked`` is not yet known (decided at first write); report False here and surface
+            # the ACTUAL outcome when the first turn starts. The bot relays only ``message``.
+            forked=False,
         )
 
     def _find_discovered(self, session_id: str) -> Optional[DiscoveredSession]:
@@ -2801,6 +2867,16 @@ class StreamingSession:
             elif turn_rt is not None:
                 # The first resumed turn completed without a resume failure → confirmed good.
                 turn_rt.resumed_unverified = False
+                # ⭐ P11 T2 (B2+B3): the first turn of an ADOPTED session completed cleanly, so
+                # the forked/continued id is now persisted (the result event's session_id landed
+                # via _persist) and is OURS alone — clear the PERSISTED fork_pending so every
+                # SUBSEQUENT resume of this project is an ordinary continue (never re-forking).
+                # Cleared HERE (after a clean turn), NOT at resume-connect, so a restart between
+                # connect and a successful turn STILL re-probes (the persisted id is still the
+                # base id until the turn's result lands). Best-effort (RB1) — never crash the
+                # turn's teardown over the write.
+                turn_rt.attach_fork = False
+                self._clear_fork_pending(chat_id, turn_name)
 
         # P6/H2/RB2: a transport/liveness driver_error on a VERIFIED session (a fresh start,
         # or a resume already confirmed good) leaves a dead/wedged SDK client behind — every

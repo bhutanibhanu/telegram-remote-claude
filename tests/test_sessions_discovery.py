@@ -421,3 +421,155 @@ def test_discover_sessions_real_is_total_and_typed():
     out = discover_sessions()
     assert isinstance(out, list)
     assert all(isinstance(s, DiscoveredSession) for s in out)
+
+
+# ===========================================================================
+# P11 T2 / B1 — degradation surfaced from INSIDE the scans (swallowed real failures),
+# the single-session re-probe (probe_one), and the SDK-internal dedupe-by-id.
+# ===========================================================================
+
+import functools  # noqa: E402
+
+from claude_tg.sessions_discovery import read_process_registry  # noqa: E402
+
+
+def test_scan_claude_processes_swallowed_failure_flags_degraded():
+    """B1: a real ``ps`` failure is swallowed to ``[]`` for the listing, but the ``degraded``
+    sink is flagged so the caller knows the proc signal could not be gathered. A CLEAN run
+    (ran fine, no claude procs) does NOT flag it (confident negative)."""
+    # A runner that raises (ps missing / nonzero / timeout) → [] AND degraded flagged.
+    sink: list[bool] = []
+    assert scan_claude_processes(runner=lambda: (_ for _ in ()).throw(RuntimeError("ps boom")),
+                                 degraded=sink) == []
+    assert sink == [True]
+    # A clean empty ps (no claude procs) → [] and NOT degraded.
+    sink2: list[bool] = []
+    assert scan_claude_processes(runner=lambda: "", degraded=sink2) == []
+    assert sink2 == []
+
+
+def test_read_process_registry_corrupt_entry_flags_degraded(tmp_path):
+    """B1: a corrupt/unreadable registry entry is skipped for the listing, but flags the
+    ``degraded`` sink (a live process's entry might be the unreadable one). A MISSING dir or a
+    cleanly-parsed dir does NOT flag it."""
+    home = tmp_path / ".claude"
+    sessions = home / "sessions"
+    sessions.mkdir(parents=True)
+    # One valid entry + one corrupt (non-JSON) entry.
+    (sessions / "111.json").write_text('{"sessionId": "s-ok", "pid": 111}')
+    (sessions / "222.json").write_text("{ this is not json ")
+    sink: list[bool] = []
+    out = read_process_registry(home=home, degraded=sink)
+    assert any(d.get("sessionId") == "s-ok" for d in out)  # the valid one is returned
+    assert sink == [True]  # the corrupt one degraded the signal
+
+    # A MISSING sessions dir → [] and NOT degraded (confident "no registry").
+    sink2: list[bool] = []
+    assert read_process_registry(home=tmp_path / "no-such", degraded=sink2) == []
+    assert sink2 == []
+
+
+def test_discover_swallowed_scan_failure_is_degraded(tmp_path):
+    """⭐ B1 end-to-end: with the PRODUCTION-shaped seams (scan_claude_processes /
+    read_process_registry, which accept ``degraded=``) a swallowed ``ps`` failure makes every
+    session ``liveness_degraded=True`` even though ``discover``'s own try/except never fired
+    (the callable returned ``[]`` rather than raising). This is the path the Codex blocker hit:
+    before B1 the swallowed failure read as a CONFIDENT negative → attach co-drove on doubt."""
+    sessions = [_raw(session_id="s", cwd="/c")]
+    # proc_scan is the REAL scan with a runner that raises internally (swallowed → [] + sink).
+    disc = SessionDiscovery(
+        lister=lambda: sessions,
+        proc_scan=functools.partial(
+            scan_claude_processes, runner=lambda: (_ for _ in ()).throw(RuntimeError("ps boom"))
+        ),
+        registry=lambda: [],
+        clock=lambda: 1e12,
+        home=tmp_path,
+    )
+    out = disc.discover()
+    assert out[0].running is False
+    assert out[0].liveness_degraded is True  # B1: the swallowed ps failure surfaced
+
+
+def test_probe_one_running_idle_uncertain(tmp_path):
+    """probe_one re-runs the composite signals for ONE (id, cwd) → (running, degraded):
+    a matching live ``ps`` proc → running; a clean empty scan → confidently idle; a swallowed
+    scan failure → uncertain (degraded)."""
+    # 1) A ps proc bound to the id → running, not degraded.
+    procs_str = f"{1} {_START_STR} claude --resume sess-x"
+    disc_live = SessionDiscovery(
+        lister=lambda: [], proc_scan=lambda: scan_claude_processes(runner=lambda: procs_str),
+        registry=lambda: [], clock=lambda: 1e12, home=tmp_path,
+    )
+    assert disc_live.probe_one("sess-x", "/c") == (True, False)
+
+    # 2) A clean empty scan (no procs, no registry, no transcript) → confidently idle.
+    disc_idle = SessionDiscovery(
+        lister=lambda: [], proc_scan=lambda: [], registry=lambda: [],
+        clock=lambda: 1e12, home=tmp_path,
+    )
+    assert disc_idle.probe_one("sess-x", "/c") == (False, False)
+
+    # 3) A swallowed ps failure → uncertain (degraded True). Production-shaped partial.
+    disc_unc = SessionDiscovery(
+        lister=lambda: [],
+        proc_scan=functools.partial(
+            scan_claude_processes, runner=lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        ),
+        registry=lambda: [], clock=lambda: 1e12, home=tmp_path,
+    )
+    assert disc_unc.probe_one("sess-x", "/c") == (False, True)
+
+
+def test_probe_one_empty_id_is_uncertain():
+    """probe_one with no id can't confirm idle → uncertain (caller forks on doubt)."""
+    disc = SessionDiscovery(lister=lambda: [], proc_scan=lambda: [], registry=lambda: [], clock=lambda: 0.0)
+    assert disc.probe_one("", "/c") == (False, True)
+
+
+def test_discover_dedupes_by_session_id(tmp_path):
+    """The SDK may return duplicate session ids; discover dedupes by id, keeping the FIRST
+    (most-recent) occurrence so a session appears exactly once."""
+    sessions = [
+        _raw(session_id="dup", cwd="/c1", title="first"),
+        _raw(session_id="dup", cwd="/c2", title="second"),  # a later dup — dropped
+        _raw(session_id="other", cwd="/c3"),
+    ]
+    disc = SessionDiscovery(lister=lambda: sessions, proc_scan=lambda: [], registry=lambda: [],
+                            clock=lambda: 1e12, home=tmp_path)
+    out = disc.discover()
+    ids = [s.session_id for s in out]
+    assert ids == ["dup", "other"]  # one "dup" row (the first), order preserved
+    # The kept row is the FIRST occurrence (cwd /c1).
+    dup_row = next(s for s in out if s.session_id == "dup")
+    assert dup_row.cwd == "/c1"
+
+
+# ---- mutation probe (B1): ignoring the swallowed-failure signal -----------
+
+def test_mutation_probe_b1_swallowed_failure_must_degrade(tmp_path):
+    """MUTATION PROBE (B1) — a SWALLOWED scan failure MUST degrade liveness. INTACT: the
+    production-shaped seam's internal failure surfaces as ``liveness_degraded=True``. If
+    someone reverted the scans to swallow failures WITHOUT signalling (the pre-B1 behavior),
+    this would read ``liveness_degraded=False`` and FAIL — catching the regression that lets
+    attach co-drive a possibly-live session on the strength of a probe that silently failed.
+    The CLEAN-empty control proves it's not just always-degrading."""
+    sessions = [_raw(session_id="s", cwd="/c")]
+    # Swallowed failure → MUST degrade.
+    disc_fail = SessionDiscovery(
+        lister=lambda: sessions,
+        proc_scan=functools.partial(
+            scan_claude_processes, runner=lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        ),
+        registry=lambda: [], clock=lambda: 1e12, home=tmp_path,
+    )
+    assert disc_fail.discover()[0].liveness_degraded is True, \
+        "a swallowed scan failure MUST surface as degraded (the mutation under test)"
+    # Control: a CLEAN empty scan must NOT degrade (confident negative).
+    disc_clean = SessionDiscovery(
+        lister=lambda: sessions,
+        proc_scan=functools.partial(scan_claude_processes, runner=lambda: ""),
+        registry=lambda: [], clock=lambda: 1e12, home=tmp_path,
+    )
+    assert disc_clean.discover()[0].liveness_degraded is False, \
+        "a clean empty scan is a confident negative (not degraded)"
