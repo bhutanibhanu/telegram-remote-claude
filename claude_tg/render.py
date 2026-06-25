@@ -1525,6 +1525,111 @@ def code_path(path: object) -> str:
     return f"<code>{html.escape(str(path), quote=False)}</code>"
 
 
+# ---------------------------------------------------------------------------
+# STATUSLINE — the pinned, edited-in-place mobile statusline (T-SL-CORE / design §5)
+# ---------------------------------------------------------------------------
+
+#: Map a model **id** to its short statusline label by family. Each pattern is matched
+#: case-insensitively as a substring of the id (``claude-opus-4-8`` → ``opus``); the first
+#: hit wins. An id matching NONE of these falls back to the raw id (RB1 — an unrecognized /
+#: future model is shown verbatim rather than mislabelled or crashing). Order does not matter
+#: (the families are disjoint), but opus/sonnet/haiku are the only ids the routing ever sets
+#: (``/fast`` = haiku, ``/deep`` = opus, plus a custom ``CLAUDE_MODEL``).
+_MODEL_FAMILY_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("opus", "opus"),
+    ("sonnet", "sonnet"),
+    ("haiku", "haiku"),
+)
+
+#: The em dash shown for ``ctx`` when the percentage is unknown — NEVER a fabricated ``0%``
+#: (design §2.1: "an em dash, not a fake 0%"). A turn that has not yet produced a usage figure
+#: (no live client, no last ``ResultMessage.usage``) shows ``🧠 ctx —``.
+_CTX_UNKNOWN = "—"
+
+
+def model_short_label(model_id: object) -> str:
+    """Reduce a model **id** to its short statusline label (``opus``/``sonnet``/``haiku``).
+
+    A regex/substring match over the id by family (case-insensitive): ``claude-opus-4-8`` →
+    ``opus``, ``claude-haiku-4-5`` → ``haiku``, a sonnet id → ``sonnet``. An id matching NONE
+    of the known families (an unexpected / future / custom ``CLAUDE_MODEL``) falls back to the
+    **raw id** verbatim (RB1 — never mislabel, never crash). A ``None``/blank/odd value reads
+    as ``"default"`` — when no per-project override and no ``CLAUDE_MODEL`` is set the effective
+    model is the SDK default, so the statusline shows ``🤖 default`` (never a blank ``🤖``).
+    Pure; no I/O. The returned label is NOT HTML-escaped here — :func:`format_statusline`
+    escapes every interpolated field once (SB3).
+    """
+    if not model_id:
+        return "default"
+    raw = str(model_id).strip()
+    if not raw:
+        return "default"
+    low = raw.casefold()
+    for needle, label in _MODEL_FAMILY_PATTERNS:
+        if needle in low:
+            return label
+    return raw  # RB1: an unrecognized id is shown verbatim, never mislabelled.
+
+
+def format_statusline(
+    *,
+    worktree: str,
+    model_label: str,
+    effort: str | None,
+    ctx_pct: int | None,
+    mode: str,
+    working: bool,
+) -> str:
+    """Build the pinned mobile statusline body (pure; no I/O) — the owner-LOCKED format.
+
+    ::
+
+        📁 <worktree> · 🤖 <model>·<effort> · 🧠 ctx <X%> · 🔒 <mode>
+
+    with a leading ``⚙️ `` when ``working`` (a turn is running). Field rules (design §1/§5):
+
+    * ``effort=None`` → show just the model (``🤖 opus``), no ``·<effort>`` (a default-effort
+      turn never invents a level).
+    * ``ctx_pct=None`` → ``🧠 ctx —`` (an em dash — design §2.1 forbids a fabricated ``0%``;
+      a turn with no usage figure yet shows the dash, not a wrong number). An ``int`` →
+      ``🧠 ctx <X>%``.
+    * ``working=True`` → a leading ``⚙️ `` marker; ``False`` → none.
+
+    **SB3 (body-free + no path-as-fake-link).** Every interpolated value is bot-derived state,
+    not a body/secret, but is HTML-escaped here defensively (escape-once insurance, mirroring
+    ``cmd_status``) so a ``<``/``&`` in any field can never break the message or inject a tag.
+    The ``worktree`` is an SB4-validated project NAME (``^[A-Za-z0-9_-]{1,32}$``) which has no
+    ``/`` so it is inert — but if a path-SHAPED value (one containing ``/``) is ever passed, it
+    is wrapped via :func:`code_path` (``<code>…</code>``) so Telegram renders it as inert
+    monospace and its ``/segment`` runs do NOT linkify into fake command-links (the P8 fix).
+    The result is therefore valid HTML and MUST be sent with ``parse_mode="HTML"``.
+
+    Pure string; no I/O. ``model_label`` should already be the short label
+    (:func:`model_short_label`); ``effort``/``mode`` are fixed SDK/posture words.
+    """
+    # SB3: the worktree is normally an SB4-clean NAME (no slash). If it is ever path-shaped
+    # (contains a "/"), render it through code_path so its segments can't linkify into fake
+    # command-links (P8) and any odd character is escaped inside the <code> wrap. Otherwise
+    # escape-once as a plain field. Either branch yields valid, parse_mode="HTML" output.
+    if "/" in str(worktree):
+        wt = code_path(worktree)
+    else:
+        wt = _escape_html(str(worktree))
+    # SB3: every other field is a fixed word / a number, but escape-once defensively anyway.
+    # Belt-and-braces: an empty/blank model_label falls back to "default" so the bar never
+    # shows a bare "🤖 " (no model configured = the SDK default model).
+    model_part = _escape_html(str(model_label).strip() or "default")
+    if effort:
+        model_part = f"{model_part}·{_escape_html(str(effort))}"
+    ctx_part = _CTX_UNKNOWN if ctx_pct is None else f"{int(ctx_pct)}%"
+    ctx_part = _escape_html(ctx_part)  # the digits/dash are safe; escape-once for consistency.
+    mode_part = _escape_html(str(mode))
+    line = f"📁 {wt} · 🤖 {model_part} · 🧠 ctx {ctx_part} · 🔒 {mode_part}"
+    if working:
+        return f"⚙️ {line}"
+    return line
+
+
 def _chunk(text: str, limit: int = TELEGRAM_MAX) -> tuple[str, ...]:
     """Split to Telegram-safe UTF-16 chunks (reuses :func:`split_message`)."""
     return tuple(split_message(text, limit=limit))
@@ -1820,53 +1925,19 @@ def _render_error(event: ErrorEvent) -> RenderAction:
     return RenderAction(op="new", chunks=_chunk(body), verbatim=True)
 
 
-def done_footer_suffix(event: ResultEvent) -> str:
-    """The ``· N turns · $X.XX`` usage suffix for a done message (T3 / P9), or ``""``.
-
-    Surfaces the SDK-provided usage the engine already carries on a
-    :class:`~claude_tg.engine.types.ResultEvent` — ``num_turns`` + ``total_cost_usd`` —
-    which the per-turn done render previously dropped whenever there was ``result_text``.
-    Each field is included only WHEN the SDK provided it (``None`` → omitted gracefully —
-    oneshot / a partial result may carry neither), so:
-
-    * both present → ``" · 3 turns · $0.01"``
-    * only turns   → ``" · 3 turns"``
-    * neither      → ``""`` (no suffix at all — never a dangling separator).
-
-    The leading ``" · "`` lets a caller append it straight onto a done line / the last
-    prose chunk. The cost is rendered to cents (``$X.XX``) per the design; **no secret is
-    in this line** (SB3 — it is two numbers the SDK reported, never tool input/output).
-    Pure string; no I/O.
-    """
-    bits: list[str] = []
-    if event.num_turns is not None:
-        # Pluralize: "1 turn" (singular) vs "N turns" — never the ungrammatical "1 turns".
-        unit = "turn" if event.num_turns == 1 else "turns"
-        bits.append(f"{event.num_turns} {unit}")
-    if event.total_cost_usd is not None:
-        bits.append(f"${event.total_cost_usd:.2f}")
-    if not bits:
-        return ""
-    return " · " + " · ".join(bits)
-
-
 def _render_result(event: ResultEvent) -> RenderAction:
     # Terminal per-turn frame. The result_text (if any) is the final answer — it is
     # Claude-authored CommonMark, so render it as Telegram HTML (with a raw fallback);
-    # otherwise a compact, bot-generated status footer stays plain text.
+    # otherwise a compact, bot-generated done line stays plain text.
     #
-    # T3 (P9): surface the SDK-provided usage (num_turns + total_cost_usd) the done frame
-    # used to drop whenever there was result_text. The ``· N turns · $X.XX`` suffix
-    # (done_footer_suffix; "" when the SDK gave neither — oneshot may not) is appended to
-    # the LAST prose chunk so the answer ends with a compact, secret-free usage line. The
-    # suffix is plain bot scaffolding (digits + glyph) so it is HTML-safe to append onto the
-    # converted HTML chunk; the parallel plain fallback gets it too (positionally parallel).
+    # STATUSLINE T-SL-WIRE (design §1/§3.3): NO dollar amounts in routine output. The
+    # per-turn ``· N turns · $X.XX`` footer is GONE — the pinned statusline is now the
+    # persistent "state after the turn" surface (worktree · model · ctx % · mode), and the
+    # turn's cumulative cost survives ONLY on the explicit ``/status`` health view
+    # (``bot.cmd_status`` reads ``store.get_cost`` directly — untouched here). So the result
+    # render is the answer prose alone, or a bare ``✅ done (<subtype>)`` when there is none.
     if event.result_text:
         html_chunks, plain = _html_chunks(event.result_text)
-        suffix = done_footer_suffix(event)
-        if suffix and html_chunks:
-            html_chunks = (*html_chunks[:-1], html_chunks[-1] + suffix)
-            plain = (*plain[:-1], plain[-1] + suffix)
         return RenderAction(
             op="new",
             chunks=html_chunks,
@@ -1874,7 +1945,7 @@ def _render_result(event: ResultEvent) -> RenderAction:
             parse_mode="HTML",
             verbatim=True,
         )
-    body = f"✅ done ({event.subtype})" + done_footer_suffix(event)
+    body = f"✅ done ({event.subtype})"
     return RenderAction(op="new", chunks=_chunk(body), verbatim=True)
 
 
@@ -2500,6 +2571,9 @@ __all__ = [
     # per-project status labels for /projects (D7)
     "ProjectStatus",
     "project_status_label",
+    # pinned mobile statusline (STATUSLINE T-SL-CORE)
+    "format_statusline",
+    "model_short_label",
     # /sessions listing (P11 T1) + attach keyboard (P11 T2)
     "sessions_listing",
     "sessions_keyboard",

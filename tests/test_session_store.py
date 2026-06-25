@@ -671,6 +671,87 @@ def test_set_model_writes_0600(tmp_path):
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
 
+# ---- T-EFFORT (STATUSLINE): per-project reasoning-EFFORT override -------------
+#   Mirrors the model-override cases above: round-trip + persist, clear-on-None,
+#   case-insensitive, unknown→None (RB1), unknown-project-raises, sparse-safe, 0600.
+
+
+def test_set_get_effort_roundtrip_and_persist(tmp_path):
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    assert store.get_effort(1, "alpha") is None  # no override by default
+    store.set_effort(1, "alpha", "max")
+    assert store.get_effort(1, "alpha") == "max"
+    # Persists across a fresh store over the same file (RB6).
+    store2 = JsonSessionStore(path)
+    assert store2.get_effort(1, "alpha") == "max"
+
+
+def test_set_effort_clear_removes_override(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.set_effort(1, "alpha", "high")
+    assert store.get_effort(1, "alpha") == "high"
+    store.set_effort(1, "alpha", None)  # bare /effort clears
+    assert store.get_effort(1, "alpha") is None
+
+
+def test_set_effort_case_insensitive_value_and_unknown_clears(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "Alpha", "/work/alpha", make_active=True)
+    store.set_effort(1, "alpha", "MAX")  # value is normalized to lowercase; key case-insensitive
+    assert store.get_effort(1, "ALPHA") == "max"
+    # An unknown/garbage level normalizes to None (a cleared override) — never a bad stored value.
+    store.set_effort(1, "alpha", "turbo")
+    assert store.get_effort(1, "alpha") is None
+    store.set_effort(1, "alpha", "xhigh")
+    assert store.get_effort(1, "alpha") == "xhigh"
+    store.set_effort(1, "alpha", "   ")  # whitespace/empty normalizes to a clear
+    assert store.get_effort(1, "alpha") is None
+
+
+def test_set_effort_unknown_project_raises(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    with pytest.raises(UnknownProject):
+        store.set_effort(1, "nope", "max")
+
+
+def test_get_effort_unknown_or_unset_is_none(tmp_path):
+    store = JsonSessionStore(tmp_path / "state.json")
+    assert store.get_effort(1, "nope") is None
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    assert store.get_effort(1, "alpha") is None
+
+
+def test_get_effort_sparse_record_and_garbage_value_are_safe(tmp_path):
+    # RB1: a hand-edited / sparse record never crashes get_effort — a non-string or
+    # unrecognized stored value (and a record with no effort field) all read as None.
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    raw = json.loads(path.read_text())
+    raw["chats"]["1"]["projects"]["alpha"]["effort"] = 12345  # non-string garbage
+    raw["chats"]["1"]["projects"]["sparse"] = {}  # sparse record, no fields at all
+    raw["chats"]["1"]["projects"]["bad"] = {"effort": "ludicrous"}  # unrecognized level
+    path.write_text(json.dumps(raw))
+    store2 = JsonSessionStore(path)
+    assert store2.get_effort(1, "alpha") is None  # non-string → None
+    assert store2.get_effort(1, "sparse") is None  # sparse → None
+    assert store2.get_effort(1, "bad") is None  # unrecognized stored level → None
+
+
+def test_set_effort_writes_0600(tmp_path):
+    import os
+    import stat
+
+    path = tmp_path / "state.json"
+    store = JsonSessionStore(path)
+    store.create(1, "alpha", "/work/alpha", make_active=True)
+    store.set_effort(1, "alpha", "max")
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
 # ---- T5 (P9): per-chat macros -------------------------------------------------
 
 

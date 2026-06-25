@@ -112,6 +112,8 @@ from .render import (
     code_path,
     decode_callback,
     error_is_raw_external,
+    format_statusline,
+    model_short_label,
     notify_attention,
     notify_done,
     notify_error,
@@ -128,6 +130,7 @@ from .session_mirror import (
     transcript_path,
 )
 from .session_store import (
+    _EFFORT_LEVELS,
     DEFAULT_PROJECT,
     DuplicateProject,
     InvalidProjectName,
@@ -145,6 +148,14 @@ EditFn = Callable[..., Awaitable[None]]
 #: A coroutine that deletes a message by id (best-effort; used to clear the transient
 #: "💭 Claude is thinking…" status line at the end of a turn so it does not linger).
 DeleteFn = Callable[..., Awaitable[None]]
+#: A coroutine that PINS a message by id (STATUSLINE T-SL-CORE). The bot's closure forwards
+#: to ``Bot.pin_chat_message`` with ``disable_notification=True`` (a silent pin — design §3.1).
+#: Best-effort: a failure is swallowed (RB1) and never breaks a turn.
+PinFn = Callable[..., Awaitable[None]]
+#: A coroutine that UNPINS a message by id (STATUSLINE T-SL-CORE). Used on orphan-recovery to
+#: best-effort drop the stale pin before re-pinning the fresh one (the "one pinned message"
+#: invariant; Telegram's current pin is the newest, so the bar self-corrects). Best-effort (RB1).
+UnpinFn = Callable[..., Awaitable[None]]
 
 #: The three operator verdicts the engine understands (mirrors PermissionDecision.verdict).
 PermissionVerdictName = Literal["allow_once", "allow_session", "deny"]
@@ -227,6 +238,7 @@ def _default_engine_factory(
     model: Optional[str] = None,
     permission_mode: str = "default",
     thinking: bool = False,
+    effort: Optional[str] = None,
     audit_sink: Optional[AuditSink] = None,
     bash_policy_mode: str = "off",
     bash_policy_extra_patterns: tuple[str, ...] = (),
@@ -284,6 +296,17 @@ def _default_engine_factory(
     Off by default (cost + flood posture); toggled per project by ``/thinking`` (transient,
     RB3). SB3: the reasoning TEXT is shown; the opaque signature is dropped in ``normalize``.
 
+    **T-EFFORT (STATUSLINE):** ``effort`` is the per-project reasoning-EFFORT override
+    (``/effort low…max``) baked into the substrate's ``ClaudeAgentOptions(effort=…)`` at
+    session-creation time (mirrors ``model`` — a session-creation knob, distinct from the P12
+    ``thinking`` VISIBILITY toggle). ``None`` (the default here, and what a bare ``/effort``
+    clears to) omits ``effort`` entirely so behavior is byte-for-byte unchanged when no
+    override is set and the SDK's own default effort (``high``) applies. There is NO
+    ``CLAUDE_*`` global default for effort: the session resolves the per-project override (else
+    ``None``) and passes it via ``_bound_factory`` at each ``_ensure_engine`` build, so an
+    ``/effort`` change takes effect on the NEXT fresh session for that project (never hot-swapped
+    mid-session).
+
     **P13 T-AUDIT:** ``audit_sink`` is the optional, BODY-FREE audit sink the engine records
     every gate decision to (a :class:`~claude_tg.audit.ChatBoundSink` over the process
     :class:`~claude_tg.audit.AuditLog`, bound per chat by ``StreamingSession._build_engine``).
@@ -312,6 +335,7 @@ def _default_engine_factory(
         decision_callback=decision_callback,
         model=model,
         thinking=thinking,
+        effort=effort,
     )
     engine = Engine(
         substrate,
@@ -424,6 +448,15 @@ class _ProjectRuntime:
     # :meth:`_ensure_engine`. ADR-001 C4: arming plan mode greenlights NOTHING about tools —
     # an approved plan's later risky tools still hit the permission gate independently.
     plan_next: bool = False
+    # STATUSLINE T-SL-WIRE (B3 fix): True WHILE a plan-mode turn is actually running on this
+    # project, so the statusline shows ``🔒 plan`` for the live plan turn's duration. The
+    # one-shot ``plan_next`` above is CONSUMED (read + cleared) in ``handle_message`` BEFORE
+    # ``_drive_turn`` runs, so by the time the plan turn is streaming ``plan_next`` is already
+    # False — reading it in :meth:`_statusline_text` would wrongly show ``gate`` DURING the plan
+    # turn. So ``_drive_turn`` sets this from the consumed ``plan_turn`` local at turn start and
+    # CLEARS it in its finally (turn end) — the line reads THIS for the live mode. Transient
+    # in-memory (RB3); a restart drops it (no turn is running across a restart anyway).
+    in_plan_turn: bool = False
     # P12 T-PLAN: the SDK ``permission_mode`` the CURRENT live engine (``engine``) was built
     # with — ``"default"`` for an ordinary session, ``"plan"`` for the fresh session built for
     # an armed ``/plan`` turn. ``_ensure_engine`` records it at build time and consults it in
@@ -451,6 +484,17 @@ class _ProjectRuntime:
     # (off→on streams from the next turn; on→off stops the wire traffic from the next turn).
     # Transient (RB3); a restart rebuilds in the default OFF.
     engine_thinking: bool = False
+    # T-EFFORT (STATUSLINE): the reasoning-EFFORT level the CURRENT live engine was built with
+    # (the resolved per-project override, else ``None`` = SDK default). ``_ensure_engine``
+    # records it at build time and the warm fast-path reuses the engine ONLY when it matches the
+    # turn's requested effort — so changing ``/effort`` rebuilds the session on the NEXT turn
+    # (effort is a session-creation knob baked into ``ClaudeAgentOptions``; it can't be
+    # hot-switched), in either direction. UNLIKE ``engine_thinking`` the override itself is
+    # PERSISTED (on the project, like the model override) — only this built-with marker is
+    # transient (RB3): a restart resolves the persisted effort fresh and rebuilds. ``None`` (no
+    # override) matches ``None`` → a back-to-back no-effort turn reuses the warm engine
+    # byte-for-byte (the default-turn path is unchanged).
+    engine_effort: Optional[str] = None
     # P11 T2 (attach-fork): True iff this project was ADOPTED from an external session that
     # was LIVE in another process at attach time, so its NEXT resume MUST fork (resume into a
     # fresh id, transcript copied) rather than continue the live id — two writers on one
@@ -669,6 +713,23 @@ class _ChatState:
     # wins — the name-echoed prompt said which). Bumped by :meth:`_next_armed_seq`; never
     # reset (strictly increasing within the process is all the ordering needs).
     armed_seq: int = 0
+    # STATUSLINE T-SL-CORE (design §3.1 / §4 RB3) — the ONE pinned statusline message per chat.
+    # ``statusline_message_id`` is the Telegram id of the pinned line (None before the first
+    # update / after an orphan-recovery clears it); ``statusline_text`` is the last body shown,
+    # for the identical-text skip (no-op edits raise "message is not modified" AND waste a send
+    # slot — mirrors the transient status line's ``status_text``). EXACTLY ONE id is ever held
+    # (we only edit it; on recovery we re-point it). Transient/in-memory only (RB3): a restart
+    # drops the reference (the bot re-creates the line on the first post-restart update) — like
+    # ``send_gate``/``status_message_id``, the live pin id is never persisted.
+    statusline_message_id: Optional[int] = None
+    statusline_text: Optional[str] = None
+    # STATUSLINE T-SL-WIRE (pin-retry fix): whether the held ``statusline_message_id`` is
+    # actually PINNED. The send and the pin are separate Telegram calls — a send can succeed
+    # (id stored) while the pin RAISES (rate-limit, perms, hiccup), leaving the line sent but
+    # UNPINNED. Without this flag the identical-text skip would short-circuit every later update
+    # and the line would stay unpinned forever. So on a failed pin we leave this False and RETRY
+    # the pin on the next update even when the text is unchanged. Transient in-memory (RB3).
+    statusline_pinned: bool = False
 
 
 class StreamingBusy(Exception):
@@ -780,6 +841,7 @@ class StreamingSession:
                 model: Optional[str] = None,
                 permission_mode: str = "default",
                 thinking: bool = False,
+                effort: Optional[str] = None,
                 audit_sink: Optional[AuditSink] = None,
             ) -> Engine:
                 return _default_engine_factory(
@@ -792,6 +854,7 @@ class StreamingSession:
                     model=model,
                     permission_mode=permission_mode,
                     thinking=thinking,
+                    effort=effort,
                     audit_sink=audit_sink,
                     # P13 T-BASH: bind the live config's Bash policy (default flag) into the
                     # production engine — consulted ADDITIVELY for Bash in on_tool_request. A
@@ -1442,6 +1505,43 @@ class StreamingSession:
                 log.exception("failed to persist model override for chat %s", chat_id)
         return normalized
 
+    def set_effort(self, chat_id: int, level: Optional[str]) -> Optional[str]:
+        """Set (or clear) the ACTIVE project's per-project reasoning-EFFORT override (T-EFFORT).
+
+        ``/effort <low|medium|high|xhigh|max>`` stores the level; a bare ``/effort`` (or
+        ``/effort default``) clears it (``None``) back to the SDK default (``high``). Exactly
+        parallel to :meth:`set_model`: persisted on the active project via the store (atomic +
+        ``0600``, RB6) so it survives a restart and a store reload; with no store it is a no-op
+        (a single implicit project, no persistence) — returns the NORMALIZED level regardless so
+        the bot can confirm. Auto-creates ``default`` if there is no active project (consistent
+        with ``set_model`` / ``set_yolo`` / ``arm_plan``).
+
+        The store VALIDATES the level against ``{low, medium, high, xhigh, max}`` and normalizes
+        anything else to ``None`` (a cleared override) — but the bot's ``cmd_effort`` rejects a
+        bad level with a clean error *before* calling this, so a stored garbage level can't arise
+        from the command path; this method simply returns what was persisted. **Applies on the
+        NEXT fresh session, never mid-turn** (effort is a session-creation param baked into
+        ``ClaudeAgentOptions``; a turn in flight keeps its current effort, and the warm fast-path
+        rebuilds on the next turn because ``engine_effort`` no longer matches). Returns the
+        normalized override that was stored (``None`` for a clear).
+        """
+        normalized = (
+            level.strip().lower()
+            if isinstance(level, str) and level.strip().lower() in _EFFORT_LEVELS
+            else None
+        )
+        # Resolve (and if needed auto-create) the active project so /effort before any turn works.
+        name, _rt = self._active_runtime(chat_id, create_default=True)
+        if self.store is not None and name is not None:
+            try:
+                self.store.set_effort(chat_id, name, normalized)
+            except Exception:
+                # RB1: never crash the command over a persist failure (e.g. the project was
+                # /rm'd in a race). The override simply isn't recorded; the next turn uses the
+                # SDK default. Mirrors set_model / _persist's swallow-and-log discipline.
+                log.exception("failed to persist effort override for chat %s", chat_id)
+        return normalized
+
     def arm_plan(self, chat_id: int) -> None:
         """Arm the ACTIVE project's NEXT turn as a plan turn (``/plan``; P12 T-PLAN-2).
 
@@ -1521,6 +1621,26 @@ class StreamingSession:
             if override:
                 return override
         return self.config.model
+
+    def _resolve_project_effort(self, chat_id: int, name: str) -> Optional[str]:
+        """The reasoning-EFFORT level to bake into ``name``'s next session (override → ``None``).
+
+        T-EFFORT (STATUSLINE): the per-project override (``/effort low…max``) if set, else
+        ``None`` (omit ``effort`` → the SDK's own default, ``high``). UNLIKE
+        :meth:`_resolve_project_model` there is NO ``CLAUDE_*`` global default for effort — when
+        unset we return ``None`` so the kwarg is omitted entirely. Read-only + fail-safe (RB1):
+        a missing store / project / field (or a garbage stored level — :meth:`get_effort`
+        validates) reads as no override. Called by :meth:`_ensure_engine` for the project it is
+        building.
+        """
+        if self.store is not None:
+            try:
+                override = self.store.get_effort(chat_id, name)
+            except Exception:  # RB1: a bad/odd record never wedges the build
+                override = None
+            if override:
+                return override
+        return None
 
     def active_run_count(self) -> int:
         """The number of turns currently RUNNING across the whole process (T2 /status).
@@ -1620,6 +1740,13 @@ class StreamingSession:
         # fast-path below reuses the engine only when its built-with flag matches, so a toggle
         # rebuilds the session on the next turn (thinking is a session-creation knob).
         thinking = rt.thinking
+        # T-EFFORT (STATUSLINE): resolve THIS project's reasoning-EFFORT override (/effort
+        # low…max), else None (SDK default — no CLAUDE_* global). Like ``model`` it is fixed for
+        # the life of the fresh session built below (a session-creation param); the warm
+        # fast-path reuses the engine only when its built-with level matches, so an /effort
+        # change rebuilds on the next turn (never hot-swapped). Resolved here (not on the
+        # runtime) so the persisted override is read fresh each build (it survives a restart).
+        effort = self._resolve_project_effort(chat_id, name)
         # P5 / ADR-005 D1 (T5): no cross-project stop here. A different project's started
         # engine is left running so N runs can be concurrent (T5 removed P4's
         # _stop_other_started). Only the SAME project's stale/non-started engine is handled
@@ -1640,11 +1767,19 @@ class StreamingSession:
         # not hot-switchable). So /thinking on→off (or off→on) rebuilds the session on the next
         # turn; a back-to-back same-thinking turn still reuses the warm engine byte-for-byte
         # (both False pre-P12 → matched → reuse, so a thinking-OFF project is unchanged).
+        #
+        # T-EFFORT (STATUSLINE): and the built-with reasoning-EFFORT level must match too — for
+        # the SAME reason (effort is a session-creation knob baked into ClaudeAgentOptions, not
+        # hot-switchable). So changing /effort (e.g. high→max, or set→cleared) rebuilds the
+        # session on the next turn; a back-to-back same-effort turn still reuses the warm engine
+        # byte-for-byte (None == None for a no-override project → matched → reuse, so the
+        # default-turn path is unchanged).
         if (
             rt.engine is not None
             and rt.started
             and rt.engine_permission_mode == permission_mode
             and rt.engine_thinking == thinking
+            and rt.engine_effort == effort
         ):
             return rt.engine, False
         # Past the warm fast-path: rt is either fresh (engine None), holds a NON-started
@@ -1686,11 +1821,13 @@ class StreamingSession:
         # mode on the runtime so the warm fast-path reuses this engine only for a same-mode turn
         # and rebuilds back to ``"default"`` after the one-shot plan turn (the mismatch path).
         engine = self._build_engine(
-            chat_id, rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
+            chat_id, rt.cwd, rt.policy, model,
+            permission_mode=permission_mode, thinking=thinking, effort=effort,
         )
         rt.engine = engine
         rt.engine_permission_mode = permission_mode
         rt.engine_thinking = thinking  # P12 T-THINK: track the built-with thinking flag
+        rt.engine_effort = effort  # T-EFFORT: track the built-with reasoning-effort level
         resume_id = self._resume_id(chat_id, name)
         # ⭐ P11 T2 (B2+B3) — the BINDING fork-vs-continue decision, made HERE at the first
         # write from a FRESH liveness re-probe (not frozen at attach time). When this project
@@ -1767,12 +1904,16 @@ class StreamingSession:
                 #     plan mode (the marker was already consumed above; this re-uses the value).
                 #     P12 T-THINK: and the SAME thinking flag — a thinking-ON project whose
                 #     resume failed still starts fresh with live reasoning on (sticky flag).
+                #     T-EFFORT: and the SAME reasoning-effort level (resolved once above) — a
+                #     project with an /effort override starts fresh at that effort too.
                 engine = self._build_engine(
-                    chat_id, rt.cwd, rt.policy, model, permission_mode=permission_mode, thinking=thinking
+                    chat_id, rt.cwd, rt.policy, model,
+                    permission_mode=permission_mode, thinking=thinking, effort=effort,
                 )
                 rt.engine = engine
                 rt.engine_permission_mode = permission_mode  # P12 T-PLAN: track the fresh mode
                 rt.engine_thinking = thinking  # P12 T-THINK: track the fresh thinking flag
+                rt.engine_effort = effort  # T-EFFORT: track the fresh reasoning-effort level
                 # (d) Start the FRESH engine — a clean fresh session (the dead id is gone).
                 await engine.start()
                 # (e) Signal the caller so handle_message posts the T7 "couldn't resume,
@@ -1882,6 +2023,7 @@ class StreamingSession:
         *,
         permission_mode: str = "default",
         thinking: bool = False,
+        effort: Optional[str] = None,
     ) -> Engine:
         """Call the engine factory, passing the T4 per-project ``model`` only when supported.
 
@@ -1908,6 +2050,12 @@ class StreamingSession:
         configured) makes the engine's hook a no-op. An injected test factory keeps its 3-kwarg
         contract and never receives it, so every existing test factory is unaffected (and the
         no-op default keeps the 1288 floor).
+
+        **T-EFFORT (STATUSLINE):** ``effort`` rides the SAME default-factory-only gate — a level
+        bakes ``ClaudeAgentOptions(effort=…)`` into the FRESH session for a project with an
+        ``/effort`` override, ``None`` (the default) omits it so a no-override turn is
+        byte-for-byte unchanged (the SDK default effort applies). An injected test factory keeps
+        its 3-kwarg contract and never receives it, so every existing test factory is unaffected.
         """
         if self._factory_accepts_model:
             return self._engine_factory(
@@ -1917,6 +2065,7 @@ class StreamingSession:
                 model=model,  # type: ignore[call-arg]  # default factory accepts model (T4)
                 permission_mode=permission_mode,  # default factory accepts it too (P12 T-PLAN-1)
                 thinking=thinking,  # default factory accepts it too (P12 T-THINK)
+                effort=effort,  # default factory accepts it too (T-EFFORT)
                 audit_sink=self._audit_sink_for(chat_id),  # default factory accepts it too (P13)
             )
         return self._engine_factory(
@@ -2778,6 +2927,8 @@ class StreamingSession:
         send: SendFn,
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
+        pin: Optional[PinFn] = None,
+        unpin: Optional[UnpinFn] = None,
     ) -> bool:
         """Fire ONE scheduled task as a fully-gated PROACTIVE turn (P14 T-FIRE ⭐).
 
@@ -2867,6 +3018,8 @@ class StreamingSession:
                 send=send,
                 edit=edit,
                 delete=delete,
+                pin=pin,
+                unpin=unpin,
                 command_initiated=True,
                 proactive=True,
                 project_override=schedule.project,
@@ -2903,6 +3056,8 @@ class StreamingSession:
         send: SendFn,
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
+        pin: Optional[PinFn] = None,
+        unpin: Optional[UnpinFn] = None,
         reply_to_message_id: Optional[int] = None,
         command_initiated: bool = False,
         images: Optional[Sequence[ImageInput]] = None,
@@ -3193,8 +3348,9 @@ class StreamingSession:
                         )
                     await self._drive_turn(
                         state, chat_id, engine, text,
-                        send=send, edit=edit, delete=delete, target=target,
-                        images=images, proactive=proactive,
+                        send=send, edit=edit, delete=delete,
+                        pin=pin, unpin=unpin, target=target,
+                        images=images, proactive=proactive, plan_turn=plan_turn,
                     )
             finally:
                 # SLOT-LEAK SAFETY: release the slot this turn held — exactly once, on every
@@ -3384,9 +3540,12 @@ class StreamingSession:
         send: SendFn,
         edit: EditFn,
         delete: Optional[DeleteFn] = None,
+        pin: Optional[PinFn] = None,
+        unpin: Optional[UnpinFn] = None,
         target: Optional[tuple[str, _ProjectRuntime]] = None,
         images: Optional[Sequence[ImageInput]] = None,
         proactive: bool = False,
+        plan_turn: bool = False,
     ) -> None:
         """Iterate ``engine.send`` → render → Telegram send/edit (coalesced).
 
@@ -3459,6 +3618,20 @@ class StreamingSession:
         turn_rt.status_message_id = None
         turn_rt.status_text = None
         turn_rt.status = "running"
+        # STATUSLINE T-SL-WIRE (B3 fix): mark the LIVE plan-mode flag for the statusline's
+        # duration so the line shows 🔒 plan WHILE the plan turn runs. ``plan_turn`` is the value
+        # ``handle_message`` consumed from the one-shot ``plan_next`` (already cleared there), so
+        # this transient flag is the only honest "this turn is a plan turn" signal at render
+        # time. Cleared in the finally (turn end → back to gate/yolo). Set BEFORE the turn-start
+        # statusline trigger so that first render already reads ``plan``.
+        turn_rt.in_plan_turn = plan_turn
+        # STATUSLINE T-SL-WIRE (design §3.1): turn START → flip the working ⚙️ marker ON (and
+        # refresh model/effort/mode/worktree). FOREGROUND-ONLY — gated on ``turn_name`` so a
+        # BACKGROUND concurrent turn never stomps the foreground line (the make-or-break
+        # invariant). Best-effort (RB1): pins/edits can't break the turn (the helper swallows).
+        await self._maybe_update_statusline(
+            chat_id, send=send, edit=edit, pin=pin, unpin=unpin, for_project=turn_name,
+        )
         # D6 "loud throughout" — but only inline for a FOREGROUND turn (a backgrounded run is
         # silent inline, D4; its yolo posture still shows on each foreground turn + via
         # /projects is not yolo-aware, so this is the loud surface when watched). Verbatim
@@ -3661,6 +3834,21 @@ class StreamingSession:
             # ADR-005 D7: the turn is over → this project is idle again (no runtime → idle is
             # the /projects default; a running/awaiting project that just ended → idle).
             turn_rt.status = "idle"
+            # STATUSLINE T-SL-WIRE (B3 fix): the plan turn is over → clear the live plan flag so
+            # the turn-end render (below) and every idle refresh show 🔒 gate/yolo again, not a
+            # lingering 🔒 plan. Cleared BEFORE the turn-end statusline trigger. (A freshly-armed
+            # /plan for the NEXT turn re-shows 🔒 plan via the command refresh's ``plan_next``.)
+            turn_rt.in_plan_turn = False
+            # STATUSLINE T-SL-WIRE (design §3.1): turn END → flip the working ⚙️ marker OFF and
+            # refresh ctx % (the context just grew, and the engine is still alive here — its
+            # teardown for a driver_error/resume-failure happens AFTER this finally — so
+            # _statusline_text's engine.context_percentage() reads the fresh figure). FOREGROUND-
+            # ONLY (``turn_name``) so a background turn's end never stomps the foreground line.
+            # In the finally + fully best-effort (RB1), so it fires on EVERY exit path (clean
+            # end, mid-stream raise, cancel) and can never mask the turn's own exception.
+            await self._maybe_update_statusline(
+                chat_id, send=send, edit=edit, pin=pin, unpin=unpin, for_project=turn_name,
+            )
             # ADR-005 D3: drop any pending-index entries this turn's project left open (an
             # ask/plan/permission the operator never answered — the engine has stopped
             # awaiting it now the stream drained / the turn died, so a late tap on it is a
@@ -3965,6 +4153,321 @@ class StreamingSession:
             )
             rt.status_message_id = mid
             rt.status_text = body
+
+    # -- the pinned mobile statusline (STATUSLINE T-SL-CORE, design §3.1/§4) --
+
+    async def _maybe_update_statusline(
+        self,
+        chat_id: int,
+        *,
+        send: Optional[SendFn],
+        edit: Optional[EditFn],
+        pin: Optional[PinFn],
+        unpin: Optional[UnpinFn],
+        for_project: Optional[str] = None,
+    ) -> None:
+        """Refresh the pinned statusline IFF this is the chat's FOREGROUND project (T-SL-WIRE).
+
+        ⭐ **The make-or-break wiring invariant (design §3.1).** The pinned line reflects the
+        chat's ACTIVE (foreground) project — the one the operator is watching. A BACKGROUND
+        concurrent turn (a non-active project running under P5 concurrency) must NEVER rewrite
+        the line, or two concurrent turns would stomp each other's state and the single pinned
+        line would stop describing "what you're looking at". So the turn-start / turn-end
+        triggers route through HERE, which:
+
+        * **skips** when ``for_project`` is not the chat's foreground (:meth:`_is_foreground`) —
+          a background turn leaves the foreground line untouched;
+        * **skips** when any closure is missing (a caller/test that didn't inject pin/unpin —
+          back-compat: the statusline simply isn't driven, the turn is unaffected);
+        * otherwise delegates to :meth:`_update_statusline` (itself fully best-effort, RB1).
+
+        ``for_project=None`` means "the caller already knows this is foreground" (the command
+        paths: ``/switch`` + the knob setters always act on the active project), so the
+        foreground gate is bypassed but the closure-presence gate still applies. The whole call
+        is wrapped so a foreground-check / build error can never escape to the turn (RB1) — the
+        statusline is an observer off the turn's critical path.
+        """
+        if send is None or edit is None or pin is None or unpin is None:
+            return  # no closures injected (a test / a caller that didn't wire them) → no-op.
+        try:
+            if for_project is not None and not self._is_foreground(chat_id, for_project):
+                # ⭐ Foreground-only: a BACKGROUND turn never rewrites the foreground line.
+                return
+            await self._update_statusline(
+                chat_id, send=send, edit=edit, pin=pin, unpin=unpin
+            )
+        except Exception:
+            # RB1: a foreground-check / dispatch error must never break the turn (the inner
+            # _update_statusline already swallows its own I/O; this guards the gate itself).
+            log.debug("statusline trigger failed for chat (ignored)", exc_info=True)
+
+    async def _statusline_text(self, chat_id: int) -> Optional[tuple[str, str]]:
+        """Build the CURRENT statusline body + the project it was built FOR (``(text, name)``).
+
+        Reads the chat's ACTIVE (foreground) project's live state — the worktree NAME, the
+        effective model + effort, the permission mode, the working/idle marker, and the ctx %
+        — and renders it through :func:`~claude_tg.render.format_statusline`. Foreground-only
+        (design §3.1): a background project's turn never rewrites the line, so the single pinned
+        line always describes "what you're looking at".
+
+        **Read-only / fail-safe (RB1):** resolves the active runtime with ``create_default=
+        False`` so a statusline refresh NEVER creates a project as a side effect; with no active
+        project (nothing run yet) returns ``None`` (nothing to show). Each field read is
+        defensive — a missing store / odd record / ctx call that raises degrades to a safe
+        default (``ctx —``, ``gate``) rather than raising.
+
+        ⭐ **Returns ``(text, built_for)``** — the rendered body AND the project NAME it describes
+        — or ``None`` when there is no foreground project. The caller uses ``built_for`` for the
+        FINAL pre-write foreground re-check (B2): the ctx ``await`` below is a switch window, so
+        the only safe guarantee is "the project this text was built for is STILL foreground at the
+        instant just before the write" — a sync check the write helpers do with no await between
+        it and the ``edit``/``send``.
+
+        ⭐ **ASYNC (B1 fix):** the ctx % comes from ``Engine.context_percentage()`` which AWAITS
+        the SDK's coroutine ``get_context_usage()`` — so this method is async and awaits it. The
+        await is still fully best-effort (any raise → ``ctx —``, never a fabricated number); it
+        is the only await here (every other field is a pure in-memory read).
+
+        * ``worktree`` — the active project NAME (SB4-validated charset, so inert — SB3).
+        * ``model`` — :meth:`_resolve_project_model` reduced by :func:`model_short_label`.
+        * ``effort`` — :meth:`_resolve_project_effort` (``None`` → model-only).
+        * ``mode`` — ``yolo`` if the project's policy is allow-all, else ``plan`` if a plan turn
+          is RUNNING (``in_plan_turn`` — B3) OR a ``/plan`` is armed for the next turn
+          (``plan_next``), else ``gate`` (the fail-closed default).
+        * ``working`` — the per-project status enum is a working state (``running`` /
+          ``awaiting_*`` / ``queued``) vs ``idle``.
+        * ``ctx_pct`` — the live engine's :meth:`~claude_tg.engine.engine.Engine.context_percentage`
+          (``None`` → ``ctx —``, never a fabricated number).
+        """
+        name, rt = self._active_runtime(chat_id, create_default=False)
+        if name is None or rt is None:
+            return None
+        worktree = name  # the SB4-validated project name (no path; SB3-inert).
+        model_label = model_short_label(self._resolve_project_model(chat_id, name))
+        effort = self._resolve_project_effort(chat_id, name)
+        # mode: yolo (allow-all) wins; else plan — either a plan turn is RUNNING NOW
+        # (``in_plan_turn``, B3 — ``plan_next`` is already consumed by the time the turn streams)
+        # OR a ``/plan`` is armed for the NEXT turn (``plan_next``); else the fail-closed gate.
+        if bool(getattr(rt.policy, "yolo", False)):
+            mode = "yolo"
+        elif bool(getattr(rt, "in_plan_turn", False)) or bool(getattr(rt, "plan_next", False)):
+            mode = "plan"
+        else:
+            mode = "gate"
+        working = rt.status in ("running", "awaiting_approval", "awaiting_answer", "awaiting_plan", "queued")
+        ctx_pct: Optional[int] = None
+        engine = rt.engine
+        if engine is not None:
+            try:
+                # ⭐ The ONLY await in this builder — and a /switch window (B2): the returned
+                # ``built_for`` lets the write helpers re-check foreground AFTER this await.
+                ctx_pct = await engine.context_percentage()
+            except Exception:  # pragma: no cover - the engine call is already best-effort (RB1)
+                ctx_pct = None
+        body = format_statusline(
+            worktree=worktree,
+            model_label=model_label,
+            effort=effort,
+            ctx_pct=ctx_pct,
+            mode=mode,
+            working=working,
+        )
+        return body, name
+
+    async def _update_statusline(
+        self,
+        chat_id: int,
+        *,
+        send: SendFn,
+        edit: EditFn,
+        pin: PinFn,
+        unpin: UnpinFn,
+    ) -> None:
+        """Refresh the chat's ONE pinned statusline — send+pin on first use, edit thereafter.
+
+        STATUSLINE T-SL-CORE (design §3.1/§4). Builds the current foreground statusline body
+        (:meth:`_statusline_text`) and reconciles it with the chat's pinned line:
+
+        * **identical text** → skip entirely (no I/O — a no-op edit raises "message is not
+          modified" AND wastes a send slot; mirrors :meth:`_edit_status`).
+        * **first update** (no id held) → SEND the body then PIN it with the notification
+          DISABLED (a silent pin — design §3.1); store the id + text.
+        * **subsequent update** → EDIT in place only (no re-pin, no re-send; a pinned message
+          edited in place stays pinned and silent).
+        * **edit FAILURE** (the operator unpinned/deleted it → "message to edit not found", an
+          API hiccup, too old) → ORPHAN RECOVERY: clear the stored id, best-effort UNPIN the
+          stale one (the "one pinned message" invariant — Telegram's current pin is the newest,
+          so the bar self-corrects), then re-SEND + re-PIN a fresh line (mirrors the orphaned
+          status-line recovery in :meth:`_edit_status`).
+
+        **⭐ RB1 — a pin/edit/send failure NEVER breaks or wedges a turn.** This is an observer
+        OFF the turn's critical path: the WHOLE body is wrapped so ANY exception (a raising
+        ``send``/``edit``/``pin``/``unpin``, a build error) is logged at debug and swallowed —
+        the caller (the turn loop / a command) is unaffected. **RB5** — every send/edit funnels
+        through the per-chat gate as the **non-verbatim** kind (:meth:`_gated_send`/
+        :meth:`_gated_edit`), so the statusline can never flood and never starves a real
+        answer/prompt. **One id invariant** — exactly one ``statusline_message_id`` is ever held
+        per chat; we only ever edit it, and on recovery re-point it.
+
+        ``send``/``edit``/``pin``/``unpin`` are injected by ``bot.py`` (the same pattern as the
+        existing send/edit/delete closures) targeting THIS chat — so the line is SB1-confined to
+        the operator's allowlisted chat (no new outbound surface).
+
+        **⭐ B2 fix — no stale line across a ``/switch`` (the FINAL guard).** The body is built
+        from the FOREGROUND project's state, but BOTH the gate's wait AND the ctx ``await`` inside
+        the rebuild are ``/switch`` windows. So the gated write helpers (1) REBUILD the body from
+        CURRENT state after the wait, then (2) do a FINAL **synchronous** foreground re-check — is
+        the project the rebuilt text was BUILT FOR still the chat's active/foreground? — with NO
+        await between that check and issuing the ``edit``/``send``. If a ``/switch`` happened
+        during ANY await, ``built_for`` is no longer foreground → the stale write is SKIPPED (the
+        ``/switch``'s own statusline trigger writes the correct line — no loop, no stale write).
+        **Pin-retry** — a send that succeeded while its pin RAISED leaves the line UNPINNED
+        (``statusline_pinned`` False); a later update RETRIES the pin even if the text is
+        unchanged, so a transient pin failure self-heals instead of sticking unpinned forever.
+        """
+        try:
+            built = await self._statusline_text(chat_id)  # async (B1: awaits the SDK ctx %)
+            if not built:
+                return  # no foreground project to describe — nothing to pin/edit.
+            body, _built_for = built  # body for the skip/decision; the helpers rebuild + re-check
+            state = self._chat(chat_id)
+            # Pin-retry: if we hold a sent id whose pin FAILED, retry the pin even on identical
+            # text (the identical-text skip below would otherwise leave it unpinned forever).
+            if (
+                state.statusline_message_id is not None
+                and not state.statusline_pinned
+                and body == state.statusline_text
+            ):
+                await self._statusline_pin(state, state.statusline_message_id, pin=pin)
+                return
+            if body == state.statusline_text:
+                # Identical to what's pinned — skip BEFORE the gate so an unchanged refresh
+                # never consumes a send slot and never triggers a no-op "not modified" edit.
+                return
+            if state.statusline_message_id is None:
+                await self._statusline_send_and_pin(chat_id, state, send=send, pin=pin)
+                return
+            try:
+                # B2: rebuild the body AFTER the gate wait (inside _statusline_gated_edit) so a
+                # /switch during the wait writes the now-current line, never the stale snapshot.
+                await self._statusline_gated_edit(
+                    chat_id, state, state.statusline_message_id, edit=edit
+                )
+            except Exception:
+                # Orphan recovery (design §4 RB1): the pinned line is gone (unpinned/deleted by
+                # the operator) / too old / an API hiccup. Clear the dead id, best-effort UNPIN
+                # the stale one (one-pin invariant), then re-send + re-pin a fresh line. The
+                # turn is unaffected either way (this whole method is best-effort).
+                log.debug("statusline edit failed for chat; re-sending + re-pinning", exc_info=True)
+                stale_id = state.statusline_message_id
+                state.statusline_message_id = None
+                state.statusline_text = None
+                state.statusline_pinned = False
+                try:
+                    await unpin(message_id=stale_id)
+                except Exception:
+                    log.debug("stale statusline unpin failed (ignored)", exc_info=True)
+                await self._statusline_send_and_pin(chat_id, state, send=send, pin=pin)
+        except Exception:
+            # ⭐ The make-or-break swallow (RB1): NOTHING the statusline does may escape to the
+            # turn. A build/gate/closure failure is logged at debug and dropped — the next state
+            # change re-creates the line.
+            log.debug("statusline update failed for chat (ignored)", exc_info=True)
+
+    async def _statusline_gated_edit(
+        self, chat_id: int, state: _ChatState, message_id: int, *, edit: EditFn
+    ) -> None:
+        """Edit the pinned line through the gate, REBUILDING + RE-CHECKING foreground (B2).
+
+        Reserves the per-chat gate slot and awaits its wait (non-verbatim — RB5), THEN re-derives
+        the statusline body + the project it was built for from CURRENT state. Two awaits precede
+        the write — the gate wait AND the ctx ``await`` inside :meth:`_statusline_text` — both
+        ``/switch`` windows. So immediately before the raw edit we do a FINAL **synchronous**
+        foreground re-check (``_is_foreground(built_for)``) with NO await between it and the
+        ``edit``: if a ``/switch`` happened during ANY await, ``built_for`` is no longer
+        foreground → SKIP (the switch's own trigger writes the correct line — no stale write, no
+        loop). An empty rebuild (foreground vanished — e.g. ``/rm``) or identical text also skips.
+        A raise propagates to the caller's orphan-recovery (the message may be gone).
+        """
+        wait = self._gate(state).reserve(verbatim=False)
+        if wait > 0:
+            await self._sleep(wait)
+        built = await self._statusline_text(chat_id)  # rebuilt AFTER the wait (B2)
+        if built is None:
+            return  # foreground vanished mid-wait → no stale write.
+        body, built_for = built
+        if body == state.statusline_text:
+            return  # nothing changed → no no-op "not modified" edit.
+        # ⭐ FINAL sync guard (B2): only write if the project this body describes is STILL the
+        # chat's foreground at THIS instant — no await between here and the edit, so a /switch
+        # during any preceding await is caught. A stale body (built_for switched away) is dropped.
+        if not self._is_foreground(chat_id, built_for):
+            return
+        await edit(message_id=message_id, text=body, parse_mode="HTML")
+        state.statusline_text = body
+
+    async def _statusline_send_and_pin(
+        self,
+        chat_id: int,
+        state: _ChatState,
+        *,
+        send: SendFn,
+        pin: PinFn,
+    ) -> None:
+        """Send the statusline body (gated, non-verbatim) then PIN it silently (design §3.1).
+
+        The first-use + orphan-recovery primitive: reserve the gate slot, await its wait, THEN
+        rebuild the body + the project it was built for from CURRENT state. Two awaits precede the
+        send — the gate wait AND the ctx ``await`` inside :meth:`_statusline_text` — both
+        ``/switch`` windows (B2). So immediately before the raw send we do a FINAL **synchronous**
+        foreground re-check (``_is_foreground(built_for)``) with NO await between it and the
+        ``send``: a ``/switch`` during any preceding await makes ``built_for`` no longer
+        foreground → SKIP (the switch's own trigger sends the correct line — no stale send, no
+        loop). A best-effort silent pin follows (``disable_notification=True`` — a pin must never
+        re-ping). The id/text are stored ONLY when the send returns an id (so a ``None`` send does
+        not leave a half-set state). A PIN failure is swallowed (RB1) AND records
+        ``statusline_pinned=False`` so the next update retries the pin. Called from
+        :meth:`_update_statusline` inside its best-effort guard, so a raising ``send`` propagates
+        to that guard's swallow.
+        """
+        wait = self._gate(state).reserve(verbatim=False)
+        if wait > 0:
+            await self._sleep(wait)
+        built = await self._statusline_text(chat_id)  # rebuilt AFTER the wait (B2)
+        if built is None:
+            return  # foreground vanished mid-wait — nothing to send.
+        body, built_for = built
+        # ⭐ FINAL sync guard (B2): only send if the project this body describes is STILL the
+        # chat's foreground at THIS instant — no await between here and the send, so a /switch
+        # during any preceding await (the gate wait OR the ctx await) is caught and the stale
+        # send is dropped (the switch's own statusline trigger sends the correct line).
+        if not self._is_foreground(chat_id, built_for):
+            return
+        mid = await send(text=body, reply_markup=None, parse_mode="HTML")
+        if mid is None:
+            # The send produced no id (a closure that returns None) — don't store a half state;
+            # the next update will try a fresh send.
+            return
+        state.statusline_message_id = mid
+        state.statusline_text = body
+        state.statusline_pinned = False  # not pinned until the pin call below succeeds.
+        await self._statusline_pin(state, mid, pin=pin)
+
+    async def _statusline_pin(self, state: _ChatState, message_id: int, *, pin: PinFn) -> None:
+        """Best-effort SILENT pin of the statusline message; record whether it stuck (pin-retry).
+
+        A pin must never re-ping (``disable_notification=True``) and never break the turn (RB1).
+        On success ``statusline_pinned`` is set True; on failure it stays/!becomes False and is
+        swallowed — :meth:`_update_statusline` then RETRIES the pin on the next update (even with
+        unchanged text) so a transient pin failure self-heals instead of leaving the line unpinned
+        forever. Only the pinned-bar placement is ever at stake here, never the turn.
+        """
+        try:
+            await pin(message_id=message_id, disable_notification=True)
+            state.statusline_pinned = True
+        except Exception:
+            state.statusline_pinned = False
+            log.debug("statusline pin failed (will retry on next update)", exc_info=True)
 
     # -- the callback resolve path (LOCK-FREE: SB1 enforced at the bot) ------
 
