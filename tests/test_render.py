@@ -2224,10 +2224,20 @@ def test_model_short_label_unknown_returns_raw_id():
     assert model_short_label("gpt-4o") == "gpt-4o"
 
 
-def test_model_short_label_none_and_blank_are_empty():
-    assert model_short_label(None) == ""
-    assert model_short_label("") == ""
-    assert model_short_label("   ") == ""
+def test_model_short_label_none_and_blank_are_default():
+    # No override + no CLAUDE_MODEL → the SDK default model → show "default", never a blank 🤖.
+    assert model_short_label(None) == "default"
+    assert model_short_label("") == "default"
+    assert model_short_label("   ") == "default"
+
+
+def test_format_statusline_empty_model_label_falls_back_to_default():
+    # Belt-and-braces: even a direct empty/blank model_label must never render a bare "🤖 ·".
+    line = format_statusline(
+        worktree="dev", model_label="", effort=None, ctx_pct=3, mode="gate", working=False
+    )
+    assert "🤖 default" in line
+    assert "🤖  ·" not in line  # no blank model / double-space
 
 
 def test_statusline_carries_no_dollar_or_secret():

@@ -1554,15 +1554,16 @@ def model_short_label(model_id: object) -> str:
     ``opus``, ``claude-haiku-4-5`` → ``haiku``, a sonnet id → ``sonnet``. An id matching NONE
     of the known families (an unexpected / future / custom ``CLAUDE_MODEL``) falls back to the
     **raw id** verbatim (RB1 — never mislabel, never crash). A ``None``/blank/odd value reads
-    as ``""`` (the caller — :func:`format_statusline` — never passes one; the active model is
-    always a config/SDK constant). Pure; no I/O. The returned label is NOT HTML-escaped here —
-    :func:`format_statusline` escapes every interpolated field once (SB3).
+    as ``"default"`` — when no per-project override and no ``CLAUDE_MODEL`` is set the effective
+    model is the SDK default, so the statusline shows ``🤖 default`` (never a blank ``🤖``).
+    Pure; no I/O. The returned label is NOT HTML-escaped here — :func:`format_statusline`
+    escapes every interpolated field once (SB3).
     """
     if not model_id:
-        return ""
+        return "default"
     raw = str(model_id).strip()
     if not raw:
-        return ""
+        return "default"
     low = raw.casefold()
     for needle, label in _MODEL_FAMILY_PATTERNS:
         if needle in low:
@@ -1615,7 +1616,9 @@ def format_statusline(
     else:
         wt = _escape_html(str(worktree))
     # SB3: every other field is a fixed word / a number, but escape-once defensively anyway.
-    model_part = _escape_html(str(model_label))
+    # Belt-and-braces: an empty/blank model_label falls back to "default" so the bar never
+    # shows a bare "🤖 " (no model configured = the SDK default model).
+    model_part = _escape_html(str(model_label).strip() or "default")
     if effort:
         model_part = f"{model_part}·{_escape_html(str(effort))}"
     ctx_part = _CTX_UNKNOWN if ctx_pct is None else f"{int(ctx_pct)}%"
