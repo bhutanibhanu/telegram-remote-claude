@@ -28,6 +28,7 @@ You choose which with one environment variable.
 - [Keeping it running (keep-alive)](#keeping-it-running-keep-alive)
 - [Commands](#commands)
 - [Multi-project & concurrency](#multi-project--concurrency-streaming-mode)
+- [Statusline](#statusline-streaming-mode)
 - [Proactive scheduler](#proactive-scheduler-streaming-mode)
 - [Configuration](#configuration-env)
 - [Troubleshooting](#troubleshooting)
@@ -218,6 +219,7 @@ Claude to read; `/get` pulls one back), or **a voice note** — with a transcrib
 | `/to <name> <text>` | **Streaming.** Send a free-text answer/feedback to a named project's pending "Other"/"Reject" prompt (or just reply to the prompt) |
 | `/yolo` | **Streaming.** Run every tool this session with **no** approval prompt (loud ⚠️ banner). Disables the gate for the session |
 | `/unyolo` | **Streaming.** Restore the per-tool approval gate (turn `/yolo` off) |
+| `/effort <level>` | **Streaming.** Set how hard Claude reasons for the active project — `low`/`medium`/`high`/`xhigh`/`max` (reasoning *depth*, distinct from `/thinking`'s visibility). Per-project, persisted, applies to your next turn; a bare `/effort` clears it to the default. Shown live in the [statusline](#statusline-streaming-mode) as `🤖 model·effort`. (`xhigh` is model-dependent.) |
 | `/projects` | **Streaming.** List your projects with the active marker, each project's cwd, run status, and last-active time |
 | `/new <name> <path>` | **Streaming.** Create a project at `<path>` and switch to it; `<path>` must be an existing directory inside `ALLOWED_ROOTS`. Needs `CLAUDE_STATE_FILE` set |
 | `/switch <name>` | **Streaming.** Switch the active project; your next message resumes it |
@@ -260,6 +262,29 @@ turns one chat into many independent workspaces:
 
 See [ADR-004](docs/adr/ADR-004-multi-project-sessions.md) (projects) and
 [ADR-005](docs/adr/ADR-005-concurrency-correlation.md) (concurrency) for the design.
+
+## Statusline (streaming mode)
+
+In streaming mode the bot keeps a single **statusline** message **pinned at the top of the
+chat** — Claude Code's terminal statusline, brought to your phone:
+
+```
+📁 worktree · 🤖 model·effort · 🧠 ctx 6% · 🔒 mode
+```
+
+It shows the **active** project's name, its effective model + reasoning [`/effort`](#commands)
+(`🤖 model·effort`), the live context-window usage (`🧠 ctx %`, the same figure Claude Code's
+`/context` reports — `🧠 ctx —` until the first turn completes, never a made-up number), and the
+permission mode (`🔒 gate`/`yolo`/`plan`). A leading `⚙️` appears while a turn is running.
+
+It's pinned **once** (silently — no notification) and **edited in place** as state changes — on
+turn start/end, `/switch`, and each knob change (`/effort`, `/yolo`, `/fast`·`/deep`, `/plan`) —
+so you always see the bot's current state at a glance without scrolling and without a re-ping. It
+tracks the project you're **watching** (a background run doesn't rewrite it). Unpin it anytime and
+it reappears on the next change. It **replaces** the old per-turn `✅ done · $cost` footer:
+**routine output no longer shows dollar amounts — cost moved to [`/status`](#commands)** (the
+explicit health view). The line is body-free and best-effort — a pin/edit hiccup never affects a
+turn. See [ADR-009](docs/adr/ADR-009-statusline.md) for the design.
 
 ## Proactive scheduler (streaming mode)
 

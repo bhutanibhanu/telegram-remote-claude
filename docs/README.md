@@ -32,6 +32,11 @@ Each ADR captures one load-bearing decision, its context, and its consequences.
   interval schedules fired as normal **gated** turns by an asyncio driver, with a per-turn
   force-gate so an unattended fire can never inherit `/yolo` / session-grants (a risky tool
   holds then auto-denies). Proactive is **not** a gate bypass.
+- [ADR-009 — Statusline](adr/ADR-009-statusline.md): a live mobile statusline pinned at the
+  top of the chat (`📁 worktree · 🤖 model·effort · 🧠 ctx % · 🔒 mode`), edited in place
+  through the send-gate, foreground-only and best-effort (RB1). Sources `ctx %` from the SDK's
+  honest `get_context_usage()`, adds a per-project `/effort` knob, and replaces the per-turn
+  done-footer (cost moves to `/status`).
 
 ## Feature specs
 
