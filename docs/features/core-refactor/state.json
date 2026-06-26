@@ -1,7 +1,7 @@
 {
   "slug": "core-refactor",
-  "phase": "built",
+  "phase": "qa",
   "branch": "feat/core-refactor",
   "worktree": "/Users/ray/dev/claude-telegram-bot-core-refactor",
-  "updated": "2026-06-26T00:30:00Z"
+  "updated": "2026-06-26T02:30:00Z"
 }
