@@ -10,7 +10,7 @@ You (Telegram)  ──▶  this bot (on your Mac)  ──▶  Claude Code  ─�
 
 The bot is a thin transport (`claude_tg/bot.py`). Two engines sit behind it: a simple
 **one-shot** runner (`claude -p`, `claude_tg/claude_runner.py`) and an interactive
-**streaming** engine (the Claude Agent SDK, `claude_tg/stream_session.py` + `engine/`).
+**streaming** engine (the Claude Agent SDK, `claude_tg/stream_session/` + `engine/`).
 You choose which with one environment variable.
 
 > **This bot runs Claude Code with tool access on your machine** — it can read/edit files
@@ -442,7 +442,7 @@ python scripts/secret_scan.py    # secret scan
 ```
 
 Layout: `claude_tg/config.py` (env), `bot.py` (Telegram transport), `claude_runner.py`
-(one-shot subprocess), `stream_session.py` + `engine/` (streaming engine, permission
+(one-shot subprocess), `stream_session/` + `engine/` (streaming engine, permission
 gating, concurrency), `session_store.py` (project/session persistence), `permissions.py`
 (tool gating + path confinement), `paths.py` (root confinement), `render.py` / `tg_html.py`
 (Telegram rendering), `util.py` (chunking). The Claude subprocess call is isolated in
