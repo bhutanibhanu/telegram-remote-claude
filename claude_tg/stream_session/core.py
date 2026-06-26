@@ -123,6 +123,7 @@ from ..sessions_discovery import DiscoveredSession, SessionDiscovery, discover_s
 from ..util import _redact_sid, _redact_sid_in_text
 from .callbacks import CallbacksMixin
 from .concurrency import ConcurrencyMixin
+from .knobs import PROJECT_KNOBS, SESSION_KEY_KNOBS
 from .runtime import (
     EngineFactory,
     _ChatState,
@@ -998,6 +999,35 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
                     return override
         return self.config.model
 
+    def _resolve_knob(
+        self, chat_id: int, name: str, knob_name: str
+    ) -> Optional[object]:
+        """The value to bake into ``name``'s next session for ONE persisted knob (override → default).
+
+        The single generalized resolver the parallel ``_resolve_project_*`` methods collapse
+        into (driven by :data:`PROJECT_KNOBS`). For the named PERSISTED knob (``"model"`` /
+        ``"effort"``): read the per-project override from the store (the project record's
+        ``knob.field``), normalize it with the knob's normalizer (the SAME rule the typed
+        ``store.get_model``/``get_effort`` apply on read — so this is byte-for-byte that read),
+        and if an override is set return it; else fall back to ``knob.config_default(config)``
+        (model → ``config.model``; effort → ``None`` — the no-global-default asymmetry).
+
+        Read-only + fail-safe (RB1): a missing store / project / field (or a garbage stored
+        value) reads as no override → the configured default. ``_ensure_engine`` calls this for
+        the project it is building, via the named ``_resolve_project_*`` wrappers below.
+        """
+        knob = PROJECT_KNOBS[knob_name]
+        if self.store is not None:
+            try:
+                record = self.store.get_project(chat_id, name)
+                raw = record.get(knob.field) if isinstance(record, dict) else None
+                override = knob.normalize(raw)
+            except Exception:  # RB1: a bad/odd record never wedges the build
+                override = None
+            if override:
+                return override
+        return knob.config_default(self.config)
+
     def _resolve_project_model(self, chat_id: int, name: str) -> Optional[str]:
         """The model id to bake into ``name``'s next session (override → CLAUDE_MODEL → None).
 
@@ -1005,15 +1035,11 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
         configured ``CLAUDE_MODEL`` (``config.model``); absent that, ``None`` (omit ``model``
         → the SDK default). Read-only + fail-safe (RB1): a missing store / project / field
         reads as no override. Called by :meth:`_ensure_engine` for the project it is building.
+
+        Thin wrapper over :meth:`_resolve_knob` (the ``"model"`` row of :data:`PROJECT_KNOBS`)
+        — the name + 2-arg signature are kept because the bot/tests call it directly.
         """
-        if self.store is not None:
-            try:
-                override = self.store.get_model(chat_id, name)
-            except Exception:  # RB1: a bad/odd record never wedges the build
-                override = None
-            if override:
-                return override
-        return self.config.model
+        return self._resolve_knob(chat_id, name, "model")  # type: ignore[return-value]
 
     def _resolve_project_effort(self, chat_id: int, name: str) -> Optional[str]:
         """The reasoning-EFFORT level to bake into ``name``'s next session (override → ``None``).
@@ -1021,19 +1047,15 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
         T-EFFORT (STATUSLINE): the per-project override (``/effort low…max``) if set, else
         ``None`` (omit ``effort`` → the SDK's own default, ``high``). UNLIKE
         :meth:`_resolve_project_model` there is NO ``CLAUDE_*`` global default for effort — when
-        unset we return ``None`` so the kwarg is omitted entirely. Read-only + fail-safe (RB1):
-        a missing store / project / field (or a garbage stored level — :meth:`get_effort`
-        validates) reads as no override. Called by :meth:`_ensure_engine` for the project it is
-        building.
+        unset we return ``None`` so the kwarg is omitted entirely (encoded as the ``"effort"``
+        row's ``config_default = lambda c: None``). Read-only + fail-safe (RB1): a missing store
+        / project / field (or a garbage stored level) reads as no override. Called by
+        :meth:`_ensure_engine` for the project it is building.
+
+        Thin wrapper over :meth:`_resolve_knob` (the ``"effort"`` row of :data:`PROJECT_KNOBS`)
+        — the name + 2-arg signature are kept because the tests call it directly.
         """
-        if self.store is not None:
-            try:
-                override = self.store.get_effort(chat_id, name)
-            except Exception:  # RB1: a bad/odd record never wedges the build
-                override = None
-            if override:
-                return override
-        return None
+        return self._resolve_knob(chat_id, name, "effort")  # type: ignore[return-value]
 
     # -- engine lifecycle ----------------------------------------------------
 
@@ -1130,6 +1152,14 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
         # change rebuilds on the next turn (never hot-swapped). Resolved here (not on the
         # runtime) so the persisted override is read fresh each build (it survives a restart).
         effort = self._resolve_project_effort(chat_id, name)
+        # The freshly-resolved value of each SESSION-IDENTITY knob, keyed by knob name — the
+        # input to the warm-engine match-key loop below. ``thinking`` is the runtime's sticky
+        # flag (read above); ``effort`` is the per-project override (resolved above). ``model``
+        # is deliberately ABSENT (it is not a session-identity knob — a model change does not
+        # rebuild the warm engine; it is re-resolved at each fresh build instead). Driving the
+        # match-key off this map + ``SESSION_KEY_KNOBS`` replaces the three hand-written
+        # ``engine_* == …`` comparisons with one loop — byte-for-byte the same decision.
+        resolved_knobs: dict[str, object] = {"thinking": thinking, "effort": effort}
         # P5 / ADR-005 D1 (T5): no cross-project stop here. A different project's started
         # engine is left running so N runs can be concurrent (T5 removed P4's
         # _stop_other_started). Only the SAME project's stale/non-started engine is handled
@@ -1161,8 +1191,10 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
             rt.engine is not None
             and rt.started
             and rt.engine_permission_mode == permission_mode
-            and rt.engine_thinking == thinking
-            and rt.engine_effort == effort
+            and all(
+                getattr(rt, knob.runtime_marker) == resolved_knobs[knob.name]
+                for knob in SESSION_KEY_KNOBS
+            )
         ):
             return rt.engine, False
         # Past the warm fast-path: rt is either fresh (engine None), holds a NON-started

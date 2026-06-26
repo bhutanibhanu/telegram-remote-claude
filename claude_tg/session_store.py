@@ -439,6 +439,37 @@ class JsonSessionStore:
         self._save_raw(raw)
         return total
 
+    def _persist_field(
+        self, chat_id: int, name: str, field: str, value: object | None
+    ) -> None:
+        """Write (or clear) one already-normalized ``field`` on the **named** project.
+
+        The single generalized per-project-knob setter the typed ``set_*`` overrides share
+        (model, effort — see :meth:`set_model` / :meth:`set_effort`, both now thin wrappers).
+        Performs the one common dance, byte-for-byte what each setter did inline: ``_load_raw``
+        → :meth:`_resolve` (matches ``name`` case-insensitively) → if ``value is None``,
+        ``record.pop(field, None)`` (clear the override) else ``record[field] = value`` → bump
+        ``last_active`` → atomic + ``0600`` :meth:`_save_raw`. Targets a NAMED project (the
+        active project can move mid-turn now ``/switch`` is free); the project's fixed
+        ``cwd``/``session_id`` are left untouched (a knob applies on the NEXT fresh session — it
+        is a session-creation param). Raises :class:`UnknownProject` if no such project exists.
+
+        ``value`` is the caller's responsibility to normalize/validate first (the wrappers do —
+        model: strip-or-``None``; effort: validate against ``{low…max}`` or ``None``); this
+        helper only persists, so ``None`` always means "clear the override". Persists.
+        """
+        raw = self._load_raw()
+        _chat, projects, key = self._resolve(raw, chat_id, name)
+        record = projects[key]
+        if not isinstance(record, dict):
+            raise UnknownProject(name)
+        if value is None:
+            record.pop(field, None)
+        else:
+            record[field] = value
+        record["last_active"] = _now()
+        self._save_raw(raw)
+
     def set_model(self, chat_id: int, name: str, model: str | None) -> None:
         """Write the per-project model override to the **named** project (case-insensitive).
 
@@ -451,19 +482,12 @@ class JsonSessionStore:
         is bumped; the project's fixed ``cwd``/``session_id`` are left untouched (the model
         applies on the NEXT fresh session — it is a session-creation param). Raises
         :class:`UnknownProject` if no such project exists. Persists.
+
+        Thin wrapper: normalize, then delegate the shared persist dance to
+        :meth:`_persist_field` (the dedup of the byte-for-byte parallel model/effort setters).
         """
         normalized = model.strip() if isinstance(model, str) and model.strip() else None
-        raw = self._load_raw()
-        _chat, projects, key = self._resolve(raw, chat_id, name)
-        record = projects[key]
-        if not isinstance(record, dict):
-            raise UnknownProject(name)
-        if normalized is None:
-            record.pop("model", None)
-        else:
-            record["model"] = normalized
-        record["last_active"] = _now()
-        self._save_raw(raw)
+        self._persist_field(chat_id, name, "model", normalized)
 
     def get_model(self, chat_id: int, name: str) -> str | None:
         """The named project's per-project model override (case-insensitive), or ``None``.
@@ -494,23 +518,17 @@ class JsonSessionStore:
         a garbage level can never wedge the project on an effort the SDK would reject (RB1) — the
         turn falls back to the SDK default. Raises :class:`UnknownProject` if no such project
         exists (the bot only ever passes a project it just resolved/created). Persists.
+
+        Thin wrapper: validate/normalize against ``{low…max}``, then delegate the shared persist
+        dance to :meth:`_persist_field` (the dedup of the byte-for-byte parallel model/effort
+        setters).
         """
         normalized = (
             effort.strip().lower()
             if isinstance(effort, str) and effort.strip().lower() in _EFFORT_LEVELS
             else None
         )
-        raw = self._load_raw()
-        _chat, projects, key = self._resolve(raw, chat_id, name)
-        record = projects[key]
-        if not isinstance(record, dict):
-            raise UnknownProject(name)
-        if normalized is None:
-            record.pop("effort", None)
-        else:
-            record["effort"] = normalized
-        record["last_active"] = _now()
-        self._save_raw(raw)
+        self._persist_field(chat_id, name, "effort", normalized)
 
     def get_effort(self, chat_id: int, name: str) -> str | None:
         """The named project's per-project effort override (case-insensitive), or ``None``.
