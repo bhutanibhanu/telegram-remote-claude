@@ -507,8 +507,8 @@ class JsonSessionStore:
         """Write the per-project reasoning-EFFORT override to the **named** project (case-insensitive).
 
         T-EFFORT (STATUSLINE): ``/effort <level>`` stores one of the five SDK levels here;
-        a bare ``/effort`` (or ``/effort default``) clears it (``None``) back to the SDK
-        default. Exactly parallel to :meth:`set_model` (the model override): targets a named
+        ``/effort default`` clears it (``None``) back to the SDK default. Exactly parallel to
+        :meth:`set_model` (the model override): targets a named
         project (the active project can move mid-turn now ``/switch`` is free), atomic +
         ``0600`` (RB6) via :meth:`_save_raw`, and bumps ``last_active``; the project's fixed
         ``cwd``/``session_id`` are left untouched (effort applies on the NEXT fresh session — it

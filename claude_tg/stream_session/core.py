@@ -902,8 +902,8 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
     def set_effort(self, chat_id: int, level: Optional[str]) -> Optional[str]:
         """Set (or clear) the ACTIVE project's per-project reasoning-EFFORT override (T-EFFORT).
 
-        ``/effort <low|medium|high|xhigh|max>`` stores the level; a bare ``/effort`` (or
-        ``/effort default``) clears it (``None``) back to the SDK default (``high``). Exactly
+        ``/effort <low|medium|high|xhigh|max>`` stores the level; ``/effort default`` clears
+        it (``None``) back to the SDK default (``high``). Exactly
         parallel to :meth:`set_model`: persisted on the active project via the store (atomic +
         ``0600``, RB6) so it survives a restart and a store reload; with no store it is a no-op
         (a single implicit project, no persistence) — returns the NORMALIZED level regardless so
@@ -935,6 +935,19 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
                 # SDK default. Mirrors set_model / _persist's swallow-and-log discipline.
                 log.exception("failed to persist effort override for chat %s", chat_id)
         return normalized
+
+    def get_effort(self, chat_id: int) -> Optional[str]:
+        """Return the ACTIVE project's reasoning-EFFORT override without mutating state.
+
+        A missing active project, missing store field, or explicit default all report ``None``.
+        That is the same value :meth:`_statusline_text` passes to ``format_statusline`` when the
+        SDK default applies, but this public read accessor lets the bot make bare ``/effort`` a
+        safe status query instead of a reset.
+        """
+        name, _rt = self._active_runtime(chat_id, create_default=False)
+        if name is None:
+            return None
+        return self._resolve_project_effort(chat_id, name)
 
     def arm_plan(self, chat_id: int) -> None:
         """Arm the ACTIVE project's NEXT turn as a plan turn (``/plan``; P12 T-PLAN-2).

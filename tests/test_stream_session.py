@@ -6320,10 +6320,12 @@ def test_set_effort_persists_on_active_project_and_resolves_it(tmp_path):
     # /effort max sets the override on the active project + persists.
     assert session.set_effort(1, "max") == "max"
     assert store.get_effort(1, "alpha") == "max"
+    assert session.get_effort(1) == "max"
     assert session._resolve_project_effort(1, "alpha") == "max"
-    # bare /effort (None) clears it → resolve falls back to None (SDK default).
+    # /effort default (None) clears it → resolve falls back to None (SDK default).
     assert session.set_effort(1, None) is None
     assert store.get_effort(1, "alpha") is None
+    assert session.get_effort(1) is None
     assert session._resolve_project_effort(1, "alpha") is None
 
 

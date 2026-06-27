@@ -111,6 +111,7 @@ class FakeStreaming:
         self.plan_calls = []
         self.thinking_calls = []
         self.effort_calls = []
+        self.current_effort = None
         self.reply_prompt_calls = []
         self.to_calls = []
         self.attach_calls = []
@@ -242,7 +243,12 @@ class FakeStreaming:
         # reasoning-EFFORT override. Record the (chat_id, level) and echo it back (the real
         # method returns the normalized level — None for a clear).
         self.effort_calls.append((chat_id, level))
+        self.current_effort = level
         return level
+
+    def get_effort(self, chat_id):
+        # T-EFFORT: bare /effort is a read-only status query.
+        return self.current_effort
 
     def get_cwd(self, chat_id):
         # P9/T1: the first-run welcome reads the active cwd via this accessor.
@@ -744,19 +750,30 @@ async def test_cmd_effort_bad_level_clean_error_lists_valid_and_does_not_set():
         assert level in reply.lower()
 
 
-async def test_cmd_effort_bare_clears_to_default():
-    # A bare /effort (no arg) CLEARS the override → SDK default (set_effort called with None).
+async def test_cmd_effort_bare_reports_current_default_without_clearing():
+    # A bare /effort (no arg) is read-only so checking the knob never resets it.
     streaming = FakeStreaming()
     bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
     upd = make_update(1, "/effort")
     await bot.cmd_effort(upd, make_ctx(args=[]))
-    assert streaming.effort_calls == [(1, None)]
+    assert streaming.effort_calls == []
     reply = upd.message.reply_text.await_args.args[0]
     assert "default" in reply.lower() and "low" in reply.lower()  # usage lists the levels too
 
 
+async def test_cmd_effort_bare_reports_current_override_without_clearing():
+    streaming = FakeStreaming()
+    streaming.current_effort = "max"
+    bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
+    upd = make_update(1, "/effort")
+    await bot.cmd_effort(upd, make_ctx(args=[]))
+    assert streaming.effort_calls == []
+    reply = upd.message.reply_text.await_args.args[0]
+    assert "max" in reply.lower()
+
+
 async def test_cmd_effort_default_keyword_clears():
-    # /effort default is the explicit clear (same as bare).
+    # /effort default is the explicit clear; bare /effort is read-only.
     streaming = FakeStreaming()
     bot = TelegramClaudeBot(make_config(engine_mode="streaming"), FakeRunner(), streaming=streaming)
     upd = make_update(1, "/effort default")

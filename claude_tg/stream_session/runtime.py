@@ -123,7 +123,7 @@ def _default_engine_factory(
     **T-EFFORT (STATUSLINE):** ``effort`` is the per-project reasoning-EFFORT override
     (``/effort low…max``) baked into the substrate's ``ClaudeAgentOptions(effort=…)`` at
     session-creation time (mirrors ``model`` — a session-creation knob, distinct from the P12
-    ``thinking`` VISIBILITY toggle). ``None`` (the default here, and what a bare ``/effort``
+    ``thinking`` VISIBILITY toggle). ``None`` (the default here, and what ``/effort default``
     clears to) omits ``effort`` entirely so behavior is byte-for-byte unchanged when no
     override is set and the SDK's own default effort (``high``) applies. There is NO
     ``CLAUDE_*`` global default for effort: the session resolves the per-project override (else

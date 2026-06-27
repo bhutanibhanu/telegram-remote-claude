@@ -94,9 +94,9 @@ HELP_TEXT = (
     "(it executes, still per-tool gated) or Reject with feedback (it revises) (streaming mode)\n"
     "/thinking on|off — stream Claude's reasoning as a 🧠 line while it works; off by default "
     "(streaming mode)\n"
-    "/effort low|medium|high|xhigh|max — set how hard Claude reasons for this project (depth, "
-    "not visibility); persisted, applies to your next turn; bare /effort clears to the default "
-    "(streaming mode)\n"
+    "/effort [low|medium|high|xhigh|max] — show or set how hard Claude reasons for this project "
+    "(depth, not visibility); persisted, applies to your next turn; /effort default clears the "
+    "override (streaming mode)\n"
     "/fast — use the fast model (Haiku) for this project's next turn (streaming mode)\n"
     "/deep — use the deep model (Opus) for this project's next turn (streaming mode)\n"
     "/auto (or /model default) — clear the model override, back to the default (streaming mode)\n"
@@ -153,7 +153,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("unyolo", "Restore the per-tool permission gate"),
     ("plan", "Run the next message in plan mode (approve the plan first)"),
     ("thinking", "Toggle the live reasoning stream: /thinking on|off (default off)"),
-    ("effort", "Set reasoning effort: /effort low|medium|high|xhigh|max"),
+    ("effort", "Show/set reasoning effort: /effort [level]"),
     ("fast", "Use the fast model (Haiku) for this project's next turn"),
     ("deep", "Use the deep model (Opus) for this project's next turn"),
     ("auto", "Clear the model override (back to the default)"),
@@ -702,15 +702,16 @@ class TelegramClaudeBot:
             )
 
     async def cmd_effort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """``/effort <low|medium|high|xhigh|max>`` — set the per-project reasoning EFFORT (T-EFFORT).
+        """``/effort [low|medium|high|xhigh|max]`` — show/set per-project reasoning EFFORT.
 
-        Sets the active project's reasoning-EFFORT level (how hard Claude thinks: ``low`` =
+        Shows or sets the active project's reasoning-EFFORT level (how hard Claude thinks: ``low`` =
         fastest/minimal … ``max`` = maximum effort). Distinct from ``/thinking`` (which only
         makes the reasoning VISIBLE as the 🧠 line); ``/effort`` dials the DEPTH and costs no
         extra wire traffic. Per-project + **persisted** (survives a restart, like the ``/fast``
-        model override). A bare ``/effort`` (or ``/effort default``) CLEARS the override back to
-        the SDK default. **Applies on the NEXT fresh session**, never mid-turn (it's a
-        session-creation knob, like ``/fast``·``/deep``).
+        model override). A bare ``/effort`` is read-only and reports the current override (or
+        default); ``/effort default`` CLEARS the override back to the SDK default. **Applies on
+        the NEXT fresh session**, never mid-turn (it's a session-creation knob, like
+        ``/fast``·``/deep``).
 
         Streaming mode only — effort is baked into the streaming engine's ``ClaudeAgentOptions``
         (one-shot has no per-project session knob), so one-shot replies a clear notice rather
@@ -729,10 +730,27 @@ class TelegramClaudeBot:
             return
         levels = " · ".join(EFFORT_LEVELS)
         arg = (ctx.args[0].strip().lower() if ctx.args else "")
-        # Bare /effort (or /effort default) CLEARS the override → SDK default. A bare invocation
-        # also shows the usage so the operator sees the valid levels (mirrors /thinking's bare
-        # usage), but it DOES clear (the documented "/effort default" UX), so it is not a no-op.
-        if arg in ("", "default"):
+        # Bare /effort is read-only. Operators naturally use it to inspect the knob, so clearing
+        # requires the explicit /effort default form.
+        if arg == "":
+            current = self.streaming.get_effort(update.effective_chat.id)
+            if current is None:
+                await update.message.reply_text(
+                    f"🧠 Effort is <b>default</b> — no per-project override is set.\n"
+                    f"Valid levels: {html.escape(levels, quote=False)}\n"
+                    "Set with /effort max; clear with /effort default.",
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    f"🧠 Effort is <b>{html.escape(current, quote=False)}</b> for this project. "
+                    "Applies to the next fresh session; a turn in flight keeps its current effort.\n"
+                    f"Valid levels: {html.escape(levels, quote=False)}\n"
+                    "Clear with /effort default.",
+                    parse_mode="HTML",
+                )
+            return
+        if arg == "default":
             self.streaming.set_effort(update.effective_chat.id, None)
             await update.message.reply_text(
                 f"🧠 Effort cleared — your next turn uses the default reasoning effort. "

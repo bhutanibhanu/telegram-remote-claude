@@ -219,7 +219,7 @@ Claude to read; `/get` pulls one back), or **a voice note** — with a transcrib
 | `/to <name> <text>` | **Streaming.** Send a free-text answer/feedback to a named project's pending "Other"/"Reject" prompt (or just reply to the prompt) |
 | `/yolo` | **Streaming.** Run every tool this session with **no** approval prompt (loud ⚠️ banner). Disables the gate for the session |
 | `/unyolo` | **Streaming.** Restore the per-tool approval gate (turn `/yolo` off) |
-| `/effort <level>` | **Streaming.** Set how hard Claude reasons for the active project — `low`/`medium`/`high`/`xhigh`/`max` (reasoning *depth*, distinct from `/thinking`'s visibility). Per-project, persisted, applies to your next turn; a bare `/effort` clears it to the default. Shown live in the [statusline](#statusline-streaming-mode) as `🤖 model·effort`. (`xhigh` is model-dependent.) |
+| `/effort [level]` | **Streaming.** Show or set how hard Claude reasons for the active project — `low`/`medium`/`high`/`xhigh`/`max` (reasoning *depth*, distinct from `/thinking`'s visibility). Per-project, persisted, applies to your next turn; `/effort default` clears it to the default. Shown live in the [statusline](#statusline-streaming-mode) as `🤖 model·effort` when an override is set. (`xhigh` is model-dependent.) |
 | `/projects` | **Streaming.** List your projects with the active marker, each project's cwd, run status, and last-active time |
 | `/new <name> <path>` | **Streaming.** Create a project at `<path>` and switch to it; `<path>` must be an existing directory inside `ALLOWED_ROOTS`. Needs `CLAUDE_STATE_FILE` set |
 | `/switch <name>` | **Streaming.** Switch the active project; your next message resumes it |

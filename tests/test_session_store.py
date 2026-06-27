@@ -693,7 +693,7 @@ def test_set_effort_clear_removes_override(tmp_path):
     store.create(1, "alpha", "/work/alpha", make_active=True)
     store.set_effort(1, "alpha", "high")
     assert store.get_effort(1, "alpha") == "high"
-    store.set_effort(1, "alpha", None)  # bare /effort clears
+    store.set_effort(1, "alpha", None)  # /effort default clears
     assert store.get_effort(1, "alpha") is None
 
 
