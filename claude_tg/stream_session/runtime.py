@@ -549,6 +549,23 @@ class _ChatState:
     # and the line would stay unpinned forever. So on a failed pin we leave this False and RETRY
     # the pin on the next update even when the text is unchanged. Transient in-memory (RB3).
     statusline_pinned: bool = False
+    # observability T5 (live activity line) — the ONE TRANSIENT "what's running right now" message
+    # per chat (the foreground turn's current tool + active-subagent type-names, ⚙️). Mirrors the
+    # statusline's id/text discipline but for an EPHEMERAL line: ``activity_message_id`` is the
+    # Telegram id of the line (None before the first activity / after the turn-end finalize removes
+    # it); ``activity_text`` is the last body shown, for the identical-text skip (a no-op edit raises
+    # "message is not modified" AND wastes a send slot); ``activity_last_edit_ts`` is the monotonic
+    # clock time of the last EDIT, for the ≲1 edit/sec time-throttle that coalesces a rapid
+    # tool/subagent burst (a change inside the interval is skipped WITHOUT advancing
+    # ``activity_text``, so the next change past the interval still shows the latest state).
+    # POSTED on first foreground activity, EDITED in place as activity changes (never a new message
+    # per change), and DELETED at turn end (no lingering ⚙️ — NOT a per-turn "done" footer; the
+    # pinned statusline is the persistent summary). Foreground-only + best-effort (RB1). Transient
+    # in-memory only (RB3): a restart drops the reference; never persisted — like ``send_gate`` /
+    # ``status_message_id`` / ``statusline_message_id``.
+    activity_message_id: Optional[int] = None
+    activity_text: Optional[str] = None
+    activity_last_edit_ts: float = 0.0
 
 
 def _resume_failure_text(event: Event) -> Optional[str]:

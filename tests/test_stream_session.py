@@ -90,7 +90,7 @@ HOLD = object()  # sentinel in a script: park send() here until a resolve/cancel
 
 
 class FakeEngine:
-    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True, ctx_pct=None, last_model=None, limit_status=None):
+    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True, ctx_pct=None, last_model=None, limit_status=None, last_activity=None):
         self._script = script
         self.session_id = session_id
         # STATUSLINE T-SL-CORE: the ctx % the statusline reads via engine.context_percentage().
@@ -104,6 +104,11 @@ class FakeEngine:
         # — (status, pct_or_None) or None. Default None (→ the 🪙 field is OMITTED); a test sets a
         # value (a tuple, or a callable to simulate a raising read for the RB1 probe).
         self._limit_status = limit_status
+        # observability T5: the activity snapshot the activity line reads via engine.last_activity()
+        # — an ActivitySnapshot or None. Default None (→ the activity line shows nothing); a test
+        # sets a value (or a callable, e.g. a lambda over a mutable box to make the snapshot CHANGE
+        # across events, or a raising lambda to exercise the activity line's best-effort RB1 guard).
+        self._last_activity = last_activity
         self.resolve_calls: list[tuple[str, object]] = []
         self.cancel_calls: list = []
         # P14 T-FIRE: records the ``proactive`` flag passed to each send() (the force-gate
@@ -169,6 +174,14 @@ class FakeEngine:
         if callable(self._limit_status):
             return self._limit_status()
         return self._limit_status
+
+    def last_activity(self):
+        # observability T5: the activity snapshot the activity line reads (sync, like the real
+        # Engine.last_activity()). A callable is CALLED — a test can pass a lambda over a mutable
+        # box so the snapshot CHANGES across events, or a lambda that raises for the RB1 probe.
+        if callable(self._last_activity):
+            return self._last_activity()
+        return self._last_activity
 
 
 class Recorder:
@@ -8718,3 +8731,443 @@ async def test_limit_warning_no_engine_turn_rearms():
     )
     assert _warnings(rec) == [], "no engine → no warning"
     assert session._chat(1).limit_warned is False, "a no-engine turn clears (re-arms) the flag"
+
+
+# ---------------------------------------------------------------------------
+# observability T5 — the live activity line (ActivityMixin)
+#
+# A TRANSIENT message showing "what's running right now" (the current tool + active-subagent
+# type-names, ⚙️), POSTED on first foreground activity, EDITED in place as activity changes
+# (throttled — skip-identical + ≲1 edit/sec, never a new message per change), and REMOVED at turn
+# end (no lingering ⚙️; NOT a per-turn "done" footer). Foreground-only (SB1), body-free (SB3 —
+# names only), best-effort (RB1 — never breaks a turn). Mock-only, like the rest of this file.
+# ---------------------------------------------------------------------------
+
+
+def _snap(tool=None, subagents=()):
+    """An ActivitySnapshot (the engine.last_activity() shape — names only, SB3-clean)."""
+    from claude_tg.engine.adapter_sdk import ActivitySnapshot
+
+    return ActivitySnapshot(current_tool=tool, subagents=tuple(subagents))
+
+
+def _advancing_clock(step=10.0):
+    """A monotonic clock that ADVANCES ``step`` seconds on each call (past the throttle interval).
+
+    Used so a deterministic time-throttle test can let successive edits THROUGH (step ≫ 1 s) — and
+    its companion ``_frozen_clock`` (0.0) coalesces them. No real time is consumed."""
+    box = {"t": 0.0}
+
+    def now():
+        box["t"] += step
+        return box["t"]
+
+    return now
+
+
+# --- _render_activity (pure) -------------------------------------------------
+
+
+def test_render_activity_none_snapshot_is_none():
+    # No activity → nothing to show (the caller removes/skips).
+    assert StreamingSession._render_activity(None) is None
+
+
+def test_render_activity_tool_only():
+    assert StreamingSession._render_activity(_snap(tool="Bash")) == "⚙️ Bash"
+
+
+def test_render_activity_tool_and_subagents():
+    line = StreamingSession._render_activity(
+        _snap(tool="Bash", subagents=("Explore", "general-purpose"))
+    )
+    assert line == "⚙️ Explore, general-purpose · Bash"
+
+
+def test_render_activity_subagents_only_no_tool():
+    assert StreamingSession._render_activity(_snap(subagents=("Explore",))) == "⚙️ Explore"
+
+
+def test_render_activity_many_subagents_collapse_to_count():
+    # > 3 subagents → a COUNT instead of a wall of names (still names-free of args either way).
+    line = StreamingSession._render_activity(
+        _snap(tool="Bash", subagents=("a", "b", "c", "d", "e"))
+    )
+    assert line == "⚙️ 5 agents · Bash"
+
+
+def test_render_activity_empty_snapshot_is_none():
+    # A defensively-empty snapshot (no tool, no subagents) renders nothing.
+    assert StreamingSession._render_activity(_snap()) is None
+
+
+def test_render_activity_is_names_only_sb3():
+    # SB3: even if a tool/subagent name arrived from a secret-laden upstream input, the snapshot is
+    # names-only by construction and the render carries ONLY those names — HTML-escaped once, no
+    # args/paths/prompt. We drive a "name" that LOOKS like it could carry junk and assert the line
+    # contains the (escaped) name and nothing resembling a body/arg.
+    line = StreamingSession._render_activity(
+        _snap(tool="Bash", subagents=("general-purpose",))
+    )
+    assert line == "⚙️ general-purpose · Bash"
+    # No raw '<'/'>' (HTML-escaped) and none of the body-shaped tokens an arg would carry.
+    for forbidden in ("<", ">", "command=", "/Users/", "prompt", "secret", "--"):
+        assert forbidden not in line
+
+
+def test_render_activity_html_escapes_names_once():
+    # A name containing HTML-significant chars is escaped exactly once (parse_mode="HTML" safety).
+    line = StreamingSession._render_activity(_snap(tool="a<b>&c"))
+    assert line == "⚙️ a&lt;b&gt;&amp;c"
+
+
+# --- _maybe_update_activity: post once, edit in place, throttle, RB1 ---------
+
+
+async def test_activity_posts_one_message_on_first_activity():
+    # First foreground activity → EXACTLY ONE send (the line is posted), no edit.
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1, f"first activity must POST exactly once, sends={rec.sends!r}"
+    assert rec.edits == [], "no edit on the first post"
+    assert rec.sends[0]["text"] == "⚙️ Bash"
+    assert rec.sends[0]["parse_mode"] == "HTML"
+    assert session._chat(1).activity_message_id == 101
+    assert session._chat(1).activity_text == "⚙️ Bash"
+
+
+async def test_activity_change_edits_same_message_not_a_new_send():
+    # A subsequent CHANGE EDITS the same message (an edit op), NOT a second send. The clock must
+    # advance past the throttle so the change is allowed through (not coalesced).
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+    session = make_session(eng, clock=_advancing_clock())
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1 and rec.edits == []
+    # Activity changes (a new tool) → EDIT in place, NOT a new send.
+    box["v"] = _snap(tool="Grep")
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1, "a change must EDIT, never a second send"
+    assert len(rec.edits) == 1, "the change is an edit op"
+    assert rec.edits[0]["message_id"] == 101, "the SAME message is edited in place"
+    assert rec.edits[0]["text"] == "⚙️ Grep"
+    assert session._chat(1).activity_text == "⚙️ Grep"
+
+
+async def test_activity_skip_identical_no_edit():
+    # An UNCHANGED snapshot → no edit (skip-identical: a no-op Telegram edit raises + wastes a slot).
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+    session = make_session(eng, clock=_advancing_clock())
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1
+    # Same snapshot again → no edit (and no new send).
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1 and rec.edits == [], "an unchanged snapshot triggers no edit"
+
+
+async def test_activity_time_throttle_coalesces_rapid_changes():
+    # Rapid successive CHANGES within the throttle interval are COALESCED — the edit count is
+    # BOUNDED, not one-per-change. With a FROZEN clock (0.0) every edit lands inside the 1 s window
+    # after the first post, so all post-first changes are skipped (the strongest coalescing).
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+    session = make_session(eng, clock=lambda: 0.0)  # frozen → every change inside the interval
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1
+    # Five rapid distinct changes, all within the throttle window → coalesced to ZERO edits.
+    for tool in ("Grep", "Read", "Edit", "Write", "Glob"):
+        box["v"] = _snap(tool=tool)
+        await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1, "no extra sends from the burst"
+    assert len(rec.edits) <= 1, f"rapid changes must coalesce (bounded edits), got {rec.edits!r}"
+    # The in-memory text was NOT advanced by a throttled skip (it still reflects the FIRST post,
+    # "⚙️ Bash"), so the next change PAST the interval still shows the latest state. Advance the
+    # clock and change to a DIFFERENT tool than the first post.
+    assert session._chat(1).activity_text == "⚙️ Bash", "a throttled skip never advanced the stored text"
+    session._clock = _advancing_clock()
+    box["v"] = _snap(tool="Glob")  # the latest state, distinct from the first post
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert any(e["text"] == "⚙️ Glob" for e in rec.edits), "the next change past the interval shows the latest state"
+
+
+async def test_activity_idle_render_skips_no_write():
+    # last_activity() → None (idle) → nothing posted/edited (removal is the finalize's job).
+    eng = FakeEngine([], last_activity=None)
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert rec.sends == [] and rec.edits == [], "idle activity writes nothing"
+    assert session._chat(1).activity_message_id is None
+
+
+async def test_activity_raising_last_activity_swallowed():
+    # RB1: a last_activity() that RAISES posts nothing and never breaks (the caller swallows).
+    def _boom():
+        raise RuntimeError("activity read blew up")
+
+    eng = FakeEngine([], last_activity=_boom)
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    # Must not raise.
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert rec.sends == [] and rec.edits == []
+
+
+async def test_activity_raising_send_swallowed():
+    # RB1: a raising SEND is swallowed (the whole update is best-effort) — no exception escapes.
+    class BoomSend(Recorder):
+        async def send(self, *, text, reply_markup=None, parse_mode=None, **kwargs) -> int:
+            raise RuntimeError("Telegram send failed")
+
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = BoomSend()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    # No id was stored (the send raised before returning one).
+    assert session._chat(1).activity_message_id is None
+
+
+async def test_activity_missing_closures_is_noop():
+    # No send/edit closures injected (a caller/test that didn't wire them) → no-op, no raise.
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    await session._maybe_update_activity(1, send=None, edit=None, for_project=None)
+    assert session._chat(1).activity_message_id is None
+
+
+# --- _finalize_activity: remove at turn end ----------------------------------
+
+
+async def test_finalize_activity_deletes_and_clears():
+    # At turn end the transient line is DELETED and its id cleared.
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert session._chat(1).activity_message_id == 101
+    await session._finalize_activity(1, delete=rec.delete)
+    assert len(rec.deletes) == 1 and rec.deletes[0]["message_id"] == 101
+    assert session._chat(1).activity_message_id is None
+    assert session._chat(1).activity_text is None
+
+
+async def test_finalize_activity_raising_delete_swallowed_state_cleared():
+    # RB1: a raising delete is swallowed AND the state is cleared regardless (no stale id leaks).
+    class BoomDelete(Recorder):
+        async def delete(self, *, message_id) -> None:
+            raise RuntimeError("Telegram delete failed")
+
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = BoomDelete()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    await session._finalize_activity(1, delete=rec.delete)  # must not raise
+    assert session._chat(1).activity_message_id is None, "a failed delete still clears the id"
+
+
+# --- end-to-end through a turn: posts, then collapses/removes at turn end -----
+
+
+async def test_activity_line_posted_during_turn_and_removed_at_end():
+    # A FOREGROUND turn that emits a tool_use posts the activity line during the turn (its engine's
+    # last_activity() reports the tool), then REMOVES it at turn end (delete + id cleared). No
+    # lingering ⚙️, no per-turn "done" footer.
+    eng = FakeEngine(
+        [
+            ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)"),
+            ResultEvent(session_id="sess-1", is_error=False, subtype="success", result_text="done!"),
+        ],
+        last_activity=lambda: _snap(tool="Bash"),
+    )
+    session = make_session(eng)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit, delete=rec.delete),
+        timeout=2.0,
+    )
+    # The activity line was posted (⚙️ Bash among the sends).
+    assert any(s["text"] == "⚙️ Bash" for s in rec.sends), "the activity line was posted during the turn"
+    # And removed at turn end: its id is cleared, and a delete was issued for it.
+    assert session._chat(1).activity_message_id is None, "the activity line id is cleared at turn end"
+    # No lingering ⚙️ activity message text persists as the final state (the id is gone).
+    # (The statusline ⚙️ working-marker is a SEPARATE pinned line; the transient activity line is
+    # identified by its body "⚙️ <tool>" with no statusline fields like 🧠/🔒.)
+    assert session._chat(1).activity_text is None
+
+
+async def test_activity_line_foreground_only_background_turn_does_not_post(tmp_path):
+    # Foreground-only: a BACKGROUND project's turn must NOT post/edit the FOREGROUND activity line.
+    # A real store is needed (with store=None every project is implicitly foreground).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)  # fg is foreground
+    store.create(1, "bg", "/work", make_active=False)
+    eng = FakeEngine(
+        [
+            ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)"),
+            ResultEvent(session_id="sess-1", is_error=False, subtype="success", result_text="done!"),
+        ],
+        last_activity=lambda: _snap(tool="Bash"),
+    )
+    session = make_session(eng, store=store)
+    _bg_name, bg_rt = session._override_runtime(1, "bg")
+    bg_rt.engine = eng
+    rec = Recorder()
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, eng, "go",
+            send=rec.send, edit=rec.edit, delete=rec.delete, target=("bg", bg_rt),
+        ),
+        timeout=2.0,
+    )
+    # No activity line was posted for the foreground chat (the background turn is silent).
+    assert not any(s["text"] == "⚙️ Bash" for s in rec.sends), "a background turn must not post the activity line"
+    assert session._chat(1).activity_message_id is None
+
+
+# --- B2 regression lock: the SYNC foreground re-check before the raw send/edit -----
+#
+# These two tests PIN the make-or-break B2 guard in _activity_send (activity.py:_activity_send)
+# and _activity_edit: the gate wait (awaited via the injected _sleep) is a /switch window, so
+# immediately before the raw send/edit there is a SYNCHRONOUS _is_foreground re-check with NO
+# await between it and the write. If a /switch happened during the wait, the stale write is
+# DROPPED. The earlier foreground-only tests don't catch a DELETION of this sync re-check (they
+# use for_project=None, or wait==0 so _sleep never runs). Here the injected _sleep FLIPS the
+# chat's foreground away mid-wait, so removing the re-check at _activity_send/_activity_edit
+# would let the stale write through and FAIL these assertions.
+
+
+def _b2_session(store, *, on_sleep):
+    """A StreamingSession with a real interval + frozen clock + an injected sleep hook (B2 lock).
+
+    ``on_sleep(delay)`` is invoked from inside the awaited gate wait (the /switch window) so a
+    test can flip the chat's foreground away DURING the wait — exercising the sync re-check that
+    runs AFTER the sleep, immediately before the raw send/edit (no await between)."""
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+
+    async def _sleep(delay: float) -> None:
+        on_sleep(delay)
+
+    return StreamingSession(
+        make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng,
+        clock=lambda: 0.0,            # frozen → the gate's wait is deterministic
+        chat_send_interval=5.0,       # a real interval so a pre-primed gate returns wait > 0
+        sleep=_sleep,                 # the injected awaited wait = the /switch window
+    ), eng
+
+
+async def test_activity_send_b2_switch_during_gate_wait_drops_stale_post(tmp_path):
+    # B2 (POST path): a /switch DURING the gate wait → the stale post is DROPPED by the sync
+    # foreground re-check. Deleting that re-check would send the line to the now-stale foreground.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)   # "fg" is foreground at call time
+    store.create(1, "other", "/work", make_active=False)
+
+    flips: list[float] = []
+
+    def _flip_foreground_away(delay: float) -> None:
+        # During the awaited gate wait, /switch away from "fg" so the sync re-check (after the
+        # sleep, before the raw send) sees "fg" is no longer foreground.
+        flips.append(delay)
+        store.switch(1, "other")
+
+    session, eng = _b2_session(store, on_sleep=_flip_foreground_away)
+    _name, rt = session._override_runtime(1, "fg")
+    rt.engine = eng
+    rec = Recorder()
+    # Pre-prime the gate so the activity write's reserve(verbatim=False) returns wait > 0 (so
+    # _sleep — and thus the mid-wait /switch — actually runs). On a frozen clock a fresh gate's
+    # first reserve is 0 (leading edge); one prior reservation pushes the tail to +interval.
+    session._gate(session._chat(1)).reserve(verbatim=False)
+
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project="fg")
+
+    assert flips, "the gate wait (the /switch window) must have been awaited (wait > 0)"
+    assert rec.sends == [], "a /switch during the gate wait must DROP the stale post (B2)"
+    assert session._chat(1).activity_message_id is None, "no id stored for a dropped post"
+
+
+async def test_activity_edit_b2_switch_during_gate_wait_drops_stale_edit(tmp_path):
+    # B2 (EDIT path): with the line already posted, a /switch DURING the gate wait of a later
+    # CHANGE → the stale edit is DROPPED by the sync re-check. Deleting that re-check would edit
+    # the line for the now-stale foreground.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)
+    store.create(1, "other", "/work", make_active=False)
+
+    # First, post the activity line cleanly while "fg" stays foreground (a no-op sleep). Use a
+    # mutable box so the snapshot can change for the second call (a genuine CHANGE → edit path).
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+
+    async def _noop_sleep(delay: float) -> None:
+        return None
+
+    session = StreamingSession(
+        make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng,
+        clock=lambda: 0.0,            # frozen → the gate's wait is deterministic
+        chat_send_interval=5.0,       # a real interval so the change's reserve returns wait > 0
+        sleep=_noop_sleep,
+    )
+    _name, rt = session._override_runtime(1, "fg")
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project="fg")
+    assert len(rec.sends) == 1 and session._chat(1).activity_message_id is not None, "line posted"
+
+    # Now arm the mid-wait /switch and drive a CHANGE that must take the edit path. On the frozen
+    # clock the post advanced the gate tail to slot 0, so the change's reserve(verbatim=False)
+    # lands at +interval → wait > 0 → the injected _sleep (the /switch window) runs. Reset the
+    # throttle ts so the change isn't coalesced by the time-throttle (frozen clock → now==last).
+    flips: list[float] = []
+
+    async def _flip_sleep(delay: float) -> None:
+        flips.append(delay)
+        store.switch(1, "other")  # /switch away from "fg" during the gate wait
+
+    session._sleep = _flip_sleep
+    session._chat(1).activity_last_edit_ts = -100.0  # past the throttle → the change reaches the gate
+    box["v"] = _snap(tool="Grep")  # a genuine change → the edit path
+
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project="fg")
+
+    assert flips, "the gate wait (the /switch window) must have been awaited (wait > 0)"
+    assert rec.edits == [], "a /switch during the gate wait must DROP the stale edit (B2)"
+    # The post-edit state was NOT advanced (the dropped edit never recorded the new body).
+    assert session._chat(1).activity_text == "⚙️ Bash", "a dropped edit leaves the shown text unchanged"

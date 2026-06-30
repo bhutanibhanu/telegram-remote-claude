@@ -9,7 +9,7 @@ spikes (T1, T2) are front-loaded so each data source is proven before any UI com
 - [x] T2 — Adapter activity telemetry + spike (Task* emitted; task_type first-class; SB3 names-only; lifecycle reconcile)
 - [x] T3 — Statusline 🪙 limit field (🪙 <pct>% / 🟢🟡🔴 badge / omit; byte-for-byte unchanged when None)
 - [x] T4 — Proactive limit warning (one-time per non-ok window, re-arm on ok; SB1/SB3/RB1; reviewer AGREE)
-- [ ] T5 — Live activity line (ActivityMixin)
+- [x] T5 — Live activity line (ActivityMixin) (transient, skip-identical + 1s throttle, B2 re-check, delete@end; reviewer AGREE)
 - [ ] T6 — ADR-010 + docs + phone-verify
 
 Legend: `[ ]` todo · `[>]` in progress · `[x]` done (sha) · `[!]` blocked

@@ -121,6 +121,7 @@ from ..session_store import (
 )
 from ..sessions_discovery import DiscoveredSession, SessionDiscovery, discover_sessions
 from ..util import _redact_sid, _redact_sid_in_text
+from .activity import ActivityMixin
 from .callbacks import CallbacksMixin
 from .concurrency import ConcurrencyMixin
 from .knobs import PROJECT_KNOBS, SESSION_KEY_KNOBS
@@ -153,7 +154,7 @@ from .types import (
 log = logging.getLogger(__name__)
 
 
-class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
+class StreamingSession(ActivityMixin, StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
     """Drives the streaming engine for every chat (the bot delegates here in streaming mode).
 
     Construct ONE per bot. Methods are called from the Telegram handlers (PTB dispatches
@@ -2967,6 +2968,17 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
                 held_kind = _pending_kind_of(event)
                 if held_kind is not None:
                     turn_rt.status = _AWAITING_STATUS[held_kind]
+                # observability T5: refresh the TRANSIENT activity line ("what's running right
+                # now" — the current tool + active-subagent type-names). Driven AFTER each event is
+                # handled, since activity (a fresh tool_use / Task*) may have just changed; POSTED
+                # on first activity, EDITED in place thereafter, THROTTLED (skip-identical + ≲1
+                # edit/sec) so it never hammers Telegram. FOREGROUND-ONLY (``turn_name``) so a
+                # BACKGROUND concurrent turn never writes the foreground line; best-effort (RB1) —
+                # the helper swallows any read/send/edit failure and never breaks the turn. The
+                # line is REMOVED in the finally (``_finalize_activity``), not per-event.
+                await self._maybe_update_activity(
+                    chat_id, send=send, edit=edit, for_project=turn_name,
+                )
                 if isinstance(event, ResultEvent):
                     # QF3: do NOT re-persist the dead session_id on a resume-failure result
                     # — it would just re-arm the same broken resume. Recovery below clears it.
@@ -3133,6 +3145,14 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
             await self._maybe_warn_limit(
                 state, chat_id, turn_rt, turn_name, send=send,
             )
+            # observability T5: REMOVE the transient activity line at turn end (best-effort delete +
+            # clear its id/throttle state) so no ⚙️ lingers after the turn — NOT a per-turn "done"
+            # footer (the owner disliked that; the pinned statusline is the persistent summary). In
+            # the finally + fully best-effort (RB1) so it fires on EVERY exit path (clean end,
+            # mid-stream raise, cancel) and a failed/absent delete never breaks the turn's
+            # completion. The state is cleared regardless, so a stale id can't leak into the next
+            # turn. Gated only by ``delete`` being injected (a test without one is a no-op).
+            await self._finalize_activity(chat_id, delete=delete)
             # ADR-005 D3: drop any pending-index entries this turn's project left open (an
             # ask/plan/permission the operator never answered — the engine has stopped
             # awaiting it now the stream drained / the turn died, so a late tap on it is a
