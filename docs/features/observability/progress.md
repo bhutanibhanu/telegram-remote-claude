@@ -6,7 +6,7 @@ spikes (T1, T2) are front-loaded so each data source is proven before any UI com
 
 ## Task list
 - [x] T1 — Adapter limit telemetry + spike (precise % available via RateLimitInfo.utilization)
-- [ ] T2 — Adapter activity telemetry + spike
+- [x] T2 — Adapter activity telemetry + spike (Task* emitted; task_type first-class; SB3 names-only; lifecycle reconcile)
 - [ ] T3 — Statusline 🪙 limit field
 - [ ] T4 — Proactive limit warning
 - [ ] T5 — Live activity line (ActivityMixin)

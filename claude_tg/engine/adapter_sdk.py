@@ -29,6 +29,7 @@ import asyncio
 import inspect
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Optional, Sequence
 
 from .substrate import DecisionCallback
@@ -245,6 +246,70 @@ def _pct_from_utilization(util: Any) -> Optional[int]:
     if isinstance(util, bool) or not isinstance(util, (int, float)):
         return None
     return max(0, min(100, round(util * 100)))
+
+
+# OBSERVABILITY T2 — the activity-line data source.
+#
+# ⭐ SPIKE ANSWER (decides the data source): the installed SDK (claude-agent-sdk==0.2.105) DOES
+# emit first-class ``Task*`` lifecycle messages for spawned subagents, and they carry the subagent
+# TYPE as a first-class field — NOT buried in any tool input:
+#   * ``TaskStartedMessage``   → ``task_id``, ``task_type`` (the subagent classifier, e.g.
+#                                "general-purpose" / "Explore"), ``description``, ``tool_use_id``.
+#   * ``TaskUpdatedMessage``   → ``task_id``, ``status`` (pending/running/paused/completed/failed/
+#                                killed) — the lifecycle transition.
+#   * ``TaskProgressMessage``  → ``task_id``, ``last_tool_name`` (the subagent's current tool),
+#                                ``usage``.
+#   * ``TaskNotificationMessage`` → ``task_id``, ``status`` (completed/failed/stopped) — terminal.
+# (Confirmed in ``claude_agent_sdk._internal.message_parser``: ``task_type`` is read straight off
+# the ``task_started`` system frame's top-level ``task_type`` key — it is a benign classifier, not a
+# body.) ``TERMINAL_TASK_STATUSES`` = {completed, failed, killed, stopped} marks the end of a task.
+#
+# So the PRIMARY source is the ``Task*`` fields (we never touch a Task's args/prompt at all). We
+# ALSO build the ``tool_use`` + ``parent_tool_use_id`` FALLBACK (a subagent's ``AssistantMessage``
+# carries a non-None ``parent_tool_use_id`` — the spawning Task's tool_use_id), so if a session/mode
+# does NOT emit ``Task*`` we can still infer "a subagent is active". Whether ``Task*`` actually flows
+# in the BOT's streaming session is finally confirmed live in T6 phone-verify; building to handle
+# both means the activity line works either way.
+TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "killed", "stopped"})
+
+
+@dataclass(frozen=True)
+class ActivitySnapshot:
+    """A BODY-FREE snapshot of "what's running right now" (the activity line's data, SB3).
+
+    Two fields, NAMES ONLY — never args, prompts, file paths, command strings, or any output:
+
+    * ``current_tool`` — the NAME of the tool currently in flight (e.g. ``"Bash"``, ``"Grep"``,
+      ``"mcp__playwright__browser_click"``), or ``None`` when no tool is mid-flight.
+    * ``subagents`` — the TYPE/classifier of each active subagent (e.g. ``"general-purpose"``,
+      ``"Explore"``), as a sorted, de-duplicated tuple of names. Empty when no subagent is active.
+
+    Frozen + names-only by construction: there is nowhere to put a body. Returned by
+    :meth:`SdkSubstrate.last_activity`; ``None`` (not an empty snapshot) means fully idle.
+    """
+
+    current_tool: Optional[str]
+    subagents: tuple[str, ...]
+
+
+def _subagent_type_from_task_tool_use(tool_input: Any) -> Optional[str]:
+    """Extract ONLY the ``subagent_type`` classifier from a ``Task`` tool_use input (SB3 fallback).
+
+    ⭐ SB3 BOUNDARY: this is the SINGLE place the adapter ever reads a ``tool_use.input``, and it
+    reads EXACTLY ONE key — ``subagent_type`` (the agent-type classifier, e.g. ``"general-purpose"``
+    / ``"Explore"``) — and NOTHING else. That one field is a benign IDENTIFIER (the same class of
+    value the owner explicitly wants shown), NOT a body: the Task's ``prompt``/``description`` and
+    every other input key are never touched. This is only the FALLBACK for inferring a subagent type
+    when a ``TaskStartedMessage`` (which carries ``task_type`` as a first-class field) was not seen;
+    when ``Task*`` flows we never reach here. Returns the trimmed type string or ``None`` (absent /
+    non-str / not a dict). Pure; never raises.
+    """
+    if not isinstance(tool_input, dict):
+        return None
+    raw = tool_input.get("subagent_type")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
 
 
 def normalize(msg: Any) -> Optional[Event]:
@@ -541,6 +606,18 @@ class SdkSubstrate:
         # (RB3); reset on stop. Single asyncio task per the substrate contract → no lock needed.
         self._last_limit_status: Optional[str] = None
         self._last_limit_pct: Optional[int] = None
+        # OBSERVABILITY T2: the live "what's running right now" activity state, for the transient
+        # activity line (T5). BODY-FREE by construction (SB3) — only tool/subagent NAMES, never args.
+        # ``_current_tool`` is the NAME of the tool in flight (set on each ``tool_use`` block, cleared
+        # at the turn's terminal ResultMessage). ``_active_subagents`` maps a subagent's id (the
+        # Task's ``task_id``, or — in the tool_use fallback — its spawning ``tool_use_id``) → the
+        # subagent TYPE/classifier name; a Task started/updated adds/refreshes the entry, a terminal
+        # status (``TERMINAL_TASK_STATUSES``) removes it, so the set reflects the currently-running
+        # subagents. SPIKE: ``Task*`` carry the type as a first-class field (preferred); the
+        # ``tool_use`` + ``parent_tool_use_id`` path is the fallback. In-memory only (RB3); reset on
+        # stop. Single asyncio task per the substrate contract → no lock needed.
+        self._current_tool: Optional[str] = None
+        self._active_subagents: dict[str, str] = {}
 
     # -- options -------------------------------------------------------------
 
@@ -730,6 +807,7 @@ class SdkSubstrate:
                 self._capture_usage(msg)
                 self._capture_model(msg)
                 self._capture_limit(msg)
+                self._capture_activity(msg)
                 for ev in self._events_from(msg):
                     yield ev
         except asyncio.TimeoutError:
@@ -971,6 +1049,134 @@ class SdkSubstrate:
             return None
         return (self._last_limit_status, self._last_limit_pct)
 
+    def _capture_activity(self, msg: Any) -> None:
+        """Track the live current-tool + active-subagent set for the activity line (T5).
+
+        OBSERVABILITY T2. A pure observer off the turn's critical path — BODY-FREE (SB3): it records
+        only tool/subagent NAMES, never args/prompts/paths/output. The data sources (SPIKE):
+
+        * ``TaskStartedMessage`` → a subagent started: record ``task_id → task_type`` (the
+          first-class classifier; falls back to a generic label — never the ``description``). Pops
+          any pre-registration under the spawning ``tool_use_id`` first, so the subagent is tracked
+          under ``task_id`` ALONE (no double-key that would survive terminal removal).
+        * ``TaskUpdatedMessage`` / ``TaskNotificationMessage`` → a lifecycle transition for an
+          existing task: a TERMINAL status (``TERMINAL_TASK_STATUSES``) REMOVES the subagent;
+          a non-terminal update keeps it active (refreshing the type if a Notification carries one).
+        * ``AssistantMessage`` content blocks → the FIRST ``ToolUseBlock`` sets ``_current_tool`` to
+          its ``.name`` (NAME only). If the message carries a non-None ``parent_tool_use_id`` (a
+          subagent's output) and that parent is not yet tracked, register it as an active subagent
+          (the ``Task*``-absent FALLBACK). A ``Task`` tool_use additionally pre-registers the spawned
+          subagent keyed by the tool_use_id, reading ONLY its ``subagent_type`` field (see
+          :func:`_subagent_type_from_task_tool_use` for the SB3 rationale).
+        * terminal ``ResultMessage`` (turn boundary) → clear ``_current_tool`` AND the active-subagent
+          set. The subagent clear is the backstop for the fallback path (a ``parent_tool_use_id``-
+          inferred subagent has no terminal Task* to remove it); :meth:`stop` is the session-scoped
+          reset.
+
+        **Best-effort + fully defensive (RB1):** any odd shape / exception leaves state UNCHANGED and
+        NEVER raises on the hot receive loop. In-memory only (RB3); dropped on :meth:`stop`.
+        """
+        from claude_agent_sdk import (  # lazy
+            AssistantMessage,
+            ResultMessage,
+            TaskNotificationMessage,
+            TaskStartedMessage,
+            TaskUpdatedMessage,
+            ToolUseBlock,
+        )
+
+        try:
+            # --- subagent lifecycle via first-class Task* messages (PRIMARY) --------------
+            if isinstance(msg, TaskStartedMessage):
+                task_id = getattr(msg, "task_id", None)
+                if isinstance(task_id, str) and task_id:
+                    # Reconcile the double-key: this subagent may already be tracked under the
+                    # SPAWNING Task tool_use's id (pre-registered in the ToolUseBlock branch below,
+                    # keyed by the block id). ``TaskStartedMessage.tool_use_id`` IS that spawning id,
+                    # so pop it before adding the ``task_id`` entry — otherwise the subagent ends up
+                    # under TWO keys and the terminal TaskUpdated (which pops only ``task_id``) leaves
+                    # the tool_use_id-keyed entry lingering "active" for the whole session.
+                    tuid = getattr(msg, "tool_use_id", None)
+                    if isinstance(tuid, str) and tuid:
+                        self._active_subagents.pop(tuid, None)
+                    name = getattr(msg, "task_type", None)
+                    self._active_subagents[task_id] = (
+                        name.strip() if isinstance(name, str) and name.strip() else "subagent"
+                    )
+                return
+            if isinstance(msg, (TaskUpdatedMessage, TaskNotificationMessage)):
+                task_id = getattr(msg, "task_id", None)
+                status = getattr(msg, "status", None)
+                if isinstance(task_id, str) and task_id:
+                    if isinstance(status, str) and status in TERMINAL_TASK_STATUSES:
+                        self._active_subagents.pop(task_id, None)
+                    elif task_id in self._active_subagents:
+                        # A non-terminal update keeps the subagent active; a Notification may carry
+                        # a (better) type — refresh it (still names-only, never the summary).
+                        name = getattr(msg, "task_type", None)
+                        if isinstance(name, str) and name.strip():
+                            self._active_subagents[task_id] = name.strip()
+                return
+
+            # --- current tool + tool_use/parent_tool_use_id FALLBACK ----------------------
+            if isinstance(msg, AssistantMessage):
+                parent = getattr(msg, "parent_tool_use_id", None)
+                # FALLBACK: a subagent's own output carries the spawning Task's tool_use_id as its
+                # parent — if Task* wasn't seen for it, register it as a generic active subagent.
+                if (
+                    isinstance(parent, str)
+                    and parent
+                    and parent not in self._active_subagents
+                ):
+                    self._active_subagents[parent] = "subagent"
+                for block in getattr(msg, "content", None) or []:
+                    if isinstance(block, ToolUseBlock):
+                        name = getattr(block, "name", None)
+                        if isinstance(name, str) and name:
+                            self._current_tool = name
+                        # A ``Task`` tool_use spawns a subagent — pre-register it keyed by the
+                        # tool_use_id, reading ONLY the ``subagent_type`` classifier (SB3, see
+                        # _subagent_type_from_task_tool_use). The matching TaskStartedMessage (if it
+                        # arrives) refreshes the same id with its first-class task_type.
+                        if name == "Task":
+                            tuid = getattr(block, "id", None)
+                            stype = _subagent_type_from_task_tool_use(
+                                getattr(block, "input", None)
+                            )
+                            if isinstance(tuid, str) and tuid:
+                                self._active_subagents[tuid] = stype or "subagent"
+                        break  # the FIRST tool_use is the current tool (one snapshot, not a log)
+                return
+
+            if isinstance(msg, ResultMessage):
+                # Turn boundary: nothing is in flight once the turn ends. Clear the current tool AND
+                # the active-subagent set. Clearing subagents here is the BACKSTOP for the fallback
+                # path: a subagent inferred from ``parent_tool_use_id`` (Task* absent) has NO terminal
+                # Task* to remove it, so without this it would linger "active" for the whole session
+                # and the activity line would never collapse to idle. (Task*-tracked subagents are
+                # normally removed by their own terminal status; this also catches any that didn't
+                # emit one.)
+                self._current_tool = None
+                self._active_subagents.clear()
+                return
+        except Exception:  # pragma: no cover - defensive; never break the receive loop (RB1)
+            log.debug("activity capture failed (ignored)", exc_info=True)
+
+    def last_activity(self) -> Optional[ActivitySnapshot]:
+        """A BODY-FREE snapshot of what's running right now, or ``None`` when idle (activity line).
+
+        OBSERVABILITY T2. Returns an :class:`ActivitySnapshot` (``current_tool`` NAME +
+        de-duplicated, sorted ``subagents`` type-names) when a tool is in flight OR a subagent is
+        active, else ``None`` (fully idle — never a fabricated/empty snapshot). Pure in-memory read
+        (no I/O, never raises) — an observer off the turn's critical path (RB1). SB3: names only.
+        """
+        if self._current_tool is None and not self._active_subagents:
+            return None
+        return ActivitySnapshot(
+            current_tool=self._current_tool,
+            subagents=tuple(sorted(set(self._active_subagents.values()))),
+        )
+
     async def context_percentage(self) -> Optional[int]:
         """Best-effort % of the context window currently used — the honest ctx figure (§2.1).
 
@@ -1035,11 +1241,17 @@ class SdkSubstrate:
             # warning) until its own first RateLimitEvent (never a stale carryover). RB3 (in-memory).
             self._last_limit_status = None
             self._last_limit_pct = None
+            # OBSERVABILITY T2: drop the activity state with the session — it described THAT session's
+            # in-flight tool + subagents; a fresh session starts fully idle (→ last_activity() None)
+            # until its own first tool_use/Task* (never a stale carryover). RB3 (in-memory only).
+            self._current_tool = None
+            self._active_subagents = {}
 
 
 __all__ = [
     "SdkSubstrate",
     "normalize",
     "INCREMENTAL_EVENT_TYPES",
+    "ActivitySnapshot",
     "_user_message_with_images",
 ]

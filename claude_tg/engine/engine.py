@@ -52,7 +52,14 @@ import asyncio
 import inspect
 import logging
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional, Sequence
+from typing import TYPE_CHECKING, Any, AsyncIterator, Optional, Sequence
+
+if TYPE_CHECKING:
+    # Type-only import (no runtime dependency — keeps the engine substrate-neutral): the body-free
+    # activity snapshot returned by :meth:`Engine.last_activity` (OBSERVABILITY T2). The real
+    # validation import is lazy, inside the method. ``ActivitySnapshot`` is a plain dataclass and
+    # pulls in no SDK.
+    from .adapter_sdk import ActivitySnapshot
 
 from ..audit import (
     KIND_PLAN_DECISION,
@@ -405,6 +412,31 @@ class Engine:
         ):
             return (value[0], value[1])
         return None
+
+    def last_activity(self) -> Optional["ActivitySnapshot"]:
+        """A body-free snapshot of what's running right now, or ``None`` when idle (observability T2).
+
+        Delegates to the substrate's ``last_activity`` (the current-tool NAME + active-subagent
+        type-names captured from each ``Task*`` / ``tool_use`` message — SB3, names only, never
+        args/bodies). The activity line (T5) renders this; ``None`` means fully idle (never a
+        fabricated snapshot). Read defensively via ``getattr`` so a substrate that predates this
+        method (or a fake in a test) simply yields ``None`` (the additive-seam discipline, mirroring
+        :meth:`limit_status`); the shape is validated (an ``ActivitySnapshot`` or ``None`` — anything
+        odd → ``None``) and the call is pure + NEVER raises — an observer off the turn's critical
+        path (RB1).
+        """
+        getter = getattr(self._substrate, "last_activity", None)
+        if getter is None:
+            return None
+        try:
+            value = getter()
+        except Exception:  # pragma: no cover - the substrate is already best-effort
+            log.debug("last_activity() failed (ignored)", exc_info=True)
+            return None
+        # Validate the shape: a real ActivitySnapshot or None — never propagate anything else.
+        from .adapter_sdk import ActivitySnapshot  # lazy (no SDK import; a plain dataclass)
+
+        return value if isinstance(value, ActivitySnapshot) else None
 
     # -- the decision seam (the async answer-hold) ---------------------------
 
