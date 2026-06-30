@@ -8,7 +8,7 @@ spikes (T1, T2) are front-loaded so each data source is proven before any UI com
 - [x] T1 — Adapter limit telemetry + spike (precise % available via RateLimitInfo.utilization)
 - [x] T2 — Adapter activity telemetry + spike (Task* emitted; task_type first-class; SB3 names-only; lifecycle reconcile)
 - [x] T3 — Statusline 🪙 limit field (🪙 <pct>% / 🟢🟡🔴 badge / omit; byte-for-byte unchanged when None)
-- [ ] T4 — Proactive limit warning
+- [x] T4 — Proactive limit warning (one-time per non-ok window, re-arm on ok; SB1/SB3/RB1; reviewer AGREE)
 - [ ] T5 — Live activity line (ActivityMixin)
 - [ ] T6 — ADR-010 + docs + phone-verify
 

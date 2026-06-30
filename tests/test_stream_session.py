@@ -8400,3 +8400,321 @@ async def test_successful_pin_sets_pinned_flag():
     await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
     assert session._chat(1).statusline_pinned is True
     assert len(rec.pins) == 1
+
+
+# --- observability T4: the proactive one-time limit warning --------------------
+#
+# The warning fires at TURN END (in _drive_turn's finally, after the statusline refresh) when the
+# foreground engine's limit_status() first crosses into "approaching"/"limited", de-duped per
+# limit-window on _ChatState.limit_warned (re-armed when the status returns to "ok"). It is
+# foreground/authorized-only (SB1), body-free (SB3), and best-effort (RB1 — never breaks a turn).
+
+#: A fragment unique to the T4 warning line, used to count warnings among the turn's sends.
+_WARN_MARK = "Approaching your Claude session limit"
+
+
+def _warnings(rec) -> list[str]:
+    """The warning messages among a Recorder's sends (T4 — identified by the fixed phrase)."""
+    return [s["text"] for s in rec.sends if _WARN_MARK in s["text"]]
+
+
+def _ok_result():
+    """A fresh clean ResultEvent script item (one per turn so a re-driven engine has events)."""
+    return ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")
+
+
+async def test_limit_warning_fires_once_on_first_crossing_approaching():
+    # WHEN a turn ends with the foreground limit signal in "approaching" and not yet warned →
+    # EXACTLY ONE warning is posted, body-free (no request content; the only number is the pct).
+    engine = FakeEngine([_ok_result()], limit_status=("approaching", 88))
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    warns = _warnings(rec)
+    assert len(warns) == 1, f"exactly one warning expected, got {warns!r}"
+    # SB3 body-free: no request content; the prompt "go" must not appear; 🟡 wording + the pct.
+    assert "🟡" in warns[0]
+    assert "🪙 88%" in warns[0]
+    assert "go" not in warns[0]
+    # The de-dup flag is armed (this chat won't warn again until the status returns to ok).
+    assert session._chat(1).limit_warned is True
+
+
+async def test_limit_warning_deduped_while_still_approaching():
+    # A SECOND turn while STILL "approaching" posts NO new warning (de-dup per limit-window).
+    status = ("approaching", 90)
+    engine = FakeEngine([_ok_result(), _ok_result()], limit_status=lambda: status)
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "the first crossing warns once"
+    # Second turn, still approaching → no new warning.
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "still approaching → de-duped, no second warning"
+
+
+async def test_limit_warning_rearms_after_ok_then_warns_again():
+    # The re-arm regression: approaching → warn; ok → re-arm (no message); approaching → warn AGAIN.
+    box = {"v": ("approaching", 70)}
+    engine = FakeEngine(
+        [_ok_result(), _ok_result(), _ok_result()], limit_status=lambda: box["v"]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    # Turn 1: approaching → one warning.
+    await asyncio.wait_for(
+        session.handle_message(1, "t1", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1
+    assert session._chat(1).limit_warned is True
+    # Turn 2: recovered to ok → the flag re-arms, NO new message.
+    box["v"] = ("ok", 10)
+    await asyncio.wait_for(
+        session.handle_message(1, "t2", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "ok must not warn"
+    assert session._chat(1).limit_warned is False, "ok re-arms the de-dup flag"
+    # Turn 3: approaching AGAIN → warns again (the re-arm worked).
+    box["v"] = ("approaching", 72)
+    await asyncio.wait_for(
+        session.handle_message(1, "t3", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 2, "a fresh crossing after ok warns again"
+
+
+async def test_limit_warning_never_when_ok_throughout():
+    # status "ok" for the whole turn → NEVER warns (no spurious heads-up).
+    engine = FakeEngine([_ok_result()], limit_status=("ok", 20))
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == [], "an ok turn must never warn"
+    assert session._chat(1).limit_warned is False
+
+
+async def test_limit_warning_fires_for_limited_status():
+    # status "limited" (🔴) warns once — the harder end of the threshold also triggers the heads-up.
+    engine = FakeEngine([_ok_result()], limit_status=("limited", 100))
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    warns = _warnings(rec)
+    assert len(warns) == 1
+    assert "🔴" in warns[0], "limited uses the 🔴 wording"
+
+
+async def test_limit_warning_no_signal_no_warning():
+    # No limit signal (limit_status() → None) → no warning, flag stays re-armed, turn completes.
+    engine = FakeEngine([_ok_result()], limit_status=None)
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == []
+    assert session._chat(1).limit_warned is False
+    # The turn still completed (the clean result rendered).
+    assert any("ok" in s["text"] for s in rec.sends)
+
+
+async def test_limit_warning_raising_read_swallowed_turn_completes():
+    # RB1: a limit_status() that RAISES posts no warning and NEVER breaks the turn (the result
+    # still renders); the de-dup flag is untouched by the failed read.
+    def _boom():
+        raise RuntimeError("limit read blew up")
+
+    engine = FakeEngine([_ok_result()], limit_status=_boom)
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == [], "a raising read posts no warning"
+    assert any("ok" in s["text"] for s in rec.sends), "the turn still completed (RB1)"
+
+
+async def test_limit_warning_background_turn_does_not_warn_foreground(tmp_path):
+    # SB1 + foreground-only: a BACKGROUND project's turn (even one whose engine reports
+    # "approaching") must NOT warn the foreground chat, and must not arm the foreground's flag.
+    # A real store is needed — with store=None every project is implicitly foreground.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)  # fg is the active/foreground project
+    store.create(1, "bg", "/work", make_active=False)
+    # Drive the BACKGROUND project ("bg") directly via _drive_turn (handle_message would pin the
+    # active project; we want the background turn's exact end-of-turn warning path).
+    engine = FakeEngine([_ok_result()], limit_status=("approaching", 95))
+    session = make_session(engine, store=store)
+    _bg_name, bg_rt = session._override_runtime(1, "bg")
+    bg_rt.engine = engine
+    rec = Recorder()
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, engine, "go",
+            send=rec.send, edit=rec.edit, target=("bg", bg_rt),
+        ),
+        timeout=2.0,
+    )
+    assert _warnings(rec) == [], "a background turn must not warn the foreground"
+    assert session._chat(1).limit_warned is False, "the foreground's de-dup flag is untouched"
+
+
+async def test_limit_warning_foreground_turn_warns_with_store(tmp_path):
+    # The companion to the background test: the FOREGROUND turn DOES warn (so the background
+    # skip above is genuinely the foreground gate, not a store/wiring artifact).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)
+    engine = FakeEngine([_ok_result()], limit_status=("approaching", 80))
+    session = make_session(engine, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "the foreground turn warns once"
+    assert session._chat(1).limit_warned is True
+
+
+async def test_limit_warning_unknown_status_is_non_event_when_armed():
+    # The most important gap: an UNRECOGNIZED status ("throttled") at turn end is a true
+    # non-event — it must NOT wrongly RE-ARM. Starting warned=True → stays True (and no message).
+    # A mutation that fell through to clearing the flag on unknown status fails this.
+    engine = FakeEngine([_ok_result()], limit_status=("throttled", None))
+    session = make_session(engine)
+    session._chat(1).limit_warned = True  # already warned this window
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == [], "an unknown status must not warn"
+    assert session._chat(1).limit_warned is True, "an unknown status must not re-arm"
+
+
+async def test_limit_warning_unknown_status_is_non_event_when_unarmed():
+    # The other half: an UNRECOGNIZED status starting warned=False → stays False (and no message).
+    # A mutation that fell through to SETTING the flag (or warning) on unknown status fails this.
+    engine = FakeEngine([_ok_result()], limit_status=("throttled", None))
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == [], "an unknown status must not warn"
+    assert session._chat(1).limit_warned is False, "an unknown status must not set the flag"
+
+
+async def test_limit_warning_send_failure_swallowed_and_rewarns():
+    # RB1 + re-warn: the warning's send RAISES on an "approaching" turn → swallowed (turn
+    # completes, no crash) AND limit_warned stays False, so the NEXT approaching turn warns again.
+    class _WarnFailRecorder(Recorder):
+        """A Recorder that raises on the T4 warning send (only), the first time it's attempted."""
+
+        def __init__(self):
+            super().__init__()
+            self._fail_warn_once = True
+
+        async def send(self, *, text, reply_markup=None, parse_mode=None, **kwargs):
+            if self._fail_warn_once and _WARN_MARK in text:
+                self._fail_warn_once = False
+                raise RuntimeError("Telegram error: warning send failed")
+            return await super().send(text=text, reply_markup=reply_markup,
+                                      parse_mode=parse_mode, **kwargs)
+
+    engine = FakeEngine([_ok_result(), _ok_result()], limit_status=("approaching", 85))
+    session = make_session(engine)
+    rec = _WarnFailRecorder()
+    # Turn 1: the warning send RAISES — swallowed (RB1); the turn still completes.
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert any("ok" in s["text"] for s in rec.sends), "the turn completed despite the failed warn"
+    assert session._chat(1).limit_warned is False, (
+        "a FAILED warning must leave the flag re-armed (never swallow the only heads-up)"
+    )
+    # Turn 2: still approaching, and now the send succeeds → it warns AGAIN.
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "the re-armed warning fires on the next approaching turn"
+    assert session._chat(1).limit_warned is True
+
+
+async def test_limit_warning_escalation_approaching_to_limited_stays_silent():
+    # Escalation stays silent: approaching (warns, sets flag) → next turn "limited" while already
+    # warned → NO second warning (one heads-up per non-ok window, intended — no per-status re-warn).
+    box = {"v": ("approaching", 78)}
+    engine = FakeEngine([_ok_result(), _ok_result()], limit_status=lambda: box["v"])
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "t1", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "approaching warns once"
+    # Escalate to limited while still in the same non-ok window (already warned) → silent.
+    box["v"] = ("limited", 100)
+    await asyncio.wait_for(
+        session.handle_message(1, "t2", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "escalation approaching→limited must not re-warn"
+
+
+async def test_limit_warning_rearms_after_limited_then_ok_then_approaching():
+    # Re-arm after LIMITED (not just after approaching): limited (warns) → ok (re-arm) →
+    # approaching → warns again.
+    box = {"v": ("limited", 100)}
+    engine = FakeEngine(
+        [_ok_result(), _ok_result(), _ok_result()], limit_status=lambda: box["v"]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "t1", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1 and "🔴" in _warnings(rec)[0], "limited warns once (🔴)"
+    assert session._chat(1).limit_warned is True
+    # Recover to ok → re-arm, no message.
+    box["v"] = ("ok", 5)
+    await asyncio.wait_for(
+        session.handle_message(1, "t2", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "ok must not warn"
+    assert session._chat(1).limit_warned is False, "ok after limited re-arms the flag"
+    # Approaching again → warns again (the re-arm after limited worked).
+    box["v"] = ("approaching", 81)
+    await asyncio.wait_for(
+        session.handle_message(1, "t3", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 2, "a fresh crossing after limited→ok warns again"
+
+
+async def test_limit_warning_no_engine_turn_rearms():
+    # The documented worst-case "extra heads-up" path: a turn whose runtime has NO engine at end
+    # → no warning AND the flag is cleared (re-armed). Drive _drive_turn directly with a runtime
+    # whose engine is None (handle_message would attach one); the engine arg only feeds the stream.
+    engine = FakeEngine([_ok_result()])
+    session = make_session(engine)
+    name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = None  # the runtime carries NO engine for the warning's foreground read
+    session._chat(1).limit_warned = True  # was warned in a prior window
+    rec = Recorder()
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, engine, "go",
+            send=rec.send, edit=rec.edit, target=(name, rt),
+        ),
+        timeout=2.0,
+    )
+    assert _warnings(rec) == [], "no engine → no warning"
+    assert session._chat(1).limit_warned is False, "a no-engine turn clears (re-arms) the flag"

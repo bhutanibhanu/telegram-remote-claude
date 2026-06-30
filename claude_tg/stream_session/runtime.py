@@ -532,6 +532,16 @@ class _ChatState:
     # ``send_gate``/``status_message_id``, the live pin id is never persisted.
     statusline_message_id: Optional[int] = None
     statusline_text: Optional[str] = None
+    # observability T4 (proactive limit warning) — the per-chat de-dup flag for the one-time
+    # "approaching your session limit" heads-up. The rolling session limit is ACCOUNT-WIDE (one
+    # signal across every project), so the warned-state lives on the chat (one warning per chat
+    # per limit-window), not per project. True from the moment a turn ends with the foreground
+    # limit signal in ``approaching``/``limited`` until the status returns to ``ok`` (or no
+    # signal), which RE-ARMS it (clears it) so the NEXT crossing warns again. Set/cleared ONLY by
+    # :meth:`StreamingSession._maybe_warn_limit` at turn end. Transient in-memory (RB3): a restart
+    # drops it (a fresh process re-arms — the worst case is one extra heads-up, never a missed
+    # cutoff). Never persisted.
+    limit_warned: bool = False
     # STATUSLINE T-SL-WIRE (pin-retry fix): whether the held ``statusline_message_id`` is
     # actually PINNED. The send and the pin are separate Telegram calls — a send can succeed
     # (id stored) while the pin RAISES (rate-limit, perms, hiccup), leaving the line sent but

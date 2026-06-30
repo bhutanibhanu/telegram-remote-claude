@@ -3124,6 +3124,15 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
             await self._maybe_update_statusline(
                 chat_id, send=send, edit=edit, pin=pin, unpin=unpin, for_project=turn_name,
             )
+            # observability T4: the one-time proactive limit warning. Fired at TURN END (after the
+            # stream drained and the statusline above refreshed — that's when limit_status()
+            # reflects any RateLimitEvent that arrived DURING the turn), FOREGROUND-ONLY
+            # (``turn_name``), and de-duped per limit-window on ``_ChatState.limit_warned``. In the
+            # finally + fully best-effort (RB1) so a send failure / odd state can NEVER abort the
+            # turn's completion — an observer off the critical path, exactly like the statusline.
+            await self._maybe_warn_limit(
+                state, chat_id, turn_rt, turn_name, send=send,
+            )
             # ADR-005 D3: drop any pending-index entries this turn's project left open (an
             # ask/plan/permission the operator never answered — the engine has stopped
             # awaiting it now the stream drained / the turn died, so a late tap on it is a
@@ -3166,6 +3175,91 @@ class StreamingSession(StatuslineMixin, CallbacksMixin, ConcurrencyMixin):
         # rendered, so no extra notice is sent (SB3 — the error body never re-surfaces).
         if driver_error_detected and not recovered:
             await self._rebuild_after_driver_error(chat_id, turn_name, turn_rt)
+
+    async def _maybe_warn_limit(
+        self,
+        state: _ChatState,
+        chat_id: int,
+        turn_rt: Optional[_ProjectRuntime],
+        turn_name: Optional[str],
+        *,
+        send: SendFn,
+    ) -> None:
+        """Post EXACTLY ONE wrap-up heads-up when the limit signal first crosses 🟡/🔴 (T4).
+
+        Called at TURN END for the FOREGROUND turn (the statusline has just refreshed, so
+        ``limit_status()`` now reflects any ``RateLimitEvent`` that arrived during the turn).
+        De-duped per limit-window on :attr:`_ChatState.limit_warned`:
+
+        * ``None`` / no engine / status ``"ok"`` → CLEAR the flag (re-arm) and return — no message.
+          The window recovered, so the NEXT crossing warns again.
+        * ``"approaching"`` / ``"limited"`` AND not yet warned → post ONE warning, SET the flag.
+        * ``"approaching"`` / ``"limited"`` AND already warned → do nothing (the de-dup).
+
+        **SB1 + foreground-only.** The warning targets ONLY the foreground/authorized turn's chat
+        (gated on ``turn_name`` being the foreground project, mirroring the statusline): a
+        BACKGROUND project's turn never warns the foreground, and the account-wide limit yields one
+        warning per chat. **SB3 (body-free):** the message is a fixed wrap-up line — no request
+        content, no numbers beyond the optional ``pct`` the signal already carries.
+
+        **RB1 (never-crash):** the WHOLE body is wrapped so ANY failure (a raising
+        ``limit_status()``, a send error, odd state) is swallowed and NEVER breaks the turn — this
+        runs in ``_drive_turn``'s ``finally`` as an observer off the critical path, exactly like the
+        statusline update.
+        """
+        try:
+            # Foreground-only (SB1 + the make-or-break statusline invariant): a BACKGROUND turn
+            # must not warn the foreground chat. A background turn's engine may report the
+            # (account-wide) limit too, but only the foreground turn owns the warning.
+            if turn_name is not None and not self._is_foreground(chat_id, turn_name):
+                return
+            engine = turn_rt.engine if turn_rt is not None else None
+            # Best-effort read of the foreground engine's limit signal — getattr/try-guarded so a
+            # predating/fake engine (or a raising read) yields None, exactly like the statusline.
+            status: Optional[str] = None
+            pct: Optional[int] = None
+            if engine is not None:
+                getter = getattr(engine, "limit_status", None)
+                if callable(getter):
+                    value = getter()
+                    if (
+                        isinstance(value, tuple)
+                        and len(value) == 2
+                        and isinstance(value[0], str)
+                    ):
+                        status = value[0]
+                        if isinstance(value[1], int) and not isinstance(value[1], bool):
+                            pct = value[1]
+            if status is None or status == "ok":
+                # No signal / recovered → re-arm so the next crossing warns again.
+                state.limit_warned = False
+                return
+            if status not in ("approaching", "limited"):
+                # An unknown status is treated as a non-event (never fabricate a warning).
+                return
+            if state.limit_warned:
+                return  # de-dup: already warned this window, still approaching/limited.
+            # First crossing this window → post ONE warning and arm the de-dup flag. SB3: a fixed
+            # body-free line (the only variable is the optional pct the signal already carries).
+            glyph = "🔴" if status == "limited" else "🟡"
+            pct_note = f" (🪙 {pct}%)" if pct is not None else ""
+            text = (
+                f"{glyph} Approaching your Claude session limit{pct_note} — consider wrapping up "
+                "or using smaller turns to avoid a mid-turn cutoff."
+            )
+            await self._gated_send(
+                state, send, verbatim=True,
+                text=text, reply_markup=None, parse_mode=None,
+            )
+            # ⭐ DELIBERATE ordering: arm the de-dup flag ONLY AFTER a SUCCESSFUL send. If the send
+            # above RAISES, the except-swallow below leaves ``limit_warned`` False, so the NEXT
+            # approaching/limited turn re-warns — we never silently swallow the operator's only
+            # heads-up over a transient send failure (correctness over de-dup at the boundary).
+            state.limit_warned = True
+        except Exception:
+            # RB1: the warning is an observer off the turn's critical path — a raising read /
+            # send / odd state is logged at debug and swallowed, NEVER breaks the turn.
+            log.debug("limit warning failed for chat %s (ignored)", chat_id, exc_info=True)
 
     async def _recover_failed_resume(
         self,
