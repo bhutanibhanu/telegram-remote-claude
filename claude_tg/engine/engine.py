@@ -370,6 +370,42 @@ class Engine:
             return None
         return value if isinstance(value, str) and value.strip() else None
 
+    def limit_status(self) -> Optional[tuple[str, Optional[int]]]:
+        """The rolling session-limit signal ``(status, pct_or_None)``, or ``None`` (observability).
+
+        Delegates to the substrate's ``limit_status`` (captured from each ``RateLimitEvent`` the
+        SDK emits when the rolling rate-limit state changes). ``status`` is the normalized ``ok`` /
+        ``approaching`` / ``limited``; the second element is the precise percent of the rolling
+        limit when the SDK exposed one (⭐ SPIKE: ``RateLimitInfo.utilization``), else ``None`` (the
+        statusline then shows the 🟢/🟡/🔴 badge). ``None`` when no signal has been seen — never a
+        fabricated value. Read defensively via ``getattr`` so a substrate that predates this method
+        (or a fake in a test) simply yields ``None`` (the additive-seam discipline, mirroring
+        :meth:`last_model`); the shape is validated and pure + never raises — an observer off the
+        turn's critical path (RB1).
+        """
+        getter = getattr(self._substrate, "limit_status", None)
+        if getter is None:
+            return None
+        try:
+            value = getter()
+        except Exception:  # pragma: no cover - the substrate is already best-effort
+            log.debug("limit_status() failed (ignored)", exc_info=True)
+            return None
+        # Validate the shape: a 2-tuple of (non-empty str status, int|None pct). Anything odd → None
+        # (never propagate a malformed signal to the renderer).
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and isinstance(value[0], str)
+            and value[0].strip()
+            and (
+                value[1] is None
+                or (isinstance(value[1], int) and not isinstance(value[1], bool))
+            )
+        ):
+            return (value[0], value[1])
+        return None
+
     # -- the decision seam (the async answer-hold) ---------------------------
 
     async def on_tool_request(

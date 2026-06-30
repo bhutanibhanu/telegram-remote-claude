@@ -209,6 +209,44 @@ def _percentage_of(resp: Any) -> Optional[int]:
     return max(0, min(100, round(raw)))
 
 
+# OBSERVABILITY T1: the SDK's rolling-limit status is one of ``allowed`` / ``allowed_warning`` /
+# ``rejected`` (``RateLimitInfo.status``). Map it to a STABLE renderer-facing enum so the UI never
+# touches the SDK's literal strings: an ``*_warning`` is "approaching" (🟡), a ``rejected`` is
+# "limited" (🔴), an ``allowed`` is "ok" (🟢). Anything else (a future/odd word) → None, so the
+# caller leaves prior state untouched rather than guess (RB1).
+def _normalize_limit_status(raw_status: Any) -> Optional[str]:
+    """Map the SDK's rate-limit status to ``ok`` / ``approaching`` / ``limited``, or ``None``."""
+    if not isinstance(raw_status, str):
+        return None
+    s = raw_status.strip().lower()
+    if s == "allowed":
+        return "ok"
+    if s == "allowed_warning":
+        return "approaching"
+    if s == "rejected":
+        return "limited"
+    # Forward-compatible fall-backs: an unforeseen ``*_warning``/``*reject*`` variant still maps
+    # to the closest meaning rather than being dropped (still bounded — never a fabricated %).
+    if "warn" in s:
+        return "approaching"
+    if "reject" in s or "limit" in s or "exceed" in s:
+        return "limited"
+    return None
+
+
+def _pct_from_utilization(util: Any) -> Optional[int]:
+    """``round(utilization*100)`` clamped to ``[0, 100]`` from ``RateLimitInfo.utilization``.
+
+    ⭐ SPIKE: ``utilization`` is a FRACTION (0.0–1.0) of the rolling limit consumed (SDK docstring
+    + parser confirmed). We scale to a percent and clamp (a number outside [0,1] is an odd shape →
+    bounded, never shown raw). ``None`` when the SDK omits it / it is non-numeric (the UI then uses
+    the status badge). Pure; never raises.
+    """
+    if isinstance(util, bool) or not isinstance(util, (int, float)):
+        return None
+    return max(0, min(100, round(util * 100)))
+
+
 def normalize(msg: Any) -> Optional[Event]:
     """Map ONE raw SDK message/block-bearing message to a normalized event.
 
@@ -492,6 +530,17 @@ class SdkSubstrate:
         # statusline show the model that is genuinely running (incl. after /fast·/deep routing)
         # instead of the literal word "default". In-memory only (RB3); reset on stop.
         self._last_model: Optional[str] = None
+        # OBSERVABILITY T1: the rolling session-limit signal, for the statusline 🪙 field + the
+        # one-time warning. Captured from each ``RateLimitEvent`` the SDK emits when the rolling
+        # rate-limit state changes (``_capture_limit``). SPIKE: the SDK DOES expose a precise % —
+        # ``RateLimitInfo.utilization`` is a fraction (0.0–1.0) of the rolling limit consumed — so
+        # we record BOTH a stable normalized status (``ok`` / ``approaching`` / ``limited``,
+        # mapped from the SDK's ``allowed`` / ``allowed_warning`` / ``rejected``) AND the precise
+        # percent (round(utilization*100)) when present. ``_last_limit_pct`` stays None when the
+        # SDK omits ``utilization`` (the UI then falls back to the status badge). In-memory only
+        # (RB3); reset on stop. Single asyncio task per the substrate contract → no lock needed.
+        self._last_limit_status: Optional[str] = None
+        self._last_limit_pct: Optional[int] = None
 
     # -- options -------------------------------------------------------------
 
@@ -680,6 +729,7 @@ class SdkSubstrate:
                 self._capture_session_id(msg)
                 self._capture_usage(msg)
                 self._capture_model(msg)
+                self._capture_limit(msg)
                 for ev in self._events_from(msg):
                     yield ev
         except asyncio.TimeoutError:
@@ -869,6 +919,58 @@ class SdkSubstrate:
         """
         return self._last_model
 
+    def _capture_limit(self, msg: Any) -> None:
+        """Stash the rolling session-limit signal (statusline 🪙 field + the one-time warning).
+
+        OBSERVABILITY T1. Only a ``RateLimitEvent`` carries the rolling rate-limit state; the SDK
+        emits one whenever that state changes. From its ``RateLimitInfo`` we record:
+
+        * a **stable normalized status** — the SDK's ``status`` is one of ``allowed`` /
+          ``allowed_warning`` / ``rejected``; we map it to ``ok`` / ``approaching`` / ``limited``
+          so the UI never re-derives the SDK's literal strings (and a future SDK status word can
+          be slotted in here, not scattered across the renderer).
+        * a **precise percent** — ⭐ SPIKE ANSWER: a precise % of the rolling limit IS exposed,
+          via ``RateLimitInfo.utilization`` (a fraction 0.0–1.0; the docstring + parser confirm
+          ``info.get("utilization")``). We record ``round(utilization*100)`` when present; if the
+          SDK omits it (``None`` / odd type) ``_last_limit_pct`` is left None and the UI falls
+          back to the status badge. SB3: only status / percent / reset are touched — NEVER any
+          request content (we read ``status``/``utilization`` only, not ``raw``'s body).
+
+        **Best-effort + fully defensive (RB1):** any missing field / odd shape / exception leaves
+        the stored values UNCHANGED — never break the hot receive loop. In-memory only (RB3);
+        dropped on :meth:`stop`.
+        """
+        from claude_agent_sdk import RateLimitEvent  # lazy
+
+        if not isinstance(msg, RateLimitEvent):
+            return
+        try:
+            info = getattr(msg, "rate_limit_info", None)
+            raw_status = getattr(info, "status", None)
+            status = _normalize_limit_status(raw_status)
+            if status is None:
+                return  # an unrecognized status leaves prior state intact (RB1)
+            util = getattr(info, "utilization", None)
+            pct = _pct_from_utilization(util)
+            self._last_limit_status = status
+            self._last_limit_pct = pct
+        except Exception:  # pragma: no cover - defensive; never break the receive loop (RB1)
+            log.debug("limit capture failed (ignored)", exc_info=True)
+
+    def limit_status(self) -> Optional[tuple[str, Optional[int]]]:
+        """The rolling session-limit signal, or ``None`` if none seen yet (statusline + warning).
+
+        Returns ``(status, pct_or_None)`` where ``status`` is the normalized ``ok`` /
+        ``approaching`` / ``limited`` (mapped by :meth:`_capture_limit` from the SDK's status) and
+        the second element is the precise percent of the rolling limit (``round(utilization*100)``)
+        when the SDK exposed one, else ``None`` (the UI then shows the 🟢/🟡/🔴 badge). ``None``
+        when no ``RateLimitEvent`` has arrived yet (never a fabricated value). Pure in-memory read
+        (no I/O, never raises) — an observer off the turn's critical path (RB1).
+        """
+        if self._last_limit_status is None:
+            return None
+        return (self._last_limit_status, self._last_limit_pct)
+
     async def context_percentage(self) -> Optional[int]:
         """Best-effort % of the context window currently used — the honest ctx figure (§2.1).
 
@@ -928,6 +1030,11 @@ class SdkSubstrate:
             # Drop the captured model id with the session — a fresh session re-captures its own
             # model from its first ``init`` event (never a stale carryover). RB3 (in-memory).
             self._last_model = None
+            # OBSERVABILITY T1: drop the rolling-limit signal with the session — it described THAT
+            # session's limit state; a fresh session starts with no signal (→ no 🪙 field / re-armed
+            # warning) until its own first RateLimitEvent (never a stale carryover). RB3 (in-memory).
+            self._last_limit_status = None
+            self._last_limit_pct = None
 
 
 __all__ = [

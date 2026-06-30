@@ -556,6 +556,96 @@ def test_stop_drops_captured_model():
     assert sub.last_model() is None
 
 
+def _rate_limit_msg(status, utilization=None):
+    # OBSERVABILITY T1: build a real SDK RateLimitEvent (the dep lets us construct messages; we
+    # never open a session). ``utilization`` is the SDK's fraction 0.0–1.0 of the rolling limit.
+    rli = sdk.RateLimitInfo(status=status, utilization=utilization, raw={})
+    return sdk.RateLimitEvent(rate_limit_info=rli, uuid="u", session_id="S1")
+
+
+def test_capture_limit_precise_percent_when_utilization_present():
+    # ⭐ SPIKE: the SDK exposes a precise % via RateLimitInfo.utilization (a fraction 0.0–1.0).
+    # A warning status with utilization=0.82 → ("approaching", 82): both the normalized status
+    # AND the rounded precise percent are captured.
+    sub = SdkSubstrate()
+    assert sub.limit_status() is None  # nothing reported yet (never fabricated)
+    sub._capture_limit(_rate_limit_msg("allowed_warning", utilization=0.82))
+    assert sub.limit_status() == ("approaching", 82)
+
+
+def test_capture_limit_status_only_when_no_utilization():
+    # A status-only shape (the SDK omitted utilization) → (status, None): the UI then uses the
+    # 🟢/🟡/🔴 badge instead of a precise %.
+    sub = SdkSubstrate()
+    sub._capture_limit(_rate_limit_msg("allowed", utilization=None))
+    assert sub.limit_status() == ("ok", None)
+
+
+def test_capture_limit_maps_each_sdk_status_to_normalized_enum():
+    # The three SDK status values map to the stable renderer-facing enum:
+    #   allowed → ok · allowed_warning → approaching · rejected → limited.
+    for raw_status, expected in (
+        ("allowed", "ok"),
+        ("allowed_warning", "approaching"),
+        ("rejected", "limited"),
+    ):
+        sub = SdkSubstrate()
+        sub._capture_limit(_rate_limit_msg(raw_status, utilization=0.5))
+        result = sub.limit_status()
+        assert result is not None
+        assert result[0] == expected
+
+
+def test_capture_limit_clamps_and_rounds_percent():
+    # utilization is scaled to a percent (round(util*100)) and clamped to [0,100]: 0.666 → 67,
+    # a 1.0 → 100, and an out-of-range 1.5 is bounded (never shown raw).
+    sub = SdkSubstrate()
+    sub._capture_limit(_rate_limit_msg("allowed", utilization=0.666))
+    assert sub.limit_status() == ("ok", 67)
+    sub._capture_limit(_rate_limit_msg("rejected", utilization=1.0))
+    assert sub.limit_status() == ("limited", 100)
+    sub._capture_limit(_rate_limit_msg("allowed_warning", utilization=1.5))
+    assert sub.limit_status() == ("approaching", 100)
+
+
+def test_capture_limit_no_signal_is_none():
+    # No RateLimitEvent seen → limit_status() is None (never a fabricated value).
+    sub = SdkSubstrate()
+    assert sub.limit_status() is None
+
+
+def test_capture_limit_garbage_leaves_state_unchanged_no_raise():
+    # RB1: a non-RateLimitEvent / an unrecognized status / an odd shape never raises and never
+    # clobbers a previously-captured good signal.
+    sub = SdkSubstrate()
+    sub._capture_limit(_rate_limit_msg("allowed_warning", utilization=0.9))
+    assert sub.limit_status() == ("approaching", 90)
+    # A wholly unrelated message is ignored (not a RateLimitEvent).
+    sub._capture_limit(object())
+    sub._capture_limit(sdk.UserMessage(content="echo"))
+    # An unrecognized status leaves the prior good signal intact (status maps to None → no-op).
+    sub._capture_limit(_rate_limit_msg("brand_new_status", utilization=0.1))
+    assert sub.limit_status() == ("approaching", 90)
+
+
+def test_stop_drops_captured_limit():
+    # The captured limit signal is session-scoped (RB3, in-memory): stop() clears it so a fresh
+    # session re-captures from its own first RateLimitEvent (never a stale carryover).
+    import asyncio
+
+    class _FakeClient:
+        async def disconnect(self):
+            pass
+
+    sub = SdkSubstrate()
+    sub._client = _FakeClient()  # stop() resets caches only once a session/client exists
+    sub._last_limit_status = "approaching"
+    sub._last_limit_pct = 90
+    assert sub.limit_status() == ("approaching", 90)
+    asyncio.run(sub.stop())
+    assert sub.limit_status() is None
+
+
 # ---------------------------------------------------------------------------
 # SDK adapter: bounded send fails clean (RB2) — uses a fake client, no network
 # ---------------------------------------------------------------------------
@@ -1507,3 +1597,61 @@ async def test_engine_context_percentage_swallows_substrate_error():
 
     eng = Engine(_Sub())
     assert await eng.context_percentage() is None
+
+
+def test_engine_limit_status_delegates_and_validates_shape():
+    # OBSERVABILITY T1: Engine.limit_status() returns the substrate's (status, pct) verbatim when
+    # the shape is valid — a precise % and a status-only (pct None) both pass through.
+    class _Sub(FakeSubstrate):
+        def __init__(self, value):
+            super().__init__()
+            self._value = value
+
+        def limit_status(self):
+            return self._value
+
+    assert Engine(_Sub(("approaching", 82))).limit_status() == ("approaching", 82)
+    assert Engine(_Sub(("ok", None))).limit_status() == ("ok", None)
+
+
+def test_engine_limit_status_none_when_substrate_lacks_method_or_returns_none():
+    # A substrate predating the method (additive seam) → None; an explicit None → None.
+    assert Engine(FakeSubstrate()).limit_status() is None
+
+    class _Sub(FakeSubstrate):
+        def limit_status(self):
+            return None
+
+    assert Engine(_Sub()).limit_status() is None
+
+
+def test_engine_limit_status_rejects_malformed_shapes():
+    # A malformed signal is never propagated to the renderer: wrong arity, empty/non-str status,
+    # a non-int pct, or a non-tuple → None (defensive shape-validation, mirroring last_model).
+    class _Sub(FakeSubstrate):
+        def __init__(self, value):
+            super().__init__()
+            self._value = value
+
+        def limit_status(self):
+            return self._value
+
+    for bad in (
+        ("approaching",),  # wrong arity
+        ("approaching", 80, "extra"),  # wrong arity
+        ("", 80),  # empty status
+        (123, 80),  # non-str status
+        ("approaching", "80"),  # non-int pct
+        ("approaching", True),  # bool is not an accepted pct
+        "approaching",  # not a tuple
+    ):
+        assert Engine(_Sub(bad)).limit_status() is None
+
+
+def test_engine_limit_status_swallows_substrate_error():
+    # A raising substrate method → None (RB1; an observer off the critical path never raises).
+    class _Sub(FakeSubstrate):
+        def limit_status(self):
+            raise RuntimeError("boom")
+
+    assert Engine(_Sub()).limit_status() is None

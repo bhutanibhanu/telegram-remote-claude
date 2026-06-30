@@ -5,7 +5,7 @@ _Two capabilities: live activity line (agents) + 🪙 limit field & warning (tok
 spikes (T1, T2) are front-loaded so each data source is proven before any UI commits to it._
 
 ## Task list
-- [ ] T1 — Adapter limit telemetry + spike
+- [x] T1 — Adapter limit telemetry + spike (precise % available via RateLimitInfo.utilization)
 - [ ] T2 — Adapter activity telemetry + spike
 - [ ] T3 — Statusline 🪙 limit field
 - [ ] T4 — Proactive limit warning
