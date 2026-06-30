@@ -37,6 +37,11 @@ Each ADR captures one load-bearing decision, its context, and its consequences.
   through the send-gate, foreground-only and best-effort (RB1). Sources `ctx %` from the SDK's
   honest `get_context_usage()`, adds a per-project `/effort` knob, and replaces the per-turn
   done-footer (cost moves to `/status`).
+- [ADR-010 — Observability](adr/ADR-010-observability.md): a live transient **activity line**
+  (current tool + active-subagent type-names, edited in place, throttled, removed at turn end) +
+  a **🪙 rolling-session-limit** field on the statusline (precise % via `RateLimitInfo.utilization`,
+  else a `🟢/🟡/🔴` badge) + a one-time **proactive limit warning** (de-duped per window). Both
+  body-free (SB3 names-only), foreground-only, best-effort observers off the turn's critical path (RB1).
 
 ## Feature specs
 

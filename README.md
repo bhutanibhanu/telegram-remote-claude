@@ -29,6 +29,7 @@ You choose which with one environment variable.
 - [Commands](#commands)
 - [Multi-project & concurrency](#multi-project--concurrency-streaming-mode)
 - [Statusline](#statusline-streaming-mode)
+- [Observability](#observability-streaming-mode)
 - [Proactive scheduler](#proactive-scheduler-streaming-mode)
 - [Configuration](#configuration-env)
 - [Troubleshooting](#troubleshooting)
@@ -269,13 +270,15 @@ In streaming mode the bot keeps a single **statusline** message **pinned at the 
 chat** — Claude Code's terminal statusline, brought to your phone:
 
 ```
-📁 worktree · 🤖 model·effort · 🧠 ctx 6% · 🔒 mode
+📁 worktree · 🤖 model·effort · 🧠 ctx 6% · 🪙 68% · 🔒 mode
 ```
 
 It shows the **active** project's name, its effective model + reasoning [`/effort`](#commands)
 (`🤖 model·effort`), the live context-window usage (`🧠 ctx %`, the same figure Claude Code's
-`/context` reports — `🧠 ctx —` until the first turn completes, never a made-up number), and the
-permission mode (`🔒 gate`/`yolo`/`plan`). A leading `⚙️` appears while a turn is running.
+`/context` reports — `🧠 ctx —` until the first turn completes, never a made-up number), the
+**rolling session-limit** usage (`🪙 %`, see [Observability](#observability-streaming-mode)
+below — omitted until a signal is seen), and the permission mode (`🔒 gate`/`yolo`/`plan`). A
+leading `⚙️` appears while a turn is running.
 
 It's pinned **once** (silently — no notification) and **edited in place** as state changes — on
 turn start/end, `/switch`, and each knob change (`/effort`, `/yolo`, `/fast`·`/deep`, `/plan`) —
@@ -285,6 +288,35 @@ it reappears on the next change. It **replaces** the old per-turn `✅ done · $
 **routine output no longer shows dollar amounts — cost moved to [`/status`](#commands)** (the
 explicit health view). The line is body-free and best-effort — a pin/edit hiccup never affects a
 turn. See [ADR-009](docs/adr/ADR-009-statusline.md) for the design.
+
+## Observability (streaming mode)
+
+So you can tell what's happening during a turn — especially subagent-heavy `/pipeline` runs — and
+not get cut off mid-turn, the bot surfaces two live, body-free signals (both best-effort — a hiccup
+never affects a turn; both describe the **foreground** project only):
+
+- **Live activity line.** A transient message that appears while a turn runs and is **edited in
+  place** as work progresses, showing the current tool and any active subagents by name:
+
+  ```
+  ⚙️ general-purpose, Explore · Bash
+  ```
+
+  It's **names only** (tool + subagent *type* — never arguments, prompts, paths, or output),
+  throttled (one message, ≲1 edit/sec — no spam), and **removed when the turn ends** (no lingering
+  ⚙️, no per-turn footer — the pinned statusline is the persistent summary).
+
+- **Rolling session-limit `🪙` + a proactive warning.** The statusline's `🪙 %` shows how much of
+  your Claude **session limit** is used (precise % when the SDK reports it, else a `🟢/🟡/🔴`
+  badge). When it crosses into "approaching" you get **one** heads-up so you can wrap up before a
+  mid-turn cutoff:
+
+  ```
+  🟡 Approaching your Claude session limit (🪙 88%) — consider wrapping up or using smaller turns to avoid a mid-turn cutoff.
+  ```
+
+  The warning fires once per limit-window and re-arms after the limit recovers. See
+  [ADR-010](docs/adr/ADR-010-observability.md) for the design.
 
 ## Proactive scheduler (streaming mode)
 
