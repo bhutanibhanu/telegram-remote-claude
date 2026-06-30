@@ -350,6 +350,26 @@ class Engine:
             return None
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
+    def last_model(self) -> Optional[str]:
+        """The actual model id the substrate reports for this session, or ``None`` (statusline).
+
+        Delegates to the substrate's ``last_model`` (the model the SDK actually used — captured
+        from the ``init``/assistant/result messages). The statusline uses this as the model
+        fallback so it shows the genuinely-running model instead of the literal ``default`` when
+        no per-project override / ``CLAUDE_MODEL`` is configured. Read defensively via ``getattr``
+        so a substrate that predates this method (or a fake in a test) simply yields ``None`` (the
+        additive-seam discipline, mirroring :meth:`context_percentage`); pure + never raises (RB1).
+        """
+        getter = getattr(self._substrate, "last_model", None)
+        if getter is None:
+            return None
+        try:
+            value = getter()
+        except Exception:  # pragma: no cover - the substrate is already best-effort
+            log.debug("last_model() failed (ignored)", exc_info=True)
+            return None
+        return value if isinstance(value, str) and value.strip() else None
+
     # -- the decision seam (the async answer-hold) ---------------------------
 
     async def on_tool_request(

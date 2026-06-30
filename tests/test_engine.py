@@ -515,6 +515,47 @@ def test_session_id_capture_prefers_system_data_then_attr():
     assert _session_id_of(object()) is None
 
 
+def test_capture_model_tracks_init_assistant_result_and_ignores_blanks():
+    # STATUSLINE: the substrate captures the ACTUAL model the SDK reports so the bar shows the
+    # real model instead of "default" when none is configured. Captured (most-recent wins) from
+    # the init system event (session start), each AssistantMessage, and the terminal
+    # ResultMessage.model_usage — and a blank / odd value never clobbers a known model (RB1).
+    sub = SdkSubstrate()
+    assert sub.last_model() is None  # nothing reported yet
+    sub._capture_model(sdk.SystemMessage(subtype="init", data={"model": "claude-sonnet-4-6"}))
+    assert sub.last_model() == "claude-sonnet-4-6"  # known at session start (closes the gap)
+    sub._capture_model(sdk.AssistantMessage(content=[], model="claude-opus-4-8"))
+    assert sub.last_model() == "claude-opus-4-8"  # refreshed mid-turn
+    sub._capture_model(
+        sdk.ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="S1", model_usage={"claude-haiku-4-5": {"contextWindow": 200000}},
+        )
+    )
+    assert sub.last_model() == "claude-haiku-4-5"  # terminal model_usage is authoritative
+    # RB1: a blank model / an init without a model / an unknown shape leaves the value UNCHANGED.
+    sub._capture_model(sdk.SystemMessage(subtype="init", data={"model": "   "}))
+    sub._capture_model(sdk.SystemMessage(subtype="init", data={}))
+    sub._capture_model(object())
+    assert sub.last_model() == "claude-haiku-4-5"
+
+
+def test_stop_drops_captured_model():
+    # The captured model is session-scoped (RB3, in-memory): stop() clears it so a fresh session
+    # re-captures its own model from its first init event (never a stale carryover).
+    import asyncio
+
+    class _FakeClient:
+        async def disconnect(self):
+            pass
+
+    sub = SdkSubstrate()
+    sub._client = _FakeClient()  # stop() resets caches only once a session/client exists
+    sub._last_model = "claude-opus-4-8"
+    asyncio.run(sub.stop())
+    assert sub.last_model() is None
+
+
 # ---------------------------------------------------------------------------
 # SDK adapter: bounded send fails clean (RB2) — uses a fake client, no network
 # ---------------------------------------------------------------------------

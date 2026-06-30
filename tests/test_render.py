@@ -2089,15 +2089,51 @@ def test_schedule_listing_due_now_when_past():
 
 def test_format_statusline_full_set_exact_format():
     # The complete, owner-locked line for a working turn: worktree · model·effort · ctx% · mode.
+    # A short name (<= the phone-truncation width) is shown verbatim.
     line = format_statusline(
-        worktree="claude-telegram-bot",
+        worktree="claude-tg",
         model_label="opus",
         effort="max",
         ctx_pct=6,
         mode="gate",
         working=True,
     )
-    assert line == "⚙️ 📁 claude-telegram-bot · 🤖 opus·max · 🧠 ctx 6% · 🔒 gate"
+    assert line == "⚙️ 📁 claude-tg · 🤖 opus·max · 🧠 ctx 6% · 🔒 gate"
+
+
+def test_format_statusline_long_name_middle_truncated_for_phone():
+    # A project NAME longer than the phone width is MIDDLE-truncated (head…tail) so worktrees
+    # that share a long common prefix stay distinguishable by their suffix. DISPLAY-ONLY.
+    from claude_tg.render import _STATUSLINE_WORKTREE_MAX
+
+    a = format_statusline(
+        worktree="claude-telegram-bot-core-refactor",
+        model_label="opus", effort="high", ctx_pct=10, mode="gate", working=False,
+    )
+    b = format_statusline(
+        worktree="claude-telegram-bot-statusline-mobile",
+        model_label="opus", effort="high", ctx_pct=10, mode="gate", working=False,
+    )
+    # Both truncated to the width, both keep the distinguishing tail, and they differ. Tail-
+    # biased, so the full distinguishing suffix survives ("re-refactor" / "line-mobile").
+    assert "…" in a and "…" in b
+    assert a != b
+    assert a.endswith("re-refactor · 🤖 opus·high · 🧠 ctx 10% · 🔒 gate")
+    assert b.endswith("line-mobile · 🤖 opus·high · 🧠 ctx 10% · 🔒 gate")
+    # The rendered NAME field is within budget (the field between 📁 and the first separator).
+    name_field = a.split("📁 ", 1)[1].split(" · ", 1)[0]
+    assert len(name_field) <= _STATUSLINE_WORKTREE_MAX
+
+
+def test_format_statusline_path_shaped_name_not_truncated():
+    # SB3/P8: a path-shaped value (defensive) is kept WHOLE in <code> — never truncated — so
+    # the inert-monospace anti-linkify guarantee holds for the complete path.
+    line = format_statusline(
+        worktree="/tmp/some/rather/long/secret/project/path",
+        model_label="opus", effort=None, ctx_pct=None, mode="gate", working=False,
+    )
+    assert "<code>/tmp/some/rather/long/secret/project/path</code>" in line
+    assert "…" not in line
 
 
 def test_format_statusline_idle_has_no_working_marker():

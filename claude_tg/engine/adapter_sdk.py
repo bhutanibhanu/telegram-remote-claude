@@ -485,6 +485,13 @@ class SdkSubstrate:
         # fabricated 0%). In-memory only (RB3); reset on stop. Single asyncio task → no lock.
         self._last_usage_tokens: Optional[int] = None
         self._last_context_window: Optional[int] = None
+        # STATUSLINE: the ACTUAL model id the SDK reports for this session — captured from the
+        # ``init`` system event (at session start, so the statusline shows the real model from
+        # the first turn — closes the "🤖 default" gap when no CLAUDE_MODEL/override is set) and
+        # refreshed from each AssistantMessage / terminal ResultMessage.model_usage. Lets the
+        # statusline show the model that is genuinely running (incl. after /fast·/deep routing)
+        # instead of the literal word "default". In-memory only (RB3); reset on stop.
+        self._last_model: Optional[str] = None
 
     # -- options -------------------------------------------------------------
 
@@ -672,6 +679,7 @@ class SdkSubstrate:
                     break
                 self._capture_session_id(msg)
                 self._capture_usage(msg)
+                self._capture_model(msg)
                 for ev in self._events_from(msg):
                     yield ev
         except asyncio.TimeoutError:
@@ -811,6 +819,56 @@ class SdkSubstrate:
         except Exception:  # pragma: no cover - defensive; never break the receive loop (RB1)
             log.debug("usage capture failed (ignored)", exc_info=True)
 
+    def _capture_model(self, msg: Any) -> None:
+        """Stash the ACTUAL model id the SDK reports for this session (statusline source).
+
+        The bot does not always know the model up front: when no per-project override and no
+        ``CLAUDE_MODEL`` is set, the SDK picks its own default — so the statusline would show
+        ``🤖 default``. The SDK, however, names the model it actually used, so we capture it
+        (most-recent wins) from whichever message carries it:
+
+        * ``SystemMessage(init).data["model"]`` — emitted at session start, BEFORE any output,
+          so the real model is known from the very first turn (closes the ``default`` gap).
+        * ``AssistantMessage.model`` — the per-message model (defensive / mid-turn refresh).
+        * ``ResultMessage.model_usage`` — the terminal turn's model (first/only key); the most
+          authoritative, and tracks ``/fast``·``/deep`` routing changes.
+
+        **Best-effort + fully defensive (RB1):** any missing key / odd shape / exception leaves
+        the stored value UNCHANGED — never overwrite a known model with a blank, never raise on
+        the hot receive path. In-memory only (RB3); dropped on :meth:`stop`.
+        """
+        from claude_agent_sdk import (  # lazy
+            AssistantMessage,
+            ResultMessage,
+            SystemMessage,
+        )
+
+        try:
+            found: Optional[str] = None
+            if isinstance(msg, SystemMessage) and getattr(msg, "subtype", None) == "init":
+                data = msg.data if isinstance(msg.data, dict) else {}
+                found = data.get("model")
+            elif isinstance(msg, AssistantMessage):
+                found = getattr(msg, "model", None)
+            elif isinstance(msg, ResultMessage):
+                model_usage = getattr(msg, "model_usage", None)
+                if isinstance(model_usage, dict):
+                    found = next(iter(model_usage), None)
+            if isinstance(found, str) and found.strip():
+                self._last_model = found.strip()
+        except Exception:  # pragma: no cover - defensive; never break the receive loop (RB1)
+            log.debug("model capture failed (ignored)", exc_info=True)
+
+    def last_model(self) -> Optional[str]:
+        """The actual model id the SDK reported for this session, or ``None`` (statusline).
+
+        Captured by :meth:`_capture_model` from the ``init``/assistant/result messages. Pure
+        in-memory read (no I/O, never raises) — the statusline uses it as the model fallback so
+        it shows the genuinely-running model instead of the literal ``default`` when no override
+        / ``CLAUDE_MODEL`` is configured. ``None`` before the first message of the first turn.
+        """
+        return self._last_model
+
     async def context_percentage(self) -> Optional[int]:
         """Best-effort % of the context window currently used — the honest ctx figure (§2.1).
 
@@ -867,6 +925,9 @@ class SdkSubstrate:
             # until its first turn completes), never a stale carryover. RB3 (in-memory only).
             self._last_usage_tokens = None
             self._last_context_window = None
+            # Drop the captured model id with the session — a fresh session re-captures its own
+            # model from its first ``init`` event (never a stale carryover). RB3 (in-memory).
+            self._last_model = None
 
 
 __all__ = [
