@@ -1546,6 +1546,37 @@ _MODEL_FAMILY_PATTERNS: tuple[tuple[str, str], ...] = (
 #: (no live client, no last ``ResultMessage.usage``) shows ``🧠 ctx —``.
 _CTX_UNKNOWN = "—"
 
+#: Max display width for the worktree/project NAME in the pinned statusline. A project name can
+#: be up to SB4's 32 chars, which is too wide to read on a phone (the owner's report); a longer
+#: name is TAIL-BIASED middle-truncated to this many characters (a small head + ``…`` + the
+#: distinguishing tail). DISPLAY-ONLY — the real project name is unchanged everywhere else
+#: (switching, the store, audit). Tweak the width / head fraction freely.
+_STATUSLINE_WORKTREE_MAX = 16
+
+#: Fraction of the truncation budget given to the HEAD (the rest is the tail). Tail-biased
+#: (< 0.5) because project names that share a long common prefix (e.g. ``claude-telegram-bot-*``
+#: worktrees) differ only in their SUFFIX — so we keep a small head for orientation and spend
+#: most of the width on the distinguishing tail.
+_STATUSLINE_NAME_HEAD_FRAC = 0.30
+
+
+def _truncate_label(text: str, limit: int) -> str:
+    """TAIL-BIASED middle-truncate ``text`` to ``limit`` characters with a ``…`` (pure).
+
+    ``len(text) <= limit`` → returned unchanged; otherwise keep a SMALL head and the rest of
+    the budget as the tail, joined by a single ``…`` (result is exactly ``limit`` chars).
+    Tail-biased — NOT centred or end-truncated — because names that share a long common prefix
+    (several ``claude-telegram-bot-*`` worktrees) differ only in their SUFFIX; a small head
+    orients while the long tail keeps them distinguishable on the bar. Operates on the RAW
+    string BEFORE any HTML-escaping, so the budget counts visible characters, not entities.
+    """
+    if len(text) <= limit:
+        return text
+    keep = max(1, limit - 1)  # room for the single "…"
+    head = max(1, int(keep * _STATUSLINE_NAME_HEAD_FRAC))
+    tail = keep - head
+    return text[:head] + "…" + (text[-tail:] if tail else "")
+
 
 def model_short_label(model_id: object) -> str:
     """Reduce a model **id** to its short statusline label (``opus``/``sonnet``/``haiku``).
@@ -1612,9 +1643,14 @@ def format_statusline(
     # command-links (P8) and any odd character is escaped inside the <code> wrap. Otherwise
     # escape-once as a plain field. Either branch yields valid, parse_mode="HTML" output.
     if "/" in str(worktree):
+        # Path-shaped (defensive — the statusline normally passes a NAME): keep it WHOLE and
+        # inert in <code> so its /segments can't linkify (P8); never truncate a path.
         wt = code_path(worktree)
     else:
-        wt = _escape_html(str(worktree))
+        # NAME: phone-friendly middle-truncation of a long project name BEFORE escaping
+        # (display-only — the real name is untouched elsewhere), so the budget counts visible
+        # characters, then escape once as before.
+        wt = _escape_html(_truncate_label(str(worktree), _STATUSLINE_WORKTREE_MAX))
     # SB3: every other field is a fixed word / a number, but escape-once defensively anyway.
     # Belt-and-braces: an empty/blank model_label falls back to "default" so the bar never
     # shows a bare "🤖 " (no model configured = the SDK default model).

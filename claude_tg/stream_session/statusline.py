@@ -33,6 +33,14 @@ from ..render import (
 from .runtime import _ChatState, _ProjectRuntime
 from .types import DeleteFn, EditFn, PinFn, SendFn, UnpinFn
 
+#: The effort shown in the statusline when no per-project ``/effort`` override is set.
+#: ``_resolve_project_effort`` returns ``None`` when unset — the deliberate asymmetry: no
+#: ``effort`` kwarg is threaded into a default turn, so turn behavior is byte-for-byte unchanged.
+#: But the owner wants the bar to ALWAYS show the current effort, and the SDK's own default
+#: effort is ``high`` (documented in ``_resolve_project_effort``), so we DISPLAY ``high`` when
+#: unset. Display-only — this never changes what is sent to the engine.
+_DEFAULT_EFFORT_LABEL = "high"
+
 if TYPE_CHECKING:
     # The foundation surface these methods consume — defined on ``StreamingSession`` (core.py),
     # not in this file. Declared here as bare ``Callable`` attribute annotations (NOT ``def``
@@ -210,8 +218,11 @@ class StatuslineMixin:
         is the only await here (every other field is a pure in-memory read).
 
         * ``worktree`` — the active project NAME (SB4-validated charset, so inert — SB3).
-        * ``model`` — :meth:`_resolve_project_model` reduced by :func:`model_short_label`.
-        * ``effort`` — :meth:`_resolve_project_effort` (``None`` → model-only).
+        * ``model`` — :meth:`_resolve_project_model` (override → ``CLAUDE_MODEL``), falling back
+          to the live engine's ``last_model`` (the model the SDK actually used) when neither is
+          configured, reduced by :func:`model_short_label`. Only ``default`` if all are unknown.
+        * ``effort`` — :meth:`_resolve_project_effort`, defaulting to ``high`` (the SDK default)
+          for DISPLAY when unset so the bar always shows the current effort (turns unchanged).
         * ``mode`` — ``yolo`` if the project's policy is allow-all, else ``plan`` if a plan turn
           is RUNNING (``in_plan_turn`` — B3) OR a ``/plan`` is armed for the next turn
           (``plan_next``), else ``gate`` (the fail-closed default).
@@ -224,8 +235,25 @@ class StatuslineMixin:
         if name is None or rt is None:
             return None
         worktree = name  # the SB4-validated project name (no path; SB3-inert).
-        model_label = model_short_label(self._resolve_project_model(chat_id, name))
-        effort = self._resolve_project_effort(chat_id, name)
+        # Model: per-project override (/fast·/deep) → CLAUDE_MODEL → else the model the SDK
+        # ACTUALLY reported for the live session (engine.last_model) → else "default". The live
+        # fallback means a session with no configured model shows its REAL model (e.g. 🤖 opus)
+        # from the first turn instead of the literal word "default". getattr-guarded so a fake /
+        # predating engine simply yields no live model (additive-seam discipline; RB1 best-effort).
+        model_id = self._resolve_project_model(chat_id, name)
+        if not model_id and rt.engine is not None:
+            getter = getattr(rt.engine, "last_model", None)
+            if callable(getter):
+                try:
+                    live = getter()
+                    if isinstance(live, str) and live.strip():
+                        model_id = live
+                except Exception:  # pragma: no cover - a telemetry read never breaks the line
+                    pass
+        model_label = model_short_label(model_id)
+        # Effort: the per-project override if set, else the SDK default (high) — the bar always
+        # shows the current effort (display-only; the turn-threading resolver is unchanged).
+        effort = self._resolve_project_effort(chat_id, name) or _DEFAULT_EFFORT_LABEL
         # mode: yolo (allow-all) wins; else plan — either a plan turn is RUNNING NOW
         # (``in_plan_turn``, B3 — ``plan_next`` is already consumed by the time the turn streams)
         # OR a ``/plan`` is armed for the NEXT turn (``plan_next``); else the fail-closed gate.

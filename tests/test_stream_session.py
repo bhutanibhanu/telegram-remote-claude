@@ -90,12 +90,16 @@ HOLD = object()  # sentinel in a script: park send() here until a resolve/cancel
 
 
 class FakeEngine:
-    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True, ctx_pct=None):
+    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True, ctx_pct=None, last_model=None):
         self._script = script
         self.session_id = session_id
         # STATUSLINE T-SL-CORE: the ctx % the statusline reads via engine.context_percentage().
         # Default None (→ "ctx —"); a test sets it to assert the figure flows into the line.
         self._ctx_pct = ctx_pct
+        # STATUSLINE: the actual model id the SDK reported (engine.last_model()). Default None
+        # (→ the statusline falls through to "default" when no model is configured); a test sets
+        # it to assert the LIVE model flows into the bar instead of the literal word "default".
+        self._last_model = last_model
         self.resolve_calls: list[tuple[str, object]] = []
         self.cancel_calls: list = []
         # P14 T-FIRE: records the ``proactive`` flag passed to each send() (the force-gate
@@ -149,6 +153,10 @@ class FakeEngine:
         # the SDK's coroutine get_context_usage() — so the live awaited path is exercised (a
         # non-awaited regression would fail: awaiting a sync int raises).
         return self._ctx_pct
+
+    def last_model(self):
+        # STATUSLINE: the actual model id the SDK reported (sync, like the real Engine).
+        return self._last_model
 
 
 class Recorder:
@@ -7842,11 +7850,13 @@ async def test_effort_change_flips_model_suffix_on_statusline(tmp_path):
     rt.engine = eng
     rec = Recorder()
     pins = PinRecorder()
-    # Initial line (no effort override) → model only, no ·effort suffix.
+    # Initial line (no /effort override) → effort shows the SDK DEFAULT (·high), not ·max
+    # (display-only default so the bar always shows the current effort; turns are unchanged).
     await session._maybe_update_statusline(
         1, send=rec.send, edit=rec.edit, pin=pins.pin, unpin=pins.unpin, for_project=None
     )
-    assert "·max" not in _statusline_sends(rec)[0]["text"]
+    initial = _statusline_sends(rec)[0]["text"]
+    assert "·high" in initial and "·max" not in initial
     # /effort max → set_effort persists → refresh → the suffix shows ·max.
     session.set_effort(1, "max")
     await session._maybe_update_statusline(
@@ -7876,6 +7886,49 @@ async def test_fast_model_change_flips_label_on_statusline(tmp_path):
         1, send=rec.send, edit=rec.edit, pin=pins.pin, unpin=pins.unpin, for_project=None
     )
     assert "🤖 haiku" in _statusline_edits(rec)[-1]["text"], "/fast → the model label flips to haiku"
+
+
+async def test_statusline_shows_live_model_not_default_when_unconfigured(tmp_path):
+    # When NO per-project override and NO CLAUDE_MODEL is configured, the SDK picks its own
+    # model — the bar must show the model the SDK ACTUALLY reported (engine.last_model), e.g.
+    # 🤖 opus, NOT the literal word "default".
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    eng = FakeEngine([], ctx_pct=6, last_model="claude-opus-4-8")
+    session = make_multi_session({str(tmp_path): eng}, store=store)
+    rt = session._runtime(1, "alpha", str(tmp_path))
+    rt.engine = eng
+    # No model override and (in the test config) no CLAUDE_MODEL → resolver yields None.
+    assert session._resolve_project_model(1, "alpha") is None
+    rec = Recorder()
+    pins = PinRecorder()
+    await session._maybe_update_statusline(
+        1, send=rec.send, edit=rec.edit, pin=pins.pin, unpin=pins.unpin, for_project=None
+    )
+    line = _statusline_sends(rec)[0]["text"]
+    assert "🤖 opus" in line, "the live SDK model must be shown"
+    assert "default" not in line, "the literal word 'default' must NOT appear"
+
+
+async def test_statusline_falls_back_to_default_only_when_model_truly_unknown(tmp_path):
+    # Belt-and-braces: no override, no CLAUDE_MODEL, AND no live model yet (engine.last_model
+    # None) → the bar shows 🤖 default (the honest "we don't know yet" state), never a blank 🤖.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "alpha", str(tmp_path), make_active=True)
+    eng = FakeEngine([], ctx_pct=6, last_model=None)
+    session = make_multi_session({str(tmp_path): eng}, store=store)
+    rt = session._runtime(1, "alpha", str(tmp_path))
+    rt.engine = eng
+    rec = Recorder()
+    pins = PinRecorder()
+    await session._maybe_update_statusline(
+        1, send=rec.send, edit=rec.edit, pin=pins.pin, unpin=pins.unpin, for_project=None
+    )
+    assert "🤖 default" in _statusline_sends(rec)[0]["text"]
 
 
 async def test_maybe_update_statusline_missing_closures_is_noop():
