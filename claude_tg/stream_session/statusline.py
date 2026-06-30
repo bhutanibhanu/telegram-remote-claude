@@ -273,6 +273,21 @@ class StatuslineMixin:
                 ctx_pct = await engine.context_percentage()
             except Exception:  # pragma: no cover - the engine call is already best-effort (RB1)
                 ctx_pct = None
+        # 🪙 rolling-limit field (observability T3): the FOREGROUND engine's limit signal, read
+        # best-effort EXACTLY like ``last_model`` above — getattr-guarded so a predating/fake
+        # engine yields None, and the call (a pure sync read that itself never raises, RB1) is
+        # try-wrapped so ANY oddity omits the field rather than breaking the line. ``None`` →
+        # format_statusline omits the field; a (status, pct) renders the %-or-badge.
+        limit: Optional[tuple[str, Optional[int]]] = None
+        if engine is not None:
+            getter = getattr(engine, "limit_status", None)
+            if callable(getter):
+                try:
+                    value = getter()
+                    if value is not None:
+                        limit = value
+                except Exception:  # pragma: no cover - the engine read is already best-effort (RB1)
+                    limit = None
         body = format_statusline(
             worktree=worktree,
             model_label=model_label,
@@ -280,6 +295,7 @@ class StatuslineMixin:
             ctx_pct=ctx_pct,
             mode=mode,
             working=working,
+            limit=limit,
         )
         return body, name
 

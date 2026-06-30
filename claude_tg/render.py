@@ -1546,6 +1546,13 @@ _MODEL_FAMILY_PATTERNS: tuple[tuple[str, str], ...] = (
 #: (no live client, no last ``ResultMessage.usage``) shows ``🧠 ctx —``.
 _CTX_UNKNOWN = "—"
 
+#: 🪙 limit-field badge per normalized limit STATUS (observability T3 / design §2.2). Shown ONLY
+#: when ``Engine.limit_status()`` gives a status but NO precise percent — a precise ``🪙 <pct>%``
+#: is preferred when available (the SPIKE found ``RateLimitInfo.utilization`` exposes one). A status
+#: NOT in this map (an unexpected/future value) → the field is OMITTED entirely (never guess a
+#: badge); a ``None`` signal omits it too. Glyphs mirror the ok/approaching/limited health bands.
+_LIMIT_BADGES: dict[str, str] = {"ok": "🟢", "approaching": "🟡", "limited": "🔴"}
+
 #: Max display width for the worktree/project NAME in the pinned statusline. A project name can
 #: be up to SB4's 32 chars, which is too wide to read on a phone (the owner's report); a longer
 #: name is TAIL-BIASED middle-truncated to this many characters (a small head + ``…`` + the
@@ -1610,12 +1617,13 @@ def format_statusline(
     ctx_pct: int | None,
     mode: str,
     working: bool,
+    limit: tuple[str, Optional[int]] | None = None,
 ) -> str:
     """Build the pinned mobile statusline body (pure; no I/O) — the owner-LOCKED format.
 
     ::
 
-        📁 <worktree> · 🤖 <model>·<effort> · 🧠 ctx <X%> · 🔒 <mode>
+        📁 <worktree> · 🤖 <model>·<effort> · 🧠 ctx <X%> · 🪙 <limit> · 🔒 <mode>
 
     with a leading ``⚙️ `` when ``working`` (a turn is running). Field rules (design §1/§5):
 
@@ -1624,6 +1632,16 @@ def format_statusline(
     * ``ctx_pct=None`` → ``🧠 ctx —`` (an em dash — design §2.1 forbids a fabricated ``0%``;
       a turn with no usage figure yet shows the dash, not a wrong number). An ``int`` →
       ``🧠 ctx <X>%``.
+    * ``limit`` (observability T3, the 🪙 ROLLING-SESSION-LIMIT field; design §2.2) — the
+      ``(status, pct)`` from :meth:`~claude_tg.engine.engine.Engine.limit_status`, placed AFTER
+      ``🧠 ctx`` and BEFORE ``🔒 <mode>``:
+        - ``None`` (no limit signal seen) → the field is **OMITTED entirely** (mirrors the
+          ``ctx —`` never-fabricate discipline; the line is byte-for-byte the pre-T3 format).
+        - ``(status, pct)`` with an ``int`` ``pct`` → the **precise** ``🪙 <pct>%`` (preferred —
+          the SPIKE found ``RateLimitInfo.utilization`` exposes one).
+        - ``(status, None)`` → the ``🟢/🟡/🔴`` **badge** for the status (``ok``/``approaching``/
+          ``limited`` — :data:`_LIMIT_BADGES`); an UNKNOWN status → the field is OMITTED (never
+          guess a badge).
     * ``working=True`` → a leading ``⚙️ `` marker; ``False`` → none.
 
     **SB3 (body-free + no path-as-fake-link).** Every interpolated value is bot-derived state,
@@ -1660,7 +1678,21 @@ def format_statusline(
     ctx_part = _CTX_UNKNOWN if ctx_pct is None else f"{int(ctx_pct)}%"
     ctx_part = _escape_html(ctx_part)  # the digits/dash are safe; escape-once for consistency.
     mode_part = _escape_html(str(mode))
-    line = f"📁 {wt} · 🤖 {model_part} · 🧠 ctx {ctx_part} · 🔒 {mode_part}"
+    # 🪙 limit field (observability T3): precise % if the SDK exposed one, else the status badge,
+    # else OMITTED (None signal OR an unknown status — never a fabricated value/guessed badge).
+    # ``limit_field`` is the trailing " · 🪙 …" segment ("" when omitted) so the line is byte-for-
+    # byte the pre-T3 format when ``limit is None``.
+    limit_field = ""
+    if limit is not None:
+        status, pct = limit
+        if pct is not None:
+            # Precise reading: escape-once like every other field (the digits are inert, SB3).
+            limit_field = f" · 🪙 {_escape_html(f'{int(pct)}%')}"
+        else:
+            badge = _LIMIT_BADGES.get(status)
+            if badge is not None:  # known status → badge; unknown → field omitted (no guess).
+                limit_field = f" · 🪙 {badge}"
+    line = f"📁 {wt} · 🤖 {model_part} · 🧠 ctx {ctx_part}{limit_field} · 🔒 {mode_part}"
     if working:
         return f"⚙️ {line}"
     return line

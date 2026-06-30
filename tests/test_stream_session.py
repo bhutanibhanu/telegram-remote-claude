@@ -90,7 +90,7 @@ HOLD = object()  # sentinel in a script: park send() here until a resolve/cancel
 
 
 class FakeEngine:
-    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True, ctx_pct=None, last_model=None):
+    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True, ctx_pct=None, last_model=None, limit_status=None):
         self._script = script
         self.session_id = session_id
         # STATUSLINE T-SL-CORE: the ctx % the statusline reads via engine.context_percentage().
@@ -100,6 +100,10 @@ class FakeEngine:
         # (→ the statusline falls through to "default" when no model is configured); a test sets
         # it to assert the LIVE model flows into the bar instead of the literal word "default".
         self._last_model = last_model
+        # observability T3: the rolling-limit signal the statusline reads via engine.limit_status()
+        # — (status, pct_or_None) or None. Default None (→ the 🪙 field is OMITTED); a test sets a
+        # value (a tuple, or a callable to simulate a raising read for the RB1 probe).
+        self._limit_status = limit_status
         self.resolve_calls: list[tuple[str, object]] = []
         self.cancel_calls: list = []
         # P14 T-FIRE: records the ``proactive`` flag passed to each send() (the force-gate
@@ -157,6 +161,14 @@ class FakeEngine:
     def last_model(self):
         # STATUSLINE: the actual model id the SDK reported (sync, like the real Engine).
         return self._last_model
+
+    def limit_status(self):
+        # observability T3: the rolling-limit signal the statusline reads (sync, like the real
+        # Engine.limit_status()). When the configured value is callable it is CALLED — a test can
+        # pass a lambda that raises to exercise the statusline's best-effort RB1 guard.
+        if callable(self._limit_status):
+            return self._limit_status()
+        return self._limit_status
 
 
 class Recorder:
@@ -7404,6 +7416,87 @@ async def test_update_statusline_first_use_sends_then_pins_silently():
     state = session._chat(1)
     assert state.statusline_message_id == 501
     assert state.statusline_text == body
+
+
+# --- observability T3: the 🪙 rolling-limit field on the pinned statusline -----
+
+
+async def test_statusline_renders_limit_pct_when_engine_reports_it():
+    # The FOREGROUND engine's limit_status() → a precise "🪙 <pct>%" on the bar (mirrors the
+    # ctx-% test). The read is best-effort + foreground-only.
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6, limit_status=("approaching", 68))
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    assert len(rec.sends) == 1
+    body = rec.sends[0]["text"]
+    assert "🪙 68%" in body
+
+
+async def test_statusline_omits_limit_field_when_engine_reports_none():
+    # No limit signal (limit_status() → None) → the 🪙 field is OMITTED (never fabricated).
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6, limit_status=None)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    body = rec.sends[0]["text"]
+    for glyph in ("🪙", "🟢", "🟡", "🔴"):
+        assert glyph not in body
+    # The ctx field still renders — the omission is the limit field only.
+    assert "🧠 ctx 6%" in body
+
+
+async def test_statusline_limit_read_raises_field_omitted_line_still_built():
+    # RB1: a limit_status() that RAISES must omit the field, never break the line (best-effort,
+    # off the turn's critical path) — the statusline is still sent with the ctx field intact.
+    session = make_session(FakeEngine([]))
+
+    def _boom():
+        raise RuntimeError("limit read blew up")
+
+    eng = FakeEngine([], ctx_pct=6, limit_status=_boom)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    assert len(rec.sends) == 1, "the line must still be built despite the raising limit read"
+    body = rec.sends[0]["text"]
+    assert "🧠 ctx 6%" in body
+    for glyph in ("🪙", "🟢", "🟡", "🔴"):
+        assert glyph not in body
+
+
+async def test_statusline_limit_field_is_foreground_only(tmp_path):
+    # Foreground-only: _maybe_update_statusline SKIPS when ``for_project`` is not the chat's
+    # foreground, so a BACKGROUND project's turn (even one whose engine reports a limit) never
+    # rewrites the pinned line — and the FOREGROUND project DOES render the 🪙 field. A real
+    # store is needed (with store=None every project is implicitly foreground).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "bg", "/work", make_active=False)
+    store.create(1, "fg", "/work", make_active=True)  # fg is the active/foreground project
+    session = make_session(FakeEngine([]), store=store)
+    # Attach a foreground engine reporting an ``ok`` (🟢) limit to the active project's runtime.
+    _name, rt = session._active_runtime(1, create_default=False)
+    assert rt is not None
+    rt.engine = FakeEngine([], ctx_pct=6, limit_status=("ok", None))
+    rt.status = "running"
+    rec = StatuslineRecorder()
+    # A different (non-foreground) project name must be skipped entirely (no send/edit).
+    await session._maybe_update_statusline(
+        1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin, for_project="bg",
+    )
+    assert rec.sends == [] and rec.edits == [], "a background project must not write the bar"
+    # The FOREGROUND project DOES render the limit field (the 🟢 badge).
+    await session._maybe_update_statusline(
+        1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin, for_project="fg",
+    )
+    assert len(rec.sends) == 1 and "🟢" in rec.sends[0]["text"]
 
 
 async def test_update_statusline_second_changed_edits_in_place_no_repin():
