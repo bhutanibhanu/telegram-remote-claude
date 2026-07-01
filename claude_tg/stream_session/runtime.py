@@ -536,9 +536,11 @@ class _ChatState:
     # "approaching your session limit" heads-up. The rolling session limit is ACCOUNT-WIDE (one
     # signal across every project), so the warned-state lives on the chat (one warning per chat
     # per limit-window), not per project. True from the moment a turn ends with the foreground
-    # limit signal in ``approaching``/``limited`` until the status returns to ``ok`` (or no
-    # signal), which RE-ARMS it (clears it) so the NEXT crossing warns again. Set/cleared ONLY by
-    # :meth:`StreamingSession._maybe_warn_limit` at turn end. Transient in-memory (RB3): a restart
+    # limit signal in ``approaching``/``limited`` until the status EXPLICITLY returns to ``ok``,
+    # which RE-ARMS it (clears it) so the NEXT crossing warns again. A ``None``/no-signal reading is
+    # a NON-EVENT — it does NOT re-arm (``None`` means this engine has no signal yet, not recovery),
+    # so a flag armed on one project survives a switch to a project whose engine reports ``None``.
+    # Set/cleared ONLY by :meth:`StreamingSession._maybe_warn_limit` at turn end. Transient in-memory (RB3): a restart
     # drops it (a fresh process re-arms — the worst case is one extra heads-up, never a missed
     # cutoff). Never persisted.
     limit_warned: bool = False
