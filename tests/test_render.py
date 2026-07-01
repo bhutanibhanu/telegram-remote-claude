@@ -2240,6 +2240,73 @@ def test_format_statusline_escapes_odd_effort_and_mode_defensively():
     assert "m&lt;x" in line and "e&amp;y" in line and "z&gt;w" in line
 
 
+# --- 🪙 limit field (observability T3): precise % | badge | omit -------------
+
+
+def test_format_statusline_limit_precise_pct():
+    # A precise % (RateLimitInfo.utilization) → "🪙 <pct>%", placed after 🧠 ctx, before 🔒.
+    line = format_statusline(
+        worktree="proj", model_label="opus", effort="high", ctx_pct=10, mode="gate",
+        working=False, limit=("approaching", 68),
+    )
+    assert "🪙 68%" in line
+    # Field position: after the ctx field, before the mode field.
+    assert "🧠 ctx 10% · 🪙 68% · 🔒 gate" in line
+
+
+def test_format_statusline_limit_badge_when_no_pct():
+    # status-only (pct=None) → the 🟢/🟡/🔴 badge for the status, NOT a "🪙 …%".
+    limited = format_statusline(
+        worktree="proj", model_label="opus", effort=None, ctx_pct=None, mode="gate",
+        working=False, limit=("limited", None),
+    )
+    assert "🔴" in limited
+    assert "🪙 " in limited and "%" not in limited  # badge, never a percent
+
+    ok = format_statusline(
+        worktree="proj", model_label="opus", effort=None, ctx_pct=None, mode="gate",
+        working=False, limit=("ok", None),
+    )
+    assert "🟢" in ok
+
+    approaching = format_statusline(
+        worktree="proj", model_label="opus", effort=None, ctx_pct=None, mode="gate",
+        working=False, limit=("approaching", None),
+    )
+    assert "🟡" in approaching
+
+
+def test_format_statusline_limit_none_omits_field_byte_for_byte():
+    # limit=None (the default — no signal seen) → the field is OMITTED entirely: no 🪙/🟢/🟡/🔴,
+    # and the line is byte-for-byte the pre-T3 format (limit defaults None, so every existing
+    # caller/test is unchanged).
+    with_limit = format_statusline(
+        worktree="proj", model_label="opus", effort="max", ctx_pct=6, mode="gate", working=True,
+        limit=None,
+    )
+    without_kwarg = format_statusline(
+        worktree="proj", model_label="opus", effort="max", ctx_pct=6, mode="gate", working=True,
+    )
+    # Explicit omission: none of the limit glyphs appear.
+    for glyph in ("🪙", "🟢", "🟡", "🔴"):
+        assert glyph not in with_limit
+    # And the default omits identically — the pre-T3 locked format.
+    assert with_limit == without_kwarg
+    assert with_limit == "⚙️ 📁 proj · 🤖 opus·max · 🧠 ctx 6% · 🔒 gate"
+
+
+def test_format_statusline_limit_unknown_status_omits_field():
+    # An UNKNOWN status with pct=None → the field is OMITTED (never guess a badge; RB1).
+    line = format_statusline(
+        worktree="proj", model_label="opus", effort=None, ctx_pct=None, mode="gate",
+        working=False, limit=("weird", None),
+    )
+    for glyph in ("🪙", "🟢", "🟡", "🔴"):
+        assert glyph not in line
+    # The line is otherwise the normal (no-limit) format.
+    assert line == "📁 proj · 🤖 opus · 🧠 ctx — · 🔒 gate"
+
+
 # --- model_short_label mapping (regex/contains → family; unknown → raw id) ----
 
 

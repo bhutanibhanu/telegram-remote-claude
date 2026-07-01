@@ -90,7 +90,7 @@ HOLD = object()  # sentinel in a script: park send() here until a resolve/cancel
 
 
 class FakeEngine:
-    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True, ctx_pct=None, last_model=None):
+    def __init__(self, script: list, *, session_id="sess-1", resolve_result=True, ctx_pct=None, last_model=None, limit_status=None, last_activity=None):
         self._script = script
         self.session_id = session_id
         # STATUSLINE T-SL-CORE: the ctx % the statusline reads via engine.context_percentage().
@@ -100,6 +100,15 @@ class FakeEngine:
         # (→ the statusline falls through to "default" when no model is configured); a test sets
         # it to assert the LIVE model flows into the bar instead of the literal word "default".
         self._last_model = last_model
+        # observability T3: the rolling-limit signal the statusline reads via engine.limit_status()
+        # — (status, pct_or_None) or None. Default None (→ the 🪙 field is OMITTED); a test sets a
+        # value (a tuple, or a callable to simulate a raising read for the RB1 probe).
+        self._limit_status = limit_status
+        # observability T5: the activity snapshot the activity line reads via engine.last_activity()
+        # — an ActivitySnapshot or None. Default None (→ the activity line shows nothing); a test
+        # sets a value (or a callable, e.g. a lambda over a mutable box to make the snapshot CHANGE
+        # across events, or a raising lambda to exercise the activity line's best-effort RB1 guard).
+        self._last_activity = last_activity
         self.resolve_calls: list[tuple[str, object]] = []
         self.cancel_calls: list = []
         # P14 T-FIRE: records the ``proactive`` flag passed to each send() (the force-gate
@@ -157,6 +166,22 @@ class FakeEngine:
     def last_model(self):
         # STATUSLINE: the actual model id the SDK reported (sync, like the real Engine).
         return self._last_model
+
+    def limit_status(self):
+        # observability T3: the rolling-limit signal the statusline reads (sync, like the real
+        # Engine.limit_status()). When the configured value is callable it is CALLED — a test can
+        # pass a lambda that raises to exercise the statusline's best-effort RB1 guard.
+        if callable(self._limit_status):
+            return self._limit_status()
+        return self._limit_status
+
+    def last_activity(self):
+        # observability T5: the activity snapshot the activity line reads (sync, like the real
+        # Engine.last_activity()). A callable is CALLED — a test can pass a lambda over a mutable
+        # box so the snapshot CHANGES across events, or a lambda that raises for the RB1 probe.
+        if callable(self._last_activity):
+            return self._last_activity()
+        return self._last_activity
 
 
 class Recorder:
@@ -7406,6 +7431,87 @@ async def test_update_statusline_first_use_sends_then_pins_silently():
     assert state.statusline_text == body
 
 
+# --- observability T3: the 🪙 rolling-limit field on the pinned statusline -----
+
+
+async def test_statusline_renders_limit_pct_when_engine_reports_it():
+    # The FOREGROUND engine's limit_status() → a precise "🪙 <pct>%" on the bar (mirrors the
+    # ctx-% test). The read is best-effort + foreground-only.
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6, limit_status=("approaching", 68))
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    assert len(rec.sends) == 1
+    body = rec.sends[0]["text"]
+    assert "🪙 68%" in body
+
+
+async def test_statusline_omits_limit_field_when_engine_reports_none():
+    # No limit signal (limit_status() → None) → the 🪙 field is OMITTED (never fabricated).
+    session = make_session(FakeEngine([]))
+    eng = FakeEngine([], ctx_pct=6, limit_status=None)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    body = rec.sends[0]["text"]
+    for glyph in ("🪙", "🟢", "🟡", "🔴"):
+        assert glyph not in body
+    # The ctx field still renders — the omission is the limit field only.
+    assert "🧠 ctx 6%" in body
+
+
+async def test_statusline_limit_read_raises_field_omitted_line_still_built():
+    # RB1: a limit_status() that RAISES must omit the field, never break the line (best-effort,
+    # off the turn's critical path) — the statusline is still sent with the ctx field intact.
+    session = make_session(FakeEngine([]))
+
+    def _boom():
+        raise RuntimeError("limit read blew up")
+
+    eng = FakeEngine([], ctx_pct=6, limit_status=_boom)
+    _prime_statusline_project(session, engine=eng, status="running")
+    rec = StatuslineRecorder()
+    await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
+
+    assert len(rec.sends) == 1, "the line must still be built despite the raising limit read"
+    body = rec.sends[0]["text"]
+    assert "🧠 ctx 6%" in body
+    for glyph in ("🪙", "🟢", "🟡", "🔴"):
+        assert glyph not in body
+
+
+async def test_statusline_limit_field_is_foreground_only(tmp_path):
+    # Foreground-only: _maybe_update_statusline SKIPS when ``for_project`` is not the chat's
+    # foreground, so a BACKGROUND project's turn (even one whose engine reports a limit) never
+    # rewrites the pinned line — and the FOREGROUND project DOES render the 🪙 field. A real
+    # store is needed (with store=None every project is implicitly foreground).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "bg", "/work", make_active=False)
+    store.create(1, "fg", "/work", make_active=True)  # fg is the active/foreground project
+    session = make_session(FakeEngine([]), store=store)
+    # Attach a foreground engine reporting an ``ok`` (🟢) limit to the active project's runtime.
+    _name, rt = session._active_runtime(1, create_default=False)
+    assert rt is not None
+    rt.engine = FakeEngine([], ctx_pct=6, limit_status=("ok", None))
+    rt.status = "running"
+    rec = StatuslineRecorder()
+    # A different (non-foreground) project name must be skipped entirely (no send/edit).
+    await session._maybe_update_statusline(
+        1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin, for_project="bg",
+    )
+    assert rec.sends == [] and rec.edits == [], "a background project must not write the bar"
+    # The FOREGROUND project DOES render the limit field (the 🟢 badge).
+    await session._maybe_update_statusline(
+        1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin, for_project="fg",
+    )
+    assert len(rec.sends) == 1 and "🟢" in rec.sends[0]["text"]
+
+
 async def test_update_statusline_second_changed_edits_in_place_no_repin():
     # A SUBSEQUENT update with changed state EDITS in place — no re-pin, no re-send.
     session = make_session(FakeEngine([]))
@@ -8307,3 +8413,865 @@ async def test_successful_pin_sets_pinned_flag():
     await session._update_statusline(1, send=rec.send, edit=rec.edit, pin=rec.pin, unpin=rec.unpin)
     assert session._chat(1).statusline_pinned is True
     assert len(rec.pins) == 1
+
+
+# --- observability T4: the proactive one-time limit warning --------------------
+#
+# The warning fires at TURN END (in _drive_turn's finally, after the statusline refresh) when the
+# foreground engine's limit_status() first crosses into "approaching"/"limited", de-duped per
+# limit-window on _ChatState.limit_warned (re-armed when the status returns to "ok"). It is
+# foreground/authorized-only (SB1), body-free (SB3), and best-effort (RB1 — never breaks a turn).
+
+#: A fragment unique to the T4 warning line, used to count warnings among the turn's sends.
+_WARN_MARK = "Approaching your Claude session limit"
+
+
+def _warnings(rec) -> list[str]:
+    """The warning messages among a Recorder's sends (T4 — identified by the fixed phrase)."""
+    return [s["text"] for s in rec.sends if _WARN_MARK in s["text"]]
+
+
+def _ok_result():
+    """A fresh clean ResultEvent script item (one per turn so a re-driven engine has events)."""
+    return ResultEvent(session_id="s", is_error=False, subtype="success", result_text="ok")
+
+
+async def test_limit_warning_fires_once_on_first_crossing_approaching():
+    # WHEN a turn ends with the foreground limit signal in "approaching" and not yet warned →
+    # EXACTLY ONE warning is posted, body-free (no request content; the only number is the pct).
+    engine = FakeEngine([_ok_result()], limit_status=("approaching", 88))
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    warns = _warnings(rec)
+    assert len(warns) == 1, f"exactly one warning expected, got {warns!r}"
+    # SB3 body-free: no request content; the prompt "go" must not appear; 🟡 wording + the pct.
+    assert "🟡" in warns[0]
+    assert "🪙 88%" in warns[0]
+    assert "go" not in warns[0]
+    # The de-dup flag is armed (this chat won't warn again until the status returns to ok).
+    assert session._chat(1).limit_warned is True
+
+
+async def test_limit_warning_deduped_while_still_approaching():
+    # A SECOND turn while STILL "approaching" posts NO new warning (de-dup per limit-window).
+    status = ("approaching", 90)
+    engine = FakeEngine([_ok_result(), _ok_result()], limit_status=lambda: status)
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "the first crossing warns once"
+    # Second turn, still approaching → no new warning.
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "still approaching → de-duped, no second warning"
+
+
+async def test_limit_warning_rearms_after_ok_then_warns_again():
+    # The re-arm regression: approaching → warn; ok → re-arm (no message); approaching → warn AGAIN.
+    box = {"v": ("approaching", 70)}
+    engine = FakeEngine(
+        [_ok_result(), _ok_result(), _ok_result()], limit_status=lambda: box["v"]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    # Turn 1: approaching → one warning.
+    await asyncio.wait_for(
+        session.handle_message(1, "t1", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1
+    assert session._chat(1).limit_warned is True
+    # Turn 2: recovered to ok → the flag re-arms, NO new message.
+    box["v"] = ("ok", 10)
+    await asyncio.wait_for(
+        session.handle_message(1, "t2", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "ok must not warn"
+    assert session._chat(1).limit_warned is False, "ok re-arms the de-dup flag"
+    # Turn 3: approaching AGAIN → warns again (the re-arm worked).
+    box["v"] = ("approaching", 72)
+    await asyncio.wait_for(
+        session.handle_message(1, "t3", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 2, "a fresh crossing after ok warns again"
+
+
+async def test_limit_warning_never_when_ok_throughout():
+    # status "ok" for the whole turn → NEVER warns (no spurious heads-up).
+    engine = FakeEngine([_ok_result()], limit_status=("ok", 20))
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == [], "an ok turn must never warn"
+    assert session._chat(1).limit_warned is False
+
+
+async def test_limit_warning_fires_for_limited_status():
+    # status "limited" (🔴) warns once — the harder end of the threshold also triggers the heads-up.
+    engine = FakeEngine([_ok_result()], limit_status=("limited", 100))
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    warns = _warnings(rec)
+    assert len(warns) == 1
+    assert "🔴" in warns[0], "limited uses the 🔴 wording"
+
+
+async def test_limit_warning_no_signal_no_warning():
+    # No limit signal (limit_status() → None) → no warning, flag stays re-armed, turn completes.
+    engine = FakeEngine([_ok_result()], limit_status=None)
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == []
+    assert session._chat(1).limit_warned is False
+    # The turn still completed (the clean result rendered).
+    assert any("ok" in s["text"] for s in rec.sends)
+
+
+async def test_limit_warning_raising_read_swallowed_turn_completes():
+    # RB1: a limit_status() that RAISES posts no warning and NEVER breaks the turn (the result
+    # still renders); the de-dup flag is untouched by the failed read.
+    def _boom():
+        raise RuntimeError("limit read blew up")
+
+    engine = FakeEngine([_ok_result()], limit_status=_boom)
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == [], "a raising read posts no warning"
+    assert any("ok" in s["text"] for s in rec.sends), "the turn still completed (RB1)"
+
+
+async def test_limit_warning_background_turn_does_not_warn_foreground(tmp_path):
+    # SB1 + foreground-only: a BACKGROUND project's turn (even one whose engine reports
+    # "approaching") must NOT warn the foreground chat, and must not arm the foreground's flag.
+    # A real store is needed — with store=None every project is implicitly foreground.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)  # fg is the active/foreground project
+    store.create(1, "bg", "/work", make_active=False)
+    # Drive the BACKGROUND project ("bg") directly via _drive_turn (handle_message would pin the
+    # active project; we want the background turn's exact end-of-turn warning path).
+    engine = FakeEngine([_ok_result()], limit_status=("approaching", 95))
+    session = make_session(engine, store=store)
+    _bg_name, bg_rt = session._override_runtime(1, "bg")
+    bg_rt.engine = engine
+    rec = Recorder()
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, engine, "go",
+            send=rec.send, edit=rec.edit, target=("bg", bg_rt),
+        ),
+        timeout=2.0,
+    )
+    assert _warnings(rec) == [], "a background turn must not warn the foreground"
+    assert session._chat(1).limit_warned is False, "the foreground's de-dup flag is untouched"
+
+
+async def test_limit_warning_foreground_turn_warns_with_store(tmp_path):
+    # The companion to the background test: the FOREGROUND turn DOES warn (so the background
+    # skip above is genuinely the foreground gate, not a store/wiring artifact).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)
+    engine = FakeEngine([_ok_result()], limit_status=("approaching", 80))
+    session = make_session(engine, store=store)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "the foreground turn warns once"
+    assert session._chat(1).limit_warned is True
+
+
+async def test_limit_warning_unknown_status_is_non_event_when_armed():
+    # The most important gap: an UNRECOGNIZED status ("throttled") at turn end is a true
+    # non-event — it must NOT wrongly RE-ARM. Starting warned=True → stays True (and no message).
+    # A mutation that fell through to clearing the flag on unknown status fails this.
+    engine = FakeEngine([_ok_result()], limit_status=("throttled", None))
+    session = make_session(engine)
+    session._chat(1).limit_warned = True  # already warned this window
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == [], "an unknown status must not warn"
+    assert session._chat(1).limit_warned is True, "an unknown status must not re-arm"
+
+
+async def test_limit_warning_unknown_status_is_non_event_when_unarmed():
+    # The other half: an UNRECOGNIZED status starting warned=False → stays False (and no message).
+    # A mutation that fell through to SETTING the flag (or warning) on unknown status fails this.
+    engine = FakeEngine([_ok_result()], limit_status=("throttled", None))
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert _warnings(rec) == [], "an unknown status must not warn"
+    assert session._chat(1).limit_warned is False, "an unknown status must not set the flag"
+
+
+async def test_limit_warning_send_failure_swallowed_and_rewarns():
+    # RB1 + re-warn: the warning's send RAISES on an "approaching" turn → swallowed (turn
+    # completes, no crash) AND limit_warned stays False, so the NEXT approaching turn warns again.
+    class _WarnFailRecorder(Recorder):
+        """A Recorder that raises on the T4 warning send (only), the first time it's attempted."""
+
+        def __init__(self):
+            super().__init__()
+            self._fail_warn_once = True
+
+        async def send(self, *, text, reply_markup=None, parse_mode=None, **kwargs):
+            if self._fail_warn_once and _WARN_MARK in text:
+                self._fail_warn_once = False
+                raise RuntimeError("Telegram error: warning send failed")
+            return await super().send(text=text, reply_markup=reply_markup,
+                                      parse_mode=parse_mode, **kwargs)
+
+    engine = FakeEngine([_ok_result(), _ok_result()], limit_status=("approaching", 85))
+    session = make_session(engine)
+    rec = _WarnFailRecorder()
+    # Turn 1: the warning send RAISES — swallowed (RB1); the turn still completes.
+    await asyncio.wait_for(
+        session.handle_message(1, "first", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert any("ok" in s["text"] for s in rec.sends), "the turn completed despite the failed warn"
+    assert session._chat(1).limit_warned is False, (
+        "a FAILED warning must leave the flag re-armed (never swallow the only heads-up)"
+    )
+    # Turn 2: still approaching, and now the send succeeds → it warns AGAIN.
+    await asyncio.wait_for(
+        session.handle_message(1, "second", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "the re-armed warning fires on the next approaching turn"
+    assert session._chat(1).limit_warned is True
+
+
+async def test_limit_warning_escalation_approaching_to_limited_stays_silent():
+    # Escalation stays silent: approaching (warns, sets flag) → next turn "limited" while already
+    # warned → NO second warning (one heads-up per non-ok window, intended — no per-status re-warn).
+    box = {"v": ("approaching", 78)}
+    engine = FakeEngine([_ok_result(), _ok_result()], limit_status=lambda: box["v"])
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "t1", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "approaching warns once"
+    # Escalate to limited while still in the same non-ok window (already warned) → silent.
+    box["v"] = ("limited", 100)
+    await asyncio.wait_for(
+        session.handle_message(1, "t2", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "escalation approaching→limited must not re-warn"
+
+
+async def test_limit_warning_rearms_after_limited_then_ok_then_approaching():
+    # Re-arm after LIMITED (not just after approaching): limited (warns) → ok (re-arm) →
+    # approaching → warns again.
+    box = {"v": ("limited", 100)}
+    engine = FakeEngine(
+        [_ok_result(), _ok_result(), _ok_result()], limit_status=lambda: box["v"]
+    )
+    session = make_session(engine)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "t1", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1 and "🔴" in _warnings(rec)[0], "limited warns once (🔴)"
+    assert session._chat(1).limit_warned is True
+    # Recover to ok → re-arm, no message.
+    box["v"] = ("ok", 5)
+    await asyncio.wait_for(
+        session.handle_message(1, "t2", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 1, "ok must not warn"
+    assert session._chat(1).limit_warned is False, "ok after limited re-arms the flag"
+    # Approaching again → warns again (the re-arm after limited worked).
+    box["v"] = ("approaching", 81)
+    await asyncio.wait_for(
+        session.handle_message(1, "t3", send=rec.send, edit=rec.edit), timeout=2.0
+    )
+    assert len(_warnings(rec)) == 2, "a fresh crossing after limited→ok warns again"
+
+
+async def test_limit_warning_no_engine_turn_rearms():
+    # BLOCKER-3 fix (premise CORRECTED): a turn whose runtime has NO engine at end reports NO limit
+    # signal (None). ``None`` means "THIS engine has no signal yet," NOT "the limit recovered" — so
+    # it is a NON-EVENT: no warning AND the de-dup flag is LEFT INTACT (NOT re-armed). ADR-010:
+    # re-arm on EXPLICIT ``ok`` only. (Previously this asserted the flag was cleared — that was the
+    # over-broad re-arm the Codex QA flagged: a project whose engine reports None could clear a flag
+    # armed on another project and cause a duplicate warning within one non-ok window.) Drive
+    # _drive_turn directly with a runtime whose engine is None; the engine arg only feeds the stream.
+    engine = FakeEngine([_ok_result()])
+    session = make_session(engine)
+    name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = None  # the runtime carries NO engine → limit_status() is None (no signal)
+    session._chat(1).limit_warned = True  # was warned in a prior (still-open) window
+    rec = Recorder()
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, engine, "go",
+            send=rec.send, edit=rec.edit, target=(name, rt),
+        ),
+        timeout=2.0,
+    )
+    assert _warnings(rec) == [], "no engine → no warning"
+    assert session._chat(1).limit_warned is True, (
+        "a no-engine (None-signal) turn is a NON-EVENT — it must NOT clear (re-arm) the flag; "
+        "re-arm is on EXPLICIT ok only (ADR-010)"
+    )
+
+
+async def test_limit_warning_multi_project_none_signal_does_not_rearm(tmp_path):
+    # BLOCKER-3 regression lock (Codex): the one-warning-per-window invariant across projects with
+    # DIFFERENT limit-signal knowledge. Warn on project A (approaching → flag set). Then a
+    # foreground turn on project B whose engine reports limit_status()==None (no signal) ends — a
+    # NON-EVENT: the de-dup flag must SURVIVE (not re-arm) and B must not warn. Switch back to A,
+    # still approaching → NO second warning (the same non-ok window). Without the fix, B's None
+    # clears the flag and A re-warns within the window (a duplicate heads-up).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "A", "/work", make_active=True)   # A is foreground first
+    store.create(1, "B", "/work", make_active=False)
+
+    eng_a = FakeEngine([_ok_result(), _ok_result()], limit_status=("approaching", 88))
+    eng_b = FakeEngine([_ok_result()], limit_status=None)  # B's engine has NO limit signal
+    session = make_session(eng_a, store=store)
+    _a_name, a_rt = session._override_runtime(1, "A")
+    a_rt.engine = eng_a
+    _b_name, b_rt = session._override_runtime(1, "B")
+    b_rt.engine = eng_b
+    rec = Recorder()
+
+    # (1) Foreground A, approaching → warns ONCE and arms the flag.
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, eng_a, "a1",
+            send=rec.send, edit=rec.edit, target=("A", a_rt),
+        ),
+        timeout=2.0,
+    )
+    assert len(_warnings(rec)) == 1, "project A (approaching) warns once"
+    assert session._chat(1).limit_warned is True
+
+    # (2) Switch foreground to B (limit_status None) and end a B turn → NON-EVENT: no warning, and
+    # the flag armed on A must NOT be cleared by B's None reading.
+    store.switch(1, "B")
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, eng_b, "b1",
+            send=rec.send, edit=rec.edit, target=("B", b_rt),
+        ),
+        timeout=2.0,
+    )
+    assert len(_warnings(rec)) == 1, "B's None-signal turn must not warn"
+    assert session._chat(1).limit_warned is True, (
+        "B's None reading is a non-event — it must NOT re-arm the flag armed on A"
+    )
+
+    # (3) Switch back to A, still approaching → NO second warning within the same non-ok window.
+    store.switch(1, "A")
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, eng_a, "a2",
+            send=rec.send, edit=rec.edit, target=("A", a_rt),
+        ),
+        timeout=2.0,
+    )
+    assert len(_warnings(rec)) == 1, (
+        "back to A (still approaching) must NOT warn again — the window never returned to ok"
+    )
+
+
+# ---------------------------------------------------------------------------
+# observability T5 — the live activity line (ActivityMixin)
+#
+# A TRANSIENT message showing "what's running right now" (the current tool + active-subagent
+# type-names, ⚙️), POSTED on first foreground activity, EDITED in place as activity changes
+# (throttled — skip-identical + ≲1 edit/sec, never a new message per change), and REMOVED at turn
+# end (no lingering ⚙️; NOT a per-turn "done" footer). Foreground-only (SB1), body-free (SB3 —
+# names only), best-effort (RB1 — never breaks a turn). Mock-only, like the rest of this file.
+# ---------------------------------------------------------------------------
+
+
+def _snap(tool=None, subagents=()):
+    """An ActivitySnapshot (the engine.last_activity() shape — names only, SB3-clean)."""
+    from claude_tg.engine.adapter_sdk import ActivitySnapshot
+
+    return ActivitySnapshot(current_tool=tool, subagents=tuple(subagents))
+
+
+def _advancing_clock(step=10.0):
+    """A monotonic clock that ADVANCES ``step`` seconds on each call (past the throttle interval).
+
+    Used so a deterministic time-throttle test can let successive edits THROUGH (step ≫ 1 s) — and
+    its companion ``_frozen_clock`` (0.0) coalesces them. No real time is consumed."""
+    box = {"t": 0.0}
+
+    def now():
+        box["t"] += step
+        return box["t"]
+
+    return now
+
+
+# --- _render_activity (pure) -------------------------------------------------
+
+
+def test_render_activity_none_snapshot_is_none():
+    # No activity → nothing to show (the caller removes/skips).
+    assert StreamingSession._render_activity(None) is None
+
+
+def test_render_activity_tool_only():
+    assert StreamingSession._render_activity(_snap(tool="Bash")) == "⚙️ Bash"
+
+
+def test_render_activity_tool_and_subagents():
+    line = StreamingSession._render_activity(
+        _snap(tool="Bash", subagents=("Explore", "general-purpose"))
+    )
+    assert line == "⚙️ Explore, general-purpose · Bash"
+
+
+def test_render_activity_subagents_only_no_tool():
+    assert StreamingSession._render_activity(_snap(subagents=("Explore",))) == "⚙️ Explore"
+
+
+def test_render_activity_many_subagents_collapse_to_count():
+    # > 3 subagents → a COUNT instead of a wall of names (still names-free of args either way).
+    line = StreamingSession._render_activity(
+        _snap(tool="Bash", subagents=("a", "b", "c", "d", "e"))
+    )
+    assert line == "⚙️ 5 agents · Bash"
+
+
+def test_render_activity_empty_snapshot_is_none():
+    # A defensively-empty snapshot (no tool, no subagents) renders nothing.
+    assert StreamingSession._render_activity(_snap()) is None
+
+
+def test_render_activity_is_names_only_sb3():
+    # SB3: even if a tool/subagent name arrived from a secret-laden upstream input, the snapshot is
+    # names-only by construction and the render carries ONLY those names — HTML-escaped once, no
+    # args/paths/prompt. We drive a "name" that LOOKS like it could carry junk and assert the line
+    # contains the (escaped) name and nothing resembling a body/arg.
+    line = StreamingSession._render_activity(
+        _snap(tool="Bash", subagents=("general-purpose",))
+    )
+    assert line == "⚙️ general-purpose · Bash"
+    # No raw '<'/'>' (HTML-escaped) and none of the body-shaped tokens an arg would carry.
+    for forbidden in ("<", ">", "command=", "/Users/", "prompt", "secret", "--"):
+        assert forbidden not in line
+
+
+def test_render_activity_html_escapes_names_once():
+    # A name containing HTML-significant chars is escaped exactly once (parse_mode="HTML" safety).
+    line = StreamingSession._render_activity(_snap(tool="a<b>&c"))
+    assert line == "⚙️ a&lt;b&gt;&amp;c"
+
+
+# --- _maybe_update_activity: post once, edit in place, throttle, RB1 ---------
+
+
+async def test_activity_posts_one_message_on_first_activity():
+    # First foreground activity → EXACTLY ONE send (the line is posted), no edit.
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1, f"first activity must POST exactly once, sends={rec.sends!r}"
+    assert rec.edits == [], "no edit on the first post"
+    assert rec.sends[0]["text"] == "⚙️ Bash"
+    assert rec.sends[0]["parse_mode"] == "HTML"
+    assert session._chat(1).activity_message_id == 101
+    assert session._chat(1).activity_text == "⚙️ Bash"
+
+
+async def test_activity_change_edits_same_message_not_a_new_send():
+    # A subsequent CHANGE EDITS the same message (an edit op), NOT a second send. The clock must
+    # advance past the throttle so the change is allowed through (not coalesced).
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+    session = make_session(eng, clock=_advancing_clock())
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1 and rec.edits == []
+    # Activity changes (a new tool) → EDIT in place, NOT a new send.
+    box["v"] = _snap(tool="Grep")
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1, "a change must EDIT, never a second send"
+    assert len(rec.edits) == 1, "the change is an edit op"
+    assert rec.edits[0]["message_id"] == 101, "the SAME message is edited in place"
+    assert rec.edits[0]["text"] == "⚙️ Grep"
+    assert session._chat(1).activity_text == "⚙️ Grep"
+
+
+async def test_activity_skip_identical_no_edit():
+    # An UNCHANGED snapshot → no edit (skip-identical: a no-op Telegram edit raises + wastes a slot).
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+    session = make_session(eng, clock=_advancing_clock())
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1
+    # Same snapshot again → no edit (and no new send).
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1 and rec.edits == [], "an unchanged snapshot triggers no edit"
+
+
+async def test_activity_time_throttle_coalesces_rapid_changes():
+    # Rapid successive CHANGES within the throttle interval are COALESCED — the edit count is
+    # BOUNDED, not one-per-change. With a FROZEN clock (0.0) every edit lands inside the 1 s window
+    # after the first post, so all post-first changes are skipped (the strongest coalescing).
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+    session = make_session(eng, clock=lambda: 0.0)  # frozen → every change inside the interval
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1
+    # Five rapid distinct changes, all within the throttle window → coalesced to ZERO edits.
+    for tool in ("Grep", "Read", "Edit", "Write", "Glob"):
+        box["v"] = _snap(tool=tool)
+        await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert len(rec.sends) == 1, "no extra sends from the burst"
+    assert len(rec.edits) <= 1, f"rapid changes must coalesce (bounded edits), got {rec.edits!r}"
+    # The in-memory text was NOT advanced by a throttled skip (it still reflects the FIRST post,
+    # "⚙️ Bash"), so the next change PAST the interval still shows the latest state. Advance the
+    # clock and change to a DIFFERENT tool than the first post.
+    assert session._chat(1).activity_text == "⚙️ Bash", "a throttled skip never advanced the stored text"
+    session._clock = _advancing_clock()
+    box["v"] = _snap(tool="Glob")  # the latest state, distinct from the first post
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert any(e["text"] == "⚙️ Glob" for e in rec.edits), "the next change past the interval shows the latest state"
+
+
+async def test_activity_idle_render_skips_no_write():
+    # last_activity() → None (idle) → nothing posted/edited (removal is the finalize's job).
+    eng = FakeEngine([], last_activity=None)
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert rec.sends == [] and rec.edits == [], "idle activity writes nothing"
+    assert session._chat(1).activity_message_id is None
+
+
+async def test_activity_raising_last_activity_swallowed():
+    # RB1: a last_activity() that RAISES posts nothing and never breaks (the caller swallows).
+    def _boom():
+        raise RuntimeError("activity read blew up")
+
+    eng = FakeEngine([], last_activity=_boom)
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    # Must not raise.
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert rec.sends == [] and rec.edits == []
+
+
+async def test_activity_raising_send_swallowed():
+    # RB1: a raising SEND is swallowed (the whole update is best-effort) — no exception escapes.
+    class BoomSend(Recorder):
+        async def send(self, *, text, reply_markup=None, parse_mode=None, **kwargs) -> int:
+            raise RuntimeError("Telegram send failed")
+
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = BoomSend()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    # No id was stored (the send raised before returning one).
+    assert session._chat(1).activity_message_id is None
+
+
+async def test_activity_missing_closures_is_noop():
+    # No send/edit closures injected (a caller/test that didn't wire them) → no-op, no raise.
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    await session._maybe_update_activity(1, send=None, edit=None, for_project=None)
+    assert session._chat(1).activity_message_id is None
+
+
+# --- _finalize_activity: remove at turn end ----------------------------------
+
+
+async def test_finalize_activity_deletes_and_clears():
+    # At turn end the transient line is DELETED and its id cleared.
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    assert session._chat(1).activity_message_id == 101
+    await session._finalize_activity(1, delete=rec.delete)
+    assert len(rec.deletes) == 1 and rec.deletes[0]["message_id"] == 101
+    assert session._chat(1).activity_message_id is None
+    assert session._chat(1).activity_text is None
+
+
+async def test_finalize_activity_raising_delete_swallowed_state_cleared():
+    # RB1: a raising delete is swallowed AND the state is cleared regardless (no stale id leaks).
+    class BoomDelete(Recorder):
+        async def delete(self, *, message_id) -> None:
+            raise RuntimeError("Telegram delete failed")
+
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng)
+    _name, rt = session._active_runtime(1, create_default=True)
+    rt.engine = eng
+    rec = BoomDelete()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
+    await session._finalize_activity(1, delete=rec.delete)  # must not raise
+    assert session._chat(1).activity_message_id is None, "a failed delete still clears the id"
+
+
+async def test_finalize_activity_background_turn_does_not_touch_foreground_line(tmp_path):
+    # BLOCKER-2 regression lock (Codex): the FOREGROUND turn posts its activity line (id held), then
+    # a BACKGROUND turn ends and calls _finalize_activity(for_project=<background>). The finalize is
+    # foreground-gated, so it must NOT delete the foreground message NOR clear the shared _ChatState
+    # activity id/text. Without the fix, the background finalize deletes the foreground line and
+    # clears the id (a phantom disappearance of the surface you're looking at).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)   # fg is the foreground project
+    store.create(1, "bg", "/work", make_active=False)
+
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng, store=store)
+    _fg_name, fg_rt = session._override_runtime(1, "fg")
+    fg_rt.engine = eng
+    rec = Recorder()
+
+    # The FOREGROUND turn posts its activity line (id held).
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project="fg")
+    posted_id = session._chat(1).activity_message_id
+    assert posted_id == 101, "the foreground activity line was posted (id held)"
+
+    # A BACKGROUND turn ends → its finalize is foreground-gated (for_project='bg' != fg).
+    await session._finalize_activity(1, delete=rec.delete, for_project="bg")
+
+    assert rec.deletes == [], "a background turn must NOT delete the foreground activity message"
+    assert session._chat(1).activity_message_id == posted_id, (
+        "a background finalize must NOT clear the foreground activity id"
+    )
+    assert session._chat(1).activity_text is not None, (
+        "a background finalize must NOT clear the foreground activity text"
+    )
+
+
+# --- end-to-end through a turn: posts, then collapses/removes at turn end -----
+
+
+async def test_activity_line_posted_during_turn_and_removed_at_end():
+    # A FOREGROUND turn that emits a tool_use posts the activity line during the turn (its engine's
+    # last_activity() reports the tool), then REMOVES it at turn end (delete + id cleared). No
+    # lingering ⚙️, no per-turn "done" footer.
+    eng = FakeEngine(
+        [
+            ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)"),
+            ResultEvent(session_id="sess-1", is_error=False, subtype="success", result_text="done!"),
+        ],
+        last_activity=lambda: _snap(tool="Bash"),
+    )
+    session = make_session(eng)
+    rec = Recorder()
+    await asyncio.wait_for(
+        session.handle_message(1, "go", send=rec.send, edit=rec.edit, delete=rec.delete),
+        timeout=2.0,
+    )
+    # The activity line was posted (⚙️ Bash among the sends).
+    assert any(s["text"] == "⚙️ Bash" for s in rec.sends), "the activity line was posted during the turn"
+    # And removed at turn end: its id is cleared, and a delete was issued for it.
+    assert session._chat(1).activity_message_id is None, "the activity line id is cleared at turn end"
+    # No lingering ⚙️ activity message text persists as the final state (the id is gone).
+    # (The statusline ⚙️ working-marker is a SEPARATE pinned line; the transient activity line is
+    # identified by its body "⚙️ <tool>" with no statusline fields like 🧠/🔒.)
+    assert session._chat(1).activity_text is None
+
+
+async def test_activity_line_foreground_only_background_turn_does_not_post(tmp_path):
+    # Foreground-only: a BACKGROUND project's turn must NOT post/edit the FOREGROUND activity line.
+    # A real store is needed (with store=None every project is implicitly foreground).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)  # fg is foreground
+    store.create(1, "bg", "/work", make_active=False)
+    eng = FakeEngine(
+        [
+            ToolUseEvent(tool_name="Bash", tool_input_summary="Bash(command=ls)"),
+            ResultEvent(session_id="sess-1", is_error=False, subtype="success", result_text="done!"),
+        ],
+        last_activity=lambda: _snap(tool="Bash"),
+    )
+    session = make_session(eng, store=store)
+    _bg_name, bg_rt = session._override_runtime(1, "bg")
+    bg_rt.engine = eng
+    rec = Recorder()
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, eng, "go",
+            send=rec.send, edit=rec.edit, delete=rec.delete, target=("bg", bg_rt),
+        ),
+        timeout=2.0,
+    )
+    # No activity line was posted for the foreground chat (the background turn is silent).
+    assert not any(s["text"] == "⚙️ Bash" for s in rec.sends), "a background turn must not post the activity line"
+    assert session._chat(1).activity_message_id is None
+
+
+# --- B2 regression lock: the SYNC foreground re-check before the raw send/edit -----
+#
+# These two tests PIN the make-or-break B2 guard in _activity_send (activity.py:_activity_send)
+# and _activity_edit: the gate wait (awaited via the injected _sleep) is a /switch window, so
+# immediately before the raw send/edit there is a SYNCHRONOUS _is_foreground re-check with NO
+# await between it and the write. If a /switch happened during the wait, the stale write is
+# DROPPED. The earlier foreground-only tests don't catch a DELETION of this sync re-check (they
+# use for_project=None, or wait==0 so _sleep never runs). Here the injected _sleep FLIPS the
+# chat's foreground away mid-wait, so removing the re-check at _activity_send/_activity_edit
+# would let the stale write through and FAIL these assertions.
+
+
+def _b2_session(store, *, on_sleep):
+    """A StreamingSession with a real interval + frozen clock + an injected sleep hook (B2 lock).
+
+    ``on_sleep(delay)`` is invoked from inside the awaited gate wait (the /switch window) so a
+    test can flip the chat's foreground away DURING the wait — exercising the sync re-check that
+    runs AFTER the sleep, immediately before the raw send/edit (no await between)."""
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+
+    async def _sleep(delay: float) -> None:
+        on_sleep(delay)
+
+    return StreamingSession(
+        make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng,
+        clock=lambda: 0.0,            # frozen → the gate's wait is deterministic
+        chat_send_interval=5.0,       # a real interval so a pre-primed gate returns wait > 0
+        sleep=_sleep,                 # the injected awaited wait = the /switch window
+    ), eng
+
+
+async def test_activity_send_b2_switch_during_gate_wait_drops_stale_post(tmp_path):
+    # B2 (POST path): a /switch DURING the gate wait → the stale post is DROPPED by the sync
+    # foreground re-check. Deleting that re-check would send the line to the now-stale foreground.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)   # "fg" is foreground at call time
+    store.create(1, "other", "/work", make_active=False)
+
+    flips: list[float] = []
+
+    def _flip_foreground_away(delay: float) -> None:
+        # During the awaited gate wait, /switch away from "fg" so the sync re-check (after the
+        # sleep, before the raw send) sees "fg" is no longer foreground.
+        flips.append(delay)
+        store.switch(1, "other")
+
+    session, eng = _b2_session(store, on_sleep=_flip_foreground_away)
+    _name, rt = session._override_runtime(1, "fg")
+    rt.engine = eng
+    rec = Recorder()
+    # Pre-prime the gate so the activity write's reserve(verbatim=False) returns wait > 0 (so
+    # _sleep — and thus the mid-wait /switch — actually runs). On a frozen clock a fresh gate's
+    # first reserve is 0 (leading edge); one prior reservation pushes the tail to +interval.
+    session._gate(session._chat(1)).reserve(verbatim=False)
+
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project="fg")
+
+    assert flips, "the gate wait (the /switch window) must have been awaited (wait > 0)"
+    assert rec.sends == [], "a /switch during the gate wait must DROP the stale post (B2)"
+    assert session._chat(1).activity_message_id is None, "no id stored for a dropped post"
+
+
+async def test_activity_edit_b2_switch_during_gate_wait_drops_stale_edit(tmp_path):
+    # B2 (EDIT path): with the line already posted, a /switch DURING the gate wait of a later
+    # CHANGE → the stale edit is DROPPED by the sync re-check. Deleting that re-check would edit
+    # the line for the now-stale foreground.
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)
+    store.create(1, "other", "/work", make_active=False)
+
+    # First, post the activity line cleanly while "fg" stays foreground (a no-op sleep). Use a
+    # mutable box so the snapshot can change for the second call (a genuine CHANGE → edit path).
+    box = {"v": _snap(tool="Bash")}
+    eng = FakeEngine([], last_activity=lambda: box["v"])
+
+    async def _noop_sleep(delay: float) -> None:
+        return None
+
+    session = StreamingSession(
+        make_config(),
+        session_store=store,
+        engine_factory=lambda *, cwd, backstop_seconds, permission_policy: eng,
+        clock=lambda: 0.0,            # frozen → the gate's wait is deterministic
+        chat_send_interval=5.0,       # a real interval so the change's reserve returns wait > 0
+        sleep=_noop_sleep,
+    )
+    _name, rt = session._override_runtime(1, "fg")
+    rt.engine = eng
+    rec = Recorder()
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project="fg")
+    assert len(rec.sends) == 1 and session._chat(1).activity_message_id is not None, "line posted"
+
+    # Now arm the mid-wait /switch and drive a CHANGE that must take the edit path. On the frozen
+    # clock the post advanced the gate tail to slot 0, so the change's reserve(verbatim=False)
+    # lands at +interval → wait > 0 → the injected _sleep (the /switch window) runs. Reset the
+    # throttle ts so the change isn't coalesced by the time-throttle (frozen clock → now==last).
+    flips: list[float] = []
+
+    async def _flip_sleep(delay: float) -> None:
+        flips.append(delay)
+        store.switch(1, "other")  # /switch away from "fg" during the gate wait
+
+    session._sleep = _flip_sleep
+    session._chat(1).activity_last_edit_ts = -100.0  # past the throttle → the change reaches the gate
+    box["v"] = _snap(tool="Grep")  # a genuine change → the edit path
+
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project="fg")
+
+    assert flips, "the gate wait (the /switch window) must have been awaited (wait > 0)"
+    assert rec.edits == [], "a /switch during the gate wait must DROP the stale edit (B2)"
+    # The post-edit state was NOT advanced (the dropped edit never recorded the new body).
+    assert session._chat(1).activity_text == "⚙️ Bash", "a dropped edit leaves the shown text unchanged"

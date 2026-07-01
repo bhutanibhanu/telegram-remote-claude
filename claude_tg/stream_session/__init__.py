@@ -19,6 +19,7 @@ moved names at the package's public path); the per-file ``# noqa: F401`` keeps r
 
 from __future__ import annotations
 
+from .activity import ActivityMixin  # noqa: F401  (re-export hub — see module docstring)
 from .core import StreamingSession
 from .knobs import PROJECT_KNOBS  # noqa: F401  (re-export hub — see module docstring)
 from .runtime import (  # noqa: F401  (re-export hub — see module docstring)
