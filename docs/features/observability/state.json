@@ -1,7 +1,7 @@
 {
   "slug": "observability",
-  "phase": "approved",
+  "phase": "shipped",
   "branch": "feat/observability",
   "worktree": "/Users/ray/dev/claude-telegram-bot-observability",
-  "updated": "2026-06-30T23:20:00Z"
+  "updated": "2026-06-30T23:35:00Z"
 }
