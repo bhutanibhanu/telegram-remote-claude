@@ -856,6 +856,54 @@ def test_capture_activity_double_key_reconciled_no_linger():
     assert sub.last_activity() is None
 
 
+def test_capture_activity_double_key_reconcile_with_inner_parent_no_phantom():
+    # ⭐ BLOCKER-1 regression lock (Codex): the FULL double-key sequence including the subagent's OWN
+    # inner AssistantMessage whose parent_tool_use_id == the SPAWNING Task tool_use id. After the
+    # TaskStarted reconcile re-keys the subagent from tool_use_id → task_id (popping the tool_use_id
+    # entry), that inner AssistantMessage must NOT re-register the popped tool_use_id as a generic
+    # "subagent" — otherwise the terminal TaskUpdated (task_id-only) leaves a PHANTOM generic
+    # subagent lingering until ResultMessage (⚙️ Explore, subagent). The fix tracks spawning Task
+    # tool_use ids and SKIPS the fallback for them. Without the fix, step (4)+(5) leaves a stale
+    # "subagent" and this test FAILS.
+    sub = SdkSubstrate()
+    # 1) Task tool_use → pre-register the spawned subagent under the block id "tuse-1".
+    sub._capture_activity(
+        _assistant_tool_use(
+            "Task", tool_id="tuse-1", tool_input={"subagent_type": "Explore", "prompt": "x"}
+        )
+    )
+    assert sub.last_activity().subagents == ("Explore",)
+    # 2) TaskStarted carrying that SAME tool_use_id + a distinct task_id → reconcile to ONE key.
+    sub._capture_activity(_task_started("task-1", "Explore", tool_use_id="tuse-1"))
+    assert set(sub._active_subagents) == {"task-1"}  # tracked under task_id ALONE
+    # 3) The SUBAGENT's own inner AssistantMessage — its parent_tool_use_id IS the spawning Task's
+    #    tool_use_id ("tuse-1"), which was just popped by the reconcile. This is the phantom trigger.
+    sub._capture_activity(
+        _assistant_tool_use("Grep", tool_id="inner-1", parent_tool_use_id="tuse-1")
+    )
+    # ⭐ The fix: "tuse-1" is a known spawning Task id → the fallback is SKIPPED. No phantom generic.
+    assert set(sub._active_subagents) == {"task-1"}, (
+        "the inner AssistantMessage must NOT resurrect the popped tool_use_id as a generic subagent"
+    )
+    snap = sub.last_activity()
+    assert snap is not None
+    assert snap.subagents == ("Explore",), "still exactly one named subagent — no stale 'subagent'"
+    assert "subagent" not in snap.subagents, "no phantom generic subagent"
+    # 4) Terminal completion of the task → the subagent is fully removed (only the task_id key
+    #    existed, so the terminal TaskUpdated removes it cleanly — no lingering generic).
+    sub._capture_activity(_task_updated("task-1", "completed"))
+    assert sub._active_subagents == {}, (
+        "the terminal TaskUpdated removes the ONLY key — no phantom lingers until ResultMessage"
+    )
+    assert sub.last_activity() is None or sub.last_activity().subagents == (), (
+        "no stale subagent remains before ResultMessage"
+    )
+    # 5) Turn boundary clears current_tool + the spawning-id set (so the next turn re-populates).
+    sub._capture_activity(_result_msg())
+    assert sub.last_activity() is None
+    assert sub._spawned_task_tool_use_ids == set(), "the spawning-id set is cleared at turn end"
+
+
 def test_capture_activity_result_clears_fallback_subagents():
     # REGRESSION: the parent_tool_use_id FALLBACK path has NO terminal Task* to remove its entries,
     # so the turn-terminal ResultMessage is the backstop that clears them — otherwise an inferred

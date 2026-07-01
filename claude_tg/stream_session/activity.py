@@ -281,6 +281,7 @@ class ActivityMixin:
         chat_id: int,
         *,
         delete: Optional[DeleteFn],
+        for_project: Optional[str] = None,
     ) -> None:
         """At turn END, REMOVE the transient activity line + clear its id/throttle state (T5).
 
@@ -291,7 +292,19 @@ class ActivityMixin:
         the statusline refresh + the limit warning) so the line is ALWAYS removed, even on a
         mid-stream raise. **RB1** — the WHOLE body is wrapped; a failed/absent delete never breaks
         the turn (the state is cleared regardless, so a stale id can't leak into the next turn).
+
+        **Foreground-only** (``for_project``, mirroring the ``_maybe_update_statusline`` /
+        ``_maybe_warn_limit`` siblings in the same ``finally``): only the FOREGROUND turn finalizes
+        its OWN live activity line. A BACKGROUND turn ending (it never posted a line) must NOT delete
+        the foreground turn's message / clear the shared ``_ChatState`` activity state — so we bail
+        BEFORE any delete/clear when ``for_project`` is not the chat's foreground. (The narrow
+        ``/switch``-mid-turn edge where a foreground turn ends after a switch-away leaves the line
+        lingering until the new foreground's next turn — ACCEPTABLE, self-healing.)
         """
+        # Foreground gate FIRST — before touching the message or the shared state. A background
+        # turn's finalize is a no-op for the foreground line it doesn't own.
+        if for_project is not None and not self._is_foreground(chat_id, for_project):
+            return
         state = self._chat(chat_id)
         try:
             if delete is not None and state.activity_message_id is not None:

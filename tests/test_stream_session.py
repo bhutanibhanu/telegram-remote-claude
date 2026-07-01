@@ -8713,14 +8713,18 @@ async def test_limit_warning_rearms_after_limited_then_ok_then_approaching():
 
 
 async def test_limit_warning_no_engine_turn_rearms():
-    # The documented worst-case "extra heads-up" path: a turn whose runtime has NO engine at end
-    # → no warning AND the flag is cleared (re-armed). Drive _drive_turn directly with a runtime
-    # whose engine is None (handle_message would attach one); the engine arg only feeds the stream.
+    # BLOCKER-3 fix (premise CORRECTED): a turn whose runtime has NO engine at end reports NO limit
+    # signal (None). ``None`` means "THIS engine has no signal yet," NOT "the limit recovered" — so
+    # it is a NON-EVENT: no warning AND the de-dup flag is LEFT INTACT (NOT re-armed). ADR-010:
+    # re-arm on EXPLICIT ``ok`` only. (Previously this asserted the flag was cleared — that was the
+    # over-broad re-arm the Codex QA flagged: a project whose engine reports None could clear a flag
+    # armed on another project and cause a duplicate warning within one non-ok window.) Drive
+    # _drive_turn directly with a runtime whose engine is None; the engine arg only feeds the stream.
     engine = FakeEngine([_ok_result()])
     session = make_session(engine)
     name, rt = session._active_runtime(1, create_default=True)
-    rt.engine = None  # the runtime carries NO engine for the warning's foreground read
-    session._chat(1).limit_warned = True  # was warned in a prior window
+    rt.engine = None  # the runtime carries NO engine → limit_status() is None (no signal)
+    session._chat(1).limit_warned = True  # was warned in a prior (still-open) window
     rec = Recorder()
     await asyncio.wait_for(
         session._drive_turn(
@@ -8730,7 +8734,72 @@ async def test_limit_warning_no_engine_turn_rearms():
         timeout=2.0,
     )
     assert _warnings(rec) == [], "no engine → no warning"
-    assert session._chat(1).limit_warned is False, "a no-engine turn clears (re-arms) the flag"
+    assert session._chat(1).limit_warned is True, (
+        "a no-engine (None-signal) turn is a NON-EVENT — it must NOT clear (re-arm) the flag; "
+        "re-arm is on EXPLICIT ok only (ADR-010)"
+    )
+
+
+async def test_limit_warning_multi_project_none_signal_does_not_rearm(tmp_path):
+    # BLOCKER-3 regression lock (Codex): the one-warning-per-window invariant across projects with
+    # DIFFERENT limit-signal knowledge. Warn on project A (approaching → flag set). Then a
+    # foreground turn on project B whose engine reports limit_status()==None (no signal) ends — a
+    # NON-EVENT: the de-dup flag must SURVIVE (not re-arm) and B must not warn. Switch back to A,
+    # still approaching → NO second warning (the same non-ok window). Without the fix, B's None
+    # clears the flag and A re-warns within the window (a duplicate heads-up).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "A", "/work", make_active=True)   # A is foreground first
+    store.create(1, "B", "/work", make_active=False)
+
+    eng_a = FakeEngine([_ok_result(), _ok_result()], limit_status=("approaching", 88))
+    eng_b = FakeEngine([_ok_result()], limit_status=None)  # B's engine has NO limit signal
+    session = make_session(eng_a, store=store)
+    _a_name, a_rt = session._override_runtime(1, "A")
+    a_rt.engine = eng_a
+    _b_name, b_rt = session._override_runtime(1, "B")
+    b_rt.engine = eng_b
+    rec = Recorder()
+
+    # (1) Foreground A, approaching → warns ONCE and arms the flag.
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, eng_a, "a1",
+            send=rec.send, edit=rec.edit, target=("A", a_rt),
+        ),
+        timeout=2.0,
+    )
+    assert len(_warnings(rec)) == 1, "project A (approaching) warns once"
+    assert session._chat(1).limit_warned is True
+
+    # (2) Switch foreground to B (limit_status None) and end a B turn → NON-EVENT: no warning, and
+    # the flag armed on A must NOT be cleared by B's None reading.
+    store.switch(1, "B")
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, eng_b, "b1",
+            send=rec.send, edit=rec.edit, target=("B", b_rt),
+        ),
+        timeout=2.0,
+    )
+    assert len(_warnings(rec)) == 1, "B's None-signal turn must not warn"
+    assert session._chat(1).limit_warned is True, (
+        "B's None reading is a non-event — it must NOT re-arm the flag armed on A"
+    )
+
+    # (3) Switch back to A, still approaching → NO second warning within the same non-ok window.
+    store.switch(1, "A")
+    await asyncio.wait_for(
+        session._drive_turn(
+            session._chat(1), 1, eng_a, "a2",
+            send=rec.send, edit=rec.edit, target=("A", a_rt),
+        ),
+        timeout=2.0,
+    )
+    assert len(_warnings(rec)) == 1, (
+        "back to A (still approaching) must NOT warn again — the window never returned to ok"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8990,6 +9059,41 @@ async def test_finalize_activity_raising_delete_swallowed_state_cleared():
     await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project=None)
     await session._finalize_activity(1, delete=rec.delete)  # must not raise
     assert session._chat(1).activity_message_id is None, "a failed delete still clears the id"
+
+
+async def test_finalize_activity_background_turn_does_not_touch_foreground_line(tmp_path):
+    # BLOCKER-2 regression lock (Codex): the FOREGROUND turn posts its activity line (id held), then
+    # a BACKGROUND turn ends and calls _finalize_activity(for_project=<background>). The finalize is
+    # foreground-gated, so it must NOT delete the foreground message NOR clear the shared _ChatState
+    # activity id/text. Without the fix, the background finalize deletes the foreground line and
+    # clears the id (a phantom disappearance of the surface you're looking at).
+    from claude_tg.session_store import JsonSessionStore
+
+    store = JsonSessionStore(tmp_path / "state.json")
+    store.create(1, "fg", "/work", make_active=True)   # fg is the foreground project
+    store.create(1, "bg", "/work", make_active=False)
+
+    eng = FakeEngine([], last_activity=lambda: _snap(tool="Bash"))
+    session = make_session(eng, store=store)
+    _fg_name, fg_rt = session._override_runtime(1, "fg")
+    fg_rt.engine = eng
+    rec = Recorder()
+
+    # The FOREGROUND turn posts its activity line (id held).
+    await session._maybe_update_activity(1, send=rec.send, edit=rec.edit, for_project="fg")
+    posted_id = session._chat(1).activity_message_id
+    assert posted_id == 101, "the foreground activity line was posted (id held)"
+
+    # A BACKGROUND turn ends → its finalize is foreground-gated (for_project='bg' != fg).
+    await session._finalize_activity(1, delete=rec.delete, for_project="bg")
+
+    assert rec.deletes == [], "a background turn must NOT delete the foreground activity message"
+    assert session._chat(1).activity_message_id == posted_id, (
+        "a background finalize must NOT clear the foreground activity id"
+    )
+    assert session._chat(1).activity_text is not None, (
+        "a background finalize must NOT clear the foreground activity text"
+    )
 
 
 # --- end-to-end through a turn: posts, then collapses/removes at turn end -----

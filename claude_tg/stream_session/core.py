@@ -3152,7 +3152,11 @@ class StreamingSession(ActivityMixin, StatuslineMixin, CallbacksMixin, Concurren
             # mid-stream raise, cancel) and a failed/absent delete never breaks the turn's
             # completion. The state is cleared regardless, so a stale id can't leak into the next
             # turn. Gated only by ``delete`` being injected (a test without one is a no-op).
-            await self._finalize_activity(chat_id, delete=delete)
+            # FOREGROUND-ONLY (``for_project=turn_name``, mirroring the statusline/warning siblings):
+            # only the foreground turn finalizes its OWN live activity line — a BACKGROUND turn
+            # ending (which never posted one) must NOT delete the foreground turn's line / clear the
+            # shared _ChatState activity state.
+            await self._finalize_activity(chat_id, delete=delete, for_project=turn_name)
             # ADR-005 D3: drop any pending-index entries this turn's project left open (an
             # ask/plan/permission the operator never answered — the engine has stopped
             # awaiting it now the stream drained / the turn died, so a late tap on it is a
@@ -3211,8 +3215,12 @@ class StreamingSession(ActivityMixin, StatuslineMixin, CallbacksMixin, Concurren
         ``limit_status()`` now reflects any ``RateLimitEvent`` that arrived during the turn).
         De-duped per limit-window on :attr:`_ChatState.limit_warned`:
 
-        * ``None`` / no engine / status ``"ok"`` → CLEAR the flag (re-arm) and return — no message.
-          The window recovered, so the NEXT crossing warns again.
+        * status ``"ok"`` → CLEAR the flag (re-arm) and return — no message. The window EXPLICITLY
+          recovered, so the NEXT crossing warns again.
+        * ``None`` / no engine / unknown status → a NON-EVENT: return WITHOUT clearing and WITHOUT
+          warning. ``None`` means THIS foreground engine has no limit signal yet — NOT that the
+          limit recovered — so the de-dup flag armed on another project survives a switch to a
+          project whose engine reports ``None`` (ADR-010: re-arm on EXPLICIT ``ok`` only).
         * ``"approaching"`` / ``"limited"`` AND not yet warned → post ONE warning, SET the flag.
         * ``"approaching"`` / ``"limited"`` AND already warned → do nothing (the de-dup).
 
@@ -3250,12 +3258,20 @@ class StreamingSession(ActivityMixin, StatuslineMixin, CallbacksMixin, Concurren
                         status = value[0]
                         if isinstance(value[1], int) and not isinstance(value[1], bool):
                             pct = value[1]
-            if status is None or status == "ok":
-                # No signal / recovered → re-arm so the next crossing warns again.
+            if status == "ok":
+                # EXPLICIT recovery → re-arm so the next crossing warns again. Only ``ok`` clears
+                # the de-dup flag; the window has genuinely recovered.
                 state.limit_warned = False
                 return
+            if status is None:
+                # NON-EVENT: ``None`` means THIS foreground engine has no limit signal yet (or has
+                # no engine), NOT that the limit recovered. Return WITHOUT clearing the flag and
+                # WITHOUT warning — so a de-dup flag armed on another project survives a switch to a
+                # project whose engine reports None, and switching back doesn't re-warn the same
+                # window. (ADR-010: re-arm on EXPLICIT ``ok`` only.)
+                return
             if status not in ("approaching", "limited"):
-                # An unknown status is treated as a non-event (never fabricate a warning).
+                # An unknown status is also a non-event (never fabricate a warning, never re-arm).
                 return
             if state.limit_warned:
                 return  # de-dup: already warned this window, still approaching/limited.

@@ -618,6 +618,16 @@ class SdkSubstrate:
         # stop. Single asyncio task per the substrate contract → no lock needed.
         self._current_tool: Optional[str] = None
         self._active_subagents: dict[str, str] = {}
+        # OBSERVABILITY T2: the set of spawning ``Task`` tool_use ids seen this turn. A subagent
+        # driven by BOTH a ``Task`` tool_use AND its own inner ``AssistantMessage`` carries that
+        # spawning tool_use_id as its ``parent_tool_use_id`` — the double-key reconcile re-keys it
+        # from the tool_use_id to the ``task_id`` (popping the tool_use_id entry), so the fallback
+        # branch must NOT re-register the now-popped tool_use_id as a generic ``"subagent"`` (that
+        # phantom would linger past the terminal TaskUpdated, which only removes the task_id entry).
+        # We remember every Task tool_use id here and SKIP the fallback for its parent — the subagent
+        # is already represented via the Task*/reconcile path. Cleared at the ResultMessage turn
+        # boundary (alongside ``_active_subagents``). In-memory only (RB3); reset on stop.
+        self._spawned_task_tool_use_ids: set[str] = set()
 
     # -- options -------------------------------------------------------------
 
@@ -1123,10 +1133,15 @@ class SdkSubstrate:
                 parent = getattr(msg, "parent_tool_use_id", None)
                 # FALLBACK: a subagent's own output carries the spawning Task's tool_use_id as its
                 # parent — if Task* wasn't seen for it, register it as a generic active subagent.
+                # But SKIP when ``parent`` is a known spawning Task tool_use id: that subagent is
+                # already tracked via the Task*/reconcile path (re-keyed from the tool_use_id to the
+                # task_id), so re-registering the popped tool_use_id here would resurrect a phantom
+                # generic ``"subagent"`` that the terminal TaskUpdated (task_id-only) can't remove.
                 if (
                     isinstance(parent, str)
                     and parent
                     and parent not in self._active_subagents
+                    and parent not in self._spawned_task_tool_use_ids
                 ):
                     self._active_subagents[parent] = "subagent"
                 for block in getattr(msg, "content", None) or []:
@@ -1145,6 +1160,10 @@ class SdkSubstrate:
                             )
                             if isinstance(tuid, str) and tuid:
                                 self._active_subagents[tuid] = stype or "subagent"
+                                # Remember this spawning id so the parent_tool_use_id fallback above
+                                # won't re-register it as a phantom generic subagent after the
+                                # TaskStarted reconcile re-keys it to the task_id.
+                                self._spawned_task_tool_use_ids.add(tuid)
                         break  # the FIRST tool_use is the current tool (one snapshot, not a log)
                 return
 
@@ -1158,6 +1177,9 @@ class SdkSubstrate:
                 # emit one.)
                 self._current_tool = None
                 self._active_subagents.clear()
+                # Drop the spawning-Task tool_use ids with the turn — they only guard the fallback
+                # within a turn; the next turn re-populates from its own Task tool_use blocks.
+                self._spawned_task_tool_use_ids.clear()
                 return
         except Exception:  # pragma: no cover - defensive; never break the receive loop (RB1)
             log.debug("activity capture failed (ignored)", exc_info=True)
@@ -1246,6 +1268,7 @@ class SdkSubstrate:
             # until its own first tool_use/Task* (never a stale carryover). RB3 (in-memory only).
             self._current_tool = None
             self._active_subagents = {}
+            self._spawned_task_tool_use_ids = set()
 
 
 __all__ = [
